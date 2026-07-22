@@ -1,4 +1,5 @@
 # Vortex-RDF for JavaScript
+[![npm](https://img.shields.io/npm/v/@vortex-rdf/vortex-rdf-store.svg)](https://www.npmjs.com/package/@vortex-rdf/vortex-rdf-store)
 
 JavaScript bindings of  [`vortex-rdf-core`](https://crates.io/crates/vortex-rdf-core) compiled via WebAssembly.
 
