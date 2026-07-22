@@ -3,7 +3,6 @@ import { DataFactory } from 'rdf-data-factory';
 import { Readable } from 'node:stream';
 import {
     VortexRdfStore,
-    init_panic_hook,
     rdf_to_vortex,
     vortex_to_rdf,
     nquads_to_vortex,
@@ -12,8 +11,6 @@ import {
 } from '../entry/node.js';
 
 const df = new DataFactory();
-
-init_panic_hook();
 
 /** Drain the quads of a match() result (via its Symbol.asyncIterator) into an array. */
 async function collect(stream: any): Promise<any[]> {
