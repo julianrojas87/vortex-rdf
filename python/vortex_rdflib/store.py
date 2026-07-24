@@ -1,4 +1,5 @@
 from pathlib import Path
+from collections import OrderedDict
 from typing import Optional
 import os
 import time
@@ -19,7 +20,9 @@ def reset_compact_materialization_trace():
     global _COMPACT_TRACE
     _COMPACT_TRACE = {"compact_native_call_ms": 0.0, "compact_term_parse_ms": 0.0,
         "compact_row_lookup_ms": 0.0, "compact_rows_yielded": 0,
-        "compact_lexical_terms": 0, "compact_calls": 0}
+        "compact_lexical_terms": 0, "compact_calls": 0,
+        "parsed_term_cache_hits": 0, "parsed_term_cache_misses": 0,
+        "parsed_term_cache_evictions": 0, "parsed_term_cache_entries": 0}
 
 def pop_compact_materialization_trace():
     global _COMPACT_TRACE
@@ -63,6 +66,11 @@ class VortexStore(Store):
         self.layout = layout
         self.backend = backend
         self._backend = None
+        # VORTEX_RDF_PARSED_TERM_LRU_CACHE_V1
+        self._parsed_term_cache_size = max(
+            0, int(os.environ.get("VORTEX_RDF_PARSED_TERM_CACHE_SIZE", "100000"))
+        )
+        self._parsed_term_cache = OrderedDict()
 
         # Do not pass configuration here, otherwise RDFLib calls open()
         # before our initialization logic is fully under control.
@@ -78,7 +86,10 @@ class VortexStore(Store):
         For this read-only Vortex store, configuration is the Vortex file path.
         """
         if configuration is not None:
-            self.path = str(Path(configuration))
+            new_path = str(Path(configuration))
+            if self.path != new_path:
+                self._parsed_term_cache.clear()
+            self.path = new_path
 
         if self.path is None:
             return NO_STORE
@@ -97,6 +108,7 @@ class VortexStore(Store):
         return VALID_STORE
 
     def close(self, commit_pending_transaction=False):
+        self._parsed_term_cache.clear()
         if self._backend is not None:
             self._backend.close()
             self._backend = None
@@ -267,11 +279,30 @@ class VortexStore(Store):
             return None
         return node.n3()
 
-    @staticmethod
-    def _from_n3_safe(value: str) -> Node:
+    def _from_n3_safe(self, value: str) -> Node:
+        cache = self._parsed_term_cache
+        if self._parsed_term_cache_size > 0:
+            cached = cache.get(value)
+            if cached is not None:
+                cache.move_to_end(value)
+                if _COMPACT_TRACE is not None:
+                    _COMPACT_TRACE["parsed_term_cache_hits"] += 1
+                    _COMPACT_TRACE["parsed_term_cache_entries"] = len(cache)
+                return cached
+        if _COMPACT_TRACE is not None:
+            _COMPACT_TRACE["parsed_term_cache_misses"] += 1
         try:
-            return from_n3(value)
+            parsed = from_n3(value)
         except Exception as e:
             raise ValueError(
                 f"Could not parse returned RDF term as N3: {value!r}"
             ) from e
+        if self._parsed_term_cache_size > 0:
+            cache[value] = parsed
+            if len(cache) > self._parsed_term_cache_size:
+                cache.popitem(last=False)
+                if _COMPACT_TRACE is not None:
+                    _COMPACT_TRACE["parsed_term_cache_evictions"] += 1
+            if _COMPACT_TRACE is not None:
+                _COMPACT_TRACE["parsed_term_cache_entries"] = len(cache)
+        return parsed
