@@ -143,8 +143,12 @@ def run_one_query(graph: Graph, query: str, silence_stdout: bool, timeout_s: flo
 
     old_handler = signal.getsignal(signal.SIGALRM)
 
+    # VORTEX_RDF_COMPACT_MATERIALIZATION_TRACE_V1
+    trace_enabled = os.environ.get("VORTEX_RDF_TRACE_COMPACT_MATERIALIZATION") == "1"
+    if trace_enabled:
+        from vortex_rdflib.store import reset_compact_materialization_trace
+        reset_compact_materialization_trace()
     start_ns = time.perf_counter_ns()
-
     try:
         if timeout_s is not None and timeout_s > 0:
             signal.signal(signal.SIGALRM, _query_timeout_handler)
@@ -160,14 +164,23 @@ def run_one_query(graph: Graph, query: str, silence_stdout: bool, timeout_s: flo
 
     end_ns = time.perf_counter_ns()
     mem_after = process.memory_info().rss
-
-    return {
+    out = {
         "elapsed_s": (end_ns - start_ns) / 1_000_000_000,
         "result_count": len(rows),
         "rss_before_mb": mem_before / (1024 * 1024),
         "rss_after_mb": mem_after / (1024 * 1024),
         "rss_delta_mb": (mem_after - mem_before) / (1024 * 1024),
     }
+    if trace_enabled:
+        from vortex_rdflib.store import pop_compact_materialization_trace
+        trace = pop_compact_materialization_trace()
+        if trace is None:
+            raise RuntimeError("compact materialization trace was not produced")
+        out.update(trace)
+        out["compact_unattributed_ms"] = max(0.0, out["elapsed_s"] * 1000.0
+            - out["compact_native_call_ms"] - out["compact_term_parse_ms"]
+            - out["compact_row_lookup_ms"])
+    return out
 
 
 class QueryProcessTimeoutError(TimeoutError):
@@ -496,6 +509,8 @@ def main():
         default=None,
         help="Append optimized native-ID diagnostic records to this JSONL file; vortex + signal mode only",
     )
+    parser.add_argument("--materialization-diagnostics-jsonl", default=None,
+        help="Append compact Python/RDFLib materialization timings; vortex + signal mode only")
     parser.add_argument(
         "--id-decode-diagnostics-jsonl",
         default=None,
@@ -518,6 +533,12 @@ def main():
         parser.error("--diagnostics-jsonl requires --timeout-mode signal")
     if args.diagnostics_jsonl and args.engines != ["vortex"]:
         parser.error("--diagnostics-jsonl requires exactly --engines vortex")
+    if args.materialization_diagnostics_jsonl and args.timeout_mode != "signal":
+        parser.error("--materialization-diagnostics-jsonl requires --timeout-mode signal")
+    if args.materialization_diagnostics_jsonl and args.engines != ["vortex"]:
+        parser.error("--materialization-diagnostics-jsonl requires exactly --engines vortex")
+    if args.materialization_diagnostics_jsonl:
+        os.environ["VORTEX_RDF_TRACE_COMPACT_MATERIALIZATION"] = "1"
     if args.id_decode_diagnostics_jsonl and args.timeout_mode != "signal":
         parser.error(
             "--id-decode-diagnostics-jsonl requires --timeout-mode signal")
@@ -664,6 +685,20 @@ def main():
                             timeout_s=args.query_timeout_s,
                         )
                     row.update(out)
+                    if args.materialization_diagnostics_jsonl:
+                        keys = ("compact_native_call_ms", "compact_term_parse_ms",
+                            "compact_row_lookup_ms", "compact_rows_yielded",
+                            "compact_lexical_terms", "compact_calls", "compact_unattributed_ms")
+                        missing = [key for key in keys if key not in row]
+                        if missing:
+                            raise RuntimeError("missing compact trace fields: " + ", ".join(missing))
+                        record = {key: row[key] for key in keys}
+                        record.update({"query_id": qrec["query_id"], "relative_path": qrec["relative_path"],
+                            "phase": phase, "run": row["run"],
+                            "benchmark_elapsed_ms": row["elapsed_s"] * 1000.0,
+                            "benchmark_result_count": row["result_count"]})
+                        with Path(args.materialization_diagnostics_jsonl).open("a", encoding="utf-8") as f:
+                            f.write(json.dumps(record, sort_keys=True) + "\n")
                     if args.diagnostics_jsonl:
                         diagnostic = run_direct_compact_diagnostic(
                             args.vortex_path,
