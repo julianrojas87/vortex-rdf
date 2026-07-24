@@ -686,12 +686,9 @@ def main():
                         )
                     row.update(out)
                     if args.materialization_diagnostics_jsonl:
-                        # VORTEX_RDF_PARSED_TERM_LRU_CACHE_V1
                         keys = ("compact_native_call_ms", "compact_term_parse_ms",
                             "compact_row_lookup_ms", "compact_rows_yielded",
-                            "compact_lexical_terms", "compact_calls", "compact_unattributed_ms",
-                            "parsed_term_cache_hits", "parsed_term_cache_misses",
-                            "parsed_term_cache_evictions", "parsed_term_cache_entries")
+                            "compact_lexical_terms", "compact_calls", "compact_unattributed_ms")
                         missing = [key for key in keys if key not in row]
                         if missing:
                             raise RuntimeError("missing compact trace fields: " + ", ".join(missing))
