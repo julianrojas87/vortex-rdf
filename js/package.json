@@ -52,7 +52,7 @@
         "oxigraph": "^0.5.9",
         "rdf-data-factory": "^2.0.2",
         "rdf-stores": "^2.2.0",
-        "tinybench": "^6.1.1",
+        "tinybench": "^6.1.2",
         "tsx": "^4.23.1",
         "typescript": "^7.0.2",
         "vitest": "^4.1.10",
