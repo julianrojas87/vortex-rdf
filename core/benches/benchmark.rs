@@ -58,8 +58,19 @@ fn main() {
 /// Single dataset size for the whole suite. In simulation mode CodSpeed counts
 /// instructions deterministically, so one representative size catches
 /// regressions in every path; larger sizes only multiply valgrind cost without
-/// adding signal (CodSpeed does not analyse scaling curves). Tune here.
-const BENCH_SIZE: usize = 100_000;
+/// adding signal (CodSpeed does not analyse scaling curves). Default matches
+/// CodSpeed CI; override locally (e.g. `BENCH_SIZE=2097152 cargo bench`, to
+/// match the JS comparative benchmark's default D=128 scale) to see how
+/// results shift at a larger size.
+fn bench_size() -> usize {
+    static SIZE: OnceLock<usize> = OnceLock::new();
+    *SIZE.get_or_init(|| {
+        std::env::var("BENCH_SIZE")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(100_000)
+    })
+}
 
 // ── shared tokio runtime ────────────────────────────────────────────────────
 
@@ -376,7 +387,7 @@ const SERIALIZE_CONFIGS: &[SerCfg] = &[
 fn serialize(bencher: divan::Bencher, cfg: &SerCfg) {
     let cfg = *cfg;
     bencher
-        .with_inputs(|| materialize_quads(BENCH_SIZE))
+        .with_inputs(|| materialize_quads(bench_size()))
         .bench_values(|quads| {
             rt().block_on(async move {
                 let mut buf = Vec::new();
@@ -491,7 +502,7 @@ fn run_match(
     pattern: Pattern,
 ) {
     bencher
-        .with_inputs(|| make_store(source, builder, layout, index, BENCH_SIZE))
+        .with_inputs(|| make_store(source, builder, layout, index, bench_size()))
         .bench_refs(|store| {
             let (s, p, o, g) = terms_for(pattern);
             rt().block_on(async {
@@ -595,7 +606,7 @@ fn match_chained(bencher: divan::Bencher, source: &Source) {
                 Builder::SortedStream,
                 Layout::Default,
                 Index::ByCopy,
-                BENCH_SIZE,
+                bench_size(),
             )
         })
         .bench_refs(|store| {
@@ -673,7 +684,7 @@ fn decode_all(bencher: divan::Bencher, cfg: &DecodeCfg) {
                 Builder::SortedStream,
                 cfg.layout,
                 Index::None,
-                BENCH_SIZE,
+                bench_size(),
             )
         })
         .bench_refs(|store| {
@@ -696,7 +707,7 @@ fn decode_all(bencher: divan::Bencher, cfg: &DecodeCfg) {
 fn open_file(bencher: divan::Bencher, layout: &Layout) {
     let layout = *layout;
     bencher
-        .with_inputs(|| cached_file(Builder::SortedStream, layout, Index::None, BENCH_SIZE))
+        .with_inputs(|| cached_file(Builder::SortedStream, layout, Index::None, bench_size()))
         .bench_refs(|path| {
             rt().block_on(async {
                 let store = VortexRdfStore::from_file(path).await.expect("open file");
@@ -715,7 +726,7 @@ fn from_bytes(bencher: divan::Bencher) {
                 Builder::SortedStream,
                 Layout::Default,
                 Index::None,
-                BENCH_SIZE,
+                bench_size(),
             )
         })
         .bench_refs(|bytes| {

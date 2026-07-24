@@ -51,7 +51,26 @@ pub(crate) fn search_sorted_bounds(
     arr: &ArrayRef,
     probe: &vortex_array::scalar::Scalar,
 ) -> Result<(usize, usize)> {
+    use vortex_array::arrays::Primitive;
     use vortex_array::search_sorted::{SearchResult, SearchSorted, SearchSortedSide};
+
+    // Typed fast path: a canonical non-nullable u32 column (the Dictionary
+    // layout's term codes). `partition_point` over the raw slice costs a few
+    // dozen loads; the generic kernel below builds a fresh `ExecutionCtx` and
+    // materializes a `Scalar` per probe, which profiling showed dominating
+    // `match_pattern`'s fixed per-call cost.
+    if arr.dtype().is_unsigned_int()
+        && !arr.dtype().is_nullable()
+        && let Ok(prim) = arr.clone().try_downcast::<Primitive>()
+        && prim.ptype() == vortex_array::dtype::PType::U32
+        && let Ok(code) = u32::try_from(probe)
+    {
+        let codes = prim.as_slice::<u32>();
+        let lo = codes.partition_point(|&v| v < code);
+        let hi = codes.partition_point(|&v| v <= code);
+        return Ok((lo, hi));
+    }
+
     let index_of = |result: SearchResult| match result {
         SearchResult::Found(i) | SearchResult::NotFound(i) => i,
     };
@@ -76,17 +95,25 @@ pub(crate) fn bool_array_to_mask(arr: ArrayRef) -> Result<Mask> {
 }
 
 /// Parses a string representation of an RDF named node (URI), stripping optional `<` and `>` boundaries.
+///
+/// **Trusted-input decode path.** Every caller reconstructs a term from the
+/// store's *own* serialized columns (see [`super::super::store::layouts`]), whose
+/// IRIs were validated by oxrdf's constructors at ingestion — so this uses
+/// [`NamedNode::new_unchecked`] rather than re-running `oxiri::Iri::parse`, which
+/// profiling showed as ~48% of every many-row read (both in-memory and
+/// file-backed). `.vortex` files are likewise trusted to have been checked when
+/// written. The `Result` is kept so the decode call sites (which `?` on genuinely
+/// fallible neighbours like [`buf_as_str`]) stay uniform.
 pub fn parse_named_node(s: &str) -> Result<NamedNode> {
     let s = s.trim_matches(|c| c == '<' || c == '>');
-    NamedNode::new(s)
-        .map_err(|e| VortexRdfError::Deserialization(format!("Invalid NamedNode '{}': {}", s, e)))
+    Ok(NamedNode::new_unchecked(s))
 }
 
-/// Parses a string representation of an RDF blank node, stripping the `_:` prefix if present.
+/// Parses a string representation of an RDF blank node, stripping the `_:` prefix
+/// if present. Trusted-input decode path — see [`parse_named_node`].
 pub fn parse_blank_node(s: &str) -> Result<BlankNode> {
     let s = s.trim_start_matches("_:");
-    BlankNode::new(s)
-        .map_err(|e| VortexRdfError::Deserialization(format!("Invalid BlankNode '{}': {}", s, e)))
+    Ok(BlankNode::new_unchecked(s))
 }
 
 /// Parses an RDF subject node, which can either be a NamedNode (URI) or a BlankNode.
@@ -134,13 +161,16 @@ pub(crate) fn graph_name_str(g: &GraphName) -> String {
 /// Handles URIs, Blank Nodes, simple literals, language-tagged literals, and typed literals.
 pub fn get_as_term(s: &str) -> Option<Term> {
     if s.starts_with('<') {
-        Some(Term::NamedNode(
-            NamedNode::new(s.trim_matches(|c| c == '<' || c == '>')).ok()?,
-        ))
+        // Trusted-input decode path — see `parse_named_node`; `new_unchecked`
+        // skips the `oxiri::Iri::parse` re-validation of an already-validated,
+        // stored IRI.
+        Some(Term::NamedNode(NamedNode::new_unchecked(
+            s.trim_matches(|c| c == '<' || c == '>'),
+        )))
     } else if s.starts_with("_:") {
-        Some(Term::BlankNode(
-            BlankNode::new(s.trim_start_matches("_:")).ok()?,
-        ))
+        Some(Term::BlankNode(BlankNode::new_unchecked(
+            s.trim_start_matches("_:"),
+        )))
     } else if s.starts_with('"') {
         if s.contains("^^") {
             let parts: Vec<&str> = s.splitn(2, "^^").collect();
@@ -148,14 +178,14 @@ pub fn get_as_term(s: &str) -> Option<Term> {
             let dt = parts[1].trim_matches(|c| c == '<' || c == '>');
             Some(Term::Literal(Literal::new_typed_literal(
                 val,
-                NamedNode::new(dt).ok()?,
+                NamedNode::new_unchecked(dt),
             )))
         } else if let Some(at_pos) = s.rfind('@') {
             if at_pos > 0 && s.as_bytes()[at_pos - 1] == b'"' {
                 let val = s[..at_pos].trim_matches('"');
                 let lang = &s[at_pos + 1..];
                 Some(Term::Literal(
-                    Literal::new_language_tagged_literal(val, lang).ok()?,
+                    Literal::new_language_tagged_literal_unchecked(val, lang),
                 ))
             } else {
                 Some(Term::Literal(Literal::new_simple_literal(
