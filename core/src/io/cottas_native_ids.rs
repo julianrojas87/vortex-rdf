@@ -5610,6 +5610,7 @@ async fn write_native_dictionary_component(
     run_paths: &[PathBuf],
     order: PairRunOrder,
     row_group_size: usize,
+    compression_profile: CottasVortexCompressionProfile,
 ) -> Result<()> {
     let temporary_path = output_path.with_extension("vortex.tmp");
     let stream = dictionary_pair_stream(run_paths.to_vec(), order, row_group_size)?;
@@ -5618,10 +5619,15 @@ async fn write_native_dictionary_component(
     let mut output = tokio::fs::File::create(&temporary_path)
         .await
         .map_err(|error| VortexRdfError::Serialization(error.to_string()))?;
-    let strategy = WriteStrategyBuilder::default()
-        .with_row_block_size(row_group_size.max(1))
-        .with_btrblocks_builder(BtrBlocksCompressorBuilder::default().with_compact())
-        .build();
+    // VORTEX_RDF_ID_TO_TERM_BALANCED_COMPRESSION_V1
+    let strategy_builder =
+        WriteStrategyBuilder::default().with_row_block_size(row_group_size.max(1));
+    let strategy_builder = match compression_profile {
+        CottasVortexCompressionProfile::Balanced => strategy_builder,
+        CottasVortexCompressionProfile::Compact => strategy_builder
+            .with_btrblocks_builder(BtrBlocksCompressorBuilder::default().with_compact()),
+    };
+    let strategy = strategy_builder.build();
     NATIVE_FILE_SESSION
         .write_options()
         .with_strategy(strategy)
@@ -5646,6 +5652,7 @@ async fn write_dictionary_lookup_sidecars_from_pair_runs(
         &pair_run_paths.id_run_paths,
         PairRunOrder::Id,
         row_group_size,
+        CottasVortexCompressionProfile::Balanced,
     )
     .await?;
     write_native_dictionary_component(
@@ -5653,6 +5660,7 @@ async fn write_dictionary_lookup_sidecars_from_pair_runs(
         &pair_run_paths.term_run_paths,
         PairRunOrder::Term,
         row_group_size,
+        CottasVortexCompressionProfile::Compact,
     )
     .await?;
     log::info!(
@@ -6364,6 +6372,7 @@ pub async fn rebuild_cottas_native_term_dictionary(
         &term_run_paths,
         PairRunOrder::Term,
         row_group_size,
+        CottasVortexCompressionProfile::Compact,
     )
     .await?;
     let write_ms = elapsed_ms(write_start);
