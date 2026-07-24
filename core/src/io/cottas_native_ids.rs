@@ -16,14 +16,11 @@ use std::time::Instant;
 use vortex::VortexSessionDefault;
 use vortex_error::{VortexError, VortexResult};
 
-use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use vortex_array::VortexSessionExecute;
 use vortex_array::arrays::chunked::ChunkedArrayExt;
-use vortex_array::arrays::filter::FilterArrayExt;
 use vortex_array::arrays::struct_::StructArrayExt;
-use vortex_array::arrays::{
-    Chunked, Filter, PrimitiveArray, StructArray, VarBinArray, VarBinViewArray,
-};
+use vortex_array::arrays::{Chunked, PrimitiveArray, StructArray, VarBinArray, VarBinViewArray};
 use vortex_array::stream::ArrayStreamAdapter;
 use vortex_array::{ArrayRef, IntoArray};
 use vortex_btrblocks::BtrBlocksCompressorBuilder;
@@ -482,28 +479,12 @@ pub struct NativeDirectCompactTimings {
     pub lexical_bytes: usize,
     // VORTEX_RDF_COMPACT_DICTIONARY_OVERRIDE_V1
     pub dictionary_path: String,
-    // VORTEX_RDF_ID_TO_TERM_ENCODING_TRACE_V1
-    pub selected_array_encoding: String,
-    pub term_column_encoding: String,
-    pub term_chunks: usize,
-    // VORTEX_RDF_CHUNK_EXECUTION_COST_TRACE_V1
-    pub term_chunk_encoding_names: Vec<String>,
-    pub term_chunk_encoding_chunks: Vec<usize>,
-    pub term_chunk_encoding_rows: Vec<usize>,
-    pub term_chunk_encoding_execute_ms: Vec<f64>,
-    // VORTEX_RDF_FILTERED_SOURCE_EXECUTION_TRACE_V2
-    pub term_filter_source_names: Vec<String>,
-    pub term_filter_source_chunks: Vec<usize>,
-    pub term_filter_source_selected_rows: Vec<usize>,
-    pub term_filter_source_input_rows: Vec<usize>,
-    pub term_filter_source_execute_ms: Vec<f64>,
     pub unique_id_collect_ms: f64,
     pub dictionary_open_ms: f64,
     pub row_indices_build_ms: f64,
     pub scan_build_ms: f64,
     pub read_all_ms: f64,
     pub struct_execute_ms: f64,
-    pub id_column_execute_ms: f64,
     pub term_column_execute_ms: f64,
     pub lexical_extract_allocate_ms: f64,
     pub id_index_insert_ms: f64,
@@ -517,7 +498,6 @@ async fn projected_native_id_rows_as_compact_triples_direct_v1_impl(
     data_path: &Path,
     rows: &NativeProjectedIdRows,
     bound: &BoundNativeRdfTerms,
-    collect_chunk_execution_stats: bool,
 ) -> Result<(NativeCompactTripleBatch, NativeDirectCompactTimings)> {
     let total_start = Instant::now();
     let mut timings = NativeDirectCompactTimings {
@@ -564,8 +544,9 @@ async fn projected_native_id_rows_as_compact_triples_direct_v1_impl(
         .scan()
         .map_err(VortexRdfError::from)?
         .with_row_indices(indices)
+        // VORTEX_RDF_TERM_ONLY_COMPACT_V1
         .with_projection(vortex_array::expr::select(
-            ["id", "term"],
+            ["term"],
             vortex_array::expr::root(),
         ))
         .into_array_stream()
@@ -574,7 +555,6 @@ async fn projected_native_id_rows_as_compact_triples_direct_v1_impl(
     let stage = Instant::now();
     let array = stream.read_all().await.map_err(VortexRdfError::from)?;
     timings.read_all_ms = elapsed_ms(stage);
-    timings.selected_array_encoding = array.to_string();
     if array.len() != requested.len() {
         return Err(VortexRdfError::Deserialization(format!(
             "direct compact dictionary selection returned {} rows for {} requested IDs",
@@ -589,19 +569,10 @@ async fn projected_native_id_rows_as_compact_triples_direct_v1_impl(
         .execute::<StructArray>(&mut ctx)
         .map_err(VortexRdfError::Vortex)?;
     timings.struct_execute_ms = elapsed_ms(stage);
-    let stage = Instant::now();
-    let id_column = struct_array
-        .unmasked_field_by_name("id")
-        .map_err(VortexRdfError::Vortex)?
-        .clone()
-        .execute::<PrimitiveArray>(&mut ctx)
-        .map_err(VortexRdfError::Vortex)?;
-    timings.id_column_execute_ms = elapsed_ms(stage);
     let term_field = struct_array
         .unmasked_field_by_name("term")
         .map_err(VortexRdfError::Vortex)?
         .clone();
-    timings.term_column_encoding = term_field.to_string();
     // VORTEX_RDF_INCREMENTAL_CHUNKED_TERM_DECODE_V1
     // Avoid the global Chunked<utf8> canonical builder. Canonicalize and
     // consume each selected chunk independently while preserving row order.
@@ -611,12 +582,9 @@ async fn projected_native_id_rows_as_compact_triples_direct_v1_impl(
             term_field
         ))
     })?;
-    timings.term_chunks = term_chunks.nchunks();
-    let loaded_ids = id_column.as_slice::<u32>();
-    if loaded_ids.len() != requested.len() || term_field.len() != requested.len() {
+    if term_field.len() != requested.len() {
         return Err(VortexRdfError::Deserialization(format!(
-            "direct compact dictionary column mismatch: ids={}, terms={}, requested={}",
-            loaded_ids.len(),
+            "direct compact dictionary term mismatch: terms={}, requested={}",
             term_field.len(),
             requested.len()
         )));
@@ -624,39 +592,10 @@ async fn projected_native_id_rows_as_compact_triples_direct_v1_impl(
     let mut terms = Vec::with_capacity(requested.len().saturating_add(3));
     let mut id_indexes = HashMap::with_capacity(requested.len());
     let mut term_execute_ms = 0.0;
-    let mut chunk_execution_stats: BTreeMap<String, (usize, usize, f64)> = BTreeMap::new();
-    // Aggregated only for diagnose_direct_compact; the production path does not
-    // inspect Filter children or allocate source-encoding labels.
-    let mut filter_source_execution_stats: BTreeMap<String, (usize, usize, usize, f64)> =
-        BTreeMap::new();
     let mut lexical_ms = 0.0;
     let mut insert_ms = 0.0;
     let mut index = 0usize;
     for chunk in term_chunks.iter_chunks() {
-        let encoding_name = collect_chunk_execution_stats.then(|| {
-            let rendered = chunk.to_string();
-            rendered
-                .split_once('(')
-                .map_or(rendered.as_str(), |(name, _)| name)
-                .to_owned()
-        });
-        let filter_source = if collect_chunk_execution_stats {
-            let filter = chunk.as_opt::<Filter>().ok_or_else(|| {
-                VortexRdfError::Deserialization(format!(
-                    "filtered-source trace expected a Filter chunk, got {}",
-                    chunk
-                ))
-            })?;
-            let source = filter.child();
-            let rendered = source.to_string();
-            let source_encoding = rendered
-                .split_once('(')
-                .map_or(rendered.as_str(), |(name, _)| name)
-                .to_owned();
-            Some((source_encoding, source.len()))
-        } else {
-            None
-        };
         let stage = Instant::now();
         let term_chunk = chunk
             .clone()
@@ -664,33 +603,13 @@ async fn projected_native_id_rows_as_compact_triples_direct_v1_impl(
             .map_err(VortexRdfError::Vortex)?;
         let chunk_execute_ms = elapsed_ms(stage);
         term_execute_ms += chunk_execute_ms;
-        if let Some(encoding_name) = encoding_name {
-            let stats = chunk_execution_stats.entry(encoding_name).or_default();
-            stats.0 += 1;
-            stats.1 += term_chunk.len();
-            stats.2 += chunk_execute_ms;
-        }
-        if let Some((source_encoding, input_rows)) = filter_source {
-            let stats = filter_source_execution_stats
-                .entry(source_encoding)
-                .or_default();
-            stats.0 += 1;
-            stats.1 += term_chunk.len();
-            stats.2 += input_rows;
-            stats.3 += chunk_execute_ms;
-        }
         for chunk_index in 0..term_chunk.len() {
             let expected = *requested.get(index).ok_or_else(|| {
                 VortexRdfError::Deserialization(
                     "direct compact term chunks exceeded requested IDs".into(),
                 )
             })?;
-            let actual = loaded_ids[index];
-            if expected != actual {
-                return Err(VortexRdfError::Deserialization(format!(
-                    "direct compact ID invariant failed at position {index}: requested {expected}, loaded {actual}"
-                )));
-            }
+            let actual = expected;
             let stage = Instant::now();
             let term_bytes = term_chunk.bytes_at(chunk_index);
             let lexical = std::str::from_utf8(&term_bytes).map_err(|error| {
@@ -720,20 +639,6 @@ async fn projected_native_id_rows_as_compact_triples_direct_v1_impl(
         )));
     }
     timings.term_column_execute_ms = term_execute_ms;
-    for (encoding, (chunks, rows, execute_ms)) in chunk_execution_stats {
-        timings.term_chunk_encoding_names.push(encoding);
-        timings.term_chunk_encoding_chunks.push(chunks);
-        timings.term_chunk_encoding_rows.push(rows);
-        timings.term_chunk_encoding_execute_ms.push(execute_ms);
-    }
-    for (encoding, (chunks, selected_rows, input_rows, execute_ms)) in filter_source_execution_stats
-    {
-        timings.term_filter_source_names.push(encoding);
-        timings.term_filter_source_chunks.push(chunks);
-        timings.term_filter_source_selected_rows.push(selected_rows);
-        timings.term_filter_source_input_rows.push(input_rows);
-        timings.term_filter_source_execute_ms.push(execute_ms);
-    }
     timings.lexical_extract_allocate_ms = lexical_ms;
     timings.id_index_insert_ms = insert_ms;
     timings.lexical_bytes = terms.iter().map(String::len).sum();
@@ -754,7 +659,6 @@ async fn projected_native_id_rows_as_compact_triples_direct_v1_impl(
         + timings.scan_build_ms
         + timings.read_all_ms
         + timings.struct_execute_ms
-        + timings.id_column_execute_ms
         + timings.term_column_execute_ms
         + timings.lexical_extract_allocate_ms
         + timings.id_index_insert_ms
@@ -769,7 +673,7 @@ async fn projected_native_id_rows_as_compact_triples_direct_v1(
     rows: &NativeProjectedIdRows,
     bound: &BoundNativeRdfTerms,
 ) -> Result<NativeCompactTripleBatch> {
-    projected_native_id_rows_as_compact_triples_direct_v1_impl(data_path, rows, bound, false)
+    projected_native_id_rows_as_compact_triples_direct_v1_impl(data_path, rows, bound)
         .await
         .map(|v| v.0)
 }
@@ -788,7 +692,6 @@ pub async fn diagnose_cottas_native_direct_compact(
         input_path,
         &planned.rows,
         &planned.bound_terms,
-        true,
     )
     .await?;
     timings.total_rust_ms = elapsed_ms(total);

@@ -169,39 +169,13 @@ fn diagnose_direct_compact<'py>(
     set!("lexical_bytes", d.lexical_bytes);
     // VORTEX_RDF_COMPACT_DICTIONARY_OVERRIDE_V1
     set!("dictionary_path", &d.dictionary_path);
-    // VORTEX_RDF_EXPOSE_ENCODING_TRACE_V1
-    set!("selected_array_encoding", &d.selected_array_encoding);
-    set!("term_column_encoding", &d.term_column_encoding);
-    set!("term_chunks", d.term_chunks);
-    set!("term_chunk_encoding_names", &d.term_chunk_encoding_names);
-    set!("term_chunk_encoding_chunks", &d.term_chunk_encoding_chunks);
-    set!("term_chunk_encoding_rows", &d.term_chunk_encoding_rows);
-    set!(
-        "term_chunk_encoding_execute_ms",
-        &d.term_chunk_encoding_execute_ms
-    );
-    // VORTEX_RDF_FILTERED_SOURCE_EXECUTION_TRACE_V2
-    set!("term_filter_source_names", &d.term_filter_source_names);
-    set!("term_filter_source_chunks", &d.term_filter_source_chunks);
-    set!(
-        "term_filter_source_selected_rows",
-        &d.term_filter_source_selected_rows
-    );
-    set!(
-        "term_filter_source_input_rows",
-        &d.term_filter_source_input_rows
-    );
-    set!(
-        "term_filter_source_execute_ms",
-        &d.term_filter_source_execute_ms
-    );
+    // VORTEX_RDF_TERM_ONLY_COMPACT_V1
     set!("unique_id_collect_ms", d.unique_id_collect_ms);
     set!("dictionary_open_ms", d.dictionary_open_ms);
     set!("row_indices_build_ms", d.row_indices_build_ms);
     set!("scan_build_ms", d.scan_build_ms);
     set!("read_all_ms", d.read_all_ms);
     set!("struct_execute_ms", d.struct_execute_ms);
-    set!("id_column_execute_ms", d.id_column_execute_ms);
     set!("term_column_execute_ms", d.term_column_execute_ms);
     set!("lexical_extract_allocate_ms", d.lexical_extract_allocate_ms);
     set!("id_index_insert_ms", d.id_index_insert_ms);
