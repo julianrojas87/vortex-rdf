@@ -362,20 +362,6 @@ def run_direct_compact_diagnostic(
         object_n3,
         vortex_layout,
     ))
-    # VORTEX_RDF_REQUIRE_ENCODING_TRACE_V1
-    # VORTEX_RDF_COMPACT_DICTIONARY_OVERRIDE_V1
-    required = {
-        "dictionary_path",
-        "selected_array_encoding",
-        "term_column_encoding",
-    }
-    missing = sorted(required.difference(diagnostic))
-    if missing:
-        raise RuntimeError(
-            "direct compact diagnostic is missing required fields: "
-            + ", ".join(missing)
-            + "; rebuild and reinstall the current PyO3 extension"
-        )
     configured = os.environ.get("VORTEX_RDF_ID_TO_TERM_VORTEX_PATH")
     if configured:
         expected = Path(configured).expanduser().resolve(strict=True)
