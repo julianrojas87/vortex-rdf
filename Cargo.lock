@@ -3396,7 +3396,7 @@ dependencies = [
 
 [[package]]
 name = "vortex-rdf"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "console_error_panic_hook",
  "futures",
@@ -3415,7 +3415,7 @@ dependencies = [
 
 [[package]]
 name = "vortex-rdf-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -3434,7 +3434,7 @@ dependencies = [
 
 [[package]]
 name = "vortex-rdf-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "clap",
  "codspeed-divan-compat",
