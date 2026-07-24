@@ -17,8 +17,6 @@ use vortex_array::arrays::struct_::{StructArray, StructArrayExt};
 use vortex_array::arrays::{ListArray, ListViewArray, PrimitiveArray, VarBinViewArray};
 #[cfg(feature = "file-io")]
 use vortex_array::expr::{root, select};
-use vortex_array::scalar::Scalar;
-use vortex_array::search_sorted::{SearchResult, SearchSorted, SearchSortedSide};
 #[cfg(feature = "file-io")]
 use vortex_array::stream::ArrayStreamExt as _;
 use vortex_array::validity::Validity;
@@ -195,29 +193,16 @@ impl TermDictionary {
     /// Uses Vortex's SearchSorted compute kernel via ArrayRef for optimized sorted search.
     /// Falls back to manual binary search only if the kernel fails.
     pub(crate) fn get_id(&self, term: &str) -> Option<u32> {
-        let probe = Scalar::from(term);
-
-        // Try the SearchSorted kernel first (optimized path for sorted columns)
-        let arr_ref = self.terms.clone().into_array();
-        if let Ok(result) = arr_ref.search_sorted(&probe, SearchSortedSide::Left) {
-            // SearchSorted returns the position where term should be inserted
-            // For an exact match, the value at that position must equal the probe
-            let idx = match result {
-                SearchResult::Found(i) | SearchResult::NotFound(i) => i,
-            };
-            if idx < self.len() && self.terms.bytes_at(idx).as_ref() == term.as_bytes() {
-                return Some(idx as u32);
-            }
-            return None;
-        }
-
-        // Fallback: manual binary search (should not happen in normal operation)
+        // Direct byte-compare binary search over the sorted term views.
+        // `terms` is a concrete VarBinViewArray, so `bytes_at` reads a view
+        // without materializing anything; the generic `search_sorted` kernel
+        // would instead build a fresh `ExecutionCtx` and a `Scalar` per probe,
+        // which profiling showed dominating `match_pattern`'s fixed cost.
         let needle = term.as_bytes();
         let (mut lo, mut hi) = (0usize, self.len());
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
-            let buf = self.terms.bytes_at(mid);
-            match buf.as_ref().cmp(needle) {
+            match self.terms.bytes_at(mid).as_ref().cmp(needle) {
                 std::cmp::Ordering::Less => lo = mid + 1,
                 std::cmp::Ordering::Equal => return Some(mid as u32),
                 std::cmp::Ordering::Greater => hi = mid,

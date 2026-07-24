@@ -111,6 +111,19 @@
   }
   nav.seclinks a:hover { color:var(--ink); border-color: var(--accent); }
 
+  /* ---- tabs ---- */
+  nav.tabs { display:flex; gap:6px; }
+  nav.tabs .tab {
+    appearance:none; background:transparent; border:1px solid var(--border-strong);
+    color:var(--ink-2); font:inherit; font-size:12px; font-weight:700; text-transform:uppercase;
+    letter-spacing:0.05em; padding:6px 13px; border-radius:6px; cursor:pointer;
+  }
+  nav.tabs .tab:hover:not(.active) { color:var(--ink); }
+  nav.tabs .tab.active { background:var(--accent); color:#fff; border-color:var(--accent); }
+  .tabpane { display:none; }
+  .tabpane.active { display:block; }
+  .tabpane > nav.seclinks { margin-bottom:22px; }
+
   main { max-width: 1280px; margin: 0 auto; padding: 28px 24px 80px; }
 
   .lede { max-width: 74ch; color:var(--ink-2); font-size:14.5px; margin: 4px 0 28px; }
@@ -142,6 +155,7 @@
   .group-desc { color:var(--ink-2); font-size:13.5px; max-width:80ch; margin: 0 0 18px; }
 
   .panel-grid { display:grid; grid-template-columns:repeat(auto-fit, minmax(420px,1fr)); gap:16px; }
+  .panel.wide { grid-column: 1 / -1; }
   .panel {
     background:var(--surface); border:1px solid var(--border); border-radius:8px;
     padding:16px 18px 18px;
@@ -155,6 +169,9 @@
 
   .filmstrip { display:grid; grid-template-columns:repeat(auto-fit, minmax(96px,1fr)); gap:10px; }
   .filmstrip.simple { grid-template-columns: minmax(0,1fr); max-width: 340px; }
+  .filmstrip.simple.wide { max-width: none; }
+  .filmstrip.cols-3 { grid-template-columns: repeat(3, minmax(0,1fr)); gap:20px; }
+  .filmstrip.cols-3 .mini .cap { font-size:12px; }
   .mini { display:flex; flex-direction:column; align-items:center; gap:4px; }
   .mini svg { width:100%; height:auto; overflow:visible; }
   .mini .cap { font-size:11px; color:var(--ink-muted); font-weight:600; letter-spacing:0.03em; }
@@ -239,19 +256,24 @@
   <div class="topbar-row">
     <div class="brand">
       <span class="mark mono">vortex-rdf · bench</span>
-      <span class="sub">divan micro-benchmark results</span>
+      <span class="sub">micro-benchmark results</span>
     </div>
-    <nav class="seclinks">
-      <a href="#overview">Overview</a>
-      <a href="#write">Write</a>
-      <a href="#query">Query</a>
-      <a href="#decode">Decode</a>
-      <a href="#data">Raw data</a>
+    <nav class="tabs" role="tablist" aria-label="Benchmark suite">
+      <button class="tab" data-tab="rust" role="tab" type="button">Rust · core</button>
+      <button class="tab" data-tab="js" role="tab" type="button">JavaScript · WASM</button>
     </nav>
   </div>
 </header>
 
 <main>
+  <div id="tab-rust" class="tabpane">
+  <nav class="seclinks">
+    <a href="#overview">Overview</a>
+    <a href="#write">Write</a>
+    <a href="#query">Query</a>
+    <a href="#decode">Decode</a>
+    <a href="#data">Raw data</a>
+  </nav>
   <section id="overview" class="group">
     <p class="lede">
       One <code>cargo bench</code> run of <code>core/benches/benchmark.rs</code> — a star
@@ -322,15 +344,138 @@
   </section>
 
   <footer class="prov mono" id="provenance"></footer>
+  </div><!-- /tab-rust -->
+
+  <div id="tab-js" class="tabpane">
+  <nav class="seclinks">
+    <a href="#js-overview">Overview</a>
+    <a href="#js-ingest">Ingest</a>
+    <a href="#js-query">Query</a>
+    <a href="#js-mutations">Mutations</a>
+    <a href="#js-variants">Variants</a>
+    <a href="#js-memory">Memory</a>
+    <a href="#js-data">Raw data</a>
+  </nav>
+
+  <section id="js-overview" class="group">
+    <p class="lede">
+      One <code>npm run bench</code> run of <code>js/bench/compare.bench.ts</code> — the
+      <code>VortexRdfStore</code> WASM bindings compared against
+      <a href="https://github.com/rubensworks/rdf-stores.js">rdf-stores.js</a> and
+      <a href="https://github.com/oxigraph/oxigraph/tree/main/js">oxigraph</a>, on an
+      rdf-stores.js-style synthetic dataset across four phases: ingest, query, add, delete.
+      Wall-clock (tinybench) — deliberately <em>not</em> uploaded to CodSpeed.
+    </p>
+    <div class="kpi-row" id="js-kpi-row"></div>
+  </section>
+
+  <section id="js-ingest" class="group">
+    <div class="group-head">
+      <span class="chan-tag mono">INGEST</span>
+      <h2>Bulk build</h2>
+    </div>
+    <p class="group-desc">Building a store from the generated triples via each library's idiomatic bulk path (Vortex <code>fromQuads</code>, oxigraph <code>new Store(quads)</code>, rdf-stores per-quad <code>addQuad</code>). Apples-to-oranges by construction — read it as “time to a queryable store”.</p>
+    <div class="panel-grid" id="js-ingest-panels"></div>
+  </section>
+
+  <section id="js-query" class="group">
+    <div class="group-head">
+      <span class="chan-tag mono">QUERY</span>
+      <h2>Match — cross-library</h2>
+    </div>
+    <p class="group-desc">
+      Resolving <code>match</code> and counting results across routing shapes:
+      <span class="mono">S</span>/<span class="mono">P</span>/<span class="mono">O</span>/<span class="mono">PO</span>/<span class="mono">SPO</span>/<span class="mono">full</span>
+      on triples, <span class="mono">G</span>/<span class="mono">SPOG</span> on named graphs. Vortex quads are
+      lazy/zero-copy, so counting doesn't materialize term strings — the <span class="mono">full</span> scan in
+      particular flatters Vortex against the eager stores.
+    </p>
+    <div class="panel-grid" id="js-query-panels"></div>
+  </section>
+
+  <section id="js-mutations" class="group">
+    <div class="group-head">
+      <span class="chan-tag mono">MUTATE</span>
+      <h2>Add &amp; delete</h2>
+    </div>
+    <p class="group-desc">Incremental per-quad additions and deletions of a fixed batch. Vortex routes these through its tail/tombstone model, so per-quad <code>addQuad</code> trails the recommended <code>addQuads</code> batch path — both are shown.</p>
+    <div class="panel-grid" id="js-mut-panels"></div>
+  </section>
+
+  <section id="js-variants" class="group">
+    <div class="group-head">
+      <span class="chan-tag mono">VARIANTS</span>
+      <h2>Vortex config variants</h2>
+    </div>
+    <p class="group-desc">The same star design as the Rust tab, over the axes reachable from JS: builder (Unsorted / Sorted), column layout (Default / Dictionary), and secondary index (none / ByReference / ByCopy).</p>
+    <div class="panel-grid" id="js-variant-panels"></div>
+  </section>
+
+  <section id="js-memory" class="group">
+    <div class="group-head">
+      <span class="chan-tag mono">MEMORY</span>
+      <h2>Peak memory (RSS)</h2>
+    </div>
+    <p class="group-desc">
+      Each adapter's full lifecycle (build, query, ingest — or add/delete for the
+      mutation phase) runs in its own process, so this is a clean, uncontaminated
+      peak resident-set size per adapter: the kernel-tracked high-water mark
+      (<span class="mono">VmHWM</span>), not a point-in-time sample. Lower is better.
+    </p>
+    <div class="panel-grid" id="js-memory-panels"></div>
+  </section>
+
+  <section id="js-data" class="group">
+    <div class="group-head">
+      <span class="chan-tag mono">DATA</span>
+      <h2>Every measured configuration</h2>
+    </div>
+    <p class="group-desc">All leaf benchmarks from this run. Click a column to sort.</p>
+    <div class="table-toolbar">
+      <input id="js-table-filter" type="text" placeholder="filter by name…" autocomplete="off" />
+      <span class="count" id="js-table-count"></span>
+    </div>
+    <div class="table-wrap">
+      <table class="data" id="js-data-table">
+        <thead><tr>
+          <th data-key="id" tabindex="0" role="button" aria-label="Sort by benchmark name">Benchmark</th>
+          <th data-key="fastest_ns" tabindex="0" role="button" aria-label="Sort by fastest">Fastest</th>
+          <th data-key="slowest_ns" tabindex="0" role="button" aria-label="Sort by slowest">Slowest</th>
+          <th data-key="median_ns" tabindex="0" role="button" aria-label="Sort by median">Median</th>
+          <th data-key="mean_ns" tabindex="0" role="button" aria-label="Sort by mean">Mean</th>
+          <th data-key="samples" tabindex="0" role="button" aria-label="Sort by sample count">Samples</th>
+        </tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+
+  <footer class="prov mono" id="js-provenance"></footer>
+  </div><!-- /tab-js -->
 </main>
 
 <script>
-const DATA = __BENCH_DATA__;
-const byId = new Map(DATA.map(d => [d.id, d]));
-const PATTERNS = ["S","P","O","PO","G","SPOG"];
+const RUST_DATA = __BENCH_DATA__;
+const JS_DATA = __JS_BENCH_DATA__;
+const JS_MEMORY = __JS_MEMORY_DATA__;
+const JS_CONFIG = __JS_CONFIG_DATA__;
+const RUST_PROVENANCE = __PROVENANCE__;
+const JS_PROVENANCE = __JS_PROVENANCE__;
+const rustById = new Map(RUST_DATA.map(d => [d.id, d]));
+const jsById = new Map(JS_DATA.map(d => [d.id, d]));
+// Reshaped to the same {median, median_ns} shape drawBarGroup/renderSimplePanel
+// already read, so the memory panels reuse those renderers instead of a parallel
+// set just for a different unit (MB peak RSS in place of a time duration).
+const jsMemById = new Map(JS_MEMORY.map(m => [`${m.slug}::${m.role}`, {
+  median: (m.peakRssMb ?? "?") + " MB", median_ns: m.peakRssMb ?? 0,
+}]));
+
+const RUST_PATTERNS = ["S","P","O","PO","G","SPOG"];
+const JS_PATTERNS = ["S","P","O","PO","SPO","full","G","SPOG"];
+const COLORS = ["var(--c1)","var(--c2)","var(--c3)","var(--c4)","#9b59b6","#16a085"];
 const NS = { ns:1, "µs":1e3, us:1e3, ms:1e6, s:1e9 };
 
-function get(id){ const r = byId.get(id); if(!r) console.warn("missing bench id", id); return r; }
+function get(map, id){ const r = map.get(id); if(!r) console.warn("missing bench id", id); return r; }
 function fmtRatio(a,b){ return (a/b).toFixed(2) + "×"; }
 function fmtNs(ns){
   if (ns < 1e3) return ns.toFixed(0) + " ns";
@@ -395,8 +540,8 @@ function legend(container, series){
 }
 
 /** One small bar-group: series = [{label, color, id}], drawn on its own scale. */
-function drawBarGroup(host, series, caption){
-  const recs = series.map(s => ({...s, rec: get(s.id)})).filter(s => s.rec);
+function drawBarGroup(host, series, caption, map){
+  const recs = series.map(s => ({...s, rec: get(map, s.id)})).filter(s => s.rec);
   if (!recs.length) return;
   const maxV = Math.max(...recs.map(s => s.rec.median_ns)) * 1.18;
   const minV = Math.min(...recs.map(s => s.rec.median_ns));
@@ -443,21 +588,21 @@ function drawBarGroup(host, series, caption){
   host.appendChild(wrap);
 }
 
-/** Axis panel with a pattern dimension: one mini bar-group per S/P/O/PO/G/SPOG. */
-function renderPatternPanel(container, cfg){
+/** Axis panel with a pattern dimension: one mini bar-group per pattern. */
+function renderPatternPanel(container, cfg, map, patterns){
   const panel = document.createElement("div");
-  panel.className = "panel";
+  panel.className = "panel" + (cfg.wide ? " wide" : "");
   panel.innerHTML = `<h3>${cfg.title}</h3><p class="note">${cfg.note}</p>`;
   legend(panel, cfg.series);
 
   const strip = document.createElement("div");
-  strip.className = "filmstrip";
+  strip.className = "filmstrip" + (cfg.cols ? " cols-"+cfg.cols : "");
   const wins = new Map(cfg.series.map(s => [s.label, 0]));
 
-  for (const p of PATTERNS){
+  for (const p of patterns){
     const series = cfg.series.map(s => ({ label:s.label, color:s.color, id:`${s.group}::${p}` }));
-    drawBarGroup(strip, series, p);
-    const recs = series.map(s => ({...s, rec: get(s.id)})).filter(s => s.rec);
+    drawBarGroup(strip, series, p, map);
+    const recs = series.map(s => ({...s, rec: get(map, s.id)})).filter(s => s.rec);
     if (recs.length){
       const best = recs.reduce((a,b) => a.rec.median_ns < b.rec.median_ns ? a : b);
       wins.set(best.label, (wins.get(best.label)||0) + 1);
@@ -469,25 +614,25 @@ function renderPatternPanel(container, cfg){
   const insight = document.createElement("div");
   insight.className = "insight";
   insight.innerHTML = "Fastest most often: " +
-    ranked.map(([label,n]) => `<b>${label}</b> (${n}/${PATTERNS.length})`).join(", ");
+    ranked.map(([label,n]) => `<b>${label}</b> (${n}/${patterns.length})`).join(", ");
   panel.appendChild(insight);
 
   container.appendChild(panel);
 }
 
 /** Axis panel without a pattern dimension: one bar-group + explicit rank list. */
-function renderSimplePanel(container, cfg){
+function renderSimplePanel(container, cfg, map){
   const panel = document.createElement("div");
-  panel.className = "panel";
+  panel.className = "panel" + (cfg.wide ? " wide" : "");
   panel.innerHTML = `<h3>${cfg.title}</h3><p class="note">${cfg.note}</p>`;
   legend(panel, cfg.series);
 
   const strip = document.createElement("div");
-  strip.className = "filmstrip simple";
-  drawBarGroup(strip, cfg.series, null);
+  strip.className = "filmstrip simple" + (cfg.wide ? " wide" : "");
+  drawBarGroup(strip, cfg.series, null, map);
   panel.appendChild(strip);
 
-  const recs = cfg.series.map(s => ({...s, rec: get(s.id)})).filter(s => s.rec)
+  const recs = cfg.series.map(s => ({...s, rec: get(map, s.id)})).filter(s => s.rec)
     .sort((a,b) => a.rec.median_ns - b.rec.median_ns);
   const fastest = recs[0];
   const list = document.createElement("ol");
@@ -502,7 +647,8 @@ function renderSimplePanel(container, cfg){
     name.append(sw, nm);
     const val = document.createElement("span"); val.className="rank-val"; val.textContent = s.rec.median;
     const delta = document.createElement("span"); delta.className="rank-delta";
-    delta.textContent = i===0 ? "baseline" : fmtRatio(s.rec.median_ns, fastest.rec.median_ns) + " slower";
+    const deltaWord = cfg.deltaWord || "slower";
+    delta.textContent = i===0 ? "baseline" : fmtRatio(s.rec.median_ns, fastest.rec.median_ns) + " " + deltaWord;
     li.append(pos, name, val, delta);
     list.appendChild(li);
   });
@@ -573,82 +719,26 @@ const decodePanels = [
   ]},
 ];
 
-// ---- render ----
-const writeHost = document.getElementById("write-panels");
-writePanels.forEach(cfg => renderSimplePanel(writeHost, cfg));
-
-const queryHost = document.getElementById("query-panels");
-queryPanels.forEach(cfg => renderPatternPanel(queryHost, cfg));
-renderSimplePanel(queryHost, chainedPanel);
-
-const decodeHost = document.getElementById("decode-panels");
-decodePanels.forEach(cfg => renderSimplePanel(decodeHost, cfg));
-
-// from_bytes stat + serialize interaction effects, folded into the write section as a table
-(function renderInteractions(){
-  const panel = document.createElement("div");
-  panel.className = "panel";
-  panel.innerHTML = `<h3>Interaction effects</h3><p class="note">Two combinations that don't reduce to a single axis: a dictionary layout's index holds codes rather than term strings, and an unsorted builder never stamps a sortedness marker.</p>`;
-  const rows = [
-    { name:"Dictionary + by-copy index", id:"serialize::sorted_stream_dictionary_by_copy",
-      refs:[["dictionary alone","serialize::sorted_stream_dictionary_no_index"], ["by-copy alone","serialize::sorted_stream_default_by_copy"]] },
-    { name:"Unsorted + by-copy index", id:"serialize::unsorted_default_by_copy",
-      refs:[["unsorted alone","serialize::unsorted_default_no_index"], ["by-copy alone","serialize::sorted_stream_default_by_copy"]] },
-  ];
-  const table = document.createElement("table");
-  table.className = "interact-table";
-  table.innerHTML = "<thead><tr><th>Configuration</th><th>Median</th><th>vs. each axis alone</th></tr></thead>";
-  const tbody = document.createElement("tbody");
-  for (const r of rows){
-    const rec = get(r.id);
-    if (!rec) continue;
-    const tr = document.createElement("tr");
-    const tdName = document.createElement("td"); tdName.textContent = r.name;
-    const tdVal = document.createElement("td"); tdVal.className="num"; tdVal.textContent = rec.median;
-    const tdRefs = document.createElement("td"); tdRefs.className="num";
-    tdRefs.textContent = r.refs.map(([label,id]) => {
-      const refRec = get(id);
-      return refRec ? `${fmtRatio(rec.median_ns, refRec.median_ns)} of ${label} (${refRec.median})` : "";
-    }).join("  ·  ");
-    tr.append(tdName, tdVal, tdRefs);
-    tbody.appendChild(tr);
-  }
-  table.appendChild(tbody);
-  panel.appendChild(table);
-  writeHost.appendChild(panel);
-})();
-
-// ---- KPI strip ----
-(function renderKpis(){
-  const host = document.getElementById("kpi-row");
-  const withMedian = DATA.filter(d => d.median_ns != null);
-  const fastest = withMedian.reduce((a,b) => a.median_ns < b.median_ns ? a : b);
-  const slowest = withMedian.reduce((a,b) => a.median_ns > b.median_ns ? a : b);
-  const tiles = [
-    { label:"Dataset size", value:"100,000", sub:"generated quads" },
-    { label:"Benchmarks", value:String(DATA.length), sub:"leaf measurements" },
-    { label:"Samples / benchmark", value:String(DATA[0].samples), sub:"iterations" },
-    { label:"Fastest op", value:fastest.median, sub:fastest.id },
-    { label:"Slowest op", value:slowest.median, sub:slowest.id },
-  ];
+// ---- generic KPI + data table (used by both tabs) ----
+function renderKpis(hostSel, tiles){
+  const host = document.querySelector(hostSel);
+  host.innerHTML = "";
   for (const t of tiles){
     const el = document.createElement("div");
     el.className = "kpi";
     el.innerHTML = `<span class="label">${t.label}</span><span class="value mono">${t.value}</span><span class="sub mono">${t.sub}</span>`;
     host.appendChild(el);
   }
-})();
+}
 
-// ---- data table ----
-(function renderTable(){
-  const tbody = document.querySelector("#data-table tbody");
-  const countEl = document.getElementById("table-count");
-  const filterEl = document.getElementById("table-filter");
-  let sortKey = "median_ns", sortDir = 1;
-  let filterText = "";
+function makeTable(data, tableSel, filterSel, countSel){
+  const tbody = document.querySelector(`${tableSel} tbody`);
+  const countEl = document.querySelector(countSel);
+  const filterEl = document.querySelector(filterSel);
+  let sortKey = "median_ns", sortDir = 1, filterText = "";
 
   function draw(){
-    const rows = DATA
+    const rows = data
       .filter(d => d.id.toLowerCase().includes(filterText))
       .sort((a,b) => {
         const av = a[sortKey], bv = b[sortKey];
@@ -669,8 +759,8 @@ decodePanels.forEach(cfg => renderSimplePanel(decodeHost, cfg));
         <td class="num">${d.samples||""}</td>`;
       tbody.appendChild(tr);
     }
-    countEl.textContent = rows.length + " / " + DATA.length + " rows";
-    document.querySelectorAll("#data-table th").forEach(th => {
+    countEl.textContent = rows.length + " / " + data.length + " rows";
+    document.querySelectorAll(`${tableSel} th`).forEach(th => {
       th.querySelector(".arrow")?.remove();
       if (th.dataset.key === sortKey){
         const arrow = document.createElement("span");
@@ -681,7 +771,7 @@ decodePanels.forEach(cfg => renderSimplePanel(decodeHost, cfg));
     });
   }
 
-  document.querySelectorAll("#data-table th").forEach(th => {
+  document.querySelectorAll(`${tableSel} th`).forEach(th => {
     const activate = () => {
       const key = th.dataset.key;
       if (key === sortKey) sortDir *= -1; else { sortKey = key; sortDir = 1; }
@@ -693,10 +783,201 @@ decodePanels.forEach(cfg => renderSimplePanel(decodeHost, cfg));
     });
   });
   filterEl.addEventListener("input", () => { filterText = filterEl.value.trim().toLowerCase(); draw(); });
-
   draw();
-})();
+}
 
-// ---- provenance ----
-document.getElementById("provenance").textContent = __PROVENANCE__;
+// ---- Rust tab ----
+function renderRust(){
+  const writeHost = document.getElementById("write-panels");
+  writePanels.forEach(cfg => renderSimplePanel(writeHost, cfg, rustById));
+
+  const queryHost = document.getElementById("query-panels");
+  queryPanels.forEach(cfg => renderPatternPanel(queryHost, cfg, rustById, RUST_PATTERNS));
+  renderSimplePanel(queryHost, chainedPanel, rustById);
+
+  const decodeHost = document.getElementById("decode-panels");
+  decodePanels.forEach(cfg => renderSimplePanel(decodeHost, cfg, rustById));
+
+  // serialize interaction effects, folded into the write section as a table
+  const panel = document.createElement("div");
+  panel.className = "panel";
+  panel.innerHTML = `<h3>Interaction effects</h3><p class="note">Two combinations that don't reduce to a single axis: a dictionary layout's index holds codes rather than term strings, and an unsorted builder never stamps a sortedness marker.</p>`;
+  const irows = [
+    { name:"Dictionary + by-copy index", id:"serialize::sorted_stream_dictionary_by_copy",
+      refs:[["dictionary alone","serialize::sorted_stream_dictionary_no_index"], ["by-copy alone","serialize::sorted_stream_default_by_copy"]] },
+    { name:"Unsorted + by-copy index", id:"serialize::unsorted_default_by_copy",
+      refs:[["unsorted alone","serialize::unsorted_default_no_index"], ["by-copy alone","serialize::sorted_stream_default_by_copy"]] },
+  ];
+  const itable = document.createElement("table");
+  itable.className = "interact-table";
+  itable.innerHTML = "<thead><tr><th>Configuration</th><th>Median</th><th>vs. each axis alone</th></tr></thead>";
+  const itbody = document.createElement("tbody");
+  for (const r of irows){
+    const rec = get(rustById, r.id);
+    if (!rec) continue;
+    const tr = document.createElement("tr");
+    const tdName = document.createElement("td"); tdName.textContent = r.name;
+    const tdVal = document.createElement("td"); tdVal.className="num"; tdVal.textContent = rec.median;
+    const tdRefs = document.createElement("td"); tdRefs.className="num";
+    tdRefs.textContent = r.refs.map(([label,id]) => {
+      const refRec = get(rustById, id);
+      return refRec ? `${fmtRatio(rec.median_ns, refRec.median_ns)} of ${label} (${refRec.median})` : "";
+    }).join("  ·  ");
+    tr.append(tdName, tdVal, tdRefs);
+    itbody.appendChild(tr);
+  }
+  itable.appendChild(itbody);
+  panel.appendChild(itable);
+  writeHost.appendChild(panel);
+
+  const withMedian = RUST_DATA.filter(d => d.median_ns != null);
+  const fastest = withMedian.reduce((a,b) => a.median_ns < b.median_ns ? a : b);
+  const slowest = withMedian.reduce((a,b) => a.median_ns > b.median_ns ? a : b);
+  renderKpis("#kpi-row", [
+    { label:"Dataset size", value:"100,000", sub:"generated quads" },
+    { label:"Benchmarks", value:String(RUST_DATA.length), sub:"leaf measurements" },
+    { label:"Samples / benchmark", value:String(RUST_DATA[0].samples), sub:"iterations" },
+    { label:"Fastest op", value:fastest.median, sub:fastest.id },
+    { label:"Slowest op", value:slowest.median, sub:slowest.id },
+  ]);
+  makeTable(RUST_DATA, "#data-table", "#table-filter", "#table-count");
+  document.getElementById("provenance").textContent = RUST_PROVENANCE;
+}
+
+// ---- JavaScript tab ----
+const JS_ADAPTERS = [
+  { slug:"vortex_unsorted_dict",       label:"Vortex Unsorted/Dict" },
+  { slug:"vortex_unsorted_default",    label:"Vortex Unsorted/Default" },
+  { slug:"vortex_sorted_dict",         label:"Vortex Sorted/Dict" },
+  { slug:"vortex_sorted_dict_byref",   label:"Vortex Sorted/Dict+ByRef" },
+  { slug:"vortex_sorted_dict_bycopy",  label:"Vortex Sorted/Dict+ByCopy" },
+  { slug:"vortex_sorted_default",      label:"Vortex Sorted/Default" },
+  { slug:"vortex_sorted_default_byref",label:"Vortex Sorted/Default+ByRef" },
+  { slug:"vortex_sorted_default_bycopy",label:"Vortex Sorted/Default+ByCopy" },
+  { slug:"rdfstores_default",          label:"rdf-stores (default)" },
+  { slug:"rdfstores_single",           label:"rdf-stores (1 index)" },
+  { slug:"oxigraph",                   label:"oxigraph" },
+];
+const JS_VORTEX = JS_ADAPTERS.slice(0, 8);
+const CROSS_LIB_SERIES = [
+  { slug:"vortex_sorted_dict_byref",    label:"Vortex Sorted/Dict+ByRef" },
+  { slug:"vortex_unsorted_dict",        label:"Vortex Unsorted/Dict" },
+  { slug:"vortex_sorted_dict_bycopy",   label:"Vortex Sorted/Dict+ByCopy" },
+  { slug:"vortex_sorted_default_byref", label:"Vortex Sorted/Default+ByRef" },
+  { slug:"vortex_sorted_default_bycopy",label:"Vortex Sorted/Default+ByCopy" },
+  { slug:"vortex_unsorted_default",     label:"Vortex Unsorted/Default" },
+  { slug:"rdfstores_default",           label:"rdf-stores (default)" },
+  { slug:"rdfstores_single",            label:"rdf-stores (1 index)" },
+  { slug:"oxigraph",                    label:"oxigraph" },
+];
+
+function renderJs(){
+  if (!JS_DATA.length){
+    document.getElementById("js-kpi-row").innerHTML =
+      `<div class="kpi"><span class="label">No JavaScript results</span><span class="value">—</span><span class="sub mono">run <code>npm run bench</code>, then re-render with <code>--js</code></span></div>`;
+    return;
+  }
+
+  // Ingest — every adapter
+  renderSimplePanel(document.getElementById("js-ingest-panels"), {
+    title:"Ingest (bulk build)", note:"Time to build a queryable store from the generated triples.",
+    series: JS_ADAPTERS.map((a,i) => ({ label:a.label, color:COLORS[i%COLORS.length], id:`ingest::${a.slug}` })),
+    wide: true,
+  }, jsById);
+
+  // Query — cross-library, per routing shape
+  renderPatternPanel(document.getElementById("js-query-panels"), {
+    title:"Cross-library match, by routing shape",
+    note:"Six Vortex build variants vs rdf-stores (both index configs) vs oxigraph.",
+    series: CROSS_LIB_SERIES.map((a,i) => ({ label:a.label, color:COLORS[i%COLORS.length], group:a.slug })),
+    wide: true, cols: 3,
+  }, jsById, JS_PATTERNS);
+
+  // Mutations — add & delete
+  const mutHost = document.getElementById("js-mut-panels");
+  renderSimplePanel(mutHost, {
+    title:"Add — incremental", note:"Per-quad additions of a fixed batch to an empty store, plus Vortex's recommended addQuads batch path.",
+    series:[
+      {label:"Vortex addQuad (per-quad)", color:COLORS[0], id:"add::vortex"},
+      {label:"Vortex addQuads (batch)",   color:COLORS[1], id:"add_batch::vortex"},
+      {label:"rdf-stores",                color:COLORS[2], id:"add::rdfstores_default"},
+      {label:"oxigraph",                  color:COLORS[4], id:"add::oxigraph"},
+    ],
+  }, jsById);
+  renderSimplePanel(mutHost, {
+    title:"Delete — per-quad", note:"Per-quad deletions of a fixed batch from a populated store.",
+    series:[
+      {label:"Vortex",     color:COLORS[0], id:"delete::vortex"},
+      {label:"rdf-stores", color:COLORS[2], id:"delete::rdfstores_default"},
+      {label:"oxigraph",   color:COLORS[4], id:"delete::oxigraph"},
+    ],
+  }, jsById);
+
+  // Vortex variants — star design
+  const varHost = document.getElementById("js-variant-panels");
+  renderPatternPanel(varHost, {
+    title:"Vortex variants, match by routing shape",
+    note:"Every reachable JS build variant across the query shapes.",
+    series: JS_VORTEX.map((a,i) => ({ label:a.label, color:COLORS[i%COLORS.length], group:a.slug })),
+    wide: true, cols: 3,
+  }, jsById, JS_PATTERNS);
+  renderSimplePanel(varHost, {
+    title:"Vortex variants, ingest", note:"Bulk build time per Vortex build variant.",
+    series: JS_VORTEX.map((a,i) => ({ label:a.label, color:COLORS[i%COLORS.length], id:`ingest::${a.slug}` })),
+  }, jsById);
+
+  // Memory — peak RSS per adapter's own process (see JS_MEMORY / jsMemById above)
+  const memHost = document.getElementById("js-memory-panels");
+  renderSimplePanel(memHost, {
+    title:"Query phase — peak RSS", note:"Build (triples + quads) + query + ingest, all in one process per adapter.",
+    series: JS_ADAPTERS.map((a,i) => ({ label:a.label, color:COLORS[i%COLORS.length], id:`${a.slug}::query` })),
+    deltaWord: "more",
+  }, jsMemById);
+  const MUT_LABELS = [
+    { slug:"vortex", label:"Vortex" },
+    { slug:"rdfstores_default", label:"rdf-stores (default)" },
+    { slug:"oxigraph", label:"oxigraph" },
+  ];
+  renderSimplePanel(memHost, {
+    title:"Mutation phase — peak RSS", note:"Add (batch of 10,000) + delete, in one process per adapter.",
+    series: MUT_LABELS.map((a,i) => ({ label:a.label, color:COLORS[i%COLORS.length], id:`${a.slug}::mutate` })),
+    deltaWord: "more",
+  }, jsMemById);
+
+  renderKpis("#js-kpi-row", [
+    { label:"Libraries", value:"3", sub:"vortex · rdf-stores · oxigraph" },
+    { label:"Vortex variants", value:String(JS_VORTEX.length), sub:"builder × layout × index" },
+    { label:"Benchmarks", value:String(JS_DATA.length), sub:"leaf measurements" },
+    { label:"Quads", value:(JS_CONFIG.triplesCount||0).toLocaleString(), sub:(JS_CONFIG.quadsCount||0).toLocaleString()+" named-graph quads" },
+    { label:"Iterations", value:`${JS_CONFIG.queryIterations??"?"} / ${JS_CONFIG.heavyIterations??"?"}`, sub:"query / ingest·mutate" },
+  ]);
+  makeTable(JS_DATA, "#js-data-table", "#js-table-filter", "#js-table-count");
+  document.getElementById("js-provenance").textContent = JS_PROVENANCE;
+}
+
+// ---- tabs ----
+const panes = { rust: document.getElementById("tab-rust"), js: document.getElementById("tab-js") };
+const tabButtons = document.querySelectorAll(".tab");
+function showTab(name){
+  if (!panes[name]) name = "rust";
+  for (const [k, el] of Object.entries(panes)) el.classList.toggle("active", k === name);
+  tabButtons.forEach(t => {
+    const on = t.dataset.tab === name;
+    t.classList.toggle("active", on);
+    t.setAttribute("aria-selected", on ? "true" : "false");
+  });
+}
+tabButtons.forEach(t => t.addEventListener("click", () => {
+  history.replaceState(null, "", `#${t.dataset.tab}`);
+  showTab(t.dataset.tab);
+}));
+window.addEventListener("hashchange", () => {
+  const h = location.hash.replace("#", "");
+  if (h === "rust" || h === "js") showTab(h);
+});
+
+// ---- render both tabs (hidden panes still populate their DOM) ----
+renderRust();
+renderJs();
+showTab(location.hash === "#js" ? "js" : "rust");
 </script>

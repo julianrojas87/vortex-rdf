@@ -123,18 +123,20 @@ def cpu_model():
     return "unknown CPU"
 
 
-def bench_size():
+def default_bench_size():
+    """The fallback dataset size baked into `core/benches/benchmark.rs`'s
+    `bench_size()`, i.e. what a run used if it didn't override `BENCH_SIZE`."""
     src = (REPO_ROOT / "core" / "benches" / "benchmark.rs").read_text(encoding="utf-8")
-    m = re.search(r"const BENCH_SIZE:\s*usize\s*=\s*([\d_]+);", src)
+    m = re.search(r"fn bench_size.*?unwrap_or\(([\d_]+)\)", src, re.DOTALL)
     return int(m.group(1).replace("_", "")) if m else None
 
 
-def build_provenance(results, timer_precision):
+def build_provenance(results, timer_precision, bench_size=None):
     commit = os.environ.get("GITHUB_SHA", git("rev-parse", "HEAD"))[:7]
     branch = os.environ.get("GITHUB_REF_NAME", git("rev-parse", "--abbrev-ref", "HEAD", default="unknown"))
     date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     samples = results[0]["samples"] if results else "?"
-    size = bench_size()
+    size = bench_size if bench_size is not None else default_bench_size()
     size_str = f"{size:,}" if size else "unknown"
     precision = f", {timer_precision} precision" if timer_precision else ""
 
@@ -145,12 +147,45 @@ def build_provenance(results, timer_precision):
     )
 
 
+def load_js_results(path):
+    """Load the JavaScript benchmark results emitted by `js/bench/compare.bench.ts`.
+
+    That file is already dashboard-shaped. It may be either a bare list of result
+    rows, or an object `{"provenance": str, "results": [...], "memory": [...],
+    "config": {...}}` (`memory` holds one `{slug, label, role, peakRssMb}` entry per
+    adapter process -- see shared.ts's `peakRssMb`; `config` holds the dataset sizes
+    and iteration counts the run used). Returns
+    `(results_list, provenance_str, memory_list, config_dict)`.
+    """
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    if isinstance(data, dict):
+        return (
+            data.get("results", []),
+            data.get("provenance", ""),
+            data.get("memory", []),
+            data.get("config", {}),
+        )
+    return data, "", [], {}
+
+
 def main():
-    if len(sys.argv) != 3:
-        print(f"usage: {sys.argv[0]} <bench-output.txt> <output.html>", file=sys.stderr)
+    if len(sys.argv) < 3:
+        print(
+            f"usage: {sys.argv[0]} <bench-output.txt> <output.html> "
+            "[--js <js-results.json>] [--bench-size <n>]",
+            file=sys.stderr,
+        )
         return 1
 
-    in_path, out_path = Path(sys.argv[1]), Path(sys.argv[2])
+    positional = [a for a in sys.argv[1:] if not a.startswith("--")]
+    in_path, out_path = Path(positional[0]), Path(positional[1])
+    js_path = None
+    if "--js" in sys.argv:
+        js_path = sys.argv[sys.argv.index("--js") + 1]
+    bench_size_override = None
+    if "--bench-size" in sys.argv:
+        bench_size_override = int(sys.argv[sys.argv.index("--bench-size") + 1])
+
     template_path = Path(__file__).resolve().parent / "bench_dashboard_template.html"
 
     results, timer_precision = parse_bench_output(in_path.read_text(encoding="utf-8"))
@@ -158,15 +193,26 @@ def main():
         print("no benchmark results parsed -- is the input the raw `cargo bench` output?", file=sys.stderr)
         return 1
 
-    provenance = build_provenance(results, timer_precision)
+    js_results, js_provenance, js_memory, js_config = ([], "", [], {})
+    if js_path:
+        js_results, js_provenance, js_memory, js_config = load_js_results(js_path)
+
+    provenance = build_provenance(results, timer_precision, bench_size_override)
     template = template_path.read_text(encoding="utf-8")
-    out = template.replace("__BENCH_DATA__", json.dumps(results)).replace(
-        "__PROVENANCE__", json.dumps(provenance)
+    out = (
+        template
+        .replace("__BENCH_DATA__", json.dumps(results))
+        .replace("__PROVENANCE__", json.dumps(provenance))
+        .replace("__JS_BENCH_DATA__", json.dumps(js_results))
+        .replace("__JS_PROVENANCE__", json.dumps(js_provenance))
+        .replace("__JS_MEMORY_DATA__", json.dumps(js_memory))
+        .replace("__JS_CONFIG_DATA__", json.dumps(js_config))
     )
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(out, encoding="utf-8")
-    print(f"parsed {len(results)} benchmark results -> {out_path}")
+    print(f"parsed {len(results)} Rust + {len(js_results)} JS benchmark results "
+          f"({len(js_memory)} memory readings) -> {out_path}")
     return 0
 
 

@@ -1,21 +1,18 @@
 import { describe, test, expect } from 'vitest';
 import { DataFactory } from "rdf-data-factory";
+import type { Quad, Stream } from '@rdfjs/types';
 import {
     VortexRdfStore,
-    init_panic_hook,
     nquads_to_vortex,
     vortex_to_nquads
 } from '../entry/node.js';
 
 const df = new DataFactory();
 
-// Initialize panic hook for better error messages
-init_panic_hook();
-
 /** Drain the quads of a match() result (via its Symbol.asyncIterator) into an array. */
-async function collect(stream: any): Promise<any[]> {
-    const out: any[] = [];
-    for await (const quad of stream) out.push(quad);
+async function collect(stream: Stream<Quad>): Promise<Quad[]> {
+    const out: Quad[] = [];
+    for await (const quad of stream as unknown as AsyncIterable<Quad>) out.push(quad);
     return out;
 }
 
@@ -61,9 +58,9 @@ describe('VortexRdfStore basic operations', () => {
         const store = await VortexRdfStore.fromString(ttl, "turtle");
 
         const stream = store.match(null, df.namedNode("http://example.org/p1"), null, null);
-        const got = await new Promise<any[]>((resolve, reject) => {
-            const acc: any[] = [];
-            stream.on('data', (q: any) => acc.push(q));
+        const got = await new Promise<Quad[]>((resolve, reject) => {
+            const acc: Quad[] = [];
+            stream.on('data', (q: Quad) => acc.push(q));
             stream.on('end', () => resolve(acc));
             stream.on('error', reject);
         });
@@ -80,7 +77,7 @@ describe('VortexRdfStore basic operations', () => {
 
         const quads = await store.getQuads(null, df.namedNode("http://example.org/p1"), null, null);
         expect(quads.length).toBe(2);
-        expect(quads.map(q => q.subject.value).sort())
+        expect(quads.map((q: Quad) => q.subject.value).sort())
             .toEqual(['http://example.org/s1', 'http://example.org/s2']);
 
         // No pattern → every quad.
@@ -91,23 +88,25 @@ describe('VortexRdfStore basic operations', () => {
         const store = VortexRdfStore.empty();
         expect(await store.size()).toBe(0);
 
+        // Deliberately duck-typed, not a real Quad instance (no .equals) — this
+        // exercises the store's structural (fields-only) acceptance path.
         const quad = {
             subject: { termType: 'NamedNode' as const, value: 'http://example.org/s' },
             predicate: { termType: 'NamedNode' as const, value: 'http://example.org/p' },
             object: { termType: 'Literal' as const, value: 'hello' },
             graph: { termType: 'DefaultGraph' as const, value: '' }
-        };
+        } as unknown as Quad;
 
         // Add
-        await store.addQuad(quad as any);
+        await store.addQuad(quad);
         expect(await store.size()).toBe(1);
 
         // Check has
-        const hasQuad = await store.has(quad as any);
+        const hasQuad = await store.has(quad);
         expect(hasQuad).toBe(true);
 
         // Delete
-        await store.deleteQuad(quad as any);
+        await store.deleteQuad(quad);
         expect(await store.size()).toBe(0);
     });
 });

@@ -1,9 +1,9 @@
 import { describe, test, expect } from 'vitest';
 import { DataFactory } from 'rdf-data-factory';
 import { Readable } from 'node:stream';
+import type { Quad, Term, Literal, Stream } from '@rdfjs/types';
 import {
     VortexRdfStore,
-    init_panic_hook,
     rdf_to_vortex,
     vortex_to_rdf,
     nquads_to_vortex,
@@ -13,12 +13,10 @@ import {
 
 const df = new DataFactory();
 
-init_panic_hook();
-
 /** Drain the quads of a match() result (via its Symbol.asyncIterator) into an array. */
-async function collect(stream: any): Promise<any[]> {
-    const out: any[] = [];
-    for await (const quad of stream) out.push(quad);
+async function collect(stream: Stream<Quad>): Promise<Quad[]> {
+    const out: Quad[] = [];
+    for await (const quad of stream as unknown as AsyncIterable<Quad>) out.push(quad);
     return out;
 }
 
@@ -68,8 +66,8 @@ describe('build variants', () => {
 
             test('matches every quad-position pattern', async () => {
                 const store = await VortexRdfStore.fromString(NQUADS, 'nquads', options);
-                const count = (s: any, p: any, o: any, g: any) =>
-                    store.getQuads(s, p, o, g).then(qs => qs.length);
+                const count = (s: Term | null, p: Term | null, o: Term | null, g: Term | null) =>
+                    store.getQuads(s, p, o, g).then((qs: Quad[]) => qs.length);
 
                 // Subject-only: exercises the sorted binary-search path.
                 expect(await count(df.namedNode('http://example.org/s1'), null, null, null)).toBe(2);
@@ -138,7 +136,7 @@ describe('build variants', () => {
                 const quads = await viaString.getQuads(null, null, null, null);
                 expect(quads.length).toBe(6);
 
-                const viaQuads = await VortexRdfStore.fromQuads(quads as any, options);
+                const viaQuads = await VortexRdfStore.fromQuads(quads, options);
                 expect(await viaQuads.size()).toBe(6);
                 expect(viaQuads.layout()).toBe(options.layout);
 
@@ -157,16 +155,16 @@ describe('match returns an RDF/JS Stream<Quad>', () => {
         // match() returns synchronously; the result is an RDF/JS Stream and also
         // implements Symbol.asyncIterator (consumed here with for-await).
         const stream = store.match(...pattern);
-        expect(typeof (stream as any).read).toBe('function'); // RDF/JS Stream.read()
-        expect(typeof (stream as any).on).toBe('function');   // EventEmitter
+        expect(typeof stream.read).toBe('function'); // RDF/JS Stream.read()
+        expect(typeof stream.on).toBe('function');    // EventEmitter
         const viaAwait = await collect(stream);
         expect(viaAwait.length).toBe(3);
 
         // Stream contract: the same pattern re-run and consumed via events.
-        const viaEvents = await new Promise<any[]>((resolve, reject) => {
-            const acc: any[] = [];
+        const viaEvents = await new Promise<Quad[]>((resolve, reject) => {
+            const acc: Quad[] = [];
             const s = store.match(...pattern);
-            s.on('data', (q: any) => acc.push(q));
+            s.on('data', (q: Quad) => acc.push(q));
             s.on('end', () => resolve(acc));
             s.on('error', reject);
         });
@@ -175,11 +173,11 @@ describe('match returns an RDF/JS Stream<Quad>', () => {
 
     test('read() drains the buffered quads after readable', async () => {
         const store = await VortexRdfStore.fromString(NQUADS, 'nquads');
-        const stream: any = store.match(null, df.namedNode('http://example.org/p1'), null, null);
-        const acc = await new Promise<any[]>((resolve) => {
-            const out: any[] = [];
+        const stream = store.match(null, df.namedNode('http://example.org/p1'), null, null);
+        const acc = await new Promise<Quad[]>((resolve) => {
+            const out: Quad[] = [];
             stream.on('readable', () => {
-                let q;
+                let q: Quad | null;
                 while ((q = stream.read()) !== null) out.push(q);
             });
             stream.on('end', () => resolve(out));
@@ -201,7 +199,7 @@ describe('fromQuads with an RDF/JS Stream', () => {
         expect(quads.length).toBe(6);
 
         const stream = Readable.from(quads, { objectMode: true });
-        const viaStream = await VortexRdfStore.fromQuads(stream as any);
+        const viaStream = await VortexRdfStore.fromQuads(stream);
         expect(await viaStream.size()).toBe(6);
 
         const p1 = await viaStream.getQuads(null, df.namedNode('http://example.org/p1'), null, null);
@@ -216,7 +214,7 @@ describe('fromQuads with an RDF/JS Stream', () => {
             },
         });
 
-        await expect(VortexRdfStore.fromQuads(stream as any)).rejects.toThrow(/boom/);
+        await expect(VortexRdfStore.fromQuads(stream)).rejects.toThrow(/boom/);
     });
 });
 
@@ -357,9 +355,9 @@ describe('match / getQuads across layouts', () => {
             // Assert on the decoded term strings, not just the count: under the
             // Dictionary layout a lost term dictionary would yield the right row
             // count but codes instead of IRIs.
-            expect(quads.map(q => q.subject.value).sort())
+            expect(quads.map((q: Quad) => q.subject.value).sort())
                 .toEqual(['http://example.org/s1', 'http://example.org/s2', 'http://example.org/s2']);
-            expect(quads.map(q => q.object.value).sort())
+            expect(quads.map((q: Quad) => q.object.value).sort())
                 .toEqual(['http://example.org/o1', 'http://example.org/o1', 'http://example.org/o2']);
         });
 
@@ -368,7 +366,7 @@ describe('match / getQuads across layouts', () => {
             const quads = await store.getQuads(null, df.namedNode('http://example.org/p1'), null, null);
 
             // Rebuild a standalone store from the matched quads and round-trip it.
-            const derived = await VortexRdfStore.fromQuads(quads as any, { builder: 'Sorted', layout });
+            const derived = await VortexRdfStore.fromQuads(quads, { builder: 'Sorted', layout });
             const restored = await VortexRdfStore.fromBytes(await derived.toBytes());
             expect(await restored.size()).toBe(3);
 
@@ -395,14 +393,14 @@ describe('lazy terms', () => {
         // Same subject term, two independent match results of the same store.
         expect(a[0].subject.equals(b[0].subject)).toBe(true);
         // Distinct terms compare unequal (p1 vs p2; subject vs object).
-        const aP1 = a.find(q => q.predicate.value === 'http://example.org/p1')!;
-        const aP2 = a.find(q => q.predicate.value === 'http://example.org/p2')!;
+        const aP1 = a.find((q: Quad) => q.predicate.value === 'http://example.org/p1')!;
+        const aP2 = a.find((q: Quad) => q.predicate.value === 'http://example.org/p2')!;
         expect(aP1.predicate.equals(aP2.predicate)).toBe(false);
         expect(aP1.subject.equals(aP1.object)).toBe(false);
 
         // The object <o1> appears under s1/p1 and s2/p1 — equal across results.
         const s2 = await store.getQuads(df.namedNode('http://example.org/s2'), df.namedNode('http://example.org/p1'), null, null);
-        const s2o1 = s2.find(q => q.object.value === 'http://example.org/o1')!;
+        const s2o1 = s2.find((q: Quad) => q.object.value === 'http://example.org/o1')!;
         expect(aP1.object.equals(s2o1.object)).toBe(true);
     });
 
@@ -412,12 +410,12 @@ describe('lazy terms', () => {
         const typed = (await store.getQuads(null, df.namedNode('http://example.org/p3'), null, null))[0];
         expect(typed.object.termType).toBe('Literal');
         expect(typed.object.value).toBe('42');
-        expect((typed.object as any).datatype.value).toBe('http://www.w3.org/2001/XMLSchema#integer');
+        expect((typed.object as Literal).datatype.value).toBe('http://www.w3.org/2001/XMLSchema#integer');
 
         const lang = (await store.getQuads(null, df.namedNode('http://example.org/p4'), null, null))[0];
         expect(lang.object.value).toBe('hola');
-        expect((lang.object as any).language).toBe('es');
-        expect((lang.object as any).datatype.value).toBe('http://www.w3.org/1999/02/22-rdf-syntax-ns#langString');
+        expect((lang.object as Literal).language).toBe('es');
+        expect((lang.object as Literal).datatype.value).toBe('http://www.w3.org/1999/02/22-rdf-syntax-ns#langString');
     });
 
     test('interoperates with foreign RDF/JS terms via .equals (both directions)', async () => {
@@ -428,9 +426,9 @@ describe('lazy terms', () => {
         expect(q.predicate.equals(df.namedNode('http://example.org/p1'))).toBe(true);
         expect(q.predicate.equals(df.namedNode('http://example.org/nope'))).toBe(false);
         // Foreign term comparing against our lazy term reads our getters.
-        expect(df.namedNode('http://example.org/p1').equals(q.predicate as any)).toBe(true);
+        expect(df.namedNode('http://example.org/p1').equals(q.predicate)).toBe(true);
         expect(df.literal('hola', 'es').equals(
-            (await store.getQuads(null, df.namedNode('http://example.org/p4'), null, null))[0].object as any,
+            (await store.getQuads(null, df.namedNode('http://example.org/p4'), null, null))[0].object,
         )).toBe(true);
     });
 
@@ -438,7 +436,7 @@ describe('lazy terms', () => {
         const store = await VortexRdfStore.fromString(NQUADS, 'nquads', { layout: 'Default' });
         const a = await store.getQuads(null, df.namedNode('http://example.org/p1'), null, null);
         // <o1> appears twice under p1 — equal by value even without codes.
-        const o1s = a.filter(q => q.object.value === 'http://example.org/o1');
+        const o1s = a.filter((q: Quad) => q.object.value === 'http://example.org/o1');
         expect(o1s.length).toBe(2);
         expect(o1s[0].object.equals(o1s[1].object)).toBe(true);
         expect(a[0].predicate.equals(df.namedNode('http://example.org/p1'))).toBe(true);
@@ -455,9 +453,9 @@ describe('adding quads', () => {
             df.namedNode('http://example.org/p9'),
             df.literal('new'),
         );
-        await store.addQuad(quad as any);
+        await store.addQuad(quad);
         expect(await store.size()).toBe(7);
-        expect(await store.has(quad as any)).toBe(true);
+        expect(await store.has(quad)).toBe(true);
         const matched = await store.getQuads(null, df.namedNode('http://example.org/p9'), null, null);
         expect(matched.length).toBe(1);
         // Decoded values must be correct: appended terms live in the string tail,
@@ -467,13 +465,13 @@ describe('adding quads', () => {
         expect(matched[0].object.value).toBe('new');
         // A pre-existing quad still decodes correctly on the mutated store too.
         const p1 = await store.getQuads(null, df.namedNode('http://example.org/p1'), null, null);
-        expect(p1.map(q => q.object.value).sort())
+        expect(p1.map((q: Quad) => q.object.value).sort())
             .toEqual(['http://example.org/o1', 'http://example.org/o1', 'http://example.org/o2']);
         // The appended store still serializes to standalone bytes (the terms
         // are re-encoded against a fresh dictionary).
         const restored = await VortexRdfStore.fromBytes(await store.toBytes());
         expect(await restored.size()).toBe(7);
-        expect(await restored.has(quad as any)).toBe(true);
+        expect(await restored.has(quad)).toBe(true);
     });
 
     test('Default layout supports addQuad', async () => {
@@ -483,9 +481,9 @@ describe('adding quads', () => {
             df.namedNode('http://example.org/p9'),
             df.literal('new'),
         );
-        await store.addQuad(quad as any);
+        await store.addQuad(quad);
         expect(await store.size()).toBe(7);
-        expect(await store.has(quad as any)).toBe(true);
+        expect(await store.has(quad)).toBe(true);
     });
 
     test('addQuad ignores a quad already present (RDF/JS set semantics)', async () => {
@@ -495,8 +493,8 @@ describe('adding quads', () => {
             df.namedNode('http://example.org/p1'),
             df.namedNode('http://example.org/o1'),
         );
-        expect(await store.has(quad as any)).toBe(true);
-        await store.addQuad(quad as any);
+        expect(await store.has(quad)).toBe(true);
+        await store.addQuad(quad);
         expect(await store.size()).toBe(6);
     });
 
@@ -512,8 +510,8 @@ describe('adding quads', () => {
             df.namedNode('http://example.org/p1'),
             df.namedNode('http://example.org/o1'),
         );
-        await store.addQuads([fresh, fresh, existing] as any);
+        await store.addQuads([fresh, fresh, existing]);
         expect(await store.size()).toBe(7);
-        expect(await store.has(fresh as any)).toBe(true);
+        expect(await store.has(fresh)).toBe(true);
     });
 });

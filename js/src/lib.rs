@@ -38,6 +38,13 @@ extern "C" {
     /// synchronously while resolving its rows lazily.
     #[wasm_bindgen(js_name = makeLazyQuadStream)]
     fn make_lazy_quad_stream(payload_promise: &JsValue) -> JsValue;
+
+    /// Flatten an RDF/JS quad array into one length-prefixed byte buffer
+    /// host-side, so bulk ingestion crosses the wasm boundary once instead of
+    /// ~16–20 Reflect calls per quad. Decoded by [`packed_to_quads`]. Throws
+    /// on a malformed quad (hence `catch`).
+    #[wasm_bindgen(js_name = packQuads, catch)]
+    fn pack_quads(quads: &js_sys::Array) -> Result<js_sys::Uint8Array, JsValue>;
 }
 
 #[wasm_bindgen(typescript_custom_section)]
@@ -542,6 +549,20 @@ async fn match_columns(
 
     if let Some(dict) = dict {
         // Code payload: u32 columns + the shared dictionary.
+        if let Some(cols) = matched.code_columns() {
+            // Fast path: codes gathered straight off the base's canonical
+            // slices — no per-call gather-and-canonicalize pipeline.
+            let n = cols[0].len();
+            for (name, col) in ["s", "p", "o", "g"].iter().zip(cols.iter()) {
+                let ta = js_sys::Uint32Array::new_with_length(col.len() as u32);
+                ta.copy_from(col);
+                Reflect::set(&payload, &(*name).into(), &ta)?;
+            }
+            Reflect::set(&payload, &"kind".into(), &"code".into())?;
+            Reflect::set(&payload, &"dict".into(), &dict)?;
+            Reflect::set(&payload, &"length".into(), &JsValue::from_f64(n as f64))?;
+            return Ok(payload.into());
+        }
         let arr = matched
             .get_quads_array()
             .await
@@ -848,14 +869,96 @@ fn layout_name(layout: LayoutStrategy) -> &'static str {
 }
 
 fn js_array_to_quads(quads: js_sys::Array) -> Result<Vec<Quad>, JsValue> {
-    quads
-        .iter()
-        .enumerate()
-        .map(|(i, quad)| {
-            js_to_quad(quad)
-                .ok_or_else(|| JsValue::from_str(&format!("Invalid quad object at index {}", i)))
-        })
-        .collect()
+    // One host-side pass packs the quads into a single byte buffer (see
+    // packQuads in lazy-rdf.js); one boundary crossing brings it here.
+    let packed = pack_quads(&quads)?;
+    packed_to_quads(&packed.to_vec())
+}
+
+/// Decode the buffer [`pack_quads`] produced back into owned quads. Term
+/// construction/validation mirrors [`js_to_quad`]: IRIs and language tags are
+/// validated, blank-node ids are taken as-is.
+fn packed_to_quads(bytes: &[u8]) -> Result<Vec<Quad>, JsValue> {
+    struct Cursor<'a> {
+        bytes: &'a [u8],
+        pos: usize,
+    }
+    impl<'a> Cursor<'a> {
+        fn u8(&mut self) -> Result<u8, JsValue> {
+            let b = *self
+                .bytes
+                .get(self.pos)
+                .ok_or_else(|| JsValue::from_str("Truncated quad buffer"))?;
+            self.pos += 1;
+            Ok(b)
+        }
+        fn u32(&mut self) -> Result<u32, JsValue> {
+            let end = self.pos + 4;
+            let s = self
+                .bytes
+                .get(self.pos..end)
+                .ok_or_else(|| JsValue::from_str("Truncated quad buffer"))?;
+            self.pos = end;
+            Ok(u32::from_le_bytes(s.try_into().unwrap()))
+        }
+        fn str(&mut self) -> Result<&'a str, JsValue> {
+            let len = self.u32()? as usize;
+            let end = self.pos + len;
+            let s = self
+                .bytes
+                .get(self.pos..end)
+                .ok_or_else(|| JsValue::from_str("Truncated quad buffer"))?;
+            self.pos = end;
+            std::str::from_utf8(s).map_err(|_| JsValue::from_str("Invalid UTF-8 in quad buffer"))
+        }
+    }
+
+    let invalid = |i: usize| JsValue::from_str(&format!("Invalid quad object at index {}", i));
+    let mut cur = Cursor { bytes, pos: 0 };
+    let n = cur.u32()? as usize;
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        // subject: NamedNode | BlankNode
+        let s = match cur.u8()? {
+            0 => NamedOrBlankNode::NamedNode(NamedNode::new(cur.str()?).map_err(|_| invalid(i))?),
+            1 => NamedOrBlankNode::BlankNode(oxrdf::BlankNode::new_unchecked(cur.str()?)),
+            _ => return Err(invalid(i)),
+        };
+        // predicate: NamedNode
+        let p = match cur.u8()? {
+            0 => NamedNode::new(cur.str()?).map_err(|_| invalid(i))?,
+            _ => return Err(invalid(i)),
+        };
+        // object: any term
+        let o = match cur.u8()? {
+            0 => Term::NamedNode(NamedNode::new(cur.str()?).map_err(|_| invalid(i))?),
+            1 => Term::BlankNode(oxrdf::BlankNode::new_unchecked(cur.str()?)),
+            2 => Term::Literal(oxrdf::Literal::new_simple_literal(cur.str()?)),
+            3 => {
+                let value = cur.str()?.to_owned();
+                let lang = cur.str()?;
+                Term::Literal(
+                    oxrdf::Literal::new_language_tagged_literal(value, lang)
+                        .map_err(|_| invalid(i))?,
+                )
+            }
+            4 => {
+                let value = cur.str()?.to_owned();
+                let dt = NamedNode::new(cur.str()?).map_err(|_| invalid(i))?;
+                Term::Literal(oxrdf::Literal::new_typed_literal(value, dt))
+            }
+            _ => return Err(invalid(i)),
+        };
+        // graph: NamedNode | BlankNode | DefaultGraph
+        let g = match cur.u8()? {
+            0 => GraphName::NamedNode(NamedNode::new(cur.str()?).map_err(|_| invalid(i))?),
+            1 => GraphName::BlankNode(oxrdf::BlankNode::new_unchecked(cur.str()?)),
+            5 => GraphName::DefaultGraph,
+            _ => return Err(invalid(i)),
+        };
+        out.push(Quad::new(s, p, o, g));
+    }
+    Ok(out)
 }
 
 /// A quad stream boxed for `build_array`, whichever of the two `fromQuads`
