@@ -494,6 +494,97 @@ pub struct NativeDirectCompactTimings {
     pub total_rust_ms: f64,
 }
 
+// VORTEX_RDF_STREAM_SELECTED_TERMS_V1
+#[derive(Default)]
+struct NativeCompactTermDecodeTimings {
+    struct_execute_ms: f64,
+    term_execute_ms: f64,
+    lexical_ms: f64,
+    insert_ms: f64,
+}
+
+fn append_selected_term_field(
+    term_field: &ArrayRef,
+    requested: &[u32],
+    next_index: &mut usize,
+    terms: &mut Vec<String>,
+    id_indexes: &mut HashMap<u32, u32>,
+    timings: &mut NativeCompactTermDecodeTimings,
+) -> Result<()> {
+    if let Some(chunks) = term_field.as_opt::<Chunked>() {
+        for chunk in chunks.iter_chunks() {
+            append_selected_term_field(chunk, requested, next_index, terms, id_indexes, timings)?;
+        }
+        return Ok(());
+    }
+
+    let mut ctx = NATIVE_FILE_SESSION.create_execution_ctx();
+    let stage = Instant::now();
+    let term_array = term_field
+        .clone()
+        .execute::<VarBinViewArray>(&mut ctx)
+        .map_err(VortexRdfError::Vortex)?;
+    timings.term_execute_ms += elapsed_ms(stage);
+
+    for row in 0..term_array.len() {
+        let id = *requested.get(*next_index).ok_or_else(|| {
+            VortexRdfError::Deserialization(
+                "selected dictionary stream exceeded requested IDs".into(),
+            )
+        })?;
+        let stage = Instant::now();
+        let bytes = term_array.bytes_at(row);
+        let lexical = std::str::from_utf8(&bytes).map_err(|error| {
+            VortexRdfError::Deserialization(format!(
+                "direct compact dictionary term for ID {id} is invalid UTF-8: {error}"
+            ))
+        })?;
+        let compact_index = u32::try_from(terms.len()).map_err(|_| {
+            VortexRdfError::InvalidOperation("compact query term table exceeds u32".into())
+        })?;
+        terms.push(lexical.to_owned());
+        timings.lexical_ms += elapsed_ms(stage);
+
+        let stage = Instant::now();
+        if id_indexes.insert(id, compact_index).is_some() {
+            return Err(VortexRdfError::Deserialization(format!(
+                "direct compact dictionary returned duplicate ID {id}"
+            )));
+        }
+        timings.insert_ms += elapsed_ms(stage);
+        *next_index += 1;
+    }
+    Ok(())
+}
+
+fn append_selected_term_batch(
+    batch: ArrayRef,
+    requested: &[u32],
+    next_index: &mut usize,
+    terms: &mut Vec<String>,
+    id_indexes: &mut HashMap<u32, u32>,
+    timings: &mut NativeCompactTermDecodeTimings,
+) -> Result<()> {
+    let mut ctx = NATIVE_FILE_SESSION.create_execution_ctx();
+    let stage = Instant::now();
+    let struct_array = batch
+        .execute::<StructArray>(&mut ctx)
+        .map_err(VortexRdfError::Vortex)?;
+    timings.struct_execute_ms += elapsed_ms(stage);
+    let term_field = struct_array
+        .unmasked_field_by_name("term")
+        .map_err(VortexRdfError::Vortex)?
+        .clone();
+    append_selected_term_field(
+        &term_field,
+        requested,
+        next_index,
+        terms,
+        id_indexes,
+        timings,
+    )
+}
+
 async fn projected_native_id_rows_as_compact_triples_direct_v1_impl(
     data_path: &Path,
     rows: &NativeProjectedIdRows,
@@ -540,11 +631,10 @@ async fn projected_native_id_rows_as_compact_triples_direct_v1_impl(
     );
     timings.row_indices_build_ms = elapsed_ms(stage);
     let stage = Instant::now();
-    let stream = file
+    let mut stream = file
         .scan()
         .map_err(VortexRdfError::from)?
         .with_row_indices(indices)
-        // VORTEX_RDF_TERM_ONLY_COMPACT_V1
         .with_projection(vortex_array::expr::select(
             ["term"],
             vortex_array::expr::root(),
@@ -552,95 +642,35 @@ async fn projected_native_id_rows_as_compact_triples_direct_v1_impl(
         .into_array_stream()
         .map_err(VortexRdfError::from)?;
     timings.scan_build_ms = elapsed_ms(stage);
-    let stage = Instant::now();
-    let array = stream.read_all().await.map_err(VortexRdfError::from)?;
-    timings.read_all_ms = elapsed_ms(stage);
-    if array.len() != requested.len() {
-        return Err(VortexRdfError::Deserialization(format!(
-            "direct compact dictionary selection returned {} rows for {} requested IDs",
-            array.len(),
-            requested.len()
-        )));
-    }
 
-    let mut ctx = NATIVE_FILE_SESSION.create_execution_ctx();
-    let stage = Instant::now();
-    let struct_array = array
-        .execute::<StructArray>(&mut ctx)
-        .map_err(VortexRdfError::Vortex)?;
-    timings.struct_execute_ms = elapsed_ms(stage);
-    let term_field = struct_array
-        .unmasked_field_by_name("term")
-        .map_err(VortexRdfError::Vortex)?
-        .clone();
-    // VORTEX_RDF_INCREMENTAL_CHUNKED_TERM_DECODE_V1
-    // Avoid the global Chunked<utf8> canonical builder. Canonicalize and
-    // consume each selected chunk independently while preserving row order.
-    let term_chunks = term_field.as_opt::<Chunked>().ok_or_else(|| {
-        VortexRdfError::Deserialization(format!(
-            "direct compact term selection expected Chunked UTF-8, got {}",
-            term_field
-        ))
-    })?;
-    if term_field.len() != requested.len() {
-        return Err(VortexRdfError::Deserialization(format!(
-            "direct compact dictionary term mismatch: terms={}, requested={}",
-            term_field.len(),
-            requested.len()
-        )));
-    }
     let mut terms = Vec::with_capacity(requested.len().saturating_add(3));
     let mut id_indexes = HashMap::with_capacity(requested.len());
-    let mut term_execute_ms = 0.0;
-    let mut lexical_ms = 0.0;
-    let mut insert_ms = 0.0;
+    let mut decode_timings = NativeCompactTermDecodeTimings::default();
     let mut index = 0usize;
-    for chunk in term_chunks.iter_chunks() {
+    loop {
         let stage = Instant::now();
-        let term_chunk = chunk
-            .clone()
-            .execute::<VarBinViewArray>(&mut ctx)
-            .map_err(VortexRdfError::Vortex)?;
-        let chunk_execute_ms = elapsed_ms(stage);
-        term_execute_ms += chunk_execute_ms;
-        for chunk_index in 0..term_chunk.len() {
-            let expected = *requested.get(index).ok_or_else(|| {
-                VortexRdfError::Deserialization(
-                    "direct compact term chunks exceeded requested IDs".into(),
-                )
-            })?;
-            let actual = expected;
-            let stage = Instant::now();
-            let term_bytes = term_chunk.bytes_at(chunk_index);
-            let lexical = std::str::from_utf8(&term_bytes).map_err(|error| {
-                VortexRdfError::Deserialization(format!(
-                    "direct compact dictionary term for ID {actual} is invalid UTF-8: {error}"
-                ))
-            })?;
-            let compact_index = u32::try_from(terms.len()).map_err(|_| {
-                VortexRdfError::InvalidOperation("compact query term table exceeds u32".into())
-            })?;
-            terms.push(lexical.to_owned());
-            lexical_ms += elapsed_ms(stage);
-            let stage = Instant::now();
-            if id_indexes.insert(actual, compact_index).is_some() {
-                return Err(VortexRdfError::Deserialization(format!(
-                    "direct compact dictionary returned duplicate ID {actual}"
-                )));
-            }
-            insert_ms += elapsed_ms(stage);
-            index += 1;
-        }
+        let next = stream.next().await;
+        timings.read_all_ms += elapsed_ms(stage);
+        let Some(batch) = next else { break };
+        append_selected_term_batch(
+            batch.map_err(VortexRdfError::from)?,
+            &requested,
+            &mut index,
+            &mut terms,
+            &mut id_indexes,
+            &mut decode_timings,
+        )?;
     }
     if index != requested.len() {
         return Err(VortexRdfError::Deserialization(format!(
-            "direct compact term chunks returned {index} rows for {} requested IDs",
+            "selected dictionary stream returned {index} rows for {} requested IDs",
             requested.len()
         )));
     }
-    timings.term_column_execute_ms = term_execute_ms;
-    timings.lexical_extract_allocate_ms = lexical_ms;
-    timings.id_index_insert_ms = insert_ms;
+    timings.struct_execute_ms = decode_timings.struct_execute_ms;
+    timings.term_column_execute_ms = decode_timings.term_execute_ms;
+    timings.lexical_extract_allocate_ms = decode_timings.lexical_ms;
+    timings.id_index_insert_ms = decode_timings.insert_ms;
     timings.lexical_bytes = terms.iter().map(String::len).sum();
     let stage = Instant::now();
     let mut bound_indexes = HashMap::with_capacity(3);
