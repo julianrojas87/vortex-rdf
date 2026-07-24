@@ -10,9 +10,9 @@
 //!
 //! 1. `match_only`      — `match_pattern` alone: selection resolution.
 //! 2. `quads_array`     — + `get_quads_array`: gathering the selected rows.
-//! 3. `canonical_cols`  — + `execute::<StructArray>` + 4× `execute::<PrimitiveArray>`
-//!                        + copying each u32 column out (the payload the JS
-//!                        bindings ship across the boundary).
+//! 3. `canonical_cols`  — + `execute::<StructArray>` + 4× `execute::<PrimitiveArray>`,
+//!    then copying each u32 column out (the payload the JS bindings ship across
+//!    the boundary).
 //!
 //! The difference between consecutive stages attributes the fixed cost; the
 //! remainder up to the observed wall-clock ~33µs is JS-boundary + promise
