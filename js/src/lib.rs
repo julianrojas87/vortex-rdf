@@ -920,9 +920,7 @@ fn packed_to_quads(bytes: &[u8]) -> Result<Vec<Quad>, JsValue> {
     for i in 0..n {
         // subject: NamedNode | BlankNode
         let s = match cur.u8()? {
-            0 => NamedOrBlankNode::NamedNode(
-                NamedNode::new(cur.str()?).map_err(|_| invalid(i))?,
-            ),
+            0 => NamedOrBlankNode::NamedNode(NamedNode::new(cur.str()?).map_err(|_| invalid(i))?),
             1 => NamedOrBlankNode::BlankNode(oxrdf::BlankNode::new_unchecked(cur.str()?)),
             _ => return Err(invalid(i)),
         };

@@ -72,13 +72,11 @@ fn store() -> &'static VortexRdfStore {
             })
             .collect();
         let array = rt()
-            .block_on(
-                VortexRdfStore::build_vortex_array_with_builder::<SortedInMemoryBuilder>(
-                    stream::iter(quads),
-                    LayoutStrategy::Dictionary,
-                    vec![],
-                ),
-            )
+            .block_on(VortexRdfStore::build_vortex_array_with_builder::<
+                SortedInMemoryBuilder,
+            >(
+                stream::iter(quads), LayoutStrategy::Dictionary, vec![]
+            ))
             .expect("failed to build vortex array");
         VortexRdfStore::new(array).expect("failed to build store")
     })

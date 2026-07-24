@@ -1,36 +1,19 @@
-use crate::common::utils::{
-    bool_array_to_mask, 
-    column_is_sorted, 
-    search_sorted_bounds
-};
+use crate::common::utils::{bool_array_to_mask, column_is_sorted, search_sorted_bounds};
 use crate::error::{Result, VortexRdfError};
-use crate::io::de::array_from_ipc_reader;
 use crate::io::VORTEX_LIGHT_SESSION;
+use crate::io::de::array_from_ipc_reader;
 use crate::store::RawQuad;
 use crate::store::builders::{
-    DEFAULT_CHUNK_SIZE, 
-    UnsortedStreamBuilder, 
-    VortexArrayBuilder, 
-    build_struct_array,
+    DEFAULT_CHUNK_SIZE, UnsortedStreamBuilder, VortexArrayBuilder, build_struct_array,
 };
 #[cfg(feature = "file-io")]
 use crate::store::indexes::resolve_indexes_file;
 use crate::store::indexes::{
-    IndexResolution, 
-    IndexType, 
-    Indexes, 
-    ServePlan, 
-    detect_indexes, 
-    resolve_indexes_in_memory,
+    IndexResolution, IndexType, Indexes, ServePlan, detect_indexes, resolve_indexes_in_memory,
     strip_index_columns, unique_indexes,
 };
 use crate::store::layouts::term_dictionary::{self, TermDictionary};
-use crate::store::layouts::{
-    Constraints, 
-    LayoutStrategy, 
-    ResolvedLayout, 
-    dictionary
-};
+use crate::store::layouts::{Constraints, LayoutStrategy, ResolvedLayout, dictionary};
 use crate::store::selection::RowSelection;
 use crate::store::{QuadsSource, Tail};
 
@@ -52,24 +35,14 @@ use web_time::Instant;
 use vortex_array::arrays::constant::ConstantArray;
 use vortex_array::arrays::struct_::StructArrayExt;
 use vortex_array::arrays::{
-    ChunkedArray, 
-    Primitive, 
-    PrimitiveArray, 
-    StructArray, 
-    VarBinView, 
-    VarBinViewArray
+    ChunkedArray, Primitive, PrimitiveArray, StructArray, VarBinView, VarBinViewArray,
 };
 use vortex_array::builtins::ArrayBuiltins;
 use vortex_array::dtype::FieldNames;
 use vortex_array::scalar::Scalar;
 use vortex_array::scalar_fn::fns::operators::Operator;
 use vortex_array::validity::Validity;
-use vortex_array::{
-    ArrayRef, 
-    IntoArray, 
-    RecursiveCanonical, 
-    VortexSessionExecute
-};
+use vortex_array::{ArrayRef, IntoArray, RecursiveCanonical, VortexSessionExecute};
 use vortex_mask::Mask;
 
 #[cfg(feature = "file-io")]
@@ -168,8 +141,7 @@ impl VortexRdfStore {
     pub fn empty() -> Self {
         // Build one empty string column and reuse it for all four fields —
         // they're all zero-length anyway, so there's nothing to distinguish.
-        let e = VarBinViewArray::from_iter_str(iter::empty::<&str>())
-            .into_array();
+        let e = VarBinViewArray::from_iter_str(iter::empty::<&str>()).into_array();
 
         let quads = StructArray::try_new(
             FieldNames::from(["s", "p", "o", "g"]),
@@ -212,9 +184,7 @@ impl VortexRdfStore {
             LayoutStrategy::Dictionary => {
                 // Dictionary-layout files need their dictionary up front too;
                 // this is a single-column projection scan, not a full read.
-                ResolvedLayout::Dictionary(
-                    Arc::new(term_dictionary::dict_from_file(&file).await?)
-                )
+                ResolvedLayout::Dictionary(Arc::new(term_dictionary::dict_from_file(&file).await?))
             }
         };
         // Discover which secondary indexes the file's schema carries.
@@ -1228,7 +1198,9 @@ impl VortexRdfStore {
         }
         match Self::mask_for(layout, &applied, subject, predicate, object, graph)? {
             None => Ok(carry(tail.selection.clone())),
-            Some(mask) => Ok(carry(tail.selection.clone().refine(&bool_array_to_mask(mask)?))),
+            Some(mask) => Ok(carry(
+                tail.selection.clone().refine(&bool_array_to_mask(mask)?),
+            )),
         }
     }
 
@@ -1578,7 +1550,9 @@ impl VortexRdfStore {
             }
         }
         let ids: Vec<u64> = if let Some(codes) = TypedEq::code_views(&cols) {
-            collect_ids(selection, base_len, |i| codes.iter().all(|(s, c)| s[i] == *c))
+            collect_ids(selection, base_len, |i| {
+                codes.iter().all(|(s, c)| s[i] == *c)
+            })
         } else {
             collect_ids(selection, base_len, |i| cols.iter().all(|c| c.matches(i)))
         };
