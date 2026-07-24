@@ -1,0 +1,10 @@
+# wasm32 has no SIMD in its default baseline, unlike native x86_64/aarch64 which
+# get AVX/NEON automatically (vortex runtime-detects AVX, and NEON is the aarch64
+# baseline). Enabling simd128 lets LLVM auto-vectorize vortex's portable scalar
+# loops (dictionary decode, take, filter, compare, bit-packing, …) into wasm v128.
+# Note: it does NOT engage vortex's hand-written SIMD kernels — those are
+# `cfg(target_arch = "x86_64" | "aarch64")` and never build for wasm; on wasm the
+# win is generic auto-vectorization only. Scoped to wasm32, so native (CLI, tests,
+# benches) builds are unaffected. simd128 is baseline in modern browsers and Node 16+.
+[target.wasm32-unknown-unknown]
+rustflags = ["-C", "target-feature=+simd128"]
