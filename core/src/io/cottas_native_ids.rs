@@ -433,7 +433,7 @@ fn append_bound_compact_term(
 }
 
 fn compact_rows_from_id_indexes(
-    rows: &NativeProjectedIdRows,
+    rows: &NativeIdBatch,
     bound: &BoundNativeRdfTerms,
     terms: Vec<String>,
     id_indexes: HashMap<u32, u32>,
@@ -459,9 +459,13 @@ fn compact_rows_from_id_indexes(
     let mut compact = Vec::with_capacity(rows.rows);
     for i in 0..rows.rows {
         compact.push((
-            resolve(bound_s, projected_id_at(&rows.s, &bound.s, i, "S")?, "S")?,
-            resolve(bound_p, projected_id_at(&rows.p, &bound.p, i, "P")?, "P")?,
-            resolve(bound_o, projected_id_at(&rows.o, &bound.o, i, "O")?, "O")?,
+            resolve(bound_s, rows.id_at(NativeIdColumn::Subject, bound, i)?, "S")?,
+            resolve(
+                bound_p,
+                rows.id_at(NativeIdColumn::Predicate, bound, i)?,
+                "P",
+            )?,
+            resolve(bound_o, rows.id_at(NativeIdColumn::Object, bound, i)?, "O")?,
         ));
     }
     Ok(NativeCompactTripleBatch {
@@ -587,7 +591,7 @@ fn append_selected_term_batch(
 
 async fn projected_native_id_rows_as_compact_triples_direct_v1_impl(
     data_path: &Path,
-    rows: &NativeProjectedIdRows,
+    rows: &NativeIdBatch,
     bound: &BoundNativeRdfTerms,
 ) -> Result<(NativeCompactTripleBatch, NativeDirectCompactTimings)> {
     let total_start = Instant::now();
@@ -600,7 +604,7 @@ async fn projected_native_id_rows_as_compact_triples_direct_v1_impl(
         return Ok((NativeCompactTripleBatch::default(), timings));
     }
     let stage = Instant::now();
-    let mut requested = collect_unique_ids_from_projected_unbound_rows(rows, bound);
+    let mut requested = rows.unique_unbound_ids(bound);
     requested.sort_unstable();
     requested.dedup();
     timings.unique_id_collect_ms = elapsed_ms(stage);
@@ -700,7 +704,7 @@ async fn projected_native_id_rows_as_compact_triples_direct_v1_impl(
 
 async fn projected_native_id_rows_as_compact_triples_direct_v1(
     data_path: &Path,
-    rows: &NativeProjectedIdRows,
+    rows: &NativeIdBatch,
     bound: &BoundNativeRdfTerms,
 ) -> Result<NativeCompactTripleBatch> {
     projected_native_id_rows_as_compact_triples_direct_v1_impl(data_path, rows, bound)
@@ -730,7 +734,7 @@ pub async fn diagnose_cottas_native_direct_compact(
 
 async fn projected_native_id_rows_as_compact_triples(
     data_path: &Path,
-    rows: &NativeProjectedIdRows,
+    rows: &NativeIdBatch,
     bound: &BoundNativeRdfTerms,
 ) -> Result<NativeCompactTripleBatch> {
     projected_native_id_rows_as_compact_triples_direct_v1(data_path, rows, bound).await
@@ -2031,18 +2035,75 @@ fn collect_unique_ids_for_unbound_native_columns(
 
 #[derive(Debug)]
 struct NativeMatchPlanResult {
-    rows: NativeProjectedIdRows,
+    rows: NativeIdBatch,
     bound_terms: BoundNativeRdfTerms,
     diagnostics: CottasNativeIdsDiagnostics,
 }
 
+// VORTEX_RDF_NATIVE_ID_BATCH_V1
+// Reusable columnar handoff before RDF lexical reconstruction. The compact
+// RDFLib adapter consumes it today; a future Arrow/DataFusion adapter can
+// consume the same native-ID columns without changing scan execution.
 #[derive(Clone, Debug, Default)]
-struct NativeProjectedIdRows {
+struct NativeIdBatch {
     s: Option<Vec<u32>>,
     p: Option<Vec<u32>>,
     o: Option<Vec<u32>>,
     g: Option<Vec<u32>>,
     rows: usize,
+}
+
+impl NativeIdBatch {
+    fn unique_unbound_ids(&self, bound: &BoundNativeRdfTerms) -> Vec<u32> {
+        let empty: &[u32] = &[];
+        collect_unique_ids_for_unbound_native_columns(
+            self.s.as_deref().unwrap_or(empty),
+            self.p.as_deref().unwrap_or(empty),
+            self.o.as_deref().unwrap_or(empty),
+            self.g.as_deref().unwrap_or(empty),
+            bound,
+        )
+    }
+
+    fn id_at(
+        &self,
+        column: NativeIdColumn,
+        bound: &BoundNativeRdfTerms,
+        row: usize,
+    ) -> Result<Option<u32>> {
+        let (values, fixed, label) = match column {
+            NativeIdColumn::Subject => (&self.s, &bound.s, "S"),
+            NativeIdColumn::Predicate => (&self.p, &bound.p, "P"),
+            NativeIdColumn::Object => (&self.o, &bound.o, "O"),
+            NativeIdColumn::Graph => (&self.g, &bound.g, "G"),
+        };
+        if fixed.is_some() {
+            return Ok(None);
+        }
+        values
+            .as_ref()
+            .ok_or_else(|| {
+                VortexRdfError::Deserialization(format!(
+                    "{label} column was required for unbound output but was not projected"
+                ))
+            })?
+            .get(row)
+            .copied()
+            .map(Some)
+            .ok_or_else(|| {
+                VortexRdfError::Deserialization(format!(
+                    "{label} projected column has no value at row {row}"
+                ))
+            })
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum NativeIdColumn {
+    Subject,
+    Predicate,
+    Object,
+    Graph,
 }
 
 fn native_projection_columns_for_bound_terms(
@@ -2150,13 +2211,13 @@ fn exact_ranges_to_row_indices(ranges: &[Range<u64>], expected_rows: u64) -> Res
 
 async fn read_native_projected_stream_all_with_scan_stats<S>(
     stream: S,
-) -> Result<(NativeProjectedIdRows, usize, usize)>
+) -> Result<(NativeIdBatch, usize, usize)>
 where
     S: Stream<Item = VortexResult<ArrayRef>>,
 {
     let mut stream = Box::pin(stream);
 
-    let mut rows = NativeProjectedIdRows::default();
+    let mut rows = NativeIdBatch::default();
     let mut batches = 0usize;
     let mut max_batch_rows = 0usize;
 
@@ -2179,46 +2240,6 @@ where
     }
 
     Ok((rows, batches, max_batch_rows))
-}
-
-fn collect_unique_ids_from_projected_unbound_rows(
-    rows: &NativeProjectedIdRows,
-    bound_terms: &BoundNativeRdfTerms,
-) -> Vec<u32> {
-    let empty: &[u32] = &[];
-
-    collect_unique_ids_for_unbound_native_columns(
-        rows.s.as_deref().unwrap_or(empty),
-        rows.p.as_deref().unwrap_or(empty),
-        rows.o.as_deref().unwrap_or(empty),
-        rows.g.as_deref().unwrap_or(empty),
-        bound_terms,
-    )
-}
-
-fn projected_id_at<'a>(
-    values: &'a Option<Vec<u32>>,
-    bound: &Option<String>,
-    row_idx: usize,
-    column_label: &str,
-) -> Result<Option<u32>> {
-    if bound.is_some() {
-        return Ok(None);
-    }
-
-    let values = values.as_ref().ok_or_else(|| {
-        VortexRdfError::Deserialization(format!(
-            "{} column was required for unbound output but was not projected",
-            column_label
-        ))
-    })?;
-
-    values.get(row_idx).copied().map(Some).ok_or_else(|| {
-        VortexRdfError::Deserialization(format!(
-            "{} projected column has no value at row {}",
-            column_label, row_idx
-        ))
-    })
 }
 
 fn lookup_projected_or_use_bound<'a>(
@@ -2278,21 +2299,21 @@ fn elapsed_ms(start: Instant) -> f64 {
 
 async fn projected_native_id_rows_as_triples(
     data_path: &Path,
-    rows: &NativeProjectedIdRows,
+    rows: &NativeIdBatch,
     bound_terms: &BoundNativeRdfTerms,
 ) -> Result<Vec<(String, String, String)>> {
     if rows.rows == 0 {
         return Ok(Vec::new());
     }
 
-    let unique_ids = collect_unique_ids_from_projected_unbound_rows(rows, bound_terms);
+    let unique_ids = rows.unique_unbound_ids(bound_terms);
     let id_to_term = lookup_terms_by_ids_from_sidecar(data_path, &unique_ids).await?;
     let mut triples = Vec::with_capacity(rows.rows);
 
     for row_idx in 0..rows.rows {
-        let s_id = projected_id_at(&rows.s, &bound_terms.s, row_idx, "S")?;
-        let p_id = projected_id_at(&rows.p, &bound_terms.p, row_idx, "P")?;
-        let o_id = projected_id_at(&rows.o, &bound_terms.o, row_idx, "O")?;
+        let s_id = rows.id_at(NativeIdColumn::Subject, bound_terms, row_idx)?;
+        let p_id = rows.id_at(NativeIdColumn::Predicate, bound_terms, row_idx)?;
+        let o_id = rows.id_at(NativeIdColumn::Object, bound_terms, row_idx)?;
 
         let subject = lookup_projected_or_use_bound(&id_to_term, &bound_terms.s, s_id, "S")?;
         let predicate = lookup_projected_or_use_bound(&id_to_term, &bound_terms.p, p_id, "P")?;
@@ -2306,7 +2327,7 @@ async fn projected_native_id_rows_as_triples(
 
 async fn write_projected_native_id_rows_as_rdf_lazy<W>(
     data_path: &Path,
-    rows: NativeProjectedIdRows,
+    rows: NativeIdBatch,
     bound_terms: &BoundNativeRdfTerms,
     writer: W,
     format: RdfFormat,
@@ -2317,7 +2338,7 @@ where
     let write_start = Instant::now();
 
     let id_extract_start = Instant::now();
-    let unique_ids = collect_unique_ids_from_projected_unbound_rows(&rows, bound_terms);
+    let unique_ids = rows.unique_unbound_ids(bound_terms);
     let id_extract_ms = elapsed_ms(id_extract_start);
 
     let id_lookup_start = Instant::now();
@@ -2329,10 +2350,10 @@ where
     let mut rdf_serializer = RdfSerializer::from_format(format).for_writer(writer);
 
     for i in 0..rows.rows {
-        let s_id = projected_id_at(&rows.s, &bound_terms.s, i, "S")?;
-        let p_id = projected_id_at(&rows.p, &bound_terms.p, i, "P")?;
-        let o_id = projected_id_at(&rows.o, &bound_terms.o, i, "O")?;
-        let g_id = projected_id_at(&rows.g, &bound_terms.g, i, "G")?;
+        let s_id = rows.id_at(NativeIdColumn::Subject, bound_terms, i)?;
+        let p_id = rows.id_at(NativeIdColumn::Predicate, bound_terms, i)?;
+        let o_id = rows.id_at(NativeIdColumn::Object, bound_terms, i)?;
+        let g_id = rows.id_at(NativeIdColumn::Graph, bound_terms, i)?;
 
         let s_raw = lookup_projected_or_use_bound(&id_to_term, &bound_terms.s, s_id, "S")?;
         let p_raw = lookup_projected_or_use_bound(&id_to_term, &bound_terms.p, p_id, "P")?;
@@ -2561,7 +2582,7 @@ async fn execute_cottas_native_match(
     let Some(resolved) = resolved else {
         diagnostics.total_ms = elapsed_ms(total_start);
         return Ok(NativeMatchPlanResult {
-            rows: NativeProjectedIdRows::default(),
+            rows: NativeIdBatch::default(),
             bound_terms,
             diagnostics,
         });
@@ -2620,7 +2641,7 @@ async fn execute_cottas_native_match(
     let selected_ranges = access_plan.ranges;
     let mut scan_build_ms = 0.0;
     let mut read_all_ms = 0.0;
-    let mut matched_rows = NativeProjectedIdRows::default();
+    let mut matched_rows = NativeIdBatch::default();
     let mut scan_batches = 0usize;
     let mut max_scan_batch_rows = 0usize;
     let mut execution_strategy = "full-scan";
