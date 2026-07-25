@@ -1,7 +1,7 @@
 use crate::common::utils::{bool_array_to_mask, column_is_sorted, search_sorted_bounds};
 use crate::error::{Result, VortexRdfError};
 use crate::io::VORTEX_LIGHT_SESSION;
-use crate::io::de::array_from_ipc_reader;
+use crate::io::de::array_from_ipc_bytes;
 use crate::store::RawQuad;
 use crate::store::builders::{
     DEFAULT_CHUNK_SIZE, UnsortedStreamBuilder, VortexArrayBuilder, build_struct_array,
@@ -25,7 +25,6 @@ use vortex_file::VortexFile;
 use futures::{Stream, stream};
 use oxrdf::{GraphName, NamedNode, NamedOrBlankNode, Quad, Term};
 use std::collections::HashSet;
-use std::io::Cursor;
 use std::iter;
 #[cfg(feature = "file-io")]
 use std::ops::Range;
@@ -207,10 +206,9 @@ impl VortexRdfStore {
 
     /// Load from IPC bytes.
     pub async fn from_bytes(bytes: &[u8]) -> Result<Self> {
-        // Wrap the byte slice so it can be read like a file, decode the
-        // single IPC array message, then reuse `new` to detect the layout.
-        let cursor = Cursor::new(bytes);
-        let arr = array_from_ipc_reader(cursor)?;
+        // Decode the IPC messages straight off the slice — no `Read` staging
+        // buffer — then reuse `new` to detect the layout.
+        let arr = array_from_ipc_bytes(bytes)?;
         Self::new(arr)
     }
 

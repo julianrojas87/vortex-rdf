@@ -3436,6 +3436,7 @@ dependencies = [
 name = "vortex-rdf-core"
 version = "0.2.1"
 dependencies = [
+ "bytes",
  "clap",
  "codspeed-divan-compat",
  "futures",
