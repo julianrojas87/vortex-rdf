@@ -13,7 +13,7 @@ permissions: # optional for public repositories
   
 jobs:
   benchmarks:
-    name: Run benchmarks
+    name: Run Rust benchmarks
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -27,7 +27,7 @@ jobs:
 
       - name: Build the benchmark target(s)
         run: cargo codspeed build
-        
+
       - name: Run the benchmarks
         uses: CodSpeedHQ/action@v4
         with:
@@ -35,3 +35,39 @@ jobs:
           run: cargo codspeed run --bench benchmark
         env:
           DIVAN_SAMPLE_COUNT: 10
+
+  js-benchmarks:
+    name: Run JS benchmarks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # wasm-pack (invoked by `npm run build`) needs a Rust toolchain with the
+      # wasm target; the bindings are compiled fresh so the bench measures HEAD.
+      - name: Setup Rust toolchain (for wasm-pack)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 25
+
+      - name: Install deps and build the wasm bindings
+        working-directory: js
+        run: |
+          npm ci
+          npm run build
+
+      # Same CodSpeed project and mode as the Rust job (simulation = instruction
+      # counting), so the JS bindings' tasks publish with flamegraphs next to the
+      # Rust benchmarks. Invoke node with the tsx loader directly (not `npx tsx`)
+      # so there is no extra process layer between the CodSpeed runner and the
+      # benchmark.
+      - name: Run the JS benchmarks
+        uses: CodSpeedHQ/action@v4
+        with:
+          mode: simulation
+          run: node --import tsx --expose-gc bench/codspeed.bench.ts
+          working-directory: js

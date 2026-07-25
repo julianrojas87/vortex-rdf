@@ -34,7 +34,8 @@
         "prepublishOnly": "npm run build",
         "test": "vitest run",
         "bench": "tsx --expose-gc --max-old-space-size=8192 bench/compare.bench.ts",
-        "bench:build": "npm run build && npm run bench"
+        "bench:build": "npm run build && npm run bench",
+        "bench:codspeed": "tsx --expose-gc bench/codspeed.bench.ts"
     },
     "keywords": [
         "rdf",
