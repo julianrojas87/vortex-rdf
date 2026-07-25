@@ -243,11 +243,28 @@ pub fn get_as_term(s: &str) -> Option<Term> {
 }
 
 /// Borrow the bytes of a UTF-8 string column value as `&str` without copying.
-/// The `Utf8` dtype guarantees valid UTF-8, so this only validates.
+///
+/// **Trusted-input decode path**, the same argument as [`parse_named_node`]:
+/// every caller reads a column whose dtype is `Utf8`, and vortex validates that
+/// invariant when the array is constructed — `VarBinViewData::validate` runs a
+/// `from_utf8` over every view on IPC decode, and the file reader validates on
+/// its own construction path. Re-validating here walks each term's bytes a
+/// second time, which profiling showed at ~7% of every many-row decode
+/// (`core::str::converts::from_utf8` under `decode_chunk`).
+///
+/// The check is kept as a `debug_assert`, so the test suite (which runs debug)
+/// still fails loudly if a non-UTF-8 column ever reaches this, while release
+/// builds skip the second walk. The `Result` is retained so the decode call
+/// sites — which `?` on genuinely fallible neighbours — stay uniform.
+#[inline]
 pub(crate) fn buf_as_str(buf: &[u8]) -> Result<&str> {
-    std::str::from_utf8(buf).map_err(|e| {
-        VortexRdfError::Deserialization(format!("Invalid UTF-8 in string column: {}", e))
-    })
+    debug_assert!(
+        std::str::from_utf8(buf).is_ok(),
+        "string column value is not valid UTF-8, but its dtype claims Utf8"
+    );
+    // SAFETY: `buf` is the bytes of a value in a `Utf8`-dtyped vortex column,
+    // which vortex validates as UTF-8 when the array is constructed (see above).
+    Ok(unsafe { std::str::from_utf8_unchecked(buf) })
 }
 
 /// Parses a stream of RDF quads from any reader using the specified RDF format.
