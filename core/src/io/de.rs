@@ -100,7 +100,11 @@ pub fn array_from_ipc_bytes(bytes: &[u8]) -> Result<ArrayRef> {
     let mut messages = BufMessageReader::new(Bytes::copy_from_slice(bytes));
 
     // The stream opens with its schema; every later message is a chunk of it.
-    let dtype = match messages.next().transpose().map_err(VortexRdfError::Vortex)? {
+    let dtype = match messages
+        .next()
+        .transpose()
+        .map_err(VortexRdfError::Vortex)? 
+    {
         Some(DecoderMessage::DType(fb_dtype)) => {
             DType::from_flatbuffer(fb_dtype, session).map_err(VortexRdfError::Vortex)?
         }

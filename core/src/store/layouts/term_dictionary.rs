@@ -160,7 +160,9 @@ impl TermDictionary {
         let i = code as usize;
         if i < self.len() {
             let reader = StrColReader::new(&self.terms);
-            std::str::from_utf8(reader.bytes_at(i)).ok().map(str::to_owned)
+            std::str::from_utf8(reader.bytes_at(i))
+                .ok()
+                .map(str::to_owned)
         } else {
             None
         }
