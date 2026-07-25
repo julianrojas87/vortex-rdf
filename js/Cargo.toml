@@ -12,6 +12,20 @@ publish = false
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+# wasm-opt's default `-O` costs ~13min on this module and buys nothing we want:
+# LLVM at opt-level=3 has already done the real optimization, so `-O` only shrinks
+# the file. Measured on the 0.83 vortex tree (14.7MB wasm-bindgen output):
+#
+#   level      wasm-opt   raw       gzip      fromQuads/match   WebAssembly.compile
+#   -O (=-O2)  13m20s     11.34MB   2.58MB    274ms / 68.2ms    14.3ms
+#   -O1           42s     12.22MB   2.46MB    267ms / 66.3ms    13.3ms
+#
+# -O1 is 19x faster to build, gzips *smaller* (what npm and CDNs actually ship),
+# and is indistinguishable at runtime. The only regression is raw uncompressed
+# size, which nothing measurably depends on.
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = ['-O1']
+
 [dependencies]
 vortex-rdf-core = { path = "../core", default-features = false }
 wasm-bindgen.workspace = true
