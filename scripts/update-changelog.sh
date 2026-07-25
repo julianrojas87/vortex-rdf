@@ -29,8 +29,10 @@ fi
 CHANGELOG='CHANGELOG.md'
 REPO='https://github.com/vortex-rdf/vortex-rdf'
 # Boundary for git-cliff in AUTO mode: commits after this ref populate [Unreleased].
-# Keep it pointed at the latest released commit/tag (tagging releases keeps this clean).
-BASE_REF='a13b6a1c7e0916d513277bec4d0b9a4ec2b1ed6e'  # v0.2.0 boundary (PR #43 merge)
+# Follows the latest git tag, so it advances automatically on every tagged release
+# — tag each release (`git tag vX.Y.Z`) to keep this correct. Falls back to the
+# v0.2.0 boundary commit (PR #43 merge) only if no tags exist yet.
+BASE_REF="$(git describe --tags --abbrev=0 2>/dev/null || echo a13b6a1c7e0916d513277bec4d0b9a4ec2b1ed6e)"
 
 version="${1:-}"
 
