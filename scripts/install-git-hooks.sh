@@ -5,4 +5,6 @@ set -euo pipefail
 
 repo_root="$(git rev-parse --show-toplevel)"
 git -C "$repo_root" config core.hooksPath scripts/hooks
-echo "Installed: git push will now run scripts/ci-check.sh (skip once with --no-verify)."
+echo "Installed git hooks (skip once with --no-verify):"
+echo "  commit-msg : enforces Conventional Commits (for CHANGELOG generation)."
+echo "  pre-push   : runs scripts/ci-check.sh (same checks as CI)."

@@ -1,0 +1,81 @@
+# git-cliff ~ configuration file
+# https://git-cliff.org/docs/configuration
+#
+# CHANGELOG.md follows the Keep a Changelog format. git-cliff regenerates only the
+# [Unreleased] section; everything from the frozen `## [0.2.1]` heading down is kept
+# verbatim by scripts/update-changelog.sh, because releases 0.1.0-0.2.1 predate the
+# project's adoption of Conventional Commits and are curated by hand. Compare links
+# are written inline in each heading, so there is no bottom link-reference block.
+#
+# Usage:
+#   scripts/update-changelog.sh            # refresh the [Unreleased] section
+#   scripts/update-changelog.sh v0.3.0     # cut a release
+
+[changelog]
+header = """
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+"""
+
+body = """
+{% if version -%}
+    ## [{{ version | trim_start_matches(pat="v") }}](https://github.com/{{ remote.github.owner }}/{{ remote.github.repo }}/compare/{{ previous.version }}...{{ version }}) - {{ timestamp | date(format="%Y-%m-%d") }}
+{% else -%}
+    ## [Unreleased](https://github.com/{{ remote.github.owner }}/{{ remote.github.repo }}/compare/{{ previous.version | default(value="v0.1.0") }}...HEAD)
+{% endif -%}
+{% for group, commits in commits | group_by(attribute="group") %}
+    ### {{ group | striptags | trim | upper_first }}
+    {% for commit in commits %}
+        - {{ commit.message | split(pat="\n") | first | upper_first | trim }}{% if commit.scope %} ({{ commit.scope }}){% endif %} ([`{{ commit.id | truncate(length=7, end="") }}`](https://github.com/{{ remote.github.owner }}/{{ remote.github.repo }}/commit/{{ commit.id }}) by {% if commit.remote.username %}[@{{ commit.remote.username }}](https://github.com/{{ commit.remote.username }}){% else %}{{ commit.author.name }}{% endif %})
+    {% endfor %}
+{% endfor %}
+"""
+
+# No footer: compare links live inline in the headings above.
+footer = ""
+
+trim = true
+
+[git]
+conventional_commits = true
+# Drop anything that is not a conventional commit (merge commits, "Bump version"…).
+filter_unconventional = true
+require_conventional = false
+# Map conventional types to Keep a Changelog groups. The <!-- N --> prefixes force
+# canonical ordering and are removed by `striptags` in the template.
+commit_parsers = [
+    { message = "^feat", group = "<!-- 0 -->Added" },
+    { message = "^add", group = "<!-- 0 -->Added" },
+    { message = "^change", group = "<!-- 1 -->Changed" },
+    { message = "^perf", group = "<!-- 1 -->Changed" },
+    { message = "^refactor", group = "<!-- 1 -->Changed" },
+    { message = "^revert", group = "<!-- 1 -->Changed" },
+    { message = "^deprecat", group = "<!-- 2 -->Deprecated" },
+    { message = "^remove", group = "<!-- 3 -->Removed" },
+    { message = "^fix", group = "<!-- 4 -->Fixed" },
+    { message = "^security", group = "<!-- 5 -->Security" },
+    { message = "^doc", skip = true },
+    { message = "^style", skip = true },
+    { message = "^test", skip = true },
+    { message = "^chore", skip = true },
+    { message = "^ci", skip = true },
+    { message = "^build", skip = true },
+    # Any other conventional commit falls under Changed.
+    { message = "^.*", group = "<!-- 1 -->Changed" },
+]
+filter_commits = false
+topo_order = false
+sort_commits = "oldest"
+
+[remote.github]
+owner = "vortex-rdf"
+repo = "vortex-rdf"
+# Author handles: when a GitHub token is available (GITHUB_TOKEN env, or
+# scripts/update-changelog.sh derives one from `gh auth token`), git-cliff resolves
+# each commit's author to their GitHub @handle (commit.remote.username) and the body
+# links it. Without a token it falls back to the plain git author name. Never commit
+# a token here — it is passed at runtime via the environment.

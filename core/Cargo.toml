@@ -62,9 +62,3 @@ tokio = { workspace = true, features = ["time", "rt-multi-thread"] }
 [[bench]]
 name = "benchmark"
 harness = false
-
-# Local-iteration target decomposing the JS bindings' read path; not part of
-# the CodSpeed CI upload (codspeed.yml runs `--bench benchmark` only).
-[[bench]]
-name = "js_read_path"
-harness = false

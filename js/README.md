@@ -165,14 +165,14 @@ The default `{ builder: 'Unsorted', layout: 'Dictionary' }` already gives compac
 For one-shot conversions without holding a store:
 
 ```javascript
-import { rdf_to_vortex, vortex_to_rdf, nquads_to_vortex, vortex_to_nquads } from '@vortex-rdf/vortex-rdf-store';
+import { rdf_to_vortex, vortex_to_rdf } from '@vortex-rdf/vortex-rdf-store';
 
 const bytes = await rdf_to_vortex(turtleText, 'turtle', { builder: 'Sorted' });
 const text  = await vortex_to_rdf(bytes, 'nquads');
 
-// N-Quads shorthands
-const bytes2 = await nquads_to_vortex(nquadsText);
-const text2  = await vortex_to_nquads(bytes2);
+// N-Quads is just another format
+const bytes2 = await rdf_to_vortex(nquadsText, 'nquads');
+const text2  = await vortex_to_rdf(bytes2, 'nquads');
 ```
 
 ### TypeScript support

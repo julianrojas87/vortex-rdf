@@ -164,8 +164,6 @@ export class VortexRdfStore {
 
 export function rdf_to_vortex(input: string, format: RdfFormatName, options?: BuildOptionsInput): Promise<Uint8Array>;
 export function vortex_to_rdf(vortex_bytes: Uint8Array, format: RdfFormatName): Promise<string>;
-export function nquads_to_vortex(nquads: string, options?: BuildOptionsInput): Promise<Uint8Array>;
-export function vortex_to_nquads(vortex_bytes: Uint8Array): Promise<string>;
 "#;
 
 #[wasm_bindgen]
@@ -683,16 +681,6 @@ pub async fn vortex_to_rdf(vortex_bytes: &[u8], format_name: &str) -> Result<Str
         .map_err(|e| JsValue::from_str(&format!("Deserialize error: {}", e)))?;
 
     String::from_utf8(output_buffer).map_err(|e| JsValue::from_str(&format!("UTF-8 error: {}", e)))
-}
-
-#[wasm_bindgen(skip_typescript)]
-pub async fn nquads_to_vortex(nquads: String, options: JsValue) -> Result<Vec<u8>, JsValue> {
-    rdf_to_vortex(nquads, "nquads", options).await
-}
-
-#[wasm_bindgen(skip_typescript)]
-pub async fn vortex_to_nquads(vortex_bytes: &[u8]) -> Result<String, JsValue> {
-    vortex_to_rdf(vortex_bytes, "nquads").await
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────

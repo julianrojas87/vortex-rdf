@@ -6,8 +6,6 @@ import {
     VortexRdfStore,
     rdf_to_vortex,
     vortex_to_rdf,
-    nquads_to_vortex,
-    vortex_to_nquads,
     type BuildOptions,
 } from '../entry/node.js';
 
@@ -257,14 +255,14 @@ describe('free functions', () => {
         expect(nq.trim().split('\n').filter(Boolean).length).toBe(6);
     });
 
-    test('nquads_to_vortex / vortex_to_nquads still work', async () => {
-        const bytes = await nquads_to_vortex(NQUADS);
-        const nq = await vortex_to_nquads(bytes);
+    test('rdf_to_vortex / vortex_to_rdf round-trip nquads', async () => {
+        const bytes = await rdf_to_vortex(NQUADS, 'nquads');
+        const nq = await vortex_to_rdf(bytes, 'nquads');
         expect(nq.trim().split('\n').filter(Boolean).length).toBe(6);
     });
 
-    test('nquads_to_vortex accepts a BuildOptions object', async () => {
-        const bytes = await nquads_to_vortex(NQUADS, { builder: 'Sorted', layout: 'Dictionary' });
+    test('rdf_to_vortex accepts a BuildOptions object', async () => {
+        const bytes = await rdf_to_vortex(NQUADS, 'nquads', { builder: 'Sorted', layout: 'Dictionary' });
         const store = await VortexRdfStore.fromBytes(bytes);
         expect(store.layout()).toBe('Dictionary');
         expect(await store.size()).toBe(6);
@@ -323,16 +321,16 @@ describe('multi-chunk payloads', () => {
         return out;
     };
 
-    test('nquads_to_vortex/vortex_to_nquads round-trips across a chunk boundary', async () => {
+    test('rdf_to_vortex/vortex_to_rdf round-trips nquads across a chunk boundary', async () => {
         const n = CHUNK_SIZE + 1;
-        const bytes = await nquads_to_vortex(manyNquads(n));
-        const out = await vortex_to_nquads(bytes);
+        const bytes = await rdf_to_vortex(manyNquads(n), 'nquads');
+        const out = await vortex_to_rdf(bytes, 'nquads');
         expect(out.trim().split('\n').filter(Boolean).length).toBe(n);
     });
 
     test('fromBytes recovers every chunk', async () => {
         const n = CHUNK_SIZE + 1;
-        const bytes = await nquads_to_vortex(manyNquads(n));
+        const bytes = await rdf_to_vortex(manyNquads(n), 'nquads');
         const store = await VortexRdfStore.fromBytes(bytes);
         expect(await store.size()).toBe(n);
     });
