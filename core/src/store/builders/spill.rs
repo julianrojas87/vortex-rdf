@@ -106,6 +106,11 @@ where
 /// Sequential rkyv reader over a spill file.
 pub(crate) struct RunReader<T> {
     reader: BufReader<File>,
+    /// Reused per-record payload buffer: a fresh `vec![0u8; len]` per record
+    /// would malloc+zero on every read (profiling showed the allocator
+    /// dominating spill read-back), and `AlignedVec` also guarantees the
+    /// alignment rkyv's archived types require.
+    payload: AlignedVec,
     _marker: PhantomData<T>,
 }
 
@@ -114,6 +119,7 @@ impl<T> RunReader<T> {
         let file = File::open(path).map_err(|e| VortexRdfError::Deserialization(e.to_string()))?;
         Ok(Self {
             reader: BufReader::new(file),
+            payload: AlignedVec::new(),
             _marker: PhantomData,
         })
     }
@@ -145,8 +151,10 @@ impl<T> RunReader<T> {
         })?;
 
         let len = u32::from_le_bytes(len_bytes) as usize;
-        let mut payload = vec![0u8; len];
-        self.reader.read_exact(&mut payload).map_err(|e| {
+        // Resize without clearing: `read_exact` overwrites all `len` bytes, so
+        // the zero-fill only ever pays for the growth delta, not every record.
+        self.payload.resize(len, 0);
+        self.reader.read_exact(&mut self.payload).map_err(|e| {
             if e.kind() == ErrorKind::UnexpectedEof {
                 VortexRdfError::Deserialization(
                     "Unexpected EOF while reading spill record payload".to_string(),
@@ -159,7 +167,7 @@ impl<T> RunReader<T> {
         // SAFETY: spill files are produced by this process using the matching
         // rkyv serializer and consumed immediately; we don't accept external
         // untrusted data on this path.
-        let item = unsafe { rkyv::from_bytes_unchecked::<T, RkyvError>(&payload) }
+        let item = unsafe { rkyv::from_bytes_unchecked::<T, RkyvError>(&self.payload) }
             .map_err(|e| VortexRdfError::Deserialization(e.to_string()))?;
         Ok(Some(item))
     }
