@@ -5,8 +5,6 @@ export {
     VortexRdfStore,
     rdf_to_vortex,
     vortex_to_rdf,
-    nquads_to_vortex,
-    vortex_to_nquads,
 } from '../pkg/web/vortex_rdf.js';
 export type {
     BuildOptions,

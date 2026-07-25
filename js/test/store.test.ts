@@ -3,8 +3,8 @@ import { DataFactory } from "rdf-data-factory";
 import type { Quad, Stream } from '@rdfjs/types';
 import {
     VortexRdfStore,
-    nquads_to_vortex,
-    vortex_to_nquads
+    rdf_to_vortex,
+    vortex_to_rdf
 } from '../entry/node.js';
 
 const df = new DataFactory();
@@ -112,13 +112,13 @@ describe('VortexRdfStore basic operations', () => {
 });
 
 describe('Helper serialization methods', () => {
-    test('nquads_to_vortex and vortex_to_nquads roundtrip', async () => {
+    test('rdf_to_vortex and vortex_to_rdf roundtrip nquads', async () => {
         const nquads = `<http://example.org/s> <http://example.org/p> "hello" .\n`;
-        const vortexBytes = await nquads_to_vortex(nquads);
+        const vortexBytes = await rdf_to_vortex(nquads, 'nquads');
         expect(vortexBytes).toBeInstanceOf(Uint8Array);
         expect(vortexBytes.length).toBeGreaterThan(0);
 
-        const restored = await vortex_to_nquads(vortexBytes);
+        const restored = await vortex_to_rdf(vortexBytes, 'nquads');
         expect(restored.trim()).toBe(nquads.trim());
     });
 });
@@ -143,20 +143,20 @@ describe('Builder strategies', () => {
             expect(matches.length).toBe(2);
         });
 
-        test(`nquads_to_vortex with ${strategy}`, async () => {
+        test(`rdf_to_vortex nquads with ${strategy}`, async () => {
             const nquads = `<http://example.org/s> <http://example.org/p> "hello" .\n`;
-            const vortexBytes = await nquads_to_vortex(nquads, strategy);
+            const vortexBytes = await rdf_to_vortex(nquads, 'nquads', strategy);
             expect(vortexBytes).toBeInstanceOf(Uint8Array);
             expect(vortexBytes.length).toBeGreaterThan(0);
 
-            const restored = await vortex_to_nquads(vortexBytes);
+            const restored = await vortex_to_rdf(vortexBytes, 'nquads');
             expect(restored.trim()).toBe(nquads.trim());
         });
     }
 
-    test('nquads_to_vortex with an unknown strategy throws', async () => {
+    test('rdf_to_vortex with an unknown strategy throws', async () => {
         const nquads = `<http://example.org/s> <http://example.org/p> "hello" .\n`;
-        await expect(nquads_to_vortex(nquads, 'SortedStream' as any)).rejects.toThrow(
+        await expect(rdf_to_vortex(nquads, 'nquads', 'SortedStream' as any)).rejects.toThrow(
             /Unknown builder strategy/
         );
     });
