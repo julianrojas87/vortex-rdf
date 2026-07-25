@@ -539,15 +539,32 @@ function legend(container, series){
   container.appendChild(row);
 }
 
-/** One small bar-group: series = [{label, color, id}], drawn on its own scale. */
-function drawBarGroup(host, series, caption, map){
+/** One small bar-group: series = [{label, color, id}], drawn on its own scale.
+ * `opts.logScale` switches from linear to log height mapping, for groups where
+ * the min and max span multiple orders of magnitude and a linear scale would
+ * flatten every bar but the largest into invisibility. */
+function drawBarGroup(host, series, caption, map, opts){
+  opts = opts || {};
   const recs = series.map(s => ({...s, rec: get(map, s.id)})).filter(s => s.rec);
   if (!recs.length) return;
-  const maxV = Math.max(...recs.map(s => s.rec.median_ns)) * 1.18;
-  const minV = Math.min(...recs.map(s => s.rec.median_ns));
+  const values = recs.map(s => s.rec.median_ns);
+  const rawMax = Math.max(...values);
+  const rawMin = Math.min(...values);
+  const logScale = !!opts.logScale && rawMin > 0 && rawMax > rawMin;
   const n = recs.length;
   const slot = 40, barW = Math.min(24, slot*0.62), gap = slot - barW;
   const chartW = n*slot, chartH = 110, baseY = 92, topPad = 20;
+  const avail = baseY - topPad;
+
+  // The log floor sits a third-decade below the smallest bar (not exactly at
+  // it) so that bar still renders with a sliver of height instead of
+  // collapsing onto the baseline.
+  const maxV = rawMax * (logScale ? 1.08 : 1.18);
+  const floor = logScale ? rawMin / 3 : 0;
+  const logSpan = logScale ? Math.log(maxV) - Math.log(floor) : 0;
+  function heightFor(v){
+    return logScale ? avail * (Math.log(v) - Math.log(floor)) / logSpan : avail * (v / maxV);
+  }
 
   const wrap = document.createElement("div");
   wrap.className = "mini";
@@ -557,10 +574,10 @@ function drawBarGroup(host, series, caption, map){
   svg.appendChild(svgEl("line", { x1:0, y1:baseY, x2:chartW, y2:baseY, class:"baseline-rule" }));
 
   recs.forEach((s, i) => {
-    const h = (baseY - topPad) * (s.rec.median_ns / maxV);
+    const h = heightFor(s.rec.median_ns);
     const x = i*slot + gap/2;
     const y = baseY - h;
-    const isBest = s.rec.median_ns === minV;
+    const isBest = s.rec.median_ns === rawMin;
     const path = svgEl("path", { d: roundedTopPath(x, y, barW, h, 4), class: "s"+((i%4)+1) });
     path.style.fill = s.color;
     path.tabIndex = 0;
@@ -592,7 +609,8 @@ function drawBarGroup(host, series, caption, map){
 function renderPatternPanel(container, cfg, map, patterns){
   const panel = document.createElement("div");
   panel.className = "panel" + (cfg.wide ? " wide" : "");
-  panel.innerHTML = `<h3>${cfg.title}</h3><p class="note">${cfg.note}</p>`;
+  const noteSuffix = cfg.logScale ? " <strong>Log scale</strong> — bar height shows order of magnitude, not raw proportion; read the printed numbers." : "";
+  panel.innerHTML = `<h3>${cfg.title}</h3><p class="note">${cfg.note}${noteSuffix}</p>`;
   legend(panel, cfg.series);
 
   const strip = document.createElement("div");
@@ -601,7 +619,7 @@ function renderPatternPanel(container, cfg, map, patterns){
 
   for (const p of patterns){
     const series = cfg.series.map(s => ({ label:s.label, color:s.color, id:`${s.group}::${p}` }));
-    drawBarGroup(strip, series, p, map);
+    drawBarGroup(strip, series, p, map, { logScale: cfg.logScale });
     const recs = series.map(s => ({...s, rec: get(map, s.id)})).filter(s => s.rec);
     if (recs.length){
       const best = recs.reduce((a,b) => a.rec.median_ns < b.rec.median_ns ? a : b);
@@ -624,12 +642,13 @@ function renderPatternPanel(container, cfg, map, patterns){
 function renderSimplePanel(container, cfg, map){
   const panel = document.createElement("div");
   panel.className = "panel" + (cfg.wide ? " wide" : "");
-  panel.innerHTML = `<h3>${cfg.title}</h3><p class="note">${cfg.note}</p>`;
+  const noteSuffix = cfg.logScale ? " <strong>Log scale</strong> — bar height shows order of magnitude, not raw proportion; read the printed numbers." : "";
+  panel.innerHTML = `<h3>${cfg.title}</h3><p class="note">${cfg.note}${noteSuffix}</p>`;
   legend(panel, cfg.series);
 
   const strip = document.createElement("div");
   strip.className = "filmstrip simple" + (cfg.wide ? " wide" : "");
-  drawBarGroup(strip, cfg.series, null, map);
+  drawBarGroup(strip, cfg.series, null, map, { logScale: cfg.logScale });
   panel.appendChild(strip);
 
   const recs = cfg.series.map(s => ({...s, rec: get(map, s.id)})).filter(s => s.rec)
@@ -890,7 +909,7 @@ function renderJs(){
     title:"Cross-library match, by routing shape",
     note:"Six Vortex build variants vs rdf-stores (both index configs) vs oxigraph.",
     series: CROSS_LIB_SERIES.map((a,i) => ({ label:a.label, color:COLORS[i%COLORS.length], group:a.slug })),
-    wide: true, cols: 3,
+    wide: true, cols: 3, logScale: true,
   }, jsById, JS_PATTERNS);
 
   // Mutations — add & delete
@@ -903,6 +922,7 @@ function renderJs(){
       {label:"rdf-stores",                color:COLORS[2], id:"add::rdfstores_default"},
       {label:"oxigraph",                  color:COLORS[4], id:"add::oxigraph"},
     ],
+    logScale: true,
   }, jsById);
   renderSimplePanel(mutHost, {
     title:"Delete — per-quad", note:"Per-quad deletions of a fixed batch from a populated store.",
@@ -911,6 +931,7 @@ function renderJs(){
       {label:"rdf-stores", color:COLORS[2], id:"delete::rdfstores_default"},
       {label:"oxigraph",   color:COLORS[4], id:"delete::oxigraph"},
     ],
+    logScale: true,
   }, jsById);
 
   // Vortex variants — star design
@@ -919,11 +940,12 @@ function renderJs(){
     title:"Vortex variants, match by routing shape",
     note:"Every reachable JS build variant across the query shapes.",
     series: JS_VORTEX.map((a,i) => ({ label:a.label, color:COLORS[i%COLORS.length], group:a.slug })),
-    wide: true, cols: 3,
+    wide: true, cols: 3, logScale: true,
   }, jsById, JS_PATTERNS);
   renderSimplePanel(varHost, {
     title:"Vortex variants, ingest", note:"Bulk build time per Vortex build variant.",
     series: JS_VORTEX.map((a,i) => ({ label:a.label, color:COLORS[i%COLORS.length], id:`ingest::${a.slug}` })),
+    logScale: true,
   }, jsById);
 
   // Memory — peak RSS per adapter's own process (see JS_MEMORY / jsMemById above)
