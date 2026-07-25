@@ -386,8 +386,8 @@ RUST_LOG=vortex_rdf_cli=debug,vortex_rdf_core=debug vortex-rdf-cli serialize --i
 
 ## Development
 
-Run `./scripts/install-git-hooks.sh` once per clone to enable a `pre-push` hook
-that mirrors the Rust jobs in [`.github/workflows/ci.yml`](.github/workflows/ci.yml) —
+Run `./scripts/install-git-hooks.sh` once per clone to enable the git hooks. The
+`pre-push` hook mirrors the Rust jobs in [`.github/workflows/ci.yml`](.github/workflows/ci.yml) —
 `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
 and both `cargo test` variants. You can also run it manually with
 `./scripts/ci-check.sh`. Skip it for one push with `git push --no-verify`.
@@ -398,3 +398,23 @@ low codegen units/opt-level) even to run reliably, and was killed under memory
 pressure locally without it. Before pushing JS/wasm changes, run it by hand
 with `(cd js && npm run build && npm test)`; otherwise rely on GitHub CI for
 that job.
+
+### Changelog
+
+[`CHANGELOG.md`](CHANGELOG.md) follows [Keep a Changelog](https://keepachangelog.com/)
+and is generated from [Conventional Commits](https://www.conventionalcommits.org)
+by [`scripts/update-changelog.sh`](scripts/update-changelog.sh), which uses
+[git-cliff](https://git-cliff.org) — install it once with `cargo binstall git-cliff`
+(or `cargo install git-cliff`). The `commit-msg` hook from `install-git-hooks.sh`
+enforces the commit format the generator relies on.
+
+- **Refresh the `[Unreleased]` section:** `./scripts/update-changelog.sh`
+- **Cut a release:** `./scripts/update-changelog.sh vX.Y.Z` moves `[Unreleased]`
+  into a dated version section. Follow it with `git tag vX.Y.Z` — the tag is what
+  advances the boundary for the next release.
+
+Each entry links its commit and author. Author names resolve to GitHub `@handles`
+when a token is available (`GITHUB_TOKEN`, or borrowed from `gh auth token`) **and
+the commit has been pushed to GitHub** — so push your branch before generating if
+you want linked handles; otherwise the plain git author name is used. Set
+`SKIP_AUTHOR_ENRICH=1` to skip the lookups (e.g. offline).
