@@ -103,7 +103,7 @@ pub fn array_from_ipc_bytes(bytes: &[u8]) -> Result<ArrayRef> {
     let dtype = match messages
         .next()
         .transpose()
-        .map_err(VortexRdfError::Vortex)? 
+        .map_err(VortexRdfError::Vortex)?
     {
         Some(DecoderMessage::DType(fb_dtype)) => {
             DType::from_flatbuffer(fb_dtype, session).map_err(VortexRdfError::Vortex)?
