@@ -5,9 +5,49 @@ use futures::{Stream, stream};
 use oxrdf::{BlankNode, GraphName, Literal, NamedNode, NamedOrBlankNode, Quad, Term};
 use oxrdfio::{RdfFormat, RdfParser};
 
+use vortex_array::arrays::varbinview::BinaryView;
 use vortex_array::arrays::{BoolArray, VarBinViewArray};
 use vortex_array::{ArrayRef, IntoArray, VortexSessionExecute};
 use vortex_mask::Mask;
+
+/// Zero-cost row access into a canonical `VarBinView` string column: the
+/// 16-byte views slice and the data buffers are resolved once, and each row's
+/// bytes are then an inline read or a plain slice of the referenced buffer.
+///
+/// `bytes_at` instead materializes a refcounted `ByteBuffer` per row (two
+/// atomic refcount ops plus alignment bookkeeping), which profiling showed
+/// costing ~5% of every many-row decode; this reader is the loop-shaped
+/// counterpart, sharing the access pattern of the typed residual filter's
+/// `StrEq`.
+pub(crate) struct StrColReader<'a> {
+    arr: &'a VarBinViewArray,
+    views: &'a [BinaryView],
+}
+
+impl<'a> StrColReader<'a> {
+    pub(crate) fn new(arr: &'a VarBinViewArray) -> Self {
+        Self {
+            arr,
+            views: arr.views(),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn bytes_at(&self, i: usize) -> &'a [u8] {
+        let view = &self.views[i];
+        if view.is_inlined() {
+            view.as_inlined().value()
+        } else {
+            let r = view.as_view();
+            &self.arr.buffer(r.buffer_index as usize)[r.as_range()]
+        }
+    }
+
+    #[inline]
+    pub(crate) fn str_at(&self, i: usize) -> Result<&'a str> {
+        buf_as_str(self.bytes_at(i))
+    }
+}
 
 /// Build a Vortex string array (`VarBinView<Utf8>`, non-nullable) from string refs.
 ///

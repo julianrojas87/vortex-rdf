@@ -25,7 +25,7 @@ use vortex_array::{ArrayRef, IntoArray, VortexSessionExecute};
 
 use super::default::decode_spog;
 use super::term_dictionary::{self, DICT_FIELD, TermDictionary, TermIdMap};
-use crate::common::utils::{buf_as_str, stamp_is_sorted};
+use crate::common::utils::{StrColReader, stamp_is_sorted};
 use crate::error::{Result, VortexRdfError};
 use crate::io::VORTEX_LIGHT_SESSION;
 use crate::store::indexes::secondary_by_copy::CopyKey;
@@ -338,9 +338,10 @@ pub(crate) fn decode_chunk(chunk: &ArrayRef, dict: &TermDictionary) -> Vec<Resul
     let o_ids = o_col.as_slice::<u32>();
     let g_ids = g_col.as_slice::<u32>();
 
-    let term_at = |id: u32| -> Result<_> {
+    let terms = StrColReader::new(dict.view());
+    let term_at = |id: u32| -> Result<&str> {
         if (id as usize) < dict.len() {
-            Ok(dict.view().bytes_at(id as usize))
+            terms.str_at(id as usize)
         } else {
             Err(VortexRdfError::Deserialization(format!(
                 "Term code {} out of dictionary bounds ({})",
@@ -354,15 +355,11 @@ pub(crate) fn decode_chunk(chunk: &ArrayRef, dict: &TermDictionary) -> Vec<Resul
         .map(|i| {
             // Zero-copy views over the dictionary's term bytes; the oxrdf
             // constructors make the single owned copy.
-            let s_buf = term_at(s_ids[i])?;
-            let p_buf = term_at(p_ids[i])?;
-            let o_buf = term_at(o_ids[i])?;
-            let g_buf = term_at(g_ids[i])?;
             decode_spog(
-                buf_as_str(s_buf.as_ref())?,
-                buf_as_str(p_buf.as_ref())?,
-                buf_as_str(o_buf.as_ref())?,
-                buf_as_str(g_buf.as_ref())?,
+                term_at(s_ids[i])?,
+                term_at(p_ids[i])?,
+                term_at(o_ids[i])?,
+                term_at(g_ids[i])?,
             )
         })
         .collect()

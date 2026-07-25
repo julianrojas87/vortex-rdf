@@ -24,6 +24,7 @@ use vortex_array::{ArrayRef, IntoArray, VortexSessionExecute};
 #[cfg(feature = "file-io")]
 use vortex_file::VortexFile;
 
+use crate::common::utils::StrColReader;
 use crate::error::{Result, VortexRdfError};
 use crate::io::VORTEX_LIGHT_SESSION;
 use crate::store::RawQuad;
@@ -158,8 +159,8 @@ impl TermDictionary {
     pub(crate) fn term_at(&self, code: u32) -> Option<String> {
         let i = code as usize;
         if i < self.len() {
-            let buf = self.terms.bytes_at(i);
-            std::str::from_utf8(buf.as_ref()).ok().map(str::to_owned)
+            let reader = StrColReader::new(&self.terms);
+            std::str::from_utf8(reader.bytes_at(i)).ok().map(str::to_owned)
         } else {
             None
         }
@@ -172,10 +173,10 @@ impl TermDictionary {
     /// from paying this allocation once per build.
     pub(crate) fn build_id_map(&self) -> TermIdMap {
         let start = Instant::now();
+        let reader = StrColReader::new(&self.terms);
         let map = (0..self.len())
             .map(|id| {
-                let term = self.terms.bytes_at(id);
-                let term = std::str::from_utf8(term.as_ref())
+                let term = std::str::from_utf8(reader.bytes_at(id))
                     .expect("term dictionary contains only valid UTF-8")
                     .to_owned();
                 (term, id as u32)
@@ -194,15 +195,16 @@ impl TermDictionary {
     /// Falls back to manual binary search only if the kernel fails.
     pub(crate) fn get_id(&self, term: &str) -> Option<u32> {
         // Direct byte-compare binary search over the sorted term views.
-        // `terms` is a concrete VarBinViewArray, so `bytes_at` reads a view
+        // `terms` is a concrete VarBinViewArray, so each probe reads a view
         // without materializing anything; the generic `search_sorted` kernel
         // would instead build a fresh `ExecutionCtx` and a `Scalar` per probe,
         // which profiling showed dominating `match_pattern`'s fixed cost.
+        let reader = StrColReader::new(&self.terms);
         let needle = term.as_bytes();
         let (mut lo, mut hi) = (0usize, self.len());
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
-            match self.terms.bytes_at(mid).as_ref().cmp(needle) {
+            match reader.bytes_at(mid).cmp(needle) {
                 std::cmp::Ordering::Less => lo = mid + 1,
                 std::cmp::Ordering::Equal => return Some(mid as u32),
                 std::cmp::Ordering::Greater => hi = mid,
@@ -301,12 +303,21 @@ pub(crate) fn dict_from_array(array: &ArrayRef) -> Result<TermDictionary> {
 
 /// Read the term dictionary from a Dictionary-layout file: a single-column
 /// projection scan of `_dict_terms` (the quad columns are never touched).
+///
+/// The scan is restricted to row 0 — by construction the only row carrying the
+/// payload (mirroring `dict_from_array`'s `slice(0..1)`). Without the
+/// restriction the scan decodes every row block of the column just to hold
+/// empty lists, which profiling showed dominating Dictionary-layout file opens.
 #[cfg(feature = "file-io")]
 pub(crate) async fn dict_from_file(file: &VortexFile) -> Result<TermDictionary> {
+    if file.row_count() == 0 {
+        return Ok(TermDictionary::empty());
+    }
     let arr = file
         .scan()
         .map_err(VortexRdfError::Vortex)?
         .with_projection(select([DICT_FIELD], root()))
+        .with_row_range(0..1)
         .into_array_stream()
         .map_err(VortexRdfError::Vortex)?
         .read_all()

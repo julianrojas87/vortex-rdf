@@ -15,7 +15,7 @@ use vortex_array::validity::Validity;
 use vortex_array::{ArrayRef, IntoArray, VortexSessionExecute};
 
 use crate::common::utils::{
-    buf_as_str, get_as_term, make_string_array, parse_graph_name, parse_named_node, parse_subject,
+    StrColReader, get_as_term, make_string_array, parse_graph_name, parse_named_node, parse_subject,
 };
 use crate::error::{Result, VortexRdfError};
 use crate::io::VORTEX_LIGHT_SESSION;
@@ -69,20 +69,16 @@ pub(crate) fn decode_chunk(chunk: &ArrayRef) -> Vec<Result<Quad>> {
     let o_col = get_str_col!("o");
     let g_col = get_str_col!("g");
 
+    let s = StrColReader::new(&s_col);
+    let p = StrColReader::new(&p_col);
+    let o = StrColReader::new(&o_col);
+    let g = StrColReader::new(&g_col);
+
     (0..n)
         .map(|i| {
             // Borrow &str views over the column buffers (zero-copy);
             // the oxrdf constructors make the single owned copy.
-            let s_buf = s_col.bytes_at(i);
-            let p_buf = p_col.bytes_at(i);
-            let o_buf = o_col.bytes_at(i);
-            let g_buf = g_col.bytes_at(i);
-            decode_spog(
-                buf_as_str(s_buf.as_ref())?,
-                buf_as_str(p_buf.as_ref())?,
-                buf_as_str(o_buf.as_ref())?,
-                buf_as_str(g_buf.as_ref())?,
-            )
+            decode_spog(s.str_at(i)?, p.str_at(i)?, o.str_at(i)?, g.str_at(i)?)
         })
         .collect()
 }

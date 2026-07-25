@@ -798,12 +798,12 @@ impl VortexRdfStore {
         match &self.layout {
             ResolvedLayout::Dictionary(dict) => {
                 let n = dict.len();
-                let view = dict.view();
+                let reader = crate::common::utils::StrColReader::new(dict.view());
                 let mut offsets = Vec::with_capacity(n + 1);
                 let mut bytes = Vec::new();
                 offsets.push(0u32);
                 for i in 0..n {
-                    bytes.extend_from_slice(view.bytes_at(i).as_ref());
+                    bytes.extend_from_slice(reader.bytes_at(i));
                     offsets.push(bytes.len() as u32);
                 }
                 Some((offsets, bytes))
