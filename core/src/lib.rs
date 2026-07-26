@@ -46,7 +46,7 @@ pub mod io;
 pub mod store;
 
 pub use error::VortexRdfError;
-pub use io::{array_from_ipc_reader, deserialize};
+pub use io::{array_from_ipc_bytes, array_from_ipc_reader, deserialize};
 #[cfg(feature = "file-io")]
 pub use io::{
     load_vortex_file_ref, quads_stream_to_vortex, quads_stream_to_vortex_writer,
@@ -548,6 +548,101 @@ mod tests {
             assert_eq!(subjects, sorted, "{name}: output not globally sorted");
             assert_eq!(subjects.len(), 10, "{name}: wrong quad count");
         }
+    }
+
+    /// The out-of-core indexed pipeline when the data genuinely spills: with a
+    /// chunk size far below the dataset the ingest produces several runs, so the
+    /// quad merge and every index family's `(value, row id)` sort all run
+    /// through their spill-and-K-way-merge branch rather than the single-run
+    /// in-memory one. The sibling tests all fit in one run, which leaves that
+    /// branch — and the global sortedness of the index columns it must still
+    /// produce — otherwise unexercised for the string layouts.
+    #[tokio::test]
+    async fn test_sorted_streaming_spilled_indexes_match_in_memory() {
+        use crate::store::builders::assemble_chunks;
+        use crate::store::builders::sorted_stream::build_sorted_stream_chunk_stream;
+
+        let indexes = vec![IndexType::SecondaryByCopy, IndexType::SecondaryByReference];
+        // Fed in reverse so nothing is accidentally in order, and wide enough
+        // (24 quads over a chunk size of 3) to force 8 runs.
+        let quads: Vec<Quad> = (0..24)
+            .rev()
+            .map(|i| {
+                make_quad(
+                    &format!("http://example.org/s{:02}", i),
+                    &format!("http://example.org/p{}", i % 3),
+                    &format!("object {}", i % 4),
+                    GraphName::DefaultGraph,
+                )
+            })
+            .collect();
+
+        let (_dtype, chunks) = build_sorted_stream_chunk_stream(
+            Box::new(quad_stream(quads.clone())),
+            LayoutStrategy::Default,
+            indexes.clone(),
+            3,
+        )
+        .await
+        .expect("spilled build");
+        let chunks: Vec<_> = chunks
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(|c| c.expect("chunk"))
+            .collect();
+        assert_eq!(
+            chunks.iter().map(|c| c.len()).collect::<Vec<_>>(),
+            [3, 3, 3, 3, 3, 3, 3, 3],
+            "unexpected chunk sizes"
+        );
+
+        let store = VortexRdfStore::new(
+            assemble_chunks(chunks, LayoutStrategy::Default, &indexes).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(store.indexes(), &indexes[..]);
+
+        // Every quad survived the spill round-trip, in global subject order.
+        let decoded: Vec<Quad> = store.quads().unwrap().try_collect().await.unwrap();
+        let mut expected = quad_strings(&quads);
+        expected.sort();
+        assert_eq!(quad_strings(&decoded), expected);
+
+        // And the index columns the spill merge emitted actually route: the
+        // same selectivities the single-run copy-index test asserts.
+        let p1 = NamedNode::new("http://example.org/p1").unwrap();
+        let o1 = Term::Literal(Literal::new_simple_literal("object 1"));
+        assert_eq!(
+            store
+                .match_pattern(None, Some(&p1), None, None)
+                .await
+                .unwrap()
+                .size()
+                .await
+                .unwrap(),
+            8
+        );
+        assert_eq!(
+            store
+                .match_pattern(None, None, Some(&o1), None)
+                .await
+                .unwrap()
+                .size()
+                .await
+                .unwrap(),
+            6
+        );
+        assert_eq!(
+            store
+                .match_pattern(None, Some(&p1), Some(&o1), None)
+                .await
+                .unwrap()
+                .size()
+                .await
+                .unwrap(),
+            2
+        );
     }
 
     #[cfg(feature = "file-io")]

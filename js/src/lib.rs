@@ -11,7 +11,7 @@ use vortex_array::{ArrayRef, IntoArray, RecursiveCanonical, VortexSessionExecute
 use vortex_rdf_core::common::utils::parse_quads_from_reader;
 use vortex_rdf_core::error::{Result as CoreResult, VortexRdfError};
 use vortex_rdf_core::io::{
-    VORTEX_LIGHT_SESSION, array_from_ipc_reader, deserialize, write_array_to_ipc,
+    VORTEX_LIGHT_SESSION, array_from_ipc_bytes, deserialize, write_array_to_ipc,
 };
 use vortex_rdf_core::{
     BuilderStrategy, IndexType, Indexes, LayoutStrategy, SortedInMemoryBuilder,
@@ -229,8 +229,7 @@ impl VortexRdfStore {
 
     #[wasm_bindgen(js_name = fromBytes, skip_typescript)]
     pub async fn from_bytes(bytes: &[u8]) -> Result<VortexRdfStore, JsValue> {
-        let cursor = Cursor::new(bytes);
-        let array = array_from_ipc_reader(cursor).map_err(|e| JsValue::from_str(&e.to_string()))?;
+        let array = array_from_ipc_bytes(bytes).map_err(|e| JsValue::from_str(&e.to_string()))?;
         let inner = CoreStore::new(array).map_err(|e| JsValue::from_str(&e.to_string()))?;
         Ok(VortexRdfStore::wrap(inner))
     }
@@ -668,8 +667,7 @@ pub async fn rdf_to_vortex(
 #[wasm_bindgen(skip_typescript)]
 pub async fn vortex_to_rdf(vortex_bytes: &[u8], format_name: &str) -> Result<String, JsValue> {
     let format = parse_format(format_name)?;
-    let cursor = Cursor::new(vortex_bytes);
-    let vortex_array = array_from_ipc_reader(cursor)
+    let vortex_array = array_from_ipc_bytes(vortex_bytes)
         .map_err(|e| JsValue::from_str(&format!("Vortex read error: {}", e)))?;
 
     let store = CoreStore::new(vortex_array)

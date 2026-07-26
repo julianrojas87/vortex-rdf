@@ -7,6 +7,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased](https://github.com/vortex-rdf/vortex-rdf/compare/v0.2.1...HEAD)
 
+### Changed
+
+- Implement StrColReader for faster string column reads ([`3813ce2`](https://github.com/vortex-rdf/vortex-rdf/commit/3813ce2d7087ef64d226f2742aea5491672c44d1) by julianrojas87)
+- Reuse payload buffer when serializing against disk ([`ab92cf4`](https://github.com/vortex-rdf/vortex-rdf/commit/ab92cf4aef3754e3061f3f2b395e6a6845da27be) by julianrojas87)
+- Decoding vortex into quads uses unchecked path ([`659273c`](https://github.com/vortex-rdf/vortex-rdf/commit/659273c591f7000494a5467e5113e4057b87a42a) by julianrojas87)
+- True zero-copy for IPC-based exchange ([`3a5d314`](https://github.com/vortex-rdf/vortex-rdf/commit/3a5d314b2e91993285e17c15af3b307b496c913b) by julianrojas87)
+- Serialize to disk only when needed for stream builders ([`a2ab133`](https://github.com/vortex-rdf/vortex-rdf/commit/a2ab1333ad22afa1444f8656ffdd0c49e5e07fec) by julianrojas87)
+
+### Fixed
+
+- WASM compilation time (from 15m to 40s) ([`c7b0225`](https://github.com/vortex-rdf/vortex-rdf/commit/c7b0225d3882fc36ca6672604c28f65bf42ea4d0) by julianrojas87)
+- Changelog update process ([`1702cef`](https://github.com/vortex-rdf/vortex-rdf/commit/1702cef296cc90c50fcdaf944b1be9c0fc8a4cc5) by julianrojas87)
+
+## [0.3.0](https://github.com/vortex-rdf/vortex-rdf/compare/v0.2.1...v0.3.0) - 2026-07-25
+
+### Changed
+
+- Implement StrColReader for faster string column reads ([`3813ce2`](https://github.com/vortex-rdf/vortex-rdf/commit/3813ce2d7087ef64d226f2742aea5491672c44d1) by julianrojas87)
+- Reuse payload buffer when serializing against disk ([`ab92cf4`](https://github.com/vortex-rdf/vortex-rdf/commit/ab92cf4aef3754e3061f3f2b395e6a6845da27be) by julianrojas87)
+- Decoding vortex into quads uses unchecked path ([`659273c`](https://github.com/vortex-rdf/vortex-rdf/commit/659273c591f7000494a5467e5113e4057b87a42a) by julianrojas87)
+- True zero-copy for IPC-based exchange ([`3a5d314`](https://github.com/vortex-rdf/vortex-rdf/commit/3a5d314b2e91993285e17c15af3b307b496c913b) by julianrojas87)
+- Serialize to disk only when needed for stream builders ([`a2ab133`](https://github.com/vortex-rdf/vortex-rdf/commit/a2ab1333ad22afa1444f8656ffdd0c49e5e07fec) by julianrojas87)
+
+### Fixed
+
+- WASM compilation time (from 15m to 40s) ([`c7b0225`](https://github.com/vortex-rdf/vortex-rdf/commit/c7b0225d3882fc36ca6672604c28f65bf42ea4d0) by julianrojas87)
+- Changelog update process ([`1702cef`](https://github.com/vortex-rdf/vortex-rdf/commit/1702cef296cc90c50fcdaf944b1be9c0fc8a4cc5) by julianrojas87)
+
+## [0.3.0](https://github.com/vortex-rdf/vortex-rdf/compare/v0.2.1...v0.3.0) - 2026-07-25
+
+### Changed
+
+- Implement StrColReader for faster string column reads ([`3813ce2`](https://github.com/vortex-rdf/vortex-rdf/commit/3813ce2d7087ef64d226f2742aea5491672c44d1) by [@julianrojas87](https://github.com/julianrojas87))
+
+- Reuse payload buffer when serializing against disk ([`ab92cf4`](https://github.com/vortex-rdf/vortex-rdf/commit/ab92cf4aef3754e3061f3f2b395e6a6845da27be) by [@julianrojas87](https://github.com/julianrojas87))
+
+- Decoding vortex into quads uses unchecked path ([`659273c`](https://github.com/vortex-rdf/vortex-rdf/commit/659273c591f7000494a5467e5113e4057b87a42a) by [@julianrojas87](https://github.com/julianrojas87))
+
+- True zero-copy for IPC-based exchange ([`3a5d314`](https://github.com/vortex-rdf/vortex-rdf/commit/3a5d314b2e91993285e17c15af3b307b496c913b) by [@julianrojas87](https://github.com/julianrojas87))
+
+- Serialize to disk only when needed for stream builders ([`a2ab133`](https://github.com/vortex-rdf/vortex-rdf/commit/a2ab1333ad22afa1444f8656ffdd0c49e5e07fec) by [@julianrojas87](https://github.com/julianrojas87))
+
+
+### Fixed
+
+- WASM compilation time (from 15m to 40s) ([`c7b0225`](https://github.com/vortex-rdf/vortex-rdf/commit/c7b0225d3882fc36ca6672604c28f65bf42ea4d0) by [@julianrojas87](https://github.com/julianrojas87))
+
 ## [0.2.1] - 2026-07-25
 
 ### Added

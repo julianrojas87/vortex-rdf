@@ -1,5 +1,5 @@
 use super::spill::{
-    PairMerger, PairRunSpiller, RunReader, RunWriter, TempRunsGuard, make_temp_dir, write_run,
+    PairMerger, PairRunSpiller, Run, RunWriter, TempRunsGuard, make_temp_dir, write_run,
 };
 use super::{
     ChunkStream, DEFAULT_CHUNK_SIZE, VortexArrayBuilder, assemble_chunks, build_struct_array,
@@ -152,10 +152,11 @@ pub(crate) async fn build_sorted_stream_chunk_stream(
         if let Some(b) = dict_builder.as_mut() {
             b.insert_quad(&raw);
         }
-        buffer.push(raw);
-        total_ingested += 1;
-
-        if buffer.len() >= chunk_size {
+        // Spill only to make room for a quad that would not fit, never merely on
+        // reaching the chunk size — a dataset of exactly `chunk_size` quads then
+        // stays one in-memory run (see [`Run`]). Peak buffered quads is
+        // unchanged, and so is the run size.
+        if buffer.len() == chunk_size {
             buffer.sort_unstable();
             let run_path = temp_dir.join(format!("run_{}.bin", run_paths.len()));
             write_run(&run_path, &buffer)?;
@@ -167,36 +168,49 @@ pub(crate) async fn build_sorted_stream_chunk_stream(
             run_paths.push(run_path);
             buffer.clear();
         }
+        buffer.push(raw);
+        total_ingested += 1;
     }
 
-    if !buffer.is_empty() {
+    // Phase 2 input: the spilled runs, plus whatever is still buffered. A lone
+    // buffer never touches the filesystem; alongside spilled runs it has to join
+    // them on disk so the K-way merge sees uniform runs.
+    let mut runs: Vec<Run<RawQuad>> = if run_paths.is_empty() {
         buffer.sort_unstable();
-        let run_path = temp_dir.join(format!("run_{}.bin", run_paths.len()));
-        write_run(&run_path, &buffer)?;
         log::debug!(
-            "[SortedStreamBuilder] Wrote final sorted run {} ({} quads)",
-            run_paths.len(),
+            "[SortedStreamBuilder] Kept the single sorted run of {} quads in memory",
             buffer.len()
         );
-        run_paths.push(run_path);
+        vec![Run::memory(buffer)]
+    } else {
+        if !buffer.is_empty() {
+            buffer.sort_unstable();
+            let run_path = temp_dir.join(format!("run_{}.bin", run_paths.len()));
+            write_run(&run_path, &buffer)?;
+            log::debug!(
+                "[SortedStreamBuilder] Wrote final sorted run {} ({} quads)",
+                run_paths.len(),
+                buffer.len()
+            );
+            run_paths.push(run_path);
+        }
         drop(buffer);
-    }
+        run_paths
+            .iter()
+            .map(|p| Run::file(p))
+            .collect::<Result<_>>()?
+    };
     log::debug!(
         "[SortedStreamBuilder] Ingested {} quads into {} runs in {:?} (dictionary collection={})",
         total_ingested,
-        run_paths.len(),
+        runs.len(),
         ingest_start.elapsed(),
         dict_builder.is_some()
     );
 
     // ── Phase 2: K-way merge setup ──
-    let mut readers: Vec<RunReader<RawQuad>> = run_paths
-        .iter()
-        .map(|p| RunReader::new(p))
-        .collect::<Result<_>>()?;
-
     let mut heap = BinaryHeap::new();
-    for (i, r) in readers.iter_mut().enumerate() {
+    for (i, r) in runs.iter_mut().enumerate() {
         if let Some(q) = r.next()? {
             heap.push(HeapItem {
                 quad: q,
@@ -225,8 +239,8 @@ pub(crate) async fn build_sorted_stream_chunk_stream(
                 build_start.elapsed()
             );
             let ids = id_map.clone();
-            let (merged_path, spilled) = merge_to_spill(
-                readers,
+            let (merged, spilled) = merge_to_spill(
+                runs,
                 heap,
                 &temp_dir,
                 chunk_size,
@@ -245,17 +259,11 @@ pub(crate) async fn build_sorted_stream_chunk_stream(
                 },
             )?;
             return emit_presorted_dict_chunks(
-                merged_path,
-                spilled,
-                dict,
-                id_map,
-                indexes,
-                chunk_size,
-                guard,
+                merged, spilled, dict, id_map, indexes, chunk_size, guard,
             );
         }
-        let (merged_path, spilled) = merge_to_spill(
-            readers,
+        let (merged, spilled) = merge_to_spill(
+            runs,
             heap,
             &temp_dir,
             chunk_size,
@@ -263,7 +271,7 @@ pub(crate) async fn build_sorted_stream_chunk_stream(
             want_copy,
             |q| Ok([q.s.clone(), q.p.clone(), q.o.clone(), q.g.clone()]),
         )?;
-        return emit_presorted_chunks(merged_path, spilled, layout, indexes, chunk_size, guard);
+        return emit_presorted_chunks(merged, spilled, layout, indexes, chunk_size, guard);
     }
 
     // ── No secondary indexes: lazily emit merged chunks ──
@@ -277,11 +285,11 @@ pub(crate) async fn build_sorted_stream_chunk_stream(
             dict_start.elapsed(),
             build_start.elapsed()
         );
-        return emit_dict_chunks(readers, heap, dict, id_map, indexes, chunk_size, guard);
+        return emit_dict_chunks(runs, heap, dict, id_map, indexes, chunk_size, guard);
     }
 
     // The first chunk is built eagerly so the schema dtype is known up front.
-    let first_buf = next_sorted_chunk(&mut readers, &mut heap, chunk_size)?;
+    let first_buf = next_sorted_chunk(&mut runs, &mut heap, chunk_size)?;
     let first = if first_buf.is_empty() {
         make_empty_struct(layout, &indexes)?
     } else {
@@ -300,14 +308,14 @@ pub(crate) async fn build_sorted_stream_chunk_stream(
     drop(first_buf);
 
     let rest = stream::unfold(
-        (readers, heap, layout, indexes, next_row, guard),
-        move |(mut readers, mut heap, layout, indexes, row, guard)| async move {
-            let buf = match next_sorted_chunk(&mut readers, &mut heap, chunk_size) {
+        (runs, heap, layout, indexes, next_row, guard),
+        move |(mut runs, mut heap, layout, indexes, row, guard)| async move {
+            let buf = match next_sorted_chunk(&mut runs, &mut heap, chunk_size) {
                 Ok(b) => b,
                 Err(e) => {
                     return Some((
                         Err(into_vortex_error(e)),
-                        (readers, heap, layout, indexes, row, guard),
+                        (runs, heap, layout, indexes, row, guard),
                     ));
                 }
             };
@@ -317,10 +325,7 @@ pub(crate) async fn build_sorted_stream_chunk_stream(
             let n = buf.len();
             let chunk = build_struct_array(&buf, layout, &indexes, n, row, true, false)
                 .map_err(into_vortex_error);
-            Some((
-                chunk,
-                (readers, heap, layout, indexes, row + n as u32, guard),
-            ))
+            Some((chunk, (runs, heap, layout, indexes, row + n as u32, guard)))
         },
     );
 
@@ -355,21 +360,26 @@ struct IndexBatches<V> {
 }
 
 /// Run the K-way quad merge to completion (pass A of the indexed pipeline):
-/// merged quads are spilled sequentially to `merged.bin`, while each quad's
-/// terms — extracted by `spog_of` as `[s, p, o, g]`, strings or u32 dictionary
-/// codes — feed the external-sort spillers of every requested index family:
+/// merged quads are collected in merge order, while each quad's terms —
+/// extracted by `spog_of` as `[s, p, o, g]`, strings or u32 dictionary codes —
+/// feed the external-sort spillers of every requested index family:
 /// (value, row ID) pairs for the reference index, full [`CopyKey`]s for the
-/// copy index. Returns the merged-quads path and the per-family mergers,
-/// ready to stream entries in global sort order.
+/// copy index. Returns the merged quads and the per-family mergers, ready to
+/// stream entries in global sort order.
+///
+/// A single input run means the whole dataset already fit in memory once, so
+/// the merged output is kept there too rather than round-tripping through
+/// `merged.bin`; with several runs the merge is unbounded by construction and
+/// spills as before.
 fn merge_to_spill<V>(
-    mut readers: Vec<RunReader<RawQuad>>,
+    mut runs: Vec<Run<RawQuad>>,
     mut heap: BinaryHeap<HeapItem>,
     temp_dir: &Path,
     pair_capacity: usize,
     want_ref: bool,
     want_copy: bool,
     mut spog_of: impl FnMut(&RawQuad) -> Result<[V; 4]>,
-) -> Result<(PathBuf, SpilledIndexes<V>)>
+) -> Result<(Run<RawQuad>, SpilledIndexes<V>)>
 where
     V: Clone
         + Ord
@@ -381,8 +391,17 @@ where
         + for<'a> RkyvSerialize<HighSerializer<AlignedVec, ArenaHandle<'a>, RkyvError>>,
     <CopyKey<V> as Archive>::Archived: RkyvDeserialize<CopyKey<V>, HighDeserializer<RkyvError>>,
 {
-    let merged_path = temp_dir.join("merged.bin");
-    let mut merged: RunWriter<RawQuad> = RunWriter::create(&merged_path)?;
+    // One run in, one run out: keep the merged quads in memory (see the doc
+    // comment); otherwise stream them into a spill file.
+    let mut merged = if runs.len() <= 1 {
+        MergedSink::Memory(Vec::new())
+    } else {
+        let path = temp_dir.join("merged.bin");
+        MergedSink::File {
+            writer: RunWriter::create(&path)?,
+            path,
+        }
+    };
     let mut o_spill = want_ref.then(|| PairRunSpiller::<V>::new(temp_dir, "idx_o", pair_capacity));
     let mut p_spill = want_ref.then(|| PairRunSpiller::<V>::new(temp_dir, "idx_p", pair_capacity));
     let mut posg_spill =
@@ -409,18 +428,18 @@ where
         if let Some(spiller) = p_spill.as_mut() {
             spiller.push(p_val, rid)?;
         }
-        merged.push(&quad)?;
+        merged.push(quad)?;
         rid += 1;
-        if let Some(next_q) = readers[r_idx].next()? {
+        if let Some(next_q) = runs[r_idx].next()? {
             heap.push(HeapItem {
                 quad: next_q,
                 reader_idx: r_idx,
             });
         }
     }
-    merged.finish()?;
+    let merged = merged.finish()?;
     log::debug!(
-        "[SortedStreamBuilder] Merged {} quads to spill; index pair runs written",
+        "[SortedStreamBuilder] Merged {} quads; index pair runs written",
         rid
     );
 
@@ -433,12 +452,45 @@ where
         _ => None,
     };
     Ok((
-        merged_path,
+        merged,
         SpilledIndexes {
             ref_pairs,
             copy_keys,
         },
     ))
+}
+
+/// Where [`merge_to_spill`] puts the merged quads: straight into memory when the
+/// merge had a single input run, otherwise into a spill file.
+enum MergedSink {
+    Memory(Vec<RawQuad>),
+    File {
+        writer: RunWriter<RawQuad>,
+        path: PathBuf,
+    },
+}
+
+impl MergedSink {
+    fn push(&mut self, quad: RawQuad) -> Result<()> {
+        match self {
+            MergedSink::Memory(quads) => {
+                quads.push(quad);
+                Ok(())
+            }
+            MergedSink::File { writer, .. } => writer.push(&quad),
+        }
+    }
+
+    /// Close the sink and hand back the merged quads as a readable run.
+    fn finish(self) -> Result<Run<RawQuad>> {
+        match self {
+            MergedSink::Memory(quads) => Ok(Run::memory(quads)),
+            MergedSink::File { writer, path } => {
+                writer.finish()?;
+                Run::file(&path)
+            }
+        }
+    }
 }
 
 /// Pull the next `n` entries off every present merger — one chunk's worth of
@@ -466,11 +518,11 @@ where
     })
 }
 
-/// Pull up to `n` quads off the merged-quads spill.
-fn read_merged_batch(reader: &mut RunReader<RawQuad>, n: usize) -> Result<Vec<RawQuad>> {
+/// Pull up to `n` quads off the merged-quads run.
+fn read_merged_batch(merged: &mut Run<RawQuad>, n: usize) -> Result<Vec<RawQuad>> {
     let mut buf = Vec::with_capacity(n.min(4096));
     while buf.len() < n {
-        match reader.next()? {
+        match merged.next()? {
             Some(q) => buf.push(q),
             None => break,
         }
@@ -504,16 +556,14 @@ fn build_presorted_chunk(
 /// merges. Quad `i` of the merge and pair-window `[i·C, (i+1)·C)` advance in
 /// lockstep, so every chunk gets exactly its rows' worth of index entries.
 fn emit_presorted_chunks(
-    merged_path: PathBuf,
+    mut merged: Run<RawQuad>,
     mut spilled: SpilledIndexes<String>,
     layout: LayoutStrategy,
     indexes: Indexes,
     chunk_size: usize,
     guard: TempRunsGuard,
 ) -> Result<(DType, ChunkStream)> {
-    let mut reader: RunReader<RawQuad> = RunReader::new(&merged_path)?;
-
-    let buf = read_merged_batch(&mut reader, chunk_size)?;
+    let buf = read_merged_batch(&mut merged, chunk_size)?;
     let first = if buf.is_empty() {
         make_empty_struct(layout, &indexes)?
     } else {
@@ -523,10 +573,10 @@ fn emit_presorted_chunks(
     let dtype = first.dtype().clone();
 
     let rest = stream::unfold(
-        (reader, spilled, layout, guard),
-        move |(mut reader, mut spilled, layout, guard)| async move {
+        (merged, spilled, layout, guard),
+        move |(mut merged, mut spilled, layout, guard)| async move {
             let chunk = (|| {
-                let buf = read_merged_batch(&mut reader, chunk_size)?;
+                let buf = read_merged_batch(&mut merged, chunk_size)?;
                 if buf.is_empty() {
                     return Ok(None);
                 }
@@ -535,8 +585,8 @@ fn emit_presorted_chunks(
             })();
             match chunk {
                 Ok(None) => None,
-                Ok(Some(c)) => Some((Ok(c), (reader, spilled, layout, guard))),
-                Err(e) => Some((Err(into_vortex_error(e)), (reader, spilled, layout, guard))),
+                Ok(Some(c)) => Some((Ok(c), (merged, spilled, layout, guard))),
+                Err(e) => Some((Err(into_vortex_error(e)), (merged, spilled, layout, guard))),
             }
         },
     );
@@ -548,7 +598,7 @@ fn emit_presorted_chunks(
 /// Dictionary-layout variant of [`emit_presorted_chunks`]: the entries hold
 /// u32 codes, and the dictionary payload is carried only by the first chunk.
 fn emit_presorted_dict_chunks(
-    merged_path: PathBuf,
+    mut merged: Run<RawQuad>,
     mut spilled: SpilledIndexes<u32>,
     dict: Arc<TermDictionary>,
     id_map: Arc<crate::store::layouts::term_dictionary::TermIdMap>,
@@ -556,9 +606,7 @@ fn emit_presorted_dict_chunks(
     chunk_size: usize,
     guard: TempRunsGuard,
 ) -> Result<(DType, ChunkStream)> {
-    let mut reader: RunReader<RawQuad> = RunReader::new(&merged_path)?;
-
-    let buf = read_merged_batch(&mut reader, chunk_size)?;
+    let buf = read_merged_batch(&mut merged, chunk_size)?;
     let first = if buf.is_empty() {
         dictionary::empty_struct(&indexes)?
     } else {
@@ -568,10 +616,10 @@ fn emit_presorted_dict_chunks(
     let dtype = first.dtype().clone();
 
     let rest = stream::unfold(
-        (reader, spilled, dict, id_map, guard),
-        move |(mut reader, mut spilled, dict, id_map, guard)| async move {
+        (merged, spilled, dict, id_map, guard),
+        move |(mut merged, mut spilled, dict, id_map, guard)| async move {
             let chunk = (|| {
-                let buf = read_merged_batch(&mut reader, chunk_size)?;
+                let buf = read_merged_batch(&mut merged, chunk_size)?;
                 if buf.is_empty() {
                     return Ok(None);
                 }
@@ -580,10 +628,10 @@ fn emit_presorted_dict_chunks(
             })();
             match chunk {
                 Ok(None) => None,
-                Ok(Some(c)) => Some((Ok(c), (reader, spilled, dict, id_map, guard))),
+                Ok(Some(c)) => Some((Ok(c), (merged, spilled, dict, id_map, guard))),
                 Err(e) => Some((
                     Err(into_vortex_error(e)),
-                    (reader, spilled, dict, id_map, guard),
+                    (merged, spilled, dict, id_map, guard),
                 )),
             }
         },
@@ -622,7 +670,7 @@ fn build_presorted_dict_chunk(
 /// chunks of u32 codes encoded against the completed global dictionary, with
 /// the dictionary payload carried only by the first chunk.
 fn emit_dict_chunks(
-    mut readers: Vec<RunReader<RawQuad>>,
+    mut runs: Vec<Run<RawQuad>>,
     mut heap: BinaryHeap<HeapItem>,
     dict: Arc<TermDictionary>,
     id_map: Arc<crate::store::layouts::term_dictionary::TermIdMap>,
@@ -630,7 +678,7 @@ fn emit_dict_chunks(
     chunk_size: usize,
     guard: TempRunsGuard,
 ) -> Result<(DType, ChunkStream)> {
-    let first_buf = next_sorted_chunk(&mut readers, &mut heap, chunk_size)?;
+    let first_buf = next_sorted_chunk(&mut runs, &mut heap, chunk_size)?;
     let first = if first_buf.is_empty() {
         dictionary::empty_struct(&indexes)?
     } else {
@@ -641,14 +689,14 @@ fn emit_dict_chunks(
     drop(first_buf);
 
     let rest = stream::unfold(
-        (readers, heap, dict, id_map, indexes, next_row, guard),
-        move |(mut readers, mut heap, dict, id_map, indexes, row, guard)| async move {
-            let buf = match next_sorted_chunk(&mut readers, &mut heap, chunk_size) {
+        (runs, heap, dict, id_map, indexes, next_row, guard),
+        move |(mut runs, mut heap, dict, id_map, indexes, row, guard)| async move {
+            let buf = match next_sorted_chunk(&mut runs, &mut heap, chunk_size) {
                 Ok(b) => b,
                 Err(e) => {
                     return Some((
                         Err(into_vortex_error(e)),
-                        (readers, heap, dict, id_map, indexes, row, guard),
+                        (runs, heap, dict, id_map, indexes, row, guard),
                     ));
                 }
             };
@@ -659,10 +707,7 @@ fn emit_dict_chunks(
             let chunk =
                 dictionary::build_chunk(&buf, &dict, &id_map, &indexes, row, true, false, false)
                     .map_err(into_vortex_error);
-            Some((
-                chunk,
-                (readers, heap, dict, id_map, indexes, row + n, guard),
-            ))
+            Some((chunk, (runs, heap, dict, id_map, indexes, row + n, guard)))
         },
     );
 
@@ -672,7 +717,7 @@ fn emit_dict_chunks(
 
 /// Pull up to `chunk_size` quads off the K-way merge in global sort order.
 fn next_sorted_chunk(
-    readers: &mut [RunReader<RawQuad>],
+    runs: &mut [Run<RawQuad>],
     heap: &mut BinaryHeap<HeapItem>,
     chunk_size: usize,
 ) -> Result<Vec<RawQuad>> {
@@ -681,7 +726,7 @@ fn next_sorted_chunk(
         let Some(item) = heap.pop() else { break };
         let r_idx = item.reader_idx;
         buf.push(item.quad);
-        if let Some(next_q) = readers[r_idx].next()? {
+        if let Some(next_q) = runs[r_idx].next()? {
             heap.push(HeapItem {
                 quad: next_q,
                 reader_idx: r_idx,

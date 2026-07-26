@@ -37,7 +37,7 @@ pub static VORTEX_LIGHT_SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
     session
 });
 
-pub use de::{array_from_ipc_reader, deserialize};
+pub use de::{array_from_ipc_bytes, array_from_ipc_reader, deserialize};
 #[cfg(feature = "file-io")]
 pub use de::{load_vortex_file_ref, open_vortex_file};
 

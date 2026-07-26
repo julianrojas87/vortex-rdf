@@ -103,9 +103,52 @@ where
     writer.finish()
 }
 
+/// One sorted run of a merge, read sequentially — either still in memory or
+/// spilled to a temp file.
+///
+/// A dataset that fits in a single run never has to round-trip through rkyv and
+/// the filesystem at all: the ingest buffer *is* the run, already sorted and
+/// already in memory. Only once a second run exists does spilling buy anything
+/// (that is the point at which the data provably exceeds the memory budget), so
+/// the builders spill lazily and keep a lone run here instead. This is the
+/// common case for datasets up to the chunk size, where the old unconditional
+/// spill paid a full serialize + write + read + deserialize of every quad.
+pub(crate) enum Run<T> {
+    Memory(std::vec::IntoIter<T>),
+    File(RunReader<T>),
+}
+
+impl<T> Run<T> {
+    /// A sorted in-memory buffer, consumed in place.
+    pub(crate) fn memory(items: Vec<T>) -> Self {
+        Run::Memory(items.into_iter())
+    }
+
+    /// A run previously spilled to `path`.
+    pub(crate) fn file(path: &Path) -> Result<Self> {
+        RunReader::new(path).map(Run::File)
+    }
+
+    pub(crate) fn next(&mut self) -> Result<Option<T>>
+    where
+        T: Archive + for<'a> RkyvSerialize<HighSerializer<AlignedVec, ArenaHandle<'a>, RkyvError>>,
+        T::Archived: RkyvDeserialize<T, HighDeserializer<RkyvError>>,
+    {
+        match self {
+            Run::Memory(items) => Ok(items.next()),
+            Run::File(reader) => reader.next(),
+        }
+    }
+}
+
 /// Sequential rkyv reader over a spill file.
 pub(crate) struct RunReader<T> {
     reader: BufReader<File>,
+    /// Reused per-record payload buffer: a fresh `vec![0u8; len]` per record
+    /// would malloc+zero on every read (profiling showed the allocator
+    /// dominating spill read-back), and `AlignedVec` also guarantees the
+    /// alignment rkyv's archived types require.
+    payload: AlignedVec,
     _marker: PhantomData<T>,
 }
 
@@ -114,6 +157,7 @@ impl<T> RunReader<T> {
         let file = File::open(path).map_err(|e| VortexRdfError::Deserialization(e.to_string()))?;
         Ok(Self {
             reader: BufReader::new(file),
+            payload: AlignedVec::new(),
             _marker: PhantomData,
         })
     }
@@ -145,8 +189,10 @@ impl<T> RunReader<T> {
         })?;
 
         let len = u32::from_le_bytes(len_bytes) as usize;
-        let mut payload = vec![0u8; len];
-        self.reader.read_exact(&mut payload).map_err(|e| {
+        // Resize without clearing: `read_exact` overwrites all `len` bytes, so
+        // the zero-fill only ever pays for the growth delta, not every record.
+        self.payload.resize(len, 0);
+        self.reader.read_exact(&mut self.payload).map_err(|e| {
             if e.kind() == ErrorKind::UnexpectedEof {
                 VortexRdfError::Deserialization(
                     "Unexpected EOF while reading spill record payload".to_string(),
@@ -159,7 +205,7 @@ impl<T> RunReader<T> {
         // SAFETY: spill files are produced by this process using the matching
         // rkyv serializer and consumed immediately; we don't accept external
         // untrusted data on this path.
-        let item = unsafe { rkyv::from_bytes_unchecked::<T, RkyvError>(&payload) }
+        let item = unsafe { rkyv::from_bytes_unchecked::<T, RkyvError>(&self.payload) }
             .map_err(|e| VortexRdfError::Deserialization(e.to_string()))?;
         Ok(Some(item))
     }
@@ -183,7 +229,7 @@ pub(crate) struct PairRunSpiller<V> {
 #[derive(
     Clone, Debug, Eq, PartialEq, Ord, PartialOrd, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
 )]
-struct PairRecord<V> {
+pub(crate) struct PairRecord<V> {
     value: V,
     rid: u32,
 }
@@ -206,10 +252,14 @@ where
     }
 
     pub(crate) fn push(&mut self, value: V, rid: u32) -> Result<()> {
-        self.buf.push(PairRecord { value, rid });
-        if self.buf.len() >= self.capacity {
+        // Spill only to make room for a record that would not fit, never merely
+        // on reaching capacity: a dataset of exactly `capacity` pairs then ends
+        // as one in-memory run and skips the spill round-trip entirely (see
+        // [`Run`]). Peak buffered records is unchanged.
+        if self.buf.len() == self.capacity {
             self.flush_run()?;
         }
+        self.buf.push(PairRecord { value, rid });
         Ok(())
     }
 
@@ -225,7 +275,15 @@ where
     }
 
     /// Flush the tail run and set up the K-way merge over all runs.
+    ///
+    /// Nothing spilled means everything still sits in `buf`: sorting it in place
+    /// is the whole merge, so it becomes a single in-memory run rather than a
+    /// file to write and immediately read back.
     pub(crate) fn into_merger(mut self) -> Result<PairMerger<V>> {
+        if self.run_paths.is_empty() {
+            self.buf.sort_unstable();
+            return Ok(PairMerger::Memory(self.buf.into_iter()));
+        }
         if !self.buf.is_empty() {
             self.flush_run()?;
         }
@@ -243,15 +301,20 @@ where
                 });
             }
         }
-        Ok(PairMerger { readers, heap })
+        Ok(PairMerger::Spilled { readers, heap })
     }
 }
 
-/// Streams `(value, row ID)` pairs in global sorted order by K-way merging
-/// the sorted runs produced by a [`PairRunSpiller`].
-pub(crate) struct PairMerger<V> {
-    readers: Vec<RunReader<PairRecord<V>>>,
-    heap: BinaryHeap<PairHeapItem<V>>,
+/// Streams `(value, row ID)` pairs in global sorted order: a K-way merge of the
+/// runs a [`PairRunSpiller`] spilled, or — when nothing had to spill — a walk
+/// over the single sorted buffer it kept in memory.
+pub(crate) enum PairMerger<V> {
+    /// Everything fit in one run; the sorted buffer *is* the merged order.
+    Memory(std::vec::IntoIter<PairRecord<V>>),
+    Spilled {
+        readers: Vec<RunReader<PairRecord<V>>>,
+        heap: BinaryHeap<PairHeapItem<V>>,
+    },
 }
 
 impl<V> PairMerger<V>
@@ -264,22 +327,29 @@ where
     /// Pull the next `n` pairs off the merge (fewer at the end of the data).
     pub(crate) fn next_batch(&mut self, n: usize) -> Result<Vec<(V, u32)>> {
         let mut batch = Vec::with_capacity(n.min(4096));
-        while batch.len() < n {
-            let Some(item) = self.heap.pop() else { break };
-            let r_idx = item.reader_idx;
-            batch.push((item.pair.value, item.pair.rid));
-            if let Some(next_pair) = self.readers[r_idx].next()? {
-                self.heap.push(PairHeapItem {
-                    pair: next_pair,
-                    reader_idx: r_idx,
-                });
+        match self {
+            PairMerger::Memory(pairs) => {
+                batch.extend(pairs.take(n).map(|pair| (pair.value, pair.rid)));
+            }
+            PairMerger::Spilled { readers, heap } => {
+                while batch.len() < n {
+                    let Some(item) = heap.pop() else { break };
+                    let r_idx = item.reader_idx;
+                    batch.push((item.pair.value, item.pair.rid));
+                    if let Some(next_pair) = readers[r_idx].next()? {
+                        heap.push(PairHeapItem {
+                            pair: next_pair,
+                            reader_idx: r_idx,
+                        });
+                    }
+                }
             }
         }
         Ok(batch)
     }
 }
 
-struct PairHeapItem<V> {
+pub(crate) struct PairHeapItem<V> {
     pair: PairRecord<V>,
     reader_idx: usize,
 }

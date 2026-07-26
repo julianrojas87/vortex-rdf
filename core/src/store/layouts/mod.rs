@@ -9,7 +9,7 @@ use vortex_array::scalar::Scalar;
 use vortex_array::validity::Validity;
 use vortex_array::{ArrayRef, IntoArray, VortexSessionExecute};
 
-use crate::common::utils::{buf_as_str, graph_name_str};
+use crate::common::utils::{StrColReader, graph_name_str};
 use crate::error::{Result, VortexRdfError};
 use crate::io::VORTEX_LIGHT_SESSION;
 use crate::store::RawQuad;
@@ -264,6 +264,7 @@ impl ResolvedLayout {
                 read_string_column(&struct_arr, "g")?,
             ),
             ResolvedLayout::Dictionary(dict) => {
+                let terms = StrColReader::new(dict.view());
                 let term = |codes: Vec<u32>| -> Result<Vec<String>> {
                     codes
                         .into_iter()
@@ -275,8 +276,7 @@ impl ResolvedLayout {
                                     dict.len()
                                 )));
                             }
-                            let bytes = dict.view().bytes_at(code as usize);
-                            buf_as_str(bytes.as_ref()).map(str::to_string)
+                            terms.str_at(code as usize).map(str::to_string)
                         })
                         .collect()
                 };
@@ -375,11 +375,9 @@ fn read_string_column(struct_arr: &StructArray, name: &str) -> Result<Vec<String
         .clone()
         .execute::<VarBinViewArray>(&mut ctx)
         .map_err(VortexRdfError::Vortex)?;
+    let reader = StrColReader::new(&col);
     (0..col.len())
-        .map(|i| {
-            let buf = col.bytes_at(i);
-            buf_as_str(buf.as_ref()).map(str::to_string)
-        })
+        .map(|i| reader.str_at(i).map(str::to_string))
         .collect()
 }
 

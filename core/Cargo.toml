@@ -39,6 +39,10 @@ thiserror.workspace = true
 uuid = { version = "1", features = ["v4"] }
 rkyv = { version = "0.8.17", features = ["std", "bytecheck"] }
 serde = { version = "1.0", features = ["derive"] }
+# Decoding IPC straight off an in-memory buffer (see `io::de::array_from_ipc_bytes`)
+# needs a `bytes::Buf` whose `copy_to_bytes` is zero-copy; vortex-ipc's decoder
+# is generic over `Buf`, so we name the same crate it does.
+bytes = "1.12"
 
 futures.workspace = true
 log = "0.4.33"

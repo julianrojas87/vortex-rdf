@@ -5,9 +5,49 @@ use futures::{Stream, stream};
 use oxrdf::{BlankNode, GraphName, Literal, NamedNode, NamedOrBlankNode, Quad, Term};
 use oxrdfio::{RdfFormat, RdfParser};
 
+use vortex_array::arrays::varbinview::BinaryView;
 use vortex_array::arrays::{BoolArray, VarBinViewArray};
 use vortex_array::{ArrayRef, IntoArray, VortexSessionExecute};
 use vortex_mask::Mask;
+
+/// Zero-cost row access into a canonical `VarBinView` string column: the
+/// 16-byte views slice and the data buffers are resolved once, and each row's
+/// bytes are then an inline read or a plain slice of the referenced buffer.
+///
+/// `bytes_at` instead materializes a refcounted `ByteBuffer` per row (two
+/// atomic refcount ops plus alignment bookkeeping), which profiling showed
+/// costing ~5% of every many-row decode; this reader is the loop-shaped
+/// counterpart, sharing the access pattern of the typed residual filter's
+/// `StrEq`.
+pub(crate) struct StrColReader<'a> {
+    arr: &'a VarBinViewArray,
+    views: &'a [BinaryView],
+}
+
+impl<'a> StrColReader<'a> {
+    pub(crate) fn new(arr: &'a VarBinViewArray) -> Self {
+        Self {
+            arr,
+            views: arr.views(),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn bytes_at(&self, i: usize) -> &'a [u8] {
+        let view = &self.views[i];
+        if view.is_inlined() {
+            view.as_inlined().value()
+        } else {
+            let r = view.as_view();
+            &self.arr.buffer(r.buffer_index as usize)[r.as_range()]
+        }
+    }
+
+    #[inline]
+    pub(crate) fn str_at(&self, i: usize) -> Result<&'a str> {
+        buf_as_str(self.bytes_at(i))
+    }
+}
 
 /// Build a Vortex string array (`VarBinView<Utf8>`, non-nullable) from string refs.
 ///
@@ -203,11 +243,28 @@ pub fn get_as_term(s: &str) -> Option<Term> {
 }
 
 /// Borrow the bytes of a UTF-8 string column value as `&str` without copying.
-/// The `Utf8` dtype guarantees valid UTF-8, so this only validates.
+///
+/// **Trusted-input decode path**, the same argument as [`parse_named_node`]:
+/// every caller reads a column whose dtype is `Utf8`, and vortex validates that
+/// invariant when the array is constructed — `VarBinViewData::validate` runs a
+/// `from_utf8` over every view on IPC decode, and the file reader validates on
+/// its own construction path. Re-validating here walks each term's bytes a
+/// second time, which profiling showed at ~7% of every many-row decode
+/// (`core::str::converts::from_utf8` under `decode_chunk`).
+///
+/// The check is kept as a `debug_assert`, so the test suite (which runs debug)
+/// still fails loudly if a non-UTF-8 column ever reaches this, while release
+/// builds skip the second walk. The `Result` is retained so the decode call
+/// sites — which `?` on genuinely fallible neighbours — stay uniform.
+#[inline]
 pub(crate) fn buf_as_str(buf: &[u8]) -> Result<&str> {
-    std::str::from_utf8(buf).map_err(|e| {
-        VortexRdfError::Deserialization(format!("Invalid UTF-8 in string column: {}", e))
-    })
+    debug_assert!(
+        std::str::from_utf8(buf).is_ok(),
+        "string column value is not valid UTF-8, but its dtype claims Utf8"
+    );
+    // SAFETY: `buf` is the bytes of a value in a `Utf8`-dtyped vortex column,
+    // which vortex validates as UTF-8 when the array is constructed (see above).
+    Ok(unsafe { std::str::from_utf8_unchecked(buf) })
 }
 
 /// Parses a stream of RDF quads from any reader using the specified RDF format.

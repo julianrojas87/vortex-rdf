@@ -1,6 +1,6 @@
 {
     "name": "@vortex-rdf/vortex-rdf-store",
-    "version": "0.2.1",
+    "version": "0.3.0",
     "description": "High-performance, zero-copy columnar RDF serialization format",
     "type": "module",
     "publishConfig": {
@@ -29,8 +29,10 @@
     ],
     "scripts": {
         "build:wasm": "wasm-pack build --target web --out-dir pkg/web --no-pack",
+        "build:wasm:fast": "wasm-pack build --target web --out-dir pkg/web --no-pack --no-opt",
         "build:clean-manifest": "node -e \"require('fs').rmSync('pkg/web/package.json',{force:true})\"",
         "build": "npm run build:wasm && npm run build:clean-manifest",
+        "build:fast": "npm run build:wasm:fast && npm run build:clean-manifest",
         "prepublishOnly": "npm run build",
         "test": "vitest run",
         "bench": "tsx --expose-gc --max-old-space-size=8192 bench/compare.bench.ts",

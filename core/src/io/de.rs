@@ -7,9 +7,12 @@ use oxrdfio::{RdfFormat, RdfSerializer};
 use std::io::Write;
 use web_time::Instant;
 
+use bytes::Bytes;
 use vortex_array::arrays::ChunkedArray;
+use vortex_array::dtype::DType;
 use vortex_array::{ArrayRef, IntoArray};
 use vortex_ipc::iterator::SyncIPCReader;
+use vortex_ipc::messages::{BufMessageReader, DecoderMessage};
 
 #[cfg(feature = "file-io")]
 use std::sync::Arc;
@@ -75,7 +78,71 @@ pub fn array_from_ipc_reader<R: std::io::Read>(reader: R) -> Result<ArrayRef> {
     for chunk in ipc_reader {
         chunks.push(chunk.map_err(VortexRdfError::Vortex)?);
     }
+    assemble_ipc_chunks(chunks)
+}
 
+/// Reads a Vortex ArrayRef from IPC bytes that are already in memory.
+///
+/// Prefer this over [`array_from_ipc_reader`] whenever the whole payload is a
+/// slice (loading a store from bytes, the wasm bindings): the `Read`-based
+/// reader stages every message through a `BytesMut` that it *zero-fills* before
+/// overwriting — profiling showed that `memset` alone at ~13% of `from_bytes`.
+/// Decoding off a `Bytes` copies the payload once and then splits each message
+/// out of that one buffer (`Bytes::copy_to_bytes` is a refcount bump), so the
+/// staging buffer disappears entirely.
+///
+/// Chunk handling matches [`array_from_ipc_reader`] exactly — see its note on
+/// why every message must be collected.
+pub fn array_from_ipc_bytes(bytes: &[u8]) -> Result<ArrayRef> {
+    let session = &super::VORTEX_LIGHT_SESSION;
+    // The one unavoidable copy: the caller lends a slice, and the decoder hands
+    // out refcounted slices of a buffer it must be able to keep alive.
+    let mut messages = BufMessageReader::new(Bytes::copy_from_slice(bytes));
+
+    // The stream opens with its schema; every later message is a chunk of it.
+    let dtype = match messages
+        .next()
+        .transpose()
+        .map_err(VortexRdfError::Vortex)?
+    {
+        Some(DecoderMessage::DType(fb_dtype)) => {
+            DType::from_flatbuffer(fb_dtype, session).map_err(VortexRdfError::Vortex)?
+        }
+        Some(other) => {
+            return Err(VortexRdfError::Deserialization(format!(
+                "Expected an IPC DType message, got {:?}",
+                other
+            )));
+        }
+        None => {
+            return Err(VortexRdfError::Deserialization(
+                "No array in IPC stream".to_string(),
+            ));
+        }
+    };
+
+    let mut chunks = Vec::new();
+    for message in messages {
+        match message.map_err(VortexRdfError::Vortex)? {
+            DecoderMessage::Array((parts, ctx, row_count)) => {
+                let chunk = parts
+                    .decode(&dtype, row_count, &ctx, session)
+                    .map_err(VortexRdfError::Vortex)?;
+                chunks.push(chunk);
+            }
+            other => {
+                return Err(VortexRdfError::Deserialization(format!(
+                    "Expected an IPC Array message, got {:?}",
+                    other
+                )));
+            }
+        }
+    }
+    assemble_ipc_chunks(chunks)
+}
+
+/// Reassemble the arrays decoded from one IPC stream, shared by both readers.
+fn assemble_ipc_chunks(mut chunks: Vec<ArrayRef>) -> Result<ArrayRef> {
     match chunks.len() {
         0 => Err(VortexRdfError::Deserialization(
             "No array in IPC stream".to_string(),

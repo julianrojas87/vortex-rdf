@@ -12,7 +12,7 @@ use vortex_array::arrays::{PrimitiveArray, VarBinViewArray};
 use vortex_array::{ArrayRef, IntoArray, VortexSessionExecute};
 
 use crate::common::utils::{
-    buf_as_str, get_as_term, make_nullable_string_array, make_string_array, parse_graph_name,
+    StrColReader, get_as_term, make_nullable_string_array, make_string_array, parse_graph_name,
     parse_named_node, parse_subject,
 };
 use crate::error::{Result, VortexRdfError};
@@ -150,29 +150,28 @@ pub(crate) fn object_terms(struct_arr: &StructArray) -> Result<Vec<String>> {
         .and_then(|c| c.clone().execute::<VarBinViewArray>(&mut ctx).ok());
 
     let kinds = kind_col.as_slice::<u8>();
+    let vals = StrColReader::new(&val_col);
+    let dts = dt_col.as_ref().map(StrColReader::new);
+    let langs = lang_col.as_ref().map(StrColReader::new);
 
     (0..struct_arr.len())
         .map(|i| {
-            let val_buf = val_col.bytes_at(i);
-            let dt_buf = dt_col.as_ref().map(|c| c.bytes_at(i));
-            let lang_buf = lang_col.as_ref().map(|c| c.bytes_at(i));
-
-            let dt = match dt_buf.as_ref() {
-                Some(b) => {
-                    let s = buf_as_str(b.as_ref())?;
+            let dt = match &dts {
+                Some(c) => {
+                    let s = c.str_at(i)?;
                     if s.is_empty() { None } else { Some(s) }
                 }
                 None => None,
             };
-            let lang = match lang_buf.as_ref() {
-                Some(b) => {
-                    let s = buf_as_str(b.as_ref())?;
+            let lang = match &langs {
+                Some(c) => {
+                    let s = c.str_at(i)?;
                     if s.is_empty() { None } else { Some(s) }
                 }
                 None => None,
             };
 
-            let object = compose_object(kinds[i], buf_as_str(val_buf.as_ref())?, dt, lang)?;
+            let object = compose_object(kinds[i], vals.str_at(i)?, dt, lang)?;
             Ok(object.to_string())
         })
         .collect()
@@ -232,38 +231,36 @@ pub(crate) fn decode_chunk(chunk: &ArrayRef) -> Vec<Result<Quad>> {
         .and_then(|c| c.clone().execute::<VarBinViewArray>(&mut ctx).ok());
 
     let kinds = kind_col.as_slice::<u8>();
+    let subjects = StrColReader::new(&s_col);
+    let predicates = StrColReader::new(&p_col);
+    let vals = StrColReader::new(&val_col);
+    let graphs = StrColReader::new(&g_col);
+    let dts = dt_col.as_ref().map(StrColReader::new);
+    let langs = lang_col.as_ref().map(StrColReader::new);
 
     (0..n)
         .map(|i| {
             // Borrow &str views over the column buffers (zero-copy);
             // the oxrdf constructors make the single owned copy.
-            let s_buf = s_col.bytes_at(i);
-            let p_buf = p_col.bytes_at(i);
-            let kind = kinds[i];
-            let val_buf = val_col.bytes_at(i);
-            let g_buf = g_col.bytes_at(i);
-            let dt_buf = dt_col.as_ref().map(|c| c.bytes_at(i));
-            let lang_buf = lang_col.as_ref().map(|c| c.bytes_at(i));
-
-            let dt = match dt_buf.as_ref() {
-                Some(b) => {
-                    let s = buf_as_str(b.as_ref())?;
+            let dt = match &dts {
+                Some(c) => {
+                    let s = c.str_at(i)?;
                     if s.is_empty() { None } else { Some(s) }
                 }
                 None => None,
             };
-            let lang = match lang_buf.as_ref() {
-                Some(b) => {
-                    let s = buf_as_str(b.as_ref())?;
+            let lang = match &langs {
+                Some(c) => {
+                    let s = c.str_at(i)?;
                     if s.is_empty() { None } else { Some(s) }
                 }
                 None => None,
             };
 
-            let subject = parse_subject(buf_as_str(s_buf.as_ref())?)?;
-            let predicate = parse_named_node(buf_as_str(p_buf.as_ref())?)?;
-            let object = compose_object(kind, buf_as_str(val_buf.as_ref())?, dt, lang)?;
-            let graph_name = parse_graph_name(buf_as_str(g_buf.as_ref())?)?;
+            let subject = parse_subject(subjects.str_at(i)?)?;
+            let predicate = parse_named_node(predicates.str_at(i)?)?;
+            let object = compose_object(kinds[i], vals.str_at(i)?, dt, lang)?;
+            let graph_name = parse_graph_name(graphs.str_at(i)?)?;
             Ok(Quad::new(subject, predicate, object, graph_name))
         })
         .collect()
