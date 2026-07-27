@@ -1313,7 +1313,17 @@ impl VortexRdfStore {
                 // its columns (e.g. a binary search of the sorted `_idx_o_val` /
                 // `_idx_o_rid` pair for a bound object). The store just folds the
                 // ids it hands back into the selection.
-                if !selection.is_empty(base.len()) {
+                // …but only while there is enough left to narrow. A fast path
+                // that already cut the view to a handful of rows makes the
+                // index a pessimization: resolving a component costs O(rows
+                // matching *that component*) — a bound predicate is 1/32nd of
+                // the store here — only to intersect it against a selection of
+                // one. Below the threshold, filtering those few rows column-wise
+                // is strictly cheaper. Nothing is lost by skipping: a view that
+                // something else narrowed already discards any serving plan.
+                let worth_indexing =
+                    !narrowed_elsewhere || selection.len(base.len()) >= INDEX_ROUTING_MIN_ROWS;
+                if !selection.is_empty(base.len()) && worth_indexing {
                     match resolve_indexes_in_memory(
                         &self.indexes,
                         &struct_arr,
@@ -1551,13 +1561,27 @@ impl VortexRdfStore {
         base_len: usize,
         eqs: &[(&'static str, Scalar)],
     ) -> Option<vortex_buffer::Buffer<u64>> {
-        // The typed residual's only edge over the vectorized mask pipeline is
-        // the per-row conjunction short-circuit across ≥2 columns. With a lone
-        // constraint there is nothing to short-circuit, and the row-at-a-time
-        // `views()` access (an erased-array deref per row) loses to SIMD
-        // `compare_views_constant` — profiling showed a single-column `[S]` scan
-        // running ~3× slower typed. Leave those to the mask scan.
-        if eqs.len() < 2 {
+        // With ≥2 columns the typed residual wins outright: it short-circuits
+        // the conjunction per row, which the vectorized pipeline cannot.
+        //
+        // With a lone constraint there is nothing to short-circuit, and the
+        // row-at-a-time `views()` access (an erased-array deref per row) loses
+        // to SIMD `compare_views_constant` — profiling showed a single-column
+        // `[S]` scan running ~3× slower typed. But that holds only while the
+        // scan is what dominates. The mask pipeline's arguments cost the same
+        // whatever the selection: `selection.apply` pushes a slice through the
+        // array optimizer and `mask_for` canonicalizes the struct, over *every*
+        // column the base carries. Once a fast path has already narrowed the
+        // view to a handful of rows — a bound subject's binary search leaving
+        // one residual term, the `SP` shape — that fixed cost is the entire
+        // query, and it scales with the store's width: on a `SecondaryByCopy`
+        // store (14 columns) `SP` cost 106 µs against `SPO`'s 8 µs, purely
+        // because the second constraint let it take this path instead.
+        //
+        // So the single-constraint rule is about selection size, not column
+        // count: keep the mask scan while there are enough rows for SIMD to pay
+        // for the setup, and take the typed loop below that.
+        if eqs.len() < 2 && selection.len(base_len) > TYPED_SINGLE_EQ_MAX_ROWS {
             return None;
         }
         let needles = Needle::extract(eqs)?;
@@ -2321,6 +2345,27 @@ fn union_deleted(existing: Option<&Mask>, doomed: Mask) -> Mask {
         None => doomed,
     }
 }
+
+/// Selection size below which an *already narrowed* view should skip secondary
+/// index routing and filter its remaining rows column-wise instead (see
+/// `match_base`).
+///
+/// An index lookup's cost tracks how many rows match the component it resolves,
+/// not how many the view still holds, so once a fast path has narrowed the view
+/// far enough the lookup is pure overhead. An unrefined view never skips —
+/// that is the case indexes exist for.
+const INDEX_ROUTING_MIN_ROWS: usize = 4_096;
+
+/// Selection size below which a *single* residual equality is better served by
+/// the typed row-at-a-time loop than the vectorized mask pipeline (see
+/// `typed_residual_ids`).
+///
+/// Above it the mask scan's SIMD comparison outruns the typed loop by enough to
+/// repay slicing and canonicalizing the base; below it the query is nothing but
+/// that fixed cost. The exact crossover depends on how many columns the store
+/// carries — a `SecondaryByCopy` store pays it over 14 — so this sits an order
+/// of magnitude under the narrowest measured crossover rather than at it.
+const TYPED_SINGLE_EQ_MAX_ROWS: usize = 4_096;
 
 /// Tail-accumulator flatten policy (see `add_quads`): fold the accreted chunks
 /// into the flat prefix once they rival it in rows — but not below this floor,
