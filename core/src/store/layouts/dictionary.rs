@@ -27,8 +27,8 @@ use vortex_array::validity::Validity;
 use vortex_array::{ArrayRef, IntoArray, VortexSessionExecute};
 
 use super::default::decode_spog;
-use super::term_dictionary::{self, DICT_FIELD, TermDictionary, TermIdMap};
-use crate::common::utils::{StrColReader, stamp_is_sorted};
+use super::term_dictionary::{self, DICT_FIELD, DictReader, TermDictionary, TermIdMap};
+use crate::common::utils::stamp_is_sorted;
 use crate::error::{Result, VortexRdfError};
 use crate::io::VORTEX_LIGHT_SESSION;
 use crate::store::indexes::secondary_by_copy::CopyKey;
@@ -354,15 +354,18 @@ pub(crate) fn decode_chunk(chunk: &ArrayRef, dict: &TermDictionary) -> Vec<Resul
     let o_ids = o_col.as_slice::<u32>();
     let g_ids = g_col.as_slice::<u32>();
 
-    let terms = StrColReader::new(dict.view());
-    let term_at = |id: u32| -> Result<&str> {
-        if (id as usize) < dict.len() {
-            terms.str_at(id as usize)
+    // One reader per role: an FSST read decodes into the reader's scratch, so
+    // the four borrows a quad needs at once must come from four readers.
+    let (mut rs, mut rp, mut ro, mut rg) =
+        (dict.reader(), dict.reader(), dict.reader(), dict.reader());
+    let n_terms = dict.len();
+    let term_at = |reader: &mut DictReader<'_>, id: u32| -> Result<String> {
+        if (id as usize) < n_terms {
+            reader.str_at(id as usize).map(str::to_owned)
         } else {
             Err(VortexRdfError::Deserialization(format!(
                 "Term code {} out of dictionary bounds ({})",
-                id,
-                dict.len()
+                id, n_terms
             )))
         }
     };
@@ -372,10 +375,10 @@ pub(crate) fn decode_chunk(chunk: &ArrayRef, dict: &TermDictionary) -> Vec<Resul
             // Zero-copy views over the dictionary's term bytes; the oxrdf
             // constructors make the single owned copy.
             decode_spog(
-                term_at(s_ids[i])?,
-                term_at(p_ids[i])?,
-                term_at(o_ids[i])?,
-                term_at(g_ids[i])?,
+                &term_at(&mut rs, s_ids[i])?,
+                &term_at(&mut rp, p_ids[i])?,
+                &term_at(&mut ro, o_ids[i])?,
+                &term_at(&mut rg, g_ids[i])?,
             )
         })
         .collect()

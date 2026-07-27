@@ -12,7 +12,7 @@ use crate::store::indexes::{
     IndexResolution, IndexType, Indexes, ServePlan, detect_indexes, resolve_indexes_in_memory,
     strip_index_columns, unique_indexes,
 };
-use crate::store::layouts::term_dictionary::{self, TermDictionary};
+use crate::store::layouts::term_dictionary::{self, DictSnapshot, TermDictionary};
 use crate::store::layouts::{
     Constraints, LayoutStrategy, PatternCodes, ResolvedLayout, Role, dictionary,
 };
@@ -62,39 +62,6 @@ use vortex_array::stream::ArrayStreamExt;
 use vortex_layout::LayoutReader;
 #[cfg(feature = "file-io")]
 use vortex_scan::selection::Selection;
-
-/// An immutable handle on a Dictionary-layout store's term dictionary, taken
-/// with [`VortexRdfStore::dictionary_snapshot`].
-///
-/// Cloning is an `Arc` bump, and the snapshot retains only the dictionary — not
-/// the store or its quad columns.
-///
-/// **Term codes are only meaningful against the dictionary they were produced
-/// with.** Mutating a store re-encodes it against a *fresh* dictionary, so a
-/// consumer holding codes must decode them through the snapshot taken when it
-/// received them, not through the store as it stands later — otherwise codes
-/// silently resolve to the wrong terms. Holding the snapshot keeps exactly the
-/// dictionary those codes address alive, and nothing more.
-#[derive(Clone)]
-pub struct DictSnapshot(Arc<TermDictionary>);
-
-impl DictSnapshot {
-    /// Decode a term code to its N-Triples string, or `None` when the code is
-    /// out of this dictionary's range.
-    pub fn decode(&self, code: u32) -> Option<String> {
-        self.0.term_at(code)
-    }
-
-    /// Number of terms in the dictionary.
-    pub fn len(&self) -> usize {
-        self.0.len()
-    }
-
-    /// Whether the dictionary holds no terms.
-    pub fn is_empty(&self) -> bool {
-        self.0.len() == 0
-    }
-}
 
 /// Columnar RDF quad storage backed by Vortex.
 ///
@@ -1036,6 +1003,36 @@ impl VortexRdfStore {
         // this store's cached, pre-append dictionary would mismatch the new
         // codes. The other layouts hold no intrinsic state, so skipping is
         // equally correct for them.
+        if self.tail.is_some() {
+            return Ok(array);
+        }
+        self.layout.attach_intrinsic_state(array)
+    }
+
+    /// The array to hand an IPC writer: rows resolved, lazy nodes evaluated,
+    /// and layout-intrinsic state attached.
+    ///
+    /// The order matters. A store derived from `match` holds an unevaluated
+    /// `filter` node, which has no IPC serialization, so the array has to be
+    /// evaluated first — and canonical form is not recursive, so a
+    /// `StructArray`'s fields may still be lazy, hence `RecursiveCanonical`.
+    /// But the term dictionary is held FSST-compressed, and canonicalizing
+    /// would expand it to plaintext — the copy the compressed form exists to
+    /// avoid. So the dictionary is attached *after* evaluation, not before.
+    ///
+    /// A tailed Dictionary read is the exception: `selected_rows` already
+    /// re-encoded everything against a fresh dictionary and embedded it, and
+    /// re-attaching this store's cached, pre-append dictionary would mismatch
+    /// the new codes. That payload is written as whatever canonicalization left
+    /// it, which is correct but not compressed.
+    pub async fn to_ipc_array(&self) -> Result<ArrayRef> {
+        let array = self.get_quads_array().await?;
+        let mut ctx = VORTEX_LIGHT_SESSION.create_execution_ctx();
+        let array = array
+            .execute::<RecursiveCanonical>(&mut ctx)
+            .map_err(VortexRdfError::Vortex)?
+            .0
+            .into_array();
         if self.tail.is_some() {
             return Ok(array);
         }

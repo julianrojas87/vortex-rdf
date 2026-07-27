@@ -324,8 +324,8 @@ impl ResolvedLayout {
                 read_string_column(&struct_arr, "g")?,
             ),
             ResolvedLayout::Dictionary(dict) => {
-                let terms = StrColReader::new(dict.view());
                 let term = |codes: Vec<u32>| -> Result<Vec<String>> {
+                    let mut reader = dict.reader();
                     codes
                         .into_iter()
                         .map(|code| {
@@ -336,7 +336,7 @@ impl ResolvedLayout {
                                     dict.len()
                                 )));
                             }
-                            terms.str_at(code as usize).map(str::to_string)
+                            reader.str_at(code as usize).map(str::to_string)
                         })
                         .collect()
                 };

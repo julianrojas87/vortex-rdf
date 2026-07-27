@@ -34,6 +34,12 @@ pub static VORTEX_LIGHT_SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
         .with::<ScalarFnSession>();
     #[cfg(feature = "file-io")]
     vortex_file::register_default_encodings(&session);
+    // The term dictionary is held and written FSST-compressed, so this
+    // encoding must be resolvable even in the light session — which is the
+    // only one wasm has, and which `register_default_encodings` above does not
+    // reach because `file-io` is off there.
+    #[cfg(not(feature = "file-io"))]
+    vortex_fsst::initialize(&session);
     session
 });
 

@@ -3529,6 +3529,74 @@ mod tests {
         assert!(decoded.is_empty());
     }
 
+    /// The dictionary is held and round-tripped FSST-compressed, and that is an
+    /// invariant this code owns rather than one it inherits: which encoding a
+    /// column gets is otherwise decided by the writer's sampling and is free to
+    /// be something else. Asserting on the encoding is the only way this stays
+    /// true — the terms decode correctly either way, so a regression to
+    /// plaintext would be silent.
+    #[tokio::test]
+    async fn test_dictionary_terms_are_fsst_through_ipc() {
+        let quads: Vec<Quad> = (0..2_000)
+            .map(|i| {
+                make_quad(
+                    &format!("http://example.org/subject/{i:06}"),
+                    &format!("http://example.org/predicate/{}", i % 16),
+                    &format!("object value {:06}", i / 2),
+                    GraphName::DefaultGraph,
+                )
+            })
+            .collect();
+        let arr = VortexRdfStore::build_vortex_array_with_builder::<SortedInMemoryBuilder>(
+            quad_stream(quads),
+            LayoutStrategy::Dictionary,
+            vec![],
+        )
+        .await
+        .unwrap();
+        let store = VortexRdfStore::new(arr).unwrap();
+
+        let encoding_of_dict_terms = |array: &vortex_array::ArrayRef| -> String {
+            use vortex_array::VortexSessionExecute as _;
+            use vortex_array::arrays::listview::ListViewArrayExt as _;
+            use vortex_array::arrays::struct_::StructArrayExt as _;
+            let mut ctx = crate::io::VORTEX_LIGHT_SESSION.create_execution_ctx();
+            let sa = array
+                .clone()
+                .execute::<vortex_array::arrays::struct_::StructArray>(&mut ctx)
+                .unwrap();
+            let col = sa.unmasked_field_by_name("_dict_terms").unwrap().clone();
+            let list = col
+                .execute::<vortex_array::arrays::ListViewArray>(&mut ctx)
+                .unwrap();
+            list.list_elements_at(0).unwrap().encoding_id().to_string()
+        };
+
+        // Written out compressed...
+        let written = store.to_ipc_array().await.unwrap();
+        assert_eq!(
+            encoding_of_dict_terms(&written),
+            "vortex.fsst",
+            "toBytes must not expand the dictionary to plaintext"
+        );
+
+        // ...and read back still compressed, not canonicalized on open.
+        let mut buf = Vec::new();
+        crate::io::write_array_to_ipc(written, &mut buf).unwrap();
+        let read_back = crate::io::array_from_ipc_bytes(&buf).unwrap();
+        assert_eq!(encoding_of_dict_terms(&read_back), "vortex.fsst");
+
+        // And the terms still resolve, through the compressed representation.
+        let reread = VortexRdfStore::new(read_back).unwrap();
+        assert_eq!(reread.size().await.unwrap(), 2_000);
+        let p = NamedNode::new("http://example.org/predicate/3").unwrap();
+        let matched = reread
+            .match_pattern(None, Some(&p), None, None)
+            .await
+            .unwrap();
+        assert_eq!(matched.size().await.unwrap(), 125);
+    }
+
     #[cfg(feature = "file-io")]
     #[tokio::test]
     async fn test_dictionary_file_roundtrip() {

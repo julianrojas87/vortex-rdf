@@ -7,7 +7,7 @@ use std::cell::RefCell;
 use std::io::Cursor;
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::struct_::{StructArray, StructArrayExt};
-use vortex_array::{ArrayRef, IntoArray, RecursiveCanonical, VortexSessionExecute};
+use vortex_array::{ArrayRef, VortexSessionExecute};
 use vortex_rdf_core::common::utils::parse_quads_from_reader;
 use vortex_rdf_core::error::{Result as CoreResult, VortexRdfError};
 use vortex_rdf_core::io::{
@@ -307,26 +307,14 @@ impl VortexRdfStore {
 
     #[wasm_bindgen(js_name = toBytes, skip_typescript)]
     pub async fn to_bytes(&self) -> Result<Vec<u8>, JsValue> {
-        // Not `get_quads_array`: a Dictionary-layout store derived from `match`
-        // may have lost the term-dictionary payload that its codes decode
-        // against, which would make the written bytes unreadable.
+        // `to_ipc_array` evaluates the lazy nodes a `match`-derived store holds
+        // and re-attaches the term dictionary afterwards, so the written bytes
+        // carry it in its compressed form rather than expanded.
         let array = self
             .inner
-            .to_serializable_array()
+            .to_ipc_array()
             .await
             .map_err(|e| JsValue::from_str(&format!("Vortex read error: {}", e)))?;
-
-        // A store derived from `match` holds an unevaluated `filter` node, which
-        // has no IPC serialization. Evaluate it away first. Canonical form is not
-        // recursive — a StructArray's fields may still be lazy — so this has to be
-        // `RecursiveCanonical` rather than `StructArray`. Not an extra cost here:
-        // `toBytes` materializes the whole payload into a JS buffer regardless.
-        let mut ctx = VORTEX_LIGHT_SESSION.create_execution_ctx();
-        let array = array
-            .execute::<RecursiveCanonical>(&mut ctx)
-            .map_err(|e| JsValue::from_str(&format!("Vortex execution error: {}", e)))?
-            .0
-            .into_array();
 
         let mut buffer = Vec::new();
         write_array_to_ipc(array, &mut buffer)

@@ -10,6 +10,7 @@
 //! [`LayoutStrategy::Dictionary`]: super::LayoutStrategy::Dictionary
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::Duration;
 use web_time::Instant;
 
@@ -18,14 +19,16 @@ use vortex_array::arrays::struct_::{StructArray, StructArrayExt};
 use vortex_array::arrays::{ListArray, ListViewArray, PrimitiveArray, VarBinViewArray};
 #[cfg(feature = "file-io")]
 use vortex_array::expr::{root, select};
+use vortex_array::match_each_integer_ptype;
 #[cfg(feature = "file-io")]
 use vortex_array::stream::ArrayStreamExt as _;
 use vortex_array::validity::Validity;
 use vortex_array::{ArrayRef, IntoArray, VortexSessionExecute};
 #[cfg(feature = "file-io")]
 use vortex_file::VortexFile;
+use vortex_fsst::{FSST, FSSTArray, FSSTArraySlotsExt as _, fsst_compress, fsst_train_compressor};
 
-use crate::common::utils::StrColReader;
+use crate::common::utils::{StrColReader, buf_as_str};
 use crate::error::{Result, VortexRdfError};
 use crate::io::VORTEX_LIGHT_SESSION;
 use crate::store::RawQuad;
@@ -94,36 +97,109 @@ impl TermDictionaryBuilder {
     }
 }
 
+/// How a dictionary's sorted terms are held in memory.
+///
+/// The dictionary is *built* FSST-compressed (see [`TermDictionary::compress`])
+/// and written out that way, so `Fsst` is the normal case. `Canonical` remains
+/// reachable and is not a legacy path: Vortex picks a column's encoding when it
+/// writes, by sampling, and the selector is free to choose something other than
+/// FSST — so a dictionary read back from a file or IPC stream may arrive in any
+/// encoding, and the read path has to be total over that. Anything that is not
+/// FSST is canonicalized to plaintext on open.
+#[derive(Clone)]
+enum TermStore {
+    /// Plaintext terms. `bytes_at` is a zero-copy read.
+    Canonical(VarBinViewArray),
+    /// FSST-compressed terms: ~4x smaller, and every read decodes.
+    Fsst(FsstTerms),
+}
+
 /// The frozen, sorted term dictionary in columnar form.
 ///
-/// term→ID is a host-side binary search over zero-copy `bytes_at` views;
-/// ID→term is a zero-copy `bytes_at` read.
+/// term→ID is a host-side binary search; ID→term reads the term at a position.
+/// Both go through [`reader`](Self::reader), whose cost depends on the encoding
+/// the terms are held in.
 #[derive(Clone)]
 pub(crate) struct TermDictionary {
-    terms: VarBinViewArray,
+    terms: TermStore,
 }
 
 impl TermDictionary {
     pub(crate) fn empty() -> Self {
         Self {
-            terms: VarBinViewArray::from_iter_str(std::iter::empty::<&str>()),
+            terms: TermStore::Canonical(VarBinViewArray::from_iter_str(std::iter::empty::<&str>())),
         }
     }
 
     /// Build from already-sorted unique term strings.
+    ///
+    /// The terms are FSST-compressed here rather than left for the writer to
+    /// compress: which encoding a column gets is otherwise decided by sampling
+    /// at write time and is not guaranteed to be FSST, so compressing at the
+    /// source is what makes "the dictionary is FSST" an invariant this code
+    /// owns instead of an assumption about somebody else's heuristic.
     fn from_sorted<'a>(terms: impl Iterator<Item = &'a str> + Clone) -> Result<Self> {
-        let dict = Self {
-            terms: VarBinViewArray::from_iter_str(terms),
-        };
+        let plain = VarBinViewArray::from_iter_str(terms);
         // List offsets are i32, so the term count must fit in one.
-        if dict.len() > i32::MAX as usize {
+        if plain.len() > i32::MAX as usize {
             return Err(VortexRdfError::Serialization(format!(
                 "Dictionary of {} unique terms exceeds the supported maximum ({})",
-                dict.len(),
+                plain.len(),
                 i32::MAX
             )));
         }
-        Ok(dict)
+        Self::compress(plain)
+    }
+
+    /// FSST-compress a plaintext term column.
+    ///
+    /// An empty dictionary is left canonical: there is nothing to train a
+    /// symbol table on, and `fsst_train_compressor` has no non-null rows to
+    /// sample.
+    /// Adopt a term column as read back from a file or IPC stream.
+    ///
+    /// Already-FSST terms are kept compressed — decoding them here would undo
+    /// the point of writing them that way, and is what made opening a store
+    /// cost a full plaintext copy of its dictionary. Any other encoding is
+    /// canonicalized: the write path compresses, but nothing in the format
+    /// obliges a producer to have done so.
+    fn from_terms_array(elements: ArrayRef, ctx: &mut vortex_array::ExecutionCtx) -> Result<Self> {
+        let elements = match elements.try_downcast::<FSST>() {
+            Ok(fsst) => {
+                return Ok(Self {
+                    terms: TermStore::Fsst(FsstTerms::new(fsst)?),
+                });
+            }
+            Err(other) => other,
+        };
+        let plain = elements
+            .execute::<VarBinViewArray>(ctx)
+            .map_err(VortexRdfError::Vortex)?;
+        Ok(Self {
+            terms: TermStore::Canonical(plain),
+        })
+    }
+
+    fn compress(plain: VarBinViewArray) -> Result<Self> {
+        if plain.is_empty() {
+            return Ok(Self {
+                terms: TermStore::Canonical(plain),
+            });
+        }
+        let start = Instant::now();
+        let array = plain.into_array();
+        let mut ctx = VORTEX_LIGHT_SESSION.create_execution_ctx();
+        let compressor = fsst_train_compressor(&array, &mut ctx).map_err(VortexRdfError::Vortex)?;
+        let fsst = fsst_compress(&array, &compressor, &mut ctx).map_err(VortexRdfError::Vortex)?;
+        let terms = FsstTerms::new(fsst)?;
+        log::debug!(
+            "[Dictionary] FSST-compressed {} terms in {:?}",
+            terms.len(),
+            start.elapsed()
+        );
+        Ok(Self {
+            terms: TermStore::Fsst(terms),
+        })
     }
 
     /// The dataset's unique terms, sorted — the raw material of both
@@ -203,27 +279,44 @@ impl TermDictionary {
     }
 
     pub(crate) fn len(&self) -> usize {
-        self.terms.len()
+        match &self.terms {
+            TermStore::Canonical(a) => a.len(),
+            TermStore::Fsst(f) => f.len(),
+        }
     }
 
-    /// The sorted term column itself (utf8, non-nullable).
-    pub(crate) fn view(&self) -> &VarBinViewArray {
-        &self.terms
+    /// The sorted term column as it is held, for serialization.
+    ///
+    /// Returns the FSST array itself when the terms are compressed, so writing
+    /// a store out carries the compressed form rather than a re-expanded copy.
+    pub(crate) fn terms_array(&self) -> ArrayRef {
+        match &self.terms {
+            TermStore::Canonical(a) => a.clone().into_array(),
+            TermStore::Fsst(f) => f.array.clone().into_array(),
+        }
+    }
+
+    /// A cursor over the terms. Holds the scratch buffer an FSST read decodes
+    /// into, so callers needing several terms at once (a quad's four roles)
+    /// must take one reader per role.
+    pub(crate) fn reader(&self) -> DictReader<'_> {
+        match &self.terms {
+            TermStore::Canonical(a) => DictReader::Canonical(StrColReader::new(a)),
+            TermStore::Fsst(f) => DictReader::Fsst {
+                terms: f,
+                scratch: f.new_scratch(),
+            },
+        }
     }
 
     /// Decode a code back to its term string (canonical N-Triples form), or
-    /// `None` if the code is out of the dictionary's range. Zero-copy read of
-    /// the term bytes; the returned `String` is the single owned copy.
+    /// `None` if the code is out of the dictionary's range.
     pub(crate) fn term_at(&self, code: u32) -> Option<String> {
         let i = code as usize;
-        if i < self.len() {
-            let reader = StrColReader::new(&self.terms);
-            std::str::from_utf8(reader.bytes_at(i))
-                .ok()
-                .map(str::to_owned)
-        } else {
-            None
+        if i >= self.len() {
+            return None;
         }
+        self.reader().str_at(i).ok().map(str::to_owned)
     }
 
     /// Materialize a temporary O(1) lookup table for bulk encoding, with owned
@@ -240,10 +333,11 @@ impl TermDictionary {
     /// [`from_quads_with_map`](Self::from_quads_with_map).
     pub(crate) fn build_id_map(&self) -> TermIdMap {
         let start = Instant::now();
-        let reader = StrColReader::new(&self.terms);
+        let mut reader = self.reader();
         let map = (0..self.len())
             .map(|id| {
-                let term = std::str::from_utf8(reader.bytes_at(id))
+                let term = reader
+                    .str_at(id)
                     .expect("term dictionary contains only valid UTF-8")
                     .to_owned();
                 (term, id as u32)
@@ -261,12 +355,15 @@ impl TermDictionary {
     /// Uses Vortex's SearchSorted compute kernel via ArrayRef for optimized sorted search.
     /// Falls back to manual binary search only if the kernel fails.
     pub(crate) fn get_id(&self, term: &str) -> Option<u32> {
-        // Direct byte-compare binary search over the sorted term views.
-        // `terms` is a concrete VarBinViewArray, so each probe reads a view
-        // without materializing anything; the generic `search_sorted` kernel
-        // would instead build a fresh `ExecutionCtx` and a `Scalar` per probe,
-        // which profiling showed dominating `match_pattern`'s fixed cost.
-        let reader = StrColReader::new(&self.terms);
+        // Direct byte-compare binary search over the sorted terms. The generic
+        // `search_sorted` kernel would instead build a fresh `ExecutionCtx` and
+        // a `Scalar` per probe, which profiling showed dominating
+        // `match_pattern`'s fixed cost.
+        //
+        // FSST is not order-preserving — roughly half of adjacent sorted pairs
+        // invert in compressed space — so the search cannot run over the codes
+        // and every probe decodes into the reader's scratch buffer.
+        let mut reader = self.reader();
         let needle = term.as_bytes();
         let (mut lo, mut hi) = (0usize, self.len());
         while lo < hi {
@@ -278,6 +375,149 @@ impl TermDictionary {
             }
         }
         None
+    }
+}
+
+/// Bytes an FSST symbol expands to at most — one code never yields more.
+const FSST_SYMBOL_LEN: usize = 8;
+
+/// Extra output headroom for `decompress_into`.
+///
+/// Its 8-symbols-at-a-time path only runs while the output has
+/// `8 * FSST_SYMBOL_LEN` bytes of room left, so a buffer sized exactly to the
+/// longest term silently falls back to the byte-at-a-time tail loop.
+const FSST_DECODE_HEADROOM: usize = 8 * FSST_SYMBOL_LEN;
+
+/// FSST-compressed sorted terms, with the pieces a hot lookup needs hoisted
+/// out of the Vortex array.
+#[derive(Clone)]
+pub(crate) struct FsstTerms {
+    /// Kept whole so the dictionary can be serialized without recompressing.
+    array: FSSTArray,
+    /// Code offsets, canonicalized once at open. The array stores them
+    /// bit-packed, and unpacking a single value allocates a `Scalar` per call —
+    /// far too expensive for a per-probe read inside a binary search.
+    offsets: Arc<[u32]>,
+    /// Scratch size that keeps `decompress_into` on its fast path.
+    scratch_cap: usize,
+}
+
+impl FsstTerms {
+    fn new(array: FSSTArray) -> Result<Self> {
+        let mut ctx = VORTEX_LIGHT_SESSION.create_execution_ctx();
+        let offsets = array
+            .codes_offsets()
+            .clone()
+            .execute::<PrimitiveArray>(&mut ctx)
+            .map_err(VortexRdfError::Vortex)?;
+        // Width is whatever the writer's scheme selection produced — a small
+        // dictionary's offsets fit in a u8 — so accept every integer type
+        // rather than the couple a given dataset happens to yield.
+        // The u32 arm of the macro casts u32 -> u32; that is the price of one
+        // arm covering every width.
+        #[allow(clippy::unnecessary_cast)]
+        let offsets: Arc<[u32]> = match_each_integer_ptype!(offsets.ptype(), |O| {
+            offsets.as_slice::<O>().iter().map(|&o| o as u32).collect()
+        });
+        // An FSST code expands to at most one 8-byte symbol, so this bounds the
+        // longest decoded term without decoding anything.
+        let widest = offsets
+            .windows(2)
+            .map(|w| (w[1] - w[0]) as usize)
+            .max()
+            .unwrap_or(0);
+        Ok(Self {
+            array,
+            offsets,
+            scratch_cap: widest * FSST_SYMBOL_LEN + FSST_DECODE_HEADROOM,
+        })
+    }
+
+    fn len(&self) -> usize {
+        self.array.len()
+    }
+
+    fn new_scratch(&self) -> Vec<u8> {
+        Vec::with_capacity(self.scratch_cap)
+    }
+
+    /// Decode term `i` into `scratch`, returning the bytes written.
+    fn decode_into<'a>(&self, i: usize, scratch: &'a mut Vec<u8>) -> &'a [u8] {
+        let (start, end) = (self.offsets[i] as usize, self.offsets[i + 1] as usize);
+        let n = self.array.decompressor().decompress_into(
+            &self.array.codes_bytes()[start..end],
+            scratch.spare_capacity_mut(),
+        );
+        // SAFETY: `decompress_into` initialized the first `n` bytes.
+        unsafe {
+            scratch.set_len(n);
+        }
+        &scratch[..n]
+    }
+}
+
+/// A cursor over a dictionary's terms.
+///
+/// `str_at` borrows from the reader rather than from the dictionary because an
+/// FSST read decodes into the reader's own scratch buffer, so the borrow ends
+/// at the next call. Callers needing several terms simultaneously — decoding a
+/// quad's four roles — take one reader per role.
+pub(crate) enum DictReader<'a> {
+    Canonical(StrColReader<'a>),
+    Fsst {
+        terms: &'a FsstTerms,
+        scratch: Vec<u8>,
+    },
+}
+
+impl DictReader<'_> {
+    #[inline]
+    pub(crate) fn bytes_at(&mut self, i: usize) -> &[u8] {
+        match self {
+            DictReader::Canonical(r) => r.bytes_at(i),
+            DictReader::Fsst { terms, scratch } => {
+                scratch.clear();
+                terms.decode_into(i, scratch)
+            }
+        }
+    }
+
+    #[inline]
+    pub(crate) fn str_at(&mut self, i: usize) -> Result<&str> {
+        buf_as_str(self.bytes_at(i))
+    }
+}
+
+/// An immutable handle on a Dictionary-layout store's term dictionary, taken
+/// with [`VortexRdfStore::dictionary_snapshot`].
+///
+/// Cloning is an `Arc` bump, and the snapshot retains only the dictionary — not
+/// the store or its quad columns.
+///
+/// **Term codes are only meaningful against the dictionary they were produced
+/// with.** Mutating a store re-encodes it against a *fresh* dictionary, so a
+/// consumer holding codes must decode them through the snapshot taken when it
+/// received them, not through the store as it stands later — otherwise codes
+/// silently resolve to the wrong terms. Holding the snapshot keeps exactly the
+/// dictionary those codes address alive, and nothing more.
+#[derive(Clone)]
+pub struct DictSnapshot(pub(crate) Arc<TermDictionary>);
+
+impl DictSnapshot {
+    /// Decode a term code to its N-Triples string, or `None` when the code is
+    /// out of this dictionary's range.
+    pub fn decode(&self, code: u32) -> Option<String> {
+        self.0.term_at(code)
+    }
+
+    /// Number of terms in the dictionary.
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Whether the dictionary holds no terms.
+    pub fn is_empty(&self) -> bool {
+        self.0.len() == 0
     }
 }
 
@@ -295,7 +535,7 @@ pub(crate) fn dict_column(
     let m = dict.len() as i32;
     let (elements, offsets): (ArrayRef, Vec<i32>) = if carry_payload && n_rows > 0 {
         (
-            dict.view().clone().into_array(),
+            dict.terms_array(),
             std::iter::once(0)
                 .chain(std::iter::repeat_n(m, n_rows))
                 .collect(),
@@ -340,10 +580,7 @@ pub(crate) fn dict_from_list_column(col: &ArrayRef) -> Result<TermDictionary> {
         .execute::<ListViewArray>(&mut ctx)
         .map_err(VortexRdfError::Vortex)?;
     let elements = list.list_elements_at(0).map_err(VortexRdfError::Vortex)?;
-    let terms = elements
-        .execute::<VarBinViewArray>(&mut ctx)
-        .map_err(VortexRdfError::Vortex)?;
-    Ok(TermDictionary { terms })
+    TermDictionary::from_terms_array(elements, &mut ctx)
 }
 
 /// Extract the term dictionary from an in-memory Dictionary-layout array.
