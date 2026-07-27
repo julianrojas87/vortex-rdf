@@ -2,7 +2,7 @@ from pathlib import Path
 from typing import Optional
 import os
 
-from rdflib.term import BNode, Node, URIRef
+from rdflib.term import BNode, Literal, Node, URIRef
 from rdflib.store import Store, NO_STORE, VALID_STORE
 from rdflib.util import from_n3
 
@@ -241,9 +241,44 @@ class VortexStore(Store):
 
     @staticmethod
     def _from_n3_safe(value: str) -> Node:
+        # URIRefs and blank nodes have unambiguous standalone N3 forms.  Build
+        # them directly rather than routing every dictionary term through
+        # RDFLib's generic from_n3 parser.  Besides avoiding parser overhead,
+        # this accepts valid absolute IRIs that from_n3 rejects in some RDFLib
+        # versions/configurations when no namespace manager is supplied.
+        if len(value) >= 2 and value[0] == "<" and value[-1] == ">":
+            return URIRef(value[1:-1])
+        if value.startswith("_:"):
+            return BNode(value[2:])
+
         try:
-            return from_n3(value)
-        except Exception as e:
+            term = from_n3(value)
+        except Exception as error:
+            # DBpedia contains a small number of language-tagged literals with
+            # an escaped apostrophe (\') even though the literal itself is
+            # double quoted.  RDFLib rejects that non-canonical escape.  The
+            # fallback is deliberately restricted to simple, language-tagged,
+            # double-quoted literals; typed and multiline literals still fail
+            # loudly through the generic error below.
+            split = value.rfind('"@')
+            if value.startswith('"') and split > 0:
+                lexical = value[1:split]
+                language = value[split + 2:]
+                if language and all(
+                    character.isalnum() or character == "-"
+                    for character in language
+                ):
+                    lexical = lexical.replace("\\'", "'")
+                    try:
+                        return Literal(from_n3(f'"{lexical}"').value, lang=language)
+                    except Exception:
+                        pass
             raise ValueError(
                 f"Could not parse returned RDF term as N3: {value!r}"
-            ) from e
+            ) from error
+
+        if term is None:
+            raise ValueError(
+                f"RDFLib returned no RDF term for N3 value: {value!r}"
+            )
+        return term
