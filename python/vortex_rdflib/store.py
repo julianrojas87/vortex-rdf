@@ -1,7 +1,6 @@
 from pathlib import Path
 from typing import Optional
 import os
-import time
 
 from rdflib.term import BNode, Node, URIRef
 from rdflib.store import Store, NO_STORE, VALID_STORE
@@ -11,23 +10,6 @@ from .vortex_rdf_native import (
     match_triples, match_triples_compact, count_triples, diagnose_match, diagnose_direct_compact
 )
 
-
-# VORTEX_RDF_COMPACT_MATERIALIZATION_TRACE_V1
-_COMPACT_TRACE = None
-
-def reset_compact_materialization_trace():
-    global _COMPACT_TRACE
-    _COMPACT_TRACE = {"compact_native_call_ms": 0.0, "compact_term_parse_ms": 0.0,
-        "compact_row_lookup_ms": 0.0, "compact_rows_yielded": 0,
-        "compact_lexical_terms": 0, "compact_calls": 0}
-
-def pop_compact_materialization_trace():
-    global _COMPACT_TRACE
-    value, _COMPACT_TRACE = _COMPACT_TRACE, None
-    return value
-
-def _trace_ms(start_ns):
-    return (time.perf_counter_ns() - start_ns) / 1_000_000
 
 def _term_debug(t):
     if t is None:
@@ -158,32 +140,22 @@ class VortexStore(Store):
             )
 
         if self.layout in {"cottas-native-ids", "cottas-native"}:
-            trace = _COMPACT_TRACE
-            started = time.perf_counter_ns() if trace is not None else None
             lexical_terms, indexed_rows = match_triples_compact(
                 self.path, s_n3, p_n3, o_n3, self.layout,
             )
-            if trace is not None:
-                trace["compact_native_call_ms"] += _trace_ms(started)
-                trace["compact_lexical_terms"] += len(lexical_terms)
-                trace["compact_calls"] += 1
-                started = time.perf_counter_ns()
             parsed_terms = [self._from_n3_safe(value) for value in lexical_terms]
-            if trace is not None:
-                trace["compact_term_parse_ms"] += _trace_ms(started)
             term_count = len(parsed_terms)
             for s_idx, p_idx, o_idx in indexed_rows:
-                started = time.perf_counter_ns() if trace is not None else None
                 if s_idx >= term_count or p_idx >= term_count or o_idx >= term_count:
                     raise ValueError(
                         "Compact native result has an invalid term index: "
                         f"{(s_idx, p_idx, o_idx)!r}, terms={term_count}"
                     )
-                triple = (parsed_terms[s_idx], parsed_terms[p_idx], parsed_terms[o_idx])
-                if trace is not None:
-                    trace["compact_row_lookup_ms"] += _trace_ms(started)
-                    trace["compact_rows_yielded"] += 1
-                yield triple, None
+                yield (
+                    parsed_terms[s_idx],
+                    parsed_terms[p_idx],
+                    parsed_terms[o_idx],
+                ), None
             return
 
         triples_out = match_triples(
