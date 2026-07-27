@@ -25,7 +25,6 @@ vortex-layout.workspace = true
 vortex-file.workspace = true
 vortex-scan.workspace = true
 vortex-buffer.workspace = true
-vortex-btrblocks = { workspace = true }
 
 tokio.workspace = true
 
