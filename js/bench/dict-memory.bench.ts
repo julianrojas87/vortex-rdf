@@ -1,13 +1,28 @@
-// Attribution sweep: how much of Vortex's wasm memory is the term dictionary?
+// How much of Vortex's wasm memory is the term dictionary?
 //
-// Run (after `npm run build`):
-//   npx tsx bench/dict-memory.bench.ts
-//   DICT_MEM_N=200000 npx tsx bench/dict-memory.bench.ts     # smaller/faster
+// This is NOT a timing benchmark and is never uploaded anywhere. It is the only
+// instrument that can attribute wasm memory at all: `compare.bench.ts` reports
+// whole-process peak RSS, which is the fair cross-library number but says
+// nothing about *what* is holding the memory.
 //
-// This is NOT a timing benchmark and is never uploaded anywhere. It exists to
-// answer one question with data rather than arithmetic: at a given row count,
-// how does wasm memory scale with the number of distinct *terms*, and how much
-// of that is the resident dictionary versus the transients around it?
+// It has two modes.
+//
+// ── Regression check (the default) ───────────────────────────────────────────
+//
+//   npm run bench:dict-memory        # one config, one process, ~1 min
+//
+// Runs the single config every committed figure was measured at and prints the
+// result against REFERENCE below. Use this after touching anything on the
+// dictionary, ingest, or serialization path.
+//
+// ── Attribution sweep (opt-in) ───────────────────────────────────────────────
+//
+//   DICT_MEM_RATIOS=0.001,0.01,0.1,0.5,1.0 \
+//   DICT_MEM_SLUGS=vortex_sorted_dict,vortex_sorted_default \
+//   npm run bench:dict-memory
+//
+// Fits per-term cost. Needs >= 2 points, and is what produced the bytes/term
+// numbers in the first place.
 //
 // Method — two nested differentials, because nothing can be read directly.
 //
@@ -17,7 +32,7 @@
 // sets the high-water mark and the store is allocated inside the space it
 // freed. See the worker's header for the measurement that established this.
 //
-// Outer (here): hold rows fixed, sweep term cardinality, and fit
+// Outer (here, sweep mode only): hold rows fixed, sweep term cardinality, and fit
 //
 //   d(retained per store)/d(terms)  the dictionary's per-term cost
 //   intercept as terms -> 0         quad columns + per-store overhead. For the
@@ -44,19 +59,30 @@ const workerPath = resolve(here, 'dict-memory.worker.ts');
 const tsxBin = resolve(here, '..', 'node_modules', '.bin', 'tsx');
 const OUT = resolve(here, process.env.DICT_MEM_OUT ?? 'dict-memory.json');
 
-/** Rows held fixed across the sweep — only term cardinality varies. */
-const N = Number(process.env.DICT_MEM_N ?? 500_000);
+/** Rows held fixed across the sweep — only term cardinality varies.
+ *
+ *  200k is the scale every committed figure was taken at. Keeping it as the
+ *  default is what makes a fresh run comparable to REFERENCE. */
+const N = Number(process.env.DICT_MEM_N ?? 200_000);
 
-/** Which build variants to sweep. Dictionary layout is the subject; Default is
- *  the control — it has no term dictionary, so its slope isolates everything
- *  that is *not* the dictionary. */
-const SLUGS = (process.env.DICT_MEM_SLUGS ?? 'vortex_sorted_dict,vortex_sorted_default').split(',');
+/** Which build variants to run. Dictionary layout is the subject. Add
+ *  `vortex_sorted_default` when sweeping: it has no term dictionary, so its
+ *  slope isolates everything that is *not* the dictionary. */
+const SLUGS = (process.env.DICT_MEM_SLUGS ?? 'vortex_sorted_dict').split(',');
 
-/** Subject/object ratios per point. Object ratio tracks subject ratio at half,
- *  so `terms` sweeps roughly two orders of magnitude. */
-const RATIOS = (process.env.DICT_MEM_RATIOS ?? '0.001,0.01,0.1,0.5,1.0')
-    .split(',')
-    .map(Number);
+/** Subject ratio per point; object ratio tracks it at half.
+ *
+ *  One point by default, at the dataset's own defaults — ratio 1.0 is 300,037
+ *  distinct terms at N=200k. Pass several to sweep cardinality and fit the
+ *  per-term cost; two orders of magnitude is what the original fit used. */
+const RATIOS = (process.env.DICT_MEM_RATIOS ?? '1.0').split(',').map(Number);
+
+/** Figures from the run that landed FSST — commit `perf!: hold and serialize
+ *  the term dictionary FSST-compressed`, at the default config above.
+ *
+ *  Memory is reproducible for a given wasm build and dataset, so drift here is
+ *  a real regression. Timings are not compared: they track the host. */
+const REFERENCE = { retainedPerStoreMb: 12.0, firstStoreMb: 93, lastStoreMb: 129, stores: 4 };
 
 interface Point {
     slug: string; n: number; terms: number; stores: number;
@@ -102,6 +128,31 @@ function runPoint(slug: string, subjRatio: number, objRatio: number): Point | nu
     }
 }
 
+/** True when this run is the exact config REFERENCE was measured at, and so is
+ *  comparable to it. Any knob turned makes the comparison meaningless. */
+function atReferenceConfig(points: Point[]): points is [Point] {
+    return points.length === 1
+        && N === 200_000
+        && RATIOS.length === 1 && RATIOS[0] === 1.0
+        && points[0].slug === 'vortex_sorted_dict'
+        && points[0].stores === REFERENCE.stores;
+}
+
+/** The regression view: today's numbers beside the ones FSST landed with. */
+function reportAgainstReference(p: Point): void {
+    const show = (now: number | null | undefined, then: number): string => {
+        if (now === null || now === undefined) return '?';
+        const d = now - then;
+        return `${now.toFixed(1)} MB  (${d >= 0 ? '+' : ''}${d.toFixed(1)} vs ${then.toFixed(1)})`;
+    };
+    console.log('\n─── vs. the FSST reference run ─────────────────────────────');
+    console.log(`  retained/store   ${show(retainedPerStore(p), REFERENCE.retainedPerStoreMb)}`);
+    console.log(`  1 store          ${show(p.wasmPerStore[0], REFERENCE.firstStoreMb)}`);
+    console.log(`  ${REFERENCE.stores} stores         ${show(p.wasmPerStore.at(-1), REFERENCE.lastStoreMb)}`);
+    console.log(`  full scan        ${p.scanMs.toFixed(0)} ms + ${p.decodeMs.toFixed(0)} ms decode `
+        + `(${p.fullRows.toLocaleString()} rows; host-dependent, not compared)`);
+}
+
 /** Least-squares fit of `y = slope*x + intercept`. */
 function fit(xs: number[], ys: number[]): { slope: number; intercept: number } {
     const k = xs.length;
@@ -117,7 +168,9 @@ function fit(xs: number[], ys: number[]): { slope: number; intercept: number } {
 }
 
 function main(): void {
-    console.log(`Dictionary memory sweep: n=${N.toLocaleString()} rows, ratios ${RATIOS.join(', ')}\n`);
+    const mode = RATIOS.length > 1 ? 'sweep' : 'regression check';
+    console.log(`Dictionary memory ${mode}: n=${N.toLocaleString()} rows, `
+        + `ratios ${RATIOS.join(', ')}, slugs ${SLUGS.join(', ')}\n`);
     const points: Point[] = [];
 
     for (const slug of SLUGS) {
@@ -170,14 +223,22 @@ function main(): void {
 
     writeFileSync(OUT, JSON.stringify({ n: N, ratios: RATIOS, points, analysis }, null, 2));
 
-    console.log('\n─── analysis ───────────────────────────────────────────────');
-    for (const [slug, a] of Object.entries(analysis)) {
-        const v = a as Record<string, unknown>;
-        console.log(`${slug}:`);
-        console.log(`  ${v.bytesPerTerm} bytes/term`);
-        console.log(`  intercept ${v.interceptMb} MB (quad columns alone would be ${v.expectedQuadColumnsMb} MB)`);
+    if (Object.keys(analysis).length > 0) {
+        console.log('\n─── analysis ───────────────────────────────────────────────');
+        for (const [slug, a] of Object.entries(analysis)) {
+            const v = a as Record<string, unknown>;
+            console.log(`${slug}:`);
+            console.log(`  ${v.bytesPerTerm} bytes/term`);
+            console.log(`  intercept ${v.interceptMb} MB (quad columns alone would be ${v.expectedQuadColumnsMb} MB)`);
+        }
+    } else if (atReferenceConfig(points)) {
+        reportAgainstReference(points[0]);
+    } else {
+        console.log('\nNo per-term fit: that needs >= 2 cardinality points. See the header '
+            + 'for the sweep invocation.');
     }
-    console.log(`\nWrote ${points.length} points → ${OUT}`);
+
+    console.log(`\nWrote ${points.length} point${points.length === 1 ? '' : 's'} → ${OUT}`);
 }
 
 main();
