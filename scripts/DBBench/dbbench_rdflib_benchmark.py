@@ -297,6 +297,176 @@ def run_one_query_process_timeout(
     raise RuntimeError(msg.get("error", "unknown child-process query error"))
 
 
+def _persistent_query_worker(
+    connection,
+    engine: str,
+    cottas_path: str,
+    vortex_path: str,
+    vortex_layout: str,
+):
+    """Own one persistent Graph and execute parent-issued requests serially."""
+    try:
+        graph = make_graph(engine, cottas_path, vortex_path, vortex_layout)
+        connection.send({"kind": "ready"})
+    except BaseException as error:
+        try:
+            connection.send({
+                "kind": "startup_error",
+                "error": repr(error),
+                "traceback": traceback.format_exc(),
+            })
+        finally:
+            connection.close()
+        return
+
+    try:
+        while True:
+            request = connection.recv()
+            if request.get("kind") == "shutdown":
+                return
+            request_id = request["request_id"]
+            try:
+                out = run_one_query(
+                    graph,
+                    request["query"],
+                    silence_stdout=request["silence_stdout"],
+                    timeout_s=None,
+                )
+                connection.send({
+                    "kind": "result",
+                    "request_id": request_id,
+                    "status": "ok",
+                    "out": out,
+                })
+            except BaseException as error:
+                connection.send({
+                    "kind": "result",
+                    "request_id": request_id,
+                    "status": "error",
+                    "error": repr(error),
+                    "traceback": traceback.format_exc(),
+                })
+    except (EOFError, BrokenPipeError):
+        return
+    finally:
+        connection.close()
+
+
+class PersistentQueryWorker:
+    """Persistent, killable Graph worker restarted after a hard timeout."""
+
+    def __init__(
+        self,
+        engine: str,
+        cottas_path: str,
+        vortex_path: str,
+        vortex_layout: str,
+        startup_timeout_s: float,
+        kill_grace_s: float,
+    ):
+        self.engine = engine
+        self.cottas_path = cottas_path
+        self.vortex_path = vortex_path
+        self.vortex_layout = vortex_layout
+        self.startup_timeout_s = startup_timeout_s
+        self.kill_grace_s = kill_grace_s
+        self._connection = None
+        self._process = None
+        self._next_request_id = 0
+
+    def _discard(self):
+        connection, process = self._connection, self._process
+        self._connection = None
+        self._process = None
+        if connection is not None:
+            connection.close()
+        if process is not None and process.is_alive():
+            _kill_process_tree(process.pid, grace_s=self.kill_grace_s)
+            process.join(timeout=max(self.kill_grace_s, 0.0))
+
+    def _start(self):
+        self._discard()
+        parent_connection, child_connection = mp.Pipe(duplex=True)
+        process = mp.Process(
+            target=_persistent_query_worker,
+            args=(
+                child_connection,
+                self.engine,
+                self.cottas_path,
+                self.vortex_path,
+                self.vortex_layout,
+            ),
+            name=f"dbbench-{self.engine}-worker",
+            daemon=True,
+        )
+        process.start()
+        child_connection.close()
+        self._connection = parent_connection
+        self._process = process
+
+        if not parent_connection.poll(self.startup_timeout_s):
+            pid = process.pid
+            self._discard()
+            raise RuntimeError(
+                f"{self.engine} worker did not initialize within "
+                f"{self.startup_timeout_s}s; killed pid={pid}"
+            )
+        message = parent_connection.recv()
+        if message.get("kind") != "ready":
+            error = message.get("error", "unknown worker startup failure")
+            self._discard()
+            raise RuntimeError(f"{self.engine} worker startup failed: {error}")
+
+    def run(self, query: str, silence_stdout: bool, timeout_s: float):
+        if self._process is None or not self._process.is_alive():
+            self._start()
+        request_id = self._next_request_id
+        self._next_request_id += 1
+        self._connection.send({
+            "kind": "query",
+            "request_id": request_id,
+            "query": query,
+            "silence_stdout": silence_stdout,
+        })
+        wait_timeout = timeout_s if timeout_s is not None and timeout_s > 0 else None
+        if not self._connection.poll(wait_timeout):
+            pid = self._process.pid
+            self._discard()
+            raise QueryProcessTimeoutError(
+                f"Query exceeded worker timeout of {timeout_s}s; killed worker pid={pid}"
+            )
+        try:
+            message = self._connection.recv()
+        except EOFError as error:
+            exitcode = self._process.exitcode
+            self._discard()
+            raise RuntimeError(
+                f"{self.engine} worker exited without a response; exitcode={exitcode}"
+            ) from error
+        if message.get("kind") != "result":
+            self._discard()
+            raise RuntimeError(f"Unexpected {self.engine} worker message: {message!r}")
+        if message.get("request_id") != request_id:
+            self._discard()
+            raise RuntimeError(
+                f"{self.engine} worker response ID mismatch: "
+                f"expected={request_id}, actual={message.get('request_id')}"
+            )
+        if message.get("status") == "ok":
+            return message["out"]
+        raise RuntimeError(message.get("error", "unknown persistent-worker query error"))
+
+    def close(self):
+        if self._connection is not None and self._process is not None:
+            if self._process.is_alive():
+                try:
+                    self._connection.send({"kind": "shutdown"})
+                    self._process.join(timeout=max(self.kill_grace_s, 0.0))
+                except (BrokenPipeError, EOFError, OSError):
+                    pass
+        self._discard()
+
+
 def extract_single_tp_bindings(query: str):
     """Return native N3 bindings for a SELECT query containing exactly one BGP triple."""
     translated = prepareQuery(query)
@@ -467,9 +637,13 @@ def main():
     parser.add_argument("--query-timeout-s", type=float, default=60.0)
     parser.add_argument(
         "--timeout-mode",
-        choices=["process", "signal"],
+        choices=["process", "signal", "worker"],
         default="process",
-        help="process = robust child-process timeout; signal = old in-process SIGALRM timeout",
+        help=(
+            "process = fresh child/Graph per run; signal = persistent in-process "
+            "Graph with unsafe native-call interruption; worker = persistent "
+            "killable child/Graph restarted after timeout"
+        ),
     )
     parser.add_argument(
         "--timeout-kill-grace-s",
@@ -575,6 +749,7 @@ def main():
     )
     print(f"Wrote query inventory: {inventory_path}")
 
+    workers = {}
     if args.timeout_mode == "signal":
         graphs = {
             engine: make_graph(
@@ -582,6 +757,19 @@ def main():
                 args.cottas_path,
                 args.vortex_path,
                 args.vortex_layout,
+            )
+            for engine in args.engines
+        }
+    elif args.timeout_mode == "worker":
+        graphs = {}
+        workers = {
+            engine: PersistentQueryWorker(
+                engine=engine,
+                cottas_path=args.cottas_path,
+                vortex_path=args.vortex_path,
+                vortex_layout=args.vortex_layout,
+                startup_timeout_s=max(args.query_timeout_s, 30.0),
+                kill_grace_s=args.timeout_kill_grace_s,
             )
             for engine in args.engines
         }
@@ -656,6 +844,12 @@ def main():
                             silence_stdout=silence_stdout,
                             timeout_s=args.query_timeout_s,
                             kill_grace_s=args.timeout_kill_grace_s,
+                        )
+                    elif args.timeout_mode == "worker":
+                        out = workers[engine].run(
+                            qrec["query"],
+                            silence_stdout=silence_stdout,
+                            timeout_s=args.query_timeout_s,
                         )
                     else:
                         out = run_one_query(
@@ -732,6 +926,8 @@ def main():
                     f"vortex={counts_by_engine['vortex']}"
                 )
 
+    for worker in workers.values():
+        worker.close()
     raw_json = out_prefix.with_suffix(".raw.json")
     raw_csv = out_prefix.with_suffix(".raw.csv")
     summary_json = out_prefix.with_suffix(".summary.json")
