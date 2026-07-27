@@ -701,6 +701,17 @@ def main():
         parser.error("--id-decode-max-range-scans must be positive")
     if args.diagnostics_jsonl and "JOINS" in args.groups:
         parser.error("--diagnostics-jsonl supports TP queries only")
+    vortex_path = Path(args.vortex_path)
+    if any(engine.startswith("vortex") for engine in args.engines):
+        if not vortex_path.is_file():
+            parser.error(
+                "--vortex-path must identify the main .vortex artifact file, "
+                f"not its containing directory: {vortex_path}"
+            )
+        if vortex_path.suffix != ".vortex":
+            parser.error(
+                f"--vortex-path must end in .vortex: {vortex_path}"
+        )
 
     query_root = Path(args.query_root)
     out_prefix = Path(args.out_prefix)
