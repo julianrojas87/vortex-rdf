@@ -525,6 +525,8 @@ def main():
             "--id-decode-diagnostics-jsonl requires exactly --engines vortex")
     if args.id_decode_max_range_scans < 1:
         parser.error("--id-decode-max-range-scans must be positive")
+    if args.diagnostics_jsonl and "JOINS" in args.groups:
+        parser.error("--diagnostics-jsonl supports TP queries only")
 
     query_root = Path(args.query_root)
     out_prefix = Path(args.out_prefix)
