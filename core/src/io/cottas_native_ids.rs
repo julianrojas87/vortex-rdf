@@ -363,18 +363,42 @@ impl NativeArtifactManifest {
 }
 
 // VORTEX_RDF_NATIVE_ARTIFACT_MANIFEST_METADATA_IO_V1
-async fn read_native_artifact_manifest(
-    artifact_path: &Path,
-) -> Result<Option<NativeArtifactManifest>> {
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum NativeArtifactKind {
+    LegacyExternal,
+    ManifestExternal(NativeArtifactManifest),
+}
+
+impl NativeArtifactKind {
+    fn from_optional_manifest(manifest: Option<NativeArtifactManifest>) -> Self {
+        match manifest {
+            Some(manifest) => Self::ManifestExternal(manifest),
+            None => Self::LegacyExternal,
+        }
+    }
+
+    fn manifest(&self) -> Option<&NativeArtifactManifest> {
+        match self {
+            Self::LegacyExternal => None,
+            Self::ManifestExternal(manifest) => Some(manifest),
+        }
+    }
+}
+
+// VORTEX_RDF_NATIVE_ARTIFACT_INSPECTION_V1
+async fn inspect_native_artifact(artifact_path: &Path) -> Result<NativeArtifactKind> {
     let file = NATIVE_FILE_SESSION
         .open_options()
         .include_metadata()
         .open_path(artifact_path)
         .await
         .map_err(VortexRdfError::from)?;
-    file.metadata_segment(NATIVE_ARTIFACT_METADATA_KEY)
+
+    let manifest = file
+        .metadata_segment(NATIVE_ARTIFACT_METADATA_KEY)
         .map(|bytes| NativeArtifactManifest::from_metadata_bytes(bytes.as_slice()))
-        .transpose()
+        .transpose()?;
+    Ok(NativeArtifactKind::from_optional_manifest(manifest))
 }
 
 #[derive(Clone, Debug)]
@@ -986,15 +1010,14 @@ where
         .map_err(|error| VortexRdfError::Serialization(error.to_string()))?;
     drop(data_file);
 
-    let persisted_manifest = read_native_artifact_manifest(output_path)
-        .await?
-        .ok_or_else(|| {
-            VortexRdfError::Deserialization(format!(
-                "new native artifact {:?} is missing required metadata segment {:?}",
-                output_path, NATIVE_ARTIFACT_METADATA_KEY
-            ))
-        })?;
-    if persisted_manifest != manifest {
+    let persisted_kind = inspect_native_artifact(output_path).await?;
+    let persisted_manifest = persisted_kind.manifest().ok_or_else(|| {
+        VortexRdfError::Deserialization(format!(
+            "new native artifact {:?} is missing required metadata segment {:?}",
+            output_path, NATIVE_ARTIFACT_METADATA_KEY
+        ))
+    })?;
+    if persisted_manifest != &manifest {
         return Err(VortexRdfError::Deserialization(format!(
             "native artifact manifest metadata round-trip mismatch for {:?}",
             output_path
@@ -7214,6 +7237,21 @@ mod native_artifact_manifest_tests {
             NATIVE_ARTIFACT_METADATA_KEY,
             "vortex.rdf.native-ids.manifest"
         );
+    }
+
+    #[test]
+    fn artifact_kind_classifies_missing_manifest_as_legacy_external() {
+        let kind = NativeArtifactKind::from_optional_manifest(None);
+        assert_eq!(kind, NativeArtifactKind::LegacyExternal);
+        assert!(kind.manifest().is_none());
+    }
+
+    #[test]
+    fn artifact_kind_classifies_valid_manifest_as_manifest_external() {
+        let manifest = NativeArtifactManifest::production_defaults();
+        let kind = NativeArtifactKind::from_optional_manifest(Some(manifest.clone()));
+        assert_eq!(kind, NativeArtifactKind::ManifestExternal(manifest.clone()));
+        assert_eq!(kind.manifest(), Some(&manifest));
     }
 
     #[test]
