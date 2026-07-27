@@ -414,19 +414,37 @@ enum ComponentLocation {
 #[derive(Clone, Debug)]
 struct NativeComponentResolver {
     artifact_path: PathBuf,
+    artifact_kind: NativeArtifactKind,
 }
 
 impl NativeComponentResolver {
-    fn new(artifact_path: &Path) -> Self {
+    fn legacy_external(artifact_path: &Path) -> Self {
         Self {
             artifact_path: artifact_path.to_path_buf(),
+            artifact_kind: NativeArtifactKind::LegacyExternal,
         }
     }
 
+    async fn inspect(artifact_path: &Path) -> Result<Self> {
+        Ok(Self {
+            artifact_path: artifact_path.to_path_buf(),
+            artifact_kind: inspect_native_artifact(artifact_path).await?,
+        })
+    }
+
+    fn artifact_kind(&self) -> &NativeArtifactKind {
+        &self.artifact_kind
+    }
+
     fn location(&self, component: NativeComponent) -> ComponentLocation {
-        // Phase B keeps the proven external Vortex components. Phase C changes
-        // this single decision to Embedded using the artifact manifest.
-        ComponentLocation::External(component.external_path(&self.artifact_path))
+        // VORTEX_RDF_MANIFEST_AWARE_RESOLVER_V1
+        // Both legacy and manifest-bearing Phase-B artifacts still use the
+        // proven external components. Phase C changes only this decision.
+        match self.artifact_kind() {
+            NativeArtifactKind::LegacyExternal | NativeArtifactKind::ManifestExternal(_) => {
+                ComponentLocation::External(component.external_path(&self.artifact_path))
+            }
+        }
     }
 
     fn external_path(&self, component: NativeComponent) -> Result<PathBuf> {
@@ -445,7 +463,7 @@ impl NativeComponentResolver {
 }
 
 fn native_component_path(data_path: &Path, component: NativeComponent) -> PathBuf {
-    NativeComponentResolver::new(data_path)
+    NativeComponentResolver::legacy_external(data_path)
         .external_path(component)
         .expect("external component resolution is infallible before Phase C")
 }
@@ -1792,13 +1810,26 @@ pub type NativeObjectAccess = NativePredicateAccess;
 #[derive(Clone, Debug)]
 pub struct NativeRdfProviders {
     data_path: PathBuf,
+    resolver: NativeComponentResolver,
 }
 
 impl NativeRdfProviders {
-    pub fn new(data_path: &Path) -> Self {
+    fn external_only(data_path: &Path) -> Self {
         Self {
             data_path: data_path.to_path_buf(),
+            resolver: NativeComponentResolver::legacy_external(data_path),
         }
+    }
+
+    async fn inspect(data_path: &Path) -> Result<Self> {
+        Ok(Self {
+            data_path: data_path.to_path_buf(),
+            resolver: NativeComponentResolver::inspect(data_path).await?,
+        })
+    }
+
+    fn resolver(&self) -> &NativeComponentResolver {
+        &self.resolver
     }
 }
 
@@ -2724,7 +2755,7 @@ async fn lookup_terms_by_ids_from_sidecar(
     data_path: &Path,
     ids: &[u32],
 ) -> Result<HashMap<u32, String>> {
-    let provider = NativeRdfProviders::new(data_path);
+    let provider = NativeRdfProviders::external_only(data_path);
     let (terms, _stats) = provider.lookup_terms_by_ids(ids).await?;
     Ok(terms)
 }
@@ -2828,7 +2859,8 @@ async fn execute_cottas_native_match(
     let total_start = Instant::now();
     let mut diagnostics = CottasNativeIdsDiagnostics::default();
     let bound_terms = BoundNativeRdfTerms::from_pattern(subject, predicate, object, graph);
-    let providers = NativeRdfProviders::new(input_path);
+    let providers = NativeRdfProviders::inspect(input_path).await?;
+    let _artifact_kind = providers.resolver().artifact_kind();
     let (resolved, term_lookup_ms, term_to_id_stats) =
         resolve_native_pattern(&providers, subject, predicate, object, graph).await?;
     diagnostics.term_lookup_ms = term_lookup_ms;
@@ -7276,6 +7308,27 @@ mod native_artifact_manifest_tests {
             NATIVE_ARTIFACT_METADATA_KEY,
             "vortex.rdf.native-ids.manifest"
         );
+    }
+
+    #[test]
+    fn resolver_preserves_external_locations_for_both_artifact_kinds() {
+        let artifact = Path::new("fixture.vortex");
+        let manifest = NativeArtifactManifest::production_defaults();
+        for artifact_kind in [
+            NativeArtifactKind::LegacyExternal,
+            NativeArtifactKind::ManifestExternal(manifest),
+        ] {
+            let resolver = NativeComponentResolver {
+                artifact_path: artifact.to_path_buf(),
+                artifact_kind,
+            };
+            for component in NativeComponent::ALL {
+                assert_eq!(
+                    resolver.external_path(component).unwrap(),
+                    component.external_path(artifact)
+                );
+            }
+        }
     }
 
     #[test]
