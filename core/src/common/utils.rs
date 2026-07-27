@@ -5,7 +5,7 @@ use oxrdfio::{RdfFormat, RdfParser};
 use vortex::VortexSessionDefault;
 use vortex::session::VortexSession;
 use vortex_array::arrays::VarBinViewArray;
-use vortex_array::arrays::listview::{ListViewArray, ListViewArrayExt};
+use vortex_array::arrays::listview::{ListViewArray, ListViewArraySlotsExt};
 use vortex_array::arrays::primitive::PrimitiveArray;
 use vortex_array::arrays::struct_::{StructArray, StructArrayExt};
 use vortex_array::{ArrayRef, VortexSessionExecute, legacy_session};

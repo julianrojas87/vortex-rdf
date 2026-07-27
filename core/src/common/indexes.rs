@@ -3,7 +3,7 @@ use clap::ValueEnum;
 use vortex::VortexSessionDefault;
 use vortex::session::VortexSession;
 use vortex_array::arrays::dict::DictArraySlotsExt;
-use vortex_array::arrays::listview::ListViewArrayExt;
+use vortex_array::arrays::listview::{ListViewArraySlotsExt};
 use vortex_array::arrays::struct_::StructArrayExt;
 use vortex_array::arrays::{
     ChunkedArray, DictArray, ListArray, ListViewArray, PrimitiveArray, StructArray,
