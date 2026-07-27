@@ -10,7 +10,7 @@
 //! [`LayoutStrategy::Dictionary`]: super::LayoutStrategy::Dictionary
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use web_time::Instant;
 
@@ -119,16 +119,40 @@ enum TermStore {
 /// term→ID is a host-side binary search; ID→term reads the term at a position.
 /// Both go through [`reader`](Self::reader), whose cost depends on the encoding
 /// the terms are held in.
-#[derive(Clone)]
 pub(crate) struct TermDictionary {
     terms: TermStore,
+    /// Memo for [`get_id`](Self::get_id); see [`ProbeCache`].
+    probes: ProbeCache,
+}
+
+/// Cloning shares nothing: the memo starts empty rather than being copied.
+///
+/// The entries would still be *valid* — they describe the terms, which are
+/// cloned with them — but a dictionary is normally shared through an `Arc`, so
+/// an actual clone is rare enough that carrying the memo across is not worth
+/// the copy.
+impl Clone for TermDictionary {
+    fn clone(&self) -> Self {
+        Self {
+            terms: self.terms.clone(),
+            probes: ProbeCache::new(),
+        }
+    }
 }
 
 impl TermDictionary {
-    pub(crate) fn empty() -> Self {
+    /// Wrap the held terms, with an empty lookup memo.
+    fn new(terms: TermStore) -> Self {
         Self {
-            terms: TermStore::Canonical(VarBinViewArray::from_iter_str(std::iter::empty::<&str>())),
+            terms,
+            probes: ProbeCache::new(),
         }
+    }
+
+    pub(crate) fn empty() -> Self {
+        Self::new(TermStore::Canonical(VarBinViewArray::from_iter_str(
+            std::iter::empty::<&str>(),
+        )))
     }
 
     /// Build from already-sorted unique term strings.
@@ -166,25 +190,19 @@ impl TermDictionary {
     fn from_terms_array(elements: ArrayRef, ctx: &mut vortex_array::ExecutionCtx) -> Result<Self> {
         let elements = match elements.try_downcast::<FSST>() {
             Ok(fsst) => {
-                return Ok(Self {
-                    terms: TermStore::Fsst(FsstTerms::new(fsst)?),
-                });
+                return Ok(Self::new(TermStore::Fsst(FsstTerms::new(fsst)?)));
             }
             Err(other) => other,
         };
         let plain = elements
             .execute::<VarBinViewArray>(ctx)
             .map_err(VortexRdfError::Vortex)?;
-        Ok(Self {
-            terms: TermStore::Canonical(plain),
-        })
+        Ok(Self::new(TermStore::Canonical(plain)))
     }
 
     fn compress(plain: VarBinViewArray) -> Result<Self> {
         if plain.is_empty() {
-            return Ok(Self {
-                terms: TermStore::Canonical(plain),
-            });
+            return Ok(Self::new(TermStore::Canonical(plain)));
         }
         let start = Instant::now();
         let array = plain.into_array();
@@ -197,9 +215,7 @@ impl TermDictionary {
             terms.len(),
             start.elapsed()
         );
-        Ok(Self {
-            terms: TermStore::Fsst(terms),
-        })
+        Ok(Self::new(TermStore::Fsst(terms)))
     }
 
     /// The dataset's unique terms, sorted — the raw material of both
@@ -351,10 +367,26 @@ impl TermDictionary {
         map
     }
 
-    /// Look up a term's ID: its position in the sorted dictionary.
-    /// Uses Vortex's SearchSorted compute kernel via ArrayRef for optimized sorted search.
-    /// Falls back to manual binary search only if the kernel fails.
+    /// Look up a term's ID: its position in the sorted dictionary, or `None`
+    /// when the dictionary does not hold it.
+    ///
+    /// Memoized. [`PatternCodes`] already collapses the repeats *within* one
+    /// match; this catches the repeats *across* matches, which is the shape
+    /// real query workloads have — the same predicate walked over many
+    /// patterns, the same subject chained through several matches.
+    ///
+    /// [`PatternCodes`]: super::PatternCodes
     pub(crate) fn get_id(&self, term: &str) -> Option<u32> {
+        if let Some(memoized) = self.probes.get(term) {
+            return memoized;
+        }
+        let found = self.search(term);
+        self.probes.put(term, found);
+        found
+    }
+
+    /// The uncached binary search behind [`get_id`](Self::get_id).
+    fn search(&self, term: &str) -> Option<u32> {
         // Direct byte-compare binary search over the sorted terms. The generic
         // `search_sorted` kernel would instead build a fresh `ExecutionCtx` and
         // a `Scalar` per probe, which profiling showed dominating
@@ -375,6 +407,98 @@ impl TermDictionary {
             }
         }
         None
+    }
+}
+
+/// Slots in a dictionary's [`ProbeCache`]. A power of two, so the slot index is
+/// a mask rather than a modulo.
+///
+/// Sized for the working set of a query workload — the bound terms of the
+/// patterns currently being asked — not for the dictionary, which is orders of
+/// magnitude larger and would defeat the point of bounding this at all.
+const PROBE_CACHE_SLOTS: usize = 256;
+
+/// A memo of term → code lookups, fixed in size and direct-mapped: one slot per
+/// hash bucket, overwritten on collision.
+///
+/// A miss costs a binary search over the sorted terms, decoding a term at every
+/// probe under FSST — ~1.6 µs at 3M terms, which is a third of a fully-bound
+/// match. Repeats are common enough across matches to be worth catching.
+///
+/// Direct-mapped rather than an LRU because the memory matters more than the
+/// hit rate here: a few KB per dictionary that never grows, against a structure
+/// that would accumulate every term ever queried. Wasm linear memory is never
+/// returned to the engine, so an unbounded cache is a leak by another name.
+///
+/// Entries cannot go stale. A dictionary's terms are immutable, so a term's
+/// code — or its absence, which is memoized too — is a property of the
+/// dictionary itself, not of when it was asked. Mutating a store builds a
+/// *new* dictionary, and with it a new cache.
+struct ProbeCache {
+    slots: RwLock<Box<[Option<ProbeEntry>]>>,
+}
+
+struct ProbeEntry {
+    /// A `String` rather than a `Box<str>` so an overwrite can reuse the
+    /// allocation: terms in a dataset are of similar length, so the replacing
+    /// term usually fits the capacity the evicted one left behind. A miss is
+    /// then a hash and a copy, with no allocator traffic.
+    term: String,
+    code: Option<u32>,
+}
+
+impl ProbeCache {
+    fn new() -> Self {
+        Self {
+            slots: RwLock::new(
+                std::iter::repeat_with(|| None)
+                    .take(PROBE_CACHE_SLOTS)
+                    .collect(),
+            ),
+        }
+    }
+
+    /// FNV-1a over the whole term. Hashing a prefix would be cheaper but
+    /// collides catastrophically on RDF data, where terms in a dataset share
+    /// long IRI prefixes and differ only near the end.
+    fn slot(term: &str) -> usize {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for &b in term.as_bytes() {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        (h as usize) & (PROBE_CACHE_SLOTS - 1)
+    }
+
+    /// `Some(code_or_absent)` on a hit, `None` when this term is not memoized.
+    ///
+    /// A poisoned lock degrades to a miss rather than propagating: the memo is
+    /// an optimization, and losing it must not fail a query.
+    fn get(&self, term: &str) -> Option<Option<u32>> {
+        let slots = self.slots.read().ok()?;
+        match &slots[Self::slot(term)] {
+            Some(entry) if entry.term == term => Some(entry.code),
+            _ => None,
+        }
+    }
+
+    fn put(&self, term: &str, code: Option<u32>) {
+        if let Ok(mut slots) = self.slots.write() {
+            let slot = Self::slot(term);
+            match &mut slots[slot] {
+                Some(entry) => {
+                    entry.term.clear();
+                    entry.term.push_str(term);
+                    entry.code = code;
+                }
+                empty => {
+                    *empty = Some(ProbeEntry {
+                        term: term.to_owned(),
+                        code,
+                    })
+                }
+            }
+        }
     }
 }
 
@@ -636,4 +760,71 @@ pub(crate) async fn dict_from_file(file: &VortexFile) -> Result<TermDictionary> 
         .map_err(VortexRdfError::Vortex)?
         .clone();
     dict_from_list_column(&col)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dict(terms: &[&str]) -> TermDictionary {
+        let mut sorted = terms.to_vec();
+        sorted.sort_unstable();
+        TermDictionary::from_sorted(sorted.into_iter()).unwrap()
+    }
+
+    /// The memo must be invisible: every lookup agrees with the uncached search,
+    /// on repeats and on absent terms alike.
+    #[test]
+    fn memoized_lookup_matches_the_search() {
+        let terms: Vec<String> = (0..500)
+            .map(|i| format!("<http://example.org/resource/{i:04}>"))
+            .collect();
+        let d = dict(&terms.iter().map(String::as_str).collect::<Vec<_>>());
+
+        for probe in terms
+            .iter()
+            .map(String::as_str)
+            .chain(["<http://absent>", ""])
+        {
+            let expected = d.search(probe);
+            // Twice: the first call fills the slot, the second reads it back.
+            assert_eq!(d.get_id(probe), expected, "cold lookup of {probe}");
+            assert_eq!(d.get_id(probe), expected, "memoized lookup of {probe}");
+        }
+    }
+
+    /// Two terms sharing a slot must not read each other's code. With one slot
+    /// per bucket the second simply evicts the first, and both stay correct.
+    #[test]
+    fn colliding_terms_do_not_alias() {
+        let terms: Vec<String> = (0..2_000)
+            .map(|i| format!("<http://example.org/collide/{i:05}>"))
+            .collect();
+        let refs: Vec<&str> = terms.iter().map(String::as_str).collect();
+        let d = dict(&refs);
+
+        // Far more distinct terms than slots, so collisions are certain.
+        assert!(terms.len() > PROBE_CACHE_SLOTS);
+        let a = &refs[7];
+        let b = refs
+            .iter()
+            .find(|t| ProbeCache::slot(t) == ProbeCache::slot(a) && *t != a)
+            .expect("2000 terms over 256 slots must collide");
+
+        assert_eq!(d.get_id(a), d.search(a));
+        assert_eq!(d.get_id(b), d.search(b));
+        // `b` evicted `a`; asking again must re-search, not return `b`'s code.
+        assert_eq!(d.get_id(a), d.search(a));
+        assert_ne!(d.get_id(a), d.get_id(b));
+    }
+
+    /// A cloned dictionary answers the same, starting from an empty memo.
+    #[test]
+    fn clone_keeps_lookups_correct() {
+        let d = dict(&["<http://a>", "<http://b>", "<http://c>"]);
+        assert_eq!(d.get_id("<http://b>"), Some(1));
+        let copy = d.clone();
+        assert_eq!(copy.get_id("<http://b>"), Some(1));
+        assert_eq!(copy.get_id("<http://zz>"), None);
+    }
 }
