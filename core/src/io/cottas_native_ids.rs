@@ -16,7 +16,7 @@ use std::time::Instant;
 use vortex::VortexSessionDefault;
 use vortex_error::{VortexError, VortexResult};
 
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::{BTreeSet, BinaryHeap, HashMap, HashSet};
 use vortex_array::VortexSessionExecute;
 use vortex_array::arrays::chunked::ChunkedArrayExt;
 use vortex_array::arrays::struct_::StructArrayExt;
@@ -208,6 +208,173 @@ impl NativeComponent {
             .unwrap_or("data.vortex");
         data_path.with_file_name(format!("{name}.{}", self.external_suffix()))
     }
+}
+
+const NATIVE_ARTIFACT_FORMAT: &str = "vortex-rdf-native-ids";
+const NATIVE_ARTIFACT_FORMAT_VERSION: u32 = 1;
+const NATIVE_ARTIFACT_METADATA_KEY: &str = "vortex.rdf.native-ids.manifest";
+const NATIVE_TRIPLES_LOGICAL_NAME: &str = "rdf.triples.native-ids.v1";
+
+impl NativeComponent {
+    const ALL: [Self; 11] = [
+        Self::DictionaryVortex,
+        Self::DictionaryTermToIdVortex,
+        Self::DictionaryTermDirectoryVortex,
+        Self::SubjectRangesVortex,
+        Self::PredicateDirectoryVortexV2,
+        Self::PredicateRangesVortexV2,
+        Self::PredicateObjectPartitionsVortexV2,
+        Self::PredicateObjectDirectoryVortexV2,
+        Self::PredicateObjectRangesVortexV2,
+        Self::ObjectDirectoryVortexV2,
+        Self::ObjectRangesVortexV2,
+    ];
+
+    fn default_implementation(self) -> &'static str {
+        match self {
+            Self::DictionaryVortex => "id-row-v1-balanced-fsst",
+            Self::DictionaryTermToIdVortex => "lexical-sorted-v1-compact",
+            Self::DictionaryTermDirectoryVortex => "sparse-fence-v1",
+            Self::SubjectRangesVortex => "subject-ranges-v1",
+            Self::PredicateDirectoryVortexV2 => "predicate-directory-v2",
+            Self::PredicateRangesVortexV2 => "predicate-ranges-v2",
+            Self::PredicateObjectPartitionsVortexV2 => "po-predicate-partitions-v2",
+            Self::PredicateObjectDirectoryVortexV2 => "po-directory-v2",
+            Self::PredicateObjectRangesVortexV2 => "po-ranges-v2",
+            Self::ObjectDirectoryVortexV2 => "object-directory-v2",
+            Self::ObjectRangesVortexV2 => "object-ranges-v2",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct NativeArtifactComponentManifest {
+    logical_name: String,
+    implementation: String,
+    required: bool,
+    row_count: Option<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct NativeArtifactManifest {
+    format: String,
+    version: u32,
+    components: Vec<NativeArtifactComponentManifest>,
+}
+
+impl NativeArtifactManifest {
+    fn production_defaults() -> Self {
+        let mut components = Vec::with_capacity(NativeComponent::ALL.len() + 1);
+        components.push(NativeArtifactComponentManifest {
+            logical_name: NATIVE_TRIPLES_LOGICAL_NAME.to_string(),
+            implementation: "spog-u32-v1".to_string(),
+            required: true,
+            row_count: None,
+        });
+        components.extend(NativeComponent::ALL.into_iter().map(|component| {
+            NativeArtifactComponentManifest {
+                logical_name: component.logical_name().to_string(),
+                implementation: component.default_implementation().to_string(),
+                required: true,
+                row_count: None,
+            }
+        }));
+        Self {
+            format: NATIVE_ARTIFACT_FORMAT.to_string(),
+            version: NATIVE_ARTIFACT_FORMAT_VERSION,
+            components,
+        }
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.format != NATIVE_ARTIFACT_FORMAT {
+            return Err(VortexRdfError::Deserialization(format!(
+                "unsupported native artifact format {:?}; expected {:?}",
+                self.format, NATIVE_ARTIFACT_FORMAT
+            )));
+        }
+        if self.version != NATIVE_ARTIFACT_FORMAT_VERSION {
+            return Err(VortexRdfError::Deserialization(format!(
+                "unsupported native artifact version {}; expected {}",
+                self.version, NATIVE_ARTIFACT_FORMAT_VERSION
+            )));
+        }
+        let expected: BTreeSet<&str> = std::iter::once(NATIVE_TRIPLES_LOGICAL_NAME)
+            .chain(
+                NativeComponent::ALL
+                    .into_iter()
+                    .map(NativeComponent::logical_name),
+            )
+            .collect();
+        let mut actual = BTreeSet::new();
+        for component in &self.components {
+            if component.logical_name.is_empty() {
+                return Err(VortexRdfError::Deserialization(
+                    "native artifact manifest contains an empty logical component name".into(),
+                ));
+            }
+            if component.implementation.is_empty() {
+                return Err(VortexRdfError::Deserialization(format!(
+                    "native artifact component {:?} has no implementation identifier",
+                    component.logical_name
+                )));
+            }
+            if !component.required {
+                return Err(VortexRdfError::Deserialization(format!(
+                    "production native artifact component {:?} must be required",
+                    component.logical_name
+                )));
+            }
+            if !actual.insert(component.logical_name.as_str()) {
+                return Err(VortexRdfError::Deserialization(format!(
+                    "native artifact manifest contains duplicate component {:?}",
+                    component.logical_name
+                )));
+            }
+        }
+        let missing: Vec<_> = expected.difference(&actual).copied().collect();
+        let unexpected: Vec<_> = actual.difference(&expected).copied().collect();
+        if !missing.is_empty() || !unexpected.is_empty() {
+            return Err(VortexRdfError::Deserialization(format!(
+                "native artifact component inventory mismatch: missing={missing:?}, unexpected={unexpected:?}"
+            )));
+        }
+        Ok(())
+    }
+
+    fn to_metadata_bytes(&self) -> Result<Vec<u8>> {
+        self.validate()?;
+        serde_json::to_vec(self).map_err(|error| {
+            VortexRdfError::Serialization(format!(
+                "failed to serialize native artifact manifest as JSON: {error}"
+            ))
+        })
+    }
+
+    fn from_metadata_bytes(bytes: &[u8]) -> Result<Self> {
+        let manifest: Self = serde_json::from_slice(bytes).map_err(|error| {
+            VortexRdfError::Deserialization(format!(
+                "failed to deserialize native artifact manifest metadata as JSON: {error}"
+            ))
+        })?;
+        manifest.validate()?;
+        Ok(manifest)
+    }
+}
+
+// VORTEX_RDF_NATIVE_ARTIFACT_MANIFEST_METADATA_IO_V1
+async fn read_native_artifact_manifest(
+    artifact_path: &Path,
+) -> Result<Option<NativeArtifactManifest>> {
+    let file = NATIVE_FILE_SESSION
+        .open_options()
+        .include_metadata()
+        .open_path(artifact_path)
+        .await
+        .map_err(VortexRdfError::from)?;
+    file.metadata_segment(NATIVE_ARTIFACT_METADATA_KEY)
+        .map(|bytes| NativeArtifactManifest::from_metadata_bytes(bytes.as_slice()))
+        .transpose()
 }
 
 #[derive(Clone, Debug)]
@@ -804,13 +971,35 @@ where
         .await
         .map_err(|e| VortexRdfError::Serialization(e.to_string()))?;
 
+    let manifest = NativeArtifactManifest::production_defaults();
     write_array_stream_to_vortex_file_streaming(
         &mut data_file,
         Box::pin(array_stream),
         row_group_size,
         config.compression_profile,
+        &manifest,
     )
     .await?;
+    data_file
+        .sync_all()
+        .await
+        .map_err(|error| VortexRdfError::Serialization(error.to_string()))?;
+    drop(data_file);
+
+    let persisted_manifest = read_native_artifact_manifest(output_path)
+        .await?
+        .ok_or_else(|| {
+            VortexRdfError::Deserialization(format!(
+                "new native artifact {:?} is missing required metadata segment {:?}",
+                output_path, NATIVE_ARTIFACT_METADATA_KEY
+            ))
+        })?;
+    if persisted_manifest != manifest {
+        return Err(VortexRdfError::Deserialization(format!(
+            "native artifact manifest metadata round-trip mismatch for {:?}",
+            output_path
+        )));
+    }
 
     write_dictionary_lookup_sidecars_from_pair_runs(
         &pair_run_paths,
@@ -1453,6 +1642,7 @@ async fn write_array_stream_to_vortex_file_streaming<W>(
     arrays: Pin<Box<dyn Stream<Item = VortexResult<ArrayRef>> + Send>>,
     row_group_size: usize,
     compression_profile: CottasVortexCompressionProfile,
+    manifest: &NativeArtifactManifest,
 ) -> Result<()>
 where
     W: VortexWrite + Unpin + Send,
@@ -1467,10 +1657,12 @@ where
             .with_btrblocks_builder(BtrBlocksCompressorBuilder::default().with_compact()),
     };
 
+    let manifest_bytes = manifest.to_metadata_bytes()?;
     let start = Instant::now();
     NATIVE_FILE_SESSION
         .write_options()
         .with_strategy(strategy_builder.build())
+        .with_metadata_segment(NATIVE_ARTIFACT_METADATA_KEY, manifest_bytes)
         .write(writer, stream)
         .await
         .map_err(VortexRdfError::from)?;
@@ -7003,4 +7195,107 @@ async fn lookup_term_id_from_sidecar_with_stats(
     stats.found_id = id;
     stats.total_ms = elapsed_ms(lookup_start);
     Ok((id, stats))
+}
+
+#[cfg(test)]
+mod native_artifact_manifest_tests {
+    use super::*;
+
+    #[test]
+    fn production_manifest_is_complete_and_valid() {
+        let manifest = NativeArtifactManifest::production_defaults();
+        manifest.validate().unwrap();
+        assert_eq!(manifest.components.len(), NativeComponent::ALL.len() + 1);
+        assert_eq!(
+            manifest.components[0].logical_name,
+            NATIVE_TRIPLES_LOGICAL_NAME
+        );
+        assert_eq!(
+            NATIVE_ARTIFACT_METADATA_KEY,
+            "vortex.rdf.native-ids.manifest"
+        );
+    }
+
+    #[test]
+    fn manifest_json_bytes_are_deterministic_and_validated() {
+        let manifest = NativeArtifactManifest::production_defaults();
+        let first = manifest.to_metadata_bytes().unwrap();
+        let second = manifest.to_metadata_bytes().unwrap();
+        assert_eq!(first, second);
+        assert_eq!(
+            NativeArtifactManifest::from_metadata_bytes(&first).unwrap(),
+            manifest
+        );
+    }
+
+    #[test]
+    fn manifest_metadata_rejects_invalid_json() {
+        let error = NativeArtifactManifest::from_metadata_bytes(b"not-json").unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("deserialize native artifact manifest")
+        );
+    }
+
+    #[test]
+    fn manifest_metadata_rejects_semantically_invalid_manifest() {
+        let mut manifest = NativeArtifactManifest::production_defaults();
+        manifest.version += 1;
+        let bytes = serde_json::to_vec(&manifest).unwrap();
+        assert!(
+            NativeArtifactManifest::from_metadata_bytes(&bytes)
+                .unwrap_err()
+                .to_string()
+                .contains("unsupported native artifact version")
+        );
+    }
+
+    #[test]
+    fn production_component_logical_names_are_unique() {
+        let names: BTreeSet<_> = NativeComponent::ALL
+            .into_iter()
+            .map(NativeComponent::logical_name)
+            .collect();
+        assert_eq!(names.len(), NativeComponent::ALL.len());
+    }
+
+    #[test]
+    fn manifest_rejects_duplicate_component() {
+        let mut manifest = NativeArtifactManifest::production_defaults();
+        manifest.components.push(manifest.components[0].clone());
+        assert!(
+            manifest
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("duplicate")
+        );
+    }
+
+    #[test]
+    fn manifest_rejects_missing_component() {
+        let mut manifest = NativeArtifactManifest::production_defaults();
+        manifest.components.pop();
+        assert!(
+            manifest
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("inventory mismatch")
+        );
+    }
+
+    #[test]
+    fn manifest_rejects_unsupported_version() {
+        let mut manifest = NativeArtifactManifest::production_defaults();
+        manifest.version += 1;
+        assert!(
+            manifest
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("unsupported native artifact version")
+        );
+    }
 }
