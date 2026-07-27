@@ -41,11 +41,12 @@ use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
 use futures::{StreamExt, TryStreamExt, stream};
-use oxrdf::{GraphName, NamedNode, NamedOrBlankNode, Quad, Term};
+use oxrdf::{GraphName, NamedNode, NamedOrBlankNode, Term};
 use tokio::runtime::Runtime;
 use vortex_array::ArrayRef;
 
 use vortex_rdf_core::common::utils::generate_rdf_data_stream;
+use vortex_rdf_core::store::RawQuad;
 use vortex_rdf_core::{
     IndexType, LayoutStrategy, SortedInMemoryBuilder, SortedStreamBuilder, UnsortedStreamBuilder,
     VortexRdfError, VortexRdfStore, io,
@@ -180,7 +181,7 @@ impl fmt::Debug for Source {
 /// is a *lazy* stream whose per-quad `format!` allocations would otherwise be
 /// polled — and charged — inside the timed serialization region; draining it
 /// here keeps those allocations out of the measurement.
-fn materialize_quads(size: usize) -> Vec<Quad> {
+fn materialize_quads(size: usize) -> Vec<RawQuad> {
     rt().block_on(async move {
         generate_rdf_data_stream(size)
             .map(|q| q.expect("quad generation is infallible"))

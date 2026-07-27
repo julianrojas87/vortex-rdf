@@ -17,7 +17,6 @@ use crate::store::layouts::term_dictionary::{TermDictionary, TermDictionaryBuild
 use crate::store::layouts::{LayoutStrategy, dictionary};
 
 use futures::{Stream, StreamExt, TryStreamExt, stream};
-use oxrdf::Quad;
 use rkyv::api::high::{HighDeserializer, HighSerializer};
 use rkyv::rancor::Error as RkyvError;
 use rkyv::ser::allocator::ArenaHandle;
@@ -71,7 +70,7 @@ impl PartialOrd for HeapItem {
 
 impl VortexArrayBuilder for SortedStreamBuilder {
     async fn build_vortex_array(
-        quad_stream: Box<dyn Stream<Item = Result<Quad>> + Unpin + Send + 'static>,
+        quad_stream: Box<dyn Stream<Item = Result<RawQuad>> + Unpin + Send + 'static>,
         layout: LayoutStrategy,
         indexes: Indexes,
     ) -> Result<ArrayRef> {
@@ -81,7 +80,7 @@ impl VortexArrayBuilder for SortedStreamBuilder {
     /// True streaming implementation: after the (inherently blocking) run-sort
     /// phase, merged chunks are built on demand as the file writer polls.
     async fn build_vortex_stream(
-        quad_stream: Box<dyn Stream<Item = Result<Quad>> + Unpin + Send + 'static>,
+        quad_stream: Box<dyn Stream<Item = Result<RawQuad>> + Unpin + Send + 'static>,
         layout: LayoutStrategy,
         indexes: Indexes,
     ) -> Result<(DType, ChunkStream)> {
@@ -96,7 +95,7 @@ impl VortexArrayBuilder for SortedStreamBuilder {
 /// array, but assembling chunks loses the per-chunk stats that `match_pattern`
 /// gates its binary searches on.
 pub(crate) async fn build_sorted_stream_array(
-    quad_stream: Box<dyn Stream<Item = Result<Quad>> + Unpin + Send + 'static>,
+    quad_stream: Box<dyn Stream<Item = Result<RawQuad>> + Unpin + Send + 'static>,
     layout: LayoutStrategy,
     indexes: Indexes,
     chunk_size: usize,
@@ -126,7 +125,7 @@ pub(crate) async fn build_sorted_stream_array(
 /// only chunk emission stays lazy. Temp run files are removed when the stream
 /// is dropped.
 pub(crate) async fn build_sorted_stream_chunk_stream(
-    mut quads_in: Box<dyn Stream<Item = Result<Quad>> + Unpin + Send + 'static>,
+    mut quads_in: Box<dyn Stream<Item = Result<RawQuad>> + Unpin + Send + 'static>,
     layout: LayoutStrategy,
     indexes: Indexes,
     chunk_size: usize,
@@ -148,7 +147,7 @@ pub(crate) async fn build_sorted_stream_chunk_stream(
     let mut total_ingested = 0usize;
 
     while let Some(res) = quads_in.next().await {
-        let raw = RawQuad::from_quad(&res?);
+        let raw = res?;
         if let Some(b) = dict_builder.as_mut() {
             b.insert_quad(&raw);
         }

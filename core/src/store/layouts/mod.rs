@@ -140,6 +140,47 @@ pub(crate) enum ResolvedLayout {
     Dictionary(Arc<TermDictionary>),
 }
 
+/// One of the four term positions of a quad pattern.
+#[derive(Clone, Copy)]
+pub(crate) enum Role {
+    S,
+    P,
+    O,
+    G,
+}
+
+/// Memoizes a pattern's term → dictionary-code resolution across the stages of
+/// one match.
+///
+/// `match_base` derives the same mapping three times from the same terms — the
+/// unmatchable-pattern gate, the sorted-subject probe, and the residual
+/// constraints after the fast paths have cleared whatever they resolved — so a
+/// fully-bound pattern performed 8 dictionary binary searches (9 with
+/// `SecondaryByCopy`) to resolve 4 terms, each preceded by its own `to_string`.
+/// Caching per role makes that one search and one `to_string` per bound term.
+///
+/// Scoped to a single `match_base`: the tail is matched under a *different*
+/// layout (it stores terms as strings precisely so a term the base's dictionary
+/// has never seen can still match), so a code cached here would be meaningless
+/// there — and the tail layout resolves no codes at all.
+#[derive(Default)]
+pub(crate) struct PatternCodes {
+    /// Per role: `None` = not resolved yet, `Some(None)` = resolved and absent
+    /// from the dictionary (so the pattern cannot match).
+    roles: [Option<Option<u32>>; 4],
+}
+
+impl PatternCodes {
+    /// The code for `role`, resolving it through `f` the first time only.
+    pub(crate) fn resolve(&mut self, role: Role, f: impl FnOnce() -> Option<u32>) -> Option<u32> {
+        let slot = &mut self.roles[role as usize];
+        match slot {
+            Some(cached) => *cached,
+            None => *slot.insert(f()),
+        }
+    }
+}
+
 /// Column equality constraints a quad pattern compiles to under a given
 /// layout: the single source of truth consumed by both the in-memory mask
 /// scan and the pushed-down file filter in `match_pattern`.
@@ -235,6 +276,25 @@ impl ResolvedLayout {
         }
     }
 
+    /// [`probe_scalar`](Self::probe_scalar) for one of the pattern's four
+    /// roles, reusing anything [`PatternCodes`] already resolved for it.
+    ///
+    /// `term_str` is a closure so that a cache hit skips the caller's
+    /// `to_string` as well as the dictionary search.
+    pub(crate) fn probe_scalar_cached(
+        &self,
+        role: Role,
+        term_str: impl FnOnce() -> String,
+        cache: &mut PatternCodes,
+    ) -> Option<Scalar> {
+        match self {
+            ResolvedLayout::Dictionary(dict) => cache
+                .resolve(role, || dict.get_id(&term_str()))
+                .map(Scalar::from),
+            _ => Some(Scalar::from(term_str().as_str())),
+        }
+    }
+
     /// Decode an array of this layout's rows back into [`RawQuad`]s — each
     /// term in its N-Triples string form, without an oxrdf parse round-trip.
     ///
@@ -298,12 +358,36 @@ impl ResolvedLayout {
 
     /// Compile a quad pattern into per-column equality constraints: the
     /// layout-specific term → (column, scalar) mapping.
+    ///
+    /// Prefer [`constraints_cached`](Self::constraints_cached) inside a single
+    /// match: the stages of `match_base` each derive this from the same terms,
+    /// and under the Dictionary layout deriving it costs a binary search per
+    /// bound term.
     pub(crate) fn constraints(
         &self,
         subject: Option<&NamedOrBlankNode>,
         predicate: Option<&NamedNode>,
         object: Option<&Term>,
         graph: Option<&GraphName>,
+    ) -> Constraints {
+        self.constraints_cached(
+            subject,
+            predicate,
+            object,
+            graph,
+            &mut PatternCodes::default(),
+        )
+    }
+
+    /// [`constraints`](Self::constraints), reusing any term→code resolution
+    /// `cache` already holds for the same match.
+    pub(crate) fn constraints_cached(
+        &self,
+        subject: Option<&NamedOrBlankNode>,
+        predicate: Option<&NamedNode>,
+        object: Option<&Term>,
+        graph: Option<&GraphName>,
+        cache: &mut PatternCodes,
     ) -> Constraints {
         let mut eqs: Vec<(&'static str, Scalar)> = Vec::new();
         match self {
@@ -345,21 +429,25 @@ impl ResolvedLayout {
             }
             ResolvedLayout::Dictionary(dict) => {
                 // Resolve every bound term to its code: a term absent from
-                // the dictionary cannot match any quad.
-                let bound = [
-                    ("s", subject.map(|s| s.to_string())),
-                    ("p", predicate.map(|p| p.to_string())),
-                    ("o", object.map(|o| o.to_string())),
-                    ("g", graph.map(graph_name_str)),
-                ];
-                for (field, term) in bound {
-                    if let Some(term_str) = term {
-                        match dict.get_id(&term_str) {
-                            Some(id) => eqs.push((field, Scalar::from(id))),
-                            None => return Constraints::AlwaysFalse,
+                // the dictionary cannot match any quad. Each term is resolved
+                // through `cache`, so the several stages of one match share a
+                // single binary search (and a single `to_string`) per role
+                // rather than repeating both.
+                macro_rules! bind {
+                    ($opt:expr, $role:expr, $field:literal, $to_str:expr) => {
+                        if let Some(term) = $opt {
+                            let to_str = $to_str;
+                            match cache.resolve($role, || dict.get_id(&to_str(term))) {
+                                Some(id) => eqs.push(($field, Scalar::from(id))),
+                                None => return Constraints::AlwaysFalse,
+                            }
                         }
-                    }
+                    };
                 }
+                bind!(subject, Role::S, "s", |s: &NamedOrBlankNode| s.to_string());
+                bind!(predicate, Role::P, "p", |p: &NamedNode| p.to_string());
+                bind!(object, Role::O, "o", |o: &Term| o.to_string());
+                bind!(graph, Role::G, "g", graph_name_str);
             }
         }
         Constraints::Eq(eqs)

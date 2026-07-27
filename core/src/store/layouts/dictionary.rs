@@ -12,6 +12,9 @@
 //!
 //! [`LayoutStrategy::Dictionary`]: super::LayoutStrategy::Dictionary
 
+use std::borrow::Borrow;
+use std::collections::HashMap;
+use std::hash::Hash;
 use std::ops::Range;
 use std::sync::Arc;
 use web_time::Instant;
@@ -38,11 +41,21 @@ pub(crate) fn field_names() -> Vec<Arc<str>> {
 }
 
 /// Encode every term of every quad to its dictionary code.
-pub(crate) fn encode_quads(
+///
+/// Generic over the map's key so both the owned [`TermIdMap`] (streaming
+/// builders) and the borrowed [`BorrowedTermIdMap`] (builders holding a live
+/// quad slice) work without a second code path — `&str: Borrow<str>` makes the
+/// `get(term)` lookup identical for either.
+///
+/// [`BorrowedTermIdMap`]: super::term_dictionary::BorrowedTermIdMap
+pub(crate) fn encode_quads<K>(
     quads: &[RawQuad],
     dict: &TermDictionary,
-    id_map: &TermIdMap,
-) -> Result<QuadCodes> {
+    id_map: &HashMap<K, u32>,
+) -> Result<QuadCodes>
+where
+    K: Borrow<str> + Eq + Hash,
+{
     let start = Instant::now();
     let encode_column = |term_of: fn(&RawQuad) -> &str| -> Result<Vec<u32>> {
         let mut ids: Vec<u32> = Vec::with_capacity(quads.len());
@@ -123,16 +136,19 @@ fn finish_chunk(names: Vec<Arc<str>>, arrays: Vec<ArrayRef>, n: usize) -> Result
 /// when `quads` is the entire dataset, so the per-chunk index sort is the
 /// global order.
 #[allow(clippy::too_many_arguments)] // each input is distinct; bundling would only add ceremony
-pub(crate) fn build_chunk(
+pub(crate) fn build_chunk<K>(
     quads: &[RawQuad],
     dict: &TermDictionary,
-    id_map: &TermIdMap,
+    id_map: &HashMap<K, u32>,
     indexes: &[IndexType],
     start_row: u32,
     s_sorted: bool,
     carry_dict: bool,
     whole_dataset: bool,
-) -> Result<ArrayRef> {
+) -> Result<ArrayRef>
+where
+    K: Borrow<str> + Eq + Hash,
+{
     let total_start = Instant::now();
     let n = quads.len();
     let encode_start = Instant::now();

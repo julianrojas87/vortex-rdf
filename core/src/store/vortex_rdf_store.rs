@@ -13,7 +13,9 @@ use crate::store::indexes::{
     strip_index_columns, unique_indexes,
 };
 use crate::store::layouts::term_dictionary::{self, TermDictionary};
-use crate::store::layouts::{Constraints, LayoutStrategy, ResolvedLayout, dictionary};
+use crate::store::layouts::{
+    Constraints, LayoutStrategy, PatternCodes, ResolvedLayout, Role, dictionary,
+};
 use crate::store::selection::RowSelection;
 use crate::store::{QuadsSource, Tail};
 
@@ -60,6 +62,39 @@ use vortex_array::stream::ArrayStreamExt;
 use vortex_layout::LayoutReader;
 #[cfg(feature = "file-io")]
 use vortex_scan::selection::Selection;
+
+/// An immutable handle on a Dictionary-layout store's term dictionary, taken
+/// with [`VortexRdfStore::dictionary_snapshot`].
+///
+/// Cloning is an `Arc` bump, and the snapshot retains only the dictionary — not
+/// the store or its quad columns.
+///
+/// **Term codes are only meaningful against the dictionary they were produced
+/// with.** Mutating a store re-encodes it against a *fresh* dictionary, so a
+/// consumer holding codes must decode them through the snapshot taken when it
+/// received them, not through the store as it stands later — otherwise codes
+/// silently resolve to the wrong terms. Holding the snapshot keeps exactly the
+/// dictionary those codes address alive, and nothing more.
+#[derive(Clone)]
+pub struct DictSnapshot(Arc<TermDictionary>);
+
+impl DictSnapshot {
+    /// Decode a term code to its N-Triples string, or `None` when the code is
+    /// out of this dictionary's range.
+    pub fn decode(&self, code: u32) -> Option<String> {
+        self.0.term_at(code)
+    }
+
+    /// Number of terms in the dictionary.
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Whether the dictionary holds no terms.
+    pub fn is_empty(&self) -> bool {
+        self.0.len() == 0
+    }
+}
 
 /// Columnar RDF quad storage backed by Vortex.
 ///
@@ -376,8 +411,7 @@ impl VortexRdfStore {
                 dictionary::empty_struct(&indexes)?,
             ),
             LayoutStrategy::Dictionary => {
-                let dict = TermDictionary::from_quads(raws)?;
-                let id_map = dict.build_id_map();
+                let (dict, id_map) = TermDictionary::from_quads_with_map(raws)?;
                 let base =
                     dictionary::build_chunk(raws, &dict, &id_map, &indexes, 0, sorted, true, true)?;
                 (ResolvedLayout::Dictionary(Arc::new(dict)), base)
@@ -524,7 +558,7 @@ impl VortexRdfStore {
 
     /// Build using the default builder (UnsortedStream, Default layout, no indexes).
     pub async fn build_vortex_array(
-        quad_stream: impl Stream<Item = Result<Quad>> + Unpin + Send + 'static,
+        quad_stream: impl Stream<Item = Result<RawQuad>> + Unpin + Send + 'static,
     ) -> Result<ArrayRef> {
         // Convenience wrapper around the generic builder entrypoint below,
         // pinned to the streaming/unsorted/no-index defaults.
@@ -538,7 +572,7 @@ impl VortexRdfStore {
 
     /// Build using a specified builder, layout, and secondary indexes.
     pub async fn build_vortex_array_with_builder<B: VortexArrayBuilder>(
-        quad_stream: impl Stream<Item = Result<Quad>> + Unpin + Send + 'static,
+        quad_stream: impl Stream<Item = Result<RawQuad>> + Unpin + Send + 'static,
         layout: LayoutStrategy,
         indexes: Indexes,
     ) -> Result<ArrayRef> {
@@ -786,26 +820,16 @@ impl VortexRdfStore {
         }
     }
 
-    /// The whole sorted term dictionary packed for zero-copy transfer: a length
-    /// array of `n + 1` prefix-sum byte offsets and a single concatenated bytes
-    /// buffer (`term i = bytes[offsets[i]..offsets[i + 1]]`). `None` when this
-    /// store is not Dictionary-layout. Consumers ship these two buffers across
-    /// the FFI/wasm boundary once and decode any term host-side without a
-    /// per-term round trip.
-    pub fn dictionary_buffers(&self) -> Option<(Vec<u32>, Vec<u8>)> {
+    /// An immutable handle on this store's term dictionary, or `None` when the
+    /// store is not Dictionary-layout.
+    ///
+    /// Taking a snapshot is O(1) and retains only the dictionary — not the
+    /// store, nor its quad columns. Hand this to any consumer that holds term
+    /// codes: see [`DictSnapshot`] for why the store itself is the wrong thing
+    /// to decode against.
+    pub fn dictionary_snapshot(&self) -> Option<DictSnapshot> {
         match &self.layout {
-            ResolvedLayout::Dictionary(dict) => {
-                let n = dict.len();
-                let reader = crate::common::utils::StrColReader::new(dict.view());
-                let mut offsets = Vec::with_capacity(n + 1);
-                let mut bytes = Vec::new();
-                offsets.push(0u32);
-                for i in 0..n {
-                    bytes.extend_from_slice(reader.bytes_at(i));
-                    offsets.push(bytes.len() as u32);
-                }
-                Some((offsets, bytes))
-            }
+            ResolvedLayout::Dictionary(dict) => Some(DictSnapshot(Arc::clone(dict))),
             _ => None,
         }
     }
@@ -926,8 +950,7 @@ impl VortexRdfStore {
                 if raws.is_empty() {
                     return dictionary::empty_struct(&[]);
                 }
-                let dict = TermDictionary::from_quads(&raws)?;
-                let id_map = dict.build_id_map();
+                let (dict, id_map) = TermDictionary::from_quads_with_map(&raws)?;
                 dictionary::build_chunk(&raws, &dict, &id_map, &[], 0, false, true, false)
             }
             _ => {
@@ -1214,6 +1237,11 @@ impl VortexRdfStore {
     ) -> Result<Self> {
         let t = Instant::now();
 
+        // Resolve each bound term to its dictionary code at most once for this
+        // whole match: the stages below each need the same mapping, and under
+        // the Dictionary layout deriving it is a binary search per term.
+        let mut codes = PatternCodes::default();
+
         match &self.quads {
             // Tombstones are deliberately not consulted here: they are applied
             // by every read path instead, so matching may name deleted rows
@@ -1229,7 +1257,8 @@ impl VortexRdfStore {
                 // A pattern the layout can prove unmatchable (e.g. a term
                 // absent from the dictionary) needs no search at all.
                 if matches!(
-                    self.layout.constraints(subject, predicate, object, graph),
+                    self.layout
+                        .constraints_cached(subject, predicate, object, graph, &mut codes),
                     Constraints::AlwaysFalse
                 ) {
                     return Ok(self.empty_view());
@@ -1267,7 +1296,9 @@ impl VortexRdfStore {
                 if let Some(subj) = s
                     && let Ok(s_col) = struct_arr.unmasked_field_by_name("s")
                     && column_is_sorted(s_col)
-                    && let Some(probe) = self.layout.probe_scalar(&subj.to_string())
+                    && let Some(probe) =
+                        self.layout
+                            .probe_scalar_cached(Role::S, || subj.to_string(), &mut codes)
                     && let Ok(scalar) = probe.cast(s_col.dtype())
                 {
                     // Left/right binary search bounds the run of rows equal to
@@ -1333,7 +1364,7 @@ impl VortexRdfStore {
                     // loops yielding exact base ids — no slice/compare/mask
                     // pipeline. Rows outside the selection are never tested,
                     // so the ids are already the intersection.
-                    let typed = match self.layout.constraints(s, p, o, g) {
+                    let typed = match self.layout.constraints_cached(s, p, o, g, &mut codes) {
                         Constraints::AlwaysFalse => return Ok(self.empty_view()),
                         Constraints::Eq(eqs) => {
                             Self::typed_residual_ids(&struct_arr, &selection, base.len(), &eqs)

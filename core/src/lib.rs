@@ -14,6 +14,7 @@
 //! ```
 //! use futures::{executor::block_on, stream};
 //! use oxrdf::{GraphName, Literal, NamedNode, NamedOrBlankNode, Quad, Term};
+//! use vortex_rdf_core::store::RawQuad;
 //! use vortex_rdf_core::{VortexRdfError, VortexRdfStore};
 //!
 //! block_on(async {
@@ -23,7 +24,9 @@
 //!         Term::Literal(Literal::new_simple_literal("hello")),
 //!         GraphName::DefaultGraph,
 //!     );
-//!     let quads = stream::iter(vec![Ok::<_, VortexRdfError>(quad)]);
+//!     // Builders consume `RawQuad` — terms already in the N-Triples form the
+//!     // columns store. `parse_quads_from_reader` yields these directly.
+//!     let quads = stream::iter(vec![Ok::<_, VortexRdfError>(RawQuad::from_quad(&quad))]);
 //!
 //!     // Build an in-memory Vortex array from the quad stream, then wrap it
 //!     // in a queryable store.
@@ -54,7 +57,7 @@ pub use io::{
 };
 
 pub use store::{
-    BuilderStrategy, IndexType, Indexes, LayoutStrategy, SortedInMemoryBuilder,
+    BuilderStrategy, DictSnapshot, IndexType, Indexes, LayoutStrategy, SortedInMemoryBuilder,
     SortedStreamBuilder, UnsortedStreamBuilder, VortexArrayBuilder, VortexRdfStore,
 };
 
@@ -81,8 +84,13 @@ mod tests {
 
     fn quad_stream(
         quads: Vec<Quad>,
-    ) -> impl futures::Stream<Item = crate::error::Result<Quad>> + Unpin + Send + 'static {
-        stream::iter(quads.into_iter().map(Ok::<_, VortexRdfError>))
+    ) -> impl futures::Stream<Item = crate::error::Result<crate::store::RawQuad>> + Unpin + Send + 'static
+    {
+        stream::iter(
+            quads
+                .into_iter()
+                .map(|q| Ok::<_, VortexRdfError>(crate::store::RawQuad::from_quad(&q))),
+        )
     }
 
     // ─── 1) Foundational roundtrip tests ───────────────────────────────────

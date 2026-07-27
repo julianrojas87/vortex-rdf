@@ -8,11 +8,10 @@ use crate::error;
 #[cfg(feature = "file-io")]
 use crate::store::builders::{UnsortedStreamBuilder, VortexArrayBuilder};
 #[cfg(feature = "file-io")]
-use crate::store::{Indexes, LayoutStrategy};
+use crate::store::{Indexes, LayoutStrategy, RawQuad};
 #[cfg(feature = "file-io")]
 use futures::{Stream, stream};
 #[cfg(feature = "file-io")]
-use oxrdf::Quad;
 #[cfg(feature = "file-io")]
 use vortex_array::expr::stats::Stat;
 #[cfg(feature = "file-io")]
@@ -101,7 +100,7 @@ pub async fn quads_stream_to_vortex_writer_with_builder<B, S, W>(
 ) -> Result<()>
 where
     B: VortexArrayBuilder,
-    S: Stream<Item = error::Result<Quad>> + Unpin + Send + 'static,
+    S: Stream<Item = error::Result<RawQuad>> + Unpin + Send + 'static,
     W: VortexWrite + Unpin + Send,
 {
     let start = Instant::now();
@@ -131,7 +130,7 @@ where
 #[cfg(feature = "file-io")]
 pub async fn quads_stream_to_vortex_writer<S, W>(quads: S, writer: W) -> error::Result<()>
 where
-    S: Stream<Item = error::Result<Quad>> + Unpin + Send + 'static,
+    S: Stream<Item = error::Result<RawQuad>> + Unpin + Send + 'static,
     W: VortexWrite + Unpin + Send,
 {
     quads_stream_to_vortex_writer_with_builder::<UnsortedStreamBuilder, _, _>(
@@ -147,7 +146,7 @@ where
 #[cfg(feature = "file-io")]
 pub async fn quads_stream_to_vortex<S>(quads: S) -> error::Result<Vec<u8>>
 where
-    S: Stream<Item = error::Result<Quad>> + Unpin + Send + 'static,
+    S: Stream<Item = error::Result<RawQuad>> + Unpin + Send + 'static,
 {
     let mut buffer = Vec::new();
     quads_stream_to_vortex_writer(quads, &mut buffer).await?;

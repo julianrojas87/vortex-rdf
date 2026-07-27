@@ -9,7 +9,6 @@ use crate::store::layouts::term_dictionary::TermDictionary;
 use crate::store::layouts::{LayoutStrategy, dictionary};
 
 use futures::{Stream, StreamExt, stream};
-use oxrdf::Quad;
 use std::sync::Arc;
 use web_time::Instant;
 
@@ -26,7 +25,7 @@ pub struct SortedInMemoryBuilder;
 
 impl VortexArrayBuilder for SortedInMemoryBuilder {
     async fn build_vortex_array(
-        quad_stream: Box<dyn Stream<Item = Result<Quad>> + Unpin + Send + 'static>,
+        quad_stream: Box<dyn Stream<Item = Result<RawQuad>> + Unpin + Send + 'static>,
         layout: LayoutStrategy,
         indexes: Indexes,
     ) -> Result<ArrayRef> {
@@ -39,8 +38,7 @@ impl VortexArrayBuilder for SortedInMemoryBuilder {
         let n = quads.len();
         let build_start = Instant::now();
         let struct_array = if layout == LayoutStrategy::Dictionary {
-            let dict = TermDictionary::from_quads(&quads)?;
-            let id_map = dict.build_id_map();
+            let (dict, id_map) = TermDictionary::from_quads_with_map(&quads)?;
             dictionary::build_chunk(&quads, &dict, &id_map, &indexes, 0, true, true, true)?
         } else {
             build_struct_array(&quads, layout, &indexes, n, 0, true, true)?
@@ -63,7 +61,7 @@ impl VortexArrayBuilder for SortedInMemoryBuilder {
     /// the writer polls, so only one chunk's Vortex arrays exist at a time —
     /// peak memory drops from ~2× dataset to ~1× dataset + one chunk.
     async fn build_vortex_stream(
-        quad_stream: Box<dyn Stream<Item = Result<Quad>> + Unpin + Send + 'static>,
+        quad_stream: Box<dyn Stream<Item = Result<RawQuad>> + Unpin + Send + 'static>,
         layout: LayoutStrategy,
         indexes: Indexes,
     ) -> Result<(DType, ChunkStream)> {
@@ -73,11 +71,11 @@ impl VortexArrayBuilder for SortedInMemoryBuilder {
 
 /// Ingest the full quad stream and sort it globally by (s, p, o, g).
 async fn ingest_and_sort(
-    mut quads_in: Box<dyn Stream<Item = Result<Quad>> + Unpin + Send + 'static>,
+    mut quads_in: Box<dyn Stream<Item = Result<RawQuad>> + Unpin + Send + 'static>,
 ) -> Result<Vec<RawQuad>> {
     let mut quads: Vec<RawQuad> = Vec::new();
     while let Some(res) = quads_in.next().await {
-        quads.push(RawQuad::from_quad(&res?));
+        quads.push(res?);
     }
     log::debug!("[SortedInMemoryBuilder] Read {} quads", quads.len());
 
@@ -99,7 +97,7 @@ async fn ingest_and_sort(
 /// chunk, so their concatenation across chunks stays globally sorted (each
 /// slice is stamped `IsSorted`) and row IDs address the assembled array.
 pub(crate) async fn build_sorted_chunk_stream(
-    quad_stream: Box<dyn Stream<Item = Result<Quad>> + Unpin + Send + 'static>,
+    quad_stream: Box<dyn Stream<Item = Result<RawQuad>> + Unpin + Send + 'static>,
     layout: LayoutStrategy,
     indexes: Indexes,
     chunk_size: usize,

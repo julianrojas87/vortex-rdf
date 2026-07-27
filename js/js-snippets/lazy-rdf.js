@@ -6,9 +6,10 @@
 // building eager Quad objects. A term's string is decoded from UTF-8 bytes only
 // when `.value`/`.termType` is read (and then interned), never eagerly and never
 // per-term across the wasm boundary. Two column backings:
-//   - Dictionary layout: a Uint32Array of codes + a shared LazyDict (the term
-//     dictionary shipped once). `.equals` between terms of the same store is an
-//     integer code compare.
+//   - Dictionary layout: a Uint32Array of codes + a shared LazyDict over an
+//     immutable snapshot of the store's term dictionary, decoding codes on
+//     demand. `.equals` between terms of the same store is an integer code
+//     compare, so it never decodes at all.
 //   - Default/TypedObject: {offsets, bytes} of the matched rows' N-Triples term
 //     strings; `.equals` falls back to value/termType compare.
 //
@@ -71,27 +72,34 @@ function namedNode(value) {
     };
 }
 
-// ── Dictionary shipped once; decode interned per code ────────────────────────
+// ── Dictionary decoded on demand, interned per code ──────────────────────────
+// Wraps a `TermDict` — an immutable snapshot of the store's dictionary — rather
+// than a copy of its bytes. Flattening the whole dictionary across the boundary
+// cost two full copies of every term (one to build the buffers wasm-side, one to
+// receive them here) on the first read after every mutation, however few terms
+// the query touched. Decoding on demand costs one boundary crossing per
+// *distinct* code observed; the cache absorbs repeats, and a query that only
+// counts rows — or compares terms via the integer fast path below — never
+// crosses at all.
 class LazyDict {
-    constructor(offsets, bytes) { 
-        this.offsets = offsets; 
-        this.bytes = bytes; 
-        this.cache = new Map(); 
+    constructor(dict) {
+        this.dict = dict;
+        this.cache = new Map();
     }
 
     decode(code) {
         let s = this.cache.get(code);
         if (s === undefined) {
-            s = DEC.decode(
-                this.bytes.subarray(this.offsets[code], this.offsets[code + 1])
-            );
+            s = this.dict.decode(code);
             this.cache.set(code, s);
         }
         return s;
     }
 }
 
-export function makeDictView(offsets, bytes) { return new LazyDict(offsets, bytes); }
+export function makeDictView(dict) { 
+    return new LazyDict(dict); 
+}
 
 // ── A single column's backing: code+dict, or packed term bytes ───────────────
 // `col` is either { dict: LazyDict, codes: Uint32Array } or { offsets, bytes }.
@@ -239,7 +247,7 @@ class QuadStream {
 //   tag 3 a lang string and for tag 4 a datatype IRI (same u32+bytes shape).
 const ENC = new TextEncoder();
 
-export function packQuads(quads) {
+export function packQuads(quads, start = 0, end = quads.length) {
     let buf = new Uint8Array(1 << 16);
     let view = new DataView(buf.buffer);
     let pos = 0;
@@ -278,8 +286,8 @@ export function packQuads(quads) {
                 throw new Error(`Invalid quad object at index ${i}`);
         }
     };
-    u32(quads.length);
-    for (let i = 0; i < quads.length; i++) {
+    u32(end - start);
+    for (let i = start; i < end; i++) {
         const q = quads[i];
         if (!q) throw new Error(`Invalid quad object at index ${i}`);
         term(q.subject, i);

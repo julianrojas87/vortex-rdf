@@ -11,7 +11,6 @@ use crate::store::layouts::term_dictionary::{TermDictionary, TermDictionaryBuild
 use crate::store::layouts::{LayoutStrategy, dictionary};
 
 use futures::{Stream, StreamExt, TryStreamExt, stream};
-use oxrdf::Quad;
 use std::sync::Arc;
 use web_time::Instant;
 
@@ -32,7 +31,7 @@ pub struct UnsortedStreamBuilder;
 
 impl VortexArrayBuilder for UnsortedStreamBuilder {
     async fn build_vortex_array(
-        quad_stream: Box<dyn Stream<Item = Result<Quad>> + Unpin + Send + 'static>,
+        quad_stream: Box<dyn Stream<Item = Result<RawQuad>> + Unpin + Send + 'static>,
         layout: LayoutStrategy,
         indexes: Indexes,
     ) -> Result<ArrayRef> {
@@ -44,10 +43,9 @@ impl VortexArrayBuilder for UnsortedStreamBuilder {
             let mut quads = quad_stream;
             let mut buf: Vec<RawQuad> = Vec::new();
             while let Some(res) = quads.next().await {
-                buf.push(RawQuad::from_quad(&res?));
+                buf.push(res?);
             }
-            let dict = TermDictionary::from_quads(&buf)?;
-            let id_map = dict.build_id_map();
+            let (dict, id_map) = TermDictionary::from_quads_with_map(&buf)?;
             // Single contiguous chunk == whole dataset: index columns are
             // globally sorted and stamped for binary-search routing.
             let result =
@@ -76,7 +74,7 @@ impl VortexArrayBuilder for UnsortedStreamBuilder {
     /// True streaming implementation: chunks are built on demand as the file
     /// writer polls the stream.
     async fn build_vortex_stream(
-        quad_stream: Box<dyn Stream<Item = Result<Quad>> + Unpin + Send + 'static>,
+        quad_stream: Box<dyn Stream<Item = Result<RawQuad>> + Unpin + Send + 'static>,
         layout: LayoutStrategy,
         indexes: Indexes,
     ) -> Result<(DType, ChunkStream)> {
@@ -92,7 +90,7 @@ impl VortexArrayBuilder for UnsortedStreamBuilder {
 /// carrying global row IDs via `start_row` so index columns stay valid across
 /// the assembled file.
 pub(crate) async fn build_chunk_stream(
-    quads: Box<dyn Stream<Item = Result<Quad>> + Unpin + Send + 'static>,
+    quads: Box<dyn Stream<Item = Result<RawQuad>> + Unpin + Send + 'static>,
     layout: LayoutStrategy,
     indexes: Indexes,
     chunk_size: usize,
@@ -118,7 +116,7 @@ pub(crate) async fn build_chunk_stream(
 /// Pass 2 reads the spill back and lazily emits u32-encoded chunks, the first
 /// carrying the dictionary payload. Peak memory: O(unique terms + chunk).
 async fn build_dict_chunk_stream(
-    mut quads: Box<dyn Stream<Item = Result<Quad>> + Unpin + Send + 'static>,
+    mut quads: Box<dyn Stream<Item = Result<RawQuad>> + Unpin + Send + 'static>,
     indexes: Indexes,
     chunk_size: usize,
 ) -> Result<(DType, ChunkStream)> {
@@ -133,7 +131,7 @@ async fn build_dict_chunk_stream(
     let mut dict_builder = TermDictionaryBuilder::new();
     let mut total = 0usize;
     while let Some(res) = quads.next().await {
-        let raw = RawQuad::from_quad(&res?);
+        let raw = res?;
         dict_builder.insert_quad(&raw);
         writer.push(&raw)?;
         total += 1;
@@ -211,7 +209,7 @@ async fn build_dict_chunk_stream(
 /// General chunk-stream path: quads are buffered as `RawQuad`s per chunk, as
 /// required by index building (whole-chunk sorts) and the TypedObject layout.
 async fn build_buffered_chunk_stream(
-    mut quads: Box<dyn Stream<Item = Result<Quad>> + Unpin + Send + 'static>,
+    mut quads: Box<dyn Stream<Item = Result<RawQuad>> + Unpin + Send + 'static>,
     layout: LayoutStrategy,
     indexes: Indexes,
     chunk_size: usize,
@@ -219,7 +217,7 @@ async fn build_buffered_chunk_stream(
     let mut buf: Vec<RawQuad> = Vec::with_capacity(chunk_size.min(4096));
     while buf.len() < chunk_size {
         match quads.next().await {
-            Some(res) => buf.push(RawQuad::from_quad(&res?)),
+            Some(res) => buf.push(res?),
             None => break,
         }
     }
@@ -250,7 +248,7 @@ async fn build_buffered_chunk_stream(
             let mut buf: Vec<RawQuad> = Vec::with_capacity(chunk_size.min(4096));
             while buf.len() < chunk_size {
                 match quads.next().await {
-                    Some(Ok(q)) => buf.push(RawQuad::from_quad(&q)),
+                    Some(Ok(q)) => buf.push(q),
                     Some(Err(e)) => {
                         return Some((Err(into_vortex_error(e)), (quads, layout, indexes, row)));
                     }
@@ -275,7 +273,7 @@ async fn build_buffered_chunk_stream(
 /// term strings directly into per-column builders, skipping the `RawQuad`
 /// intermediate (4 String allocations + frees per quad) entirely.
 async fn build_direct_chunk_stream(
-    mut quads: Box<dyn Stream<Item = Result<Quad>> + Unpin + Send + 'static>,
+    mut quads: Box<dyn Stream<Item = Result<RawQuad>> + Unpin + Send + 'static>,
     chunk_size: usize,
 ) -> Result<(DType, ChunkStream)> {
     let mut builder = DirectChunkBuilder::new(chunk_size.min(4096));

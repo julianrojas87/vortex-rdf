@@ -13,8 +13,9 @@ use vortex_rdf_core::error::{Result as CoreResult, VortexRdfError};
 use vortex_rdf_core::io::{
     VORTEX_LIGHT_SESSION, array_from_ipc_bytes, deserialize, write_array_to_ipc,
 };
+use vortex_rdf_core::store::RawQuad;
 use vortex_rdf_core::{
-    BuilderStrategy, IndexType, Indexes, LayoutStrategy, SortedInMemoryBuilder,
+    BuilderStrategy, DictSnapshot, IndexType, Indexes, LayoutStrategy, SortedInMemoryBuilder,
     UnsortedStreamBuilder, VortexRdfStore as CoreStore,
 };
 use wasm_bindgen::prelude::*;
@@ -25,10 +26,10 @@ use wasm_bindgen_futures::future_to_promise;
 // See js/js-snippets/lazy-rdf.js.
 #[wasm_bindgen(module = "/js-snippets/lazy-rdf.js")]
 extern "C" {
-    /// Wrap the packed dictionary buffers into a `LazyDict` (decodes a term code
-    /// to its string host-side, interned). Built once per store.
+    /// Wrap a `TermDict` handle into a `LazyDict`, which decodes a term code to
+    /// its string on demand and interns the result. Built once per store read.
     #[wasm_bindgen(js_name = makeDictView)]
-    fn make_dict_view(offsets: js_sys::Uint32Array, bytes: js_sys::Uint8Array) -> JsValue;
+    fn make_dict_view(dict: TermDict) -> JsValue;
 
     /// Build a `LazyQuad[]` from a column payload — for `getQuads`.
     #[wasm_bindgen(js_name = buildLazyQuads)]
@@ -44,7 +45,11 @@ extern "C" {
     /// ~16–20 Reflect calls per quad. Decoded by [`packed_to_quads`]. Throws
     /// on a malformed quad (hence `catch`).
     #[wasm_bindgen(js_name = packQuads, catch)]
-    fn pack_quads(quads: &js_sys::Array) -> Result<js_sys::Uint8Array, JsValue>;
+    fn pack_quads(
+        quads: &js_sys::Array,
+        start: u32,
+        end: u32,
+    ) -> Result<js_sys::Uint8Array, JsValue>;
 }
 
 #[wasm_bindgen(typescript_custom_section)]
@@ -203,20 +208,54 @@ impl VortexRdfStore {
         self.dict_view()
     }
 
-    /// The store's `LazyDict` (built once from the packed dictionary buffers),
-    /// or `None` when this store is not Dictionary-layout.
+    /// The store's `LazyDict`, or `None` when this store is not
+    /// Dictionary-layout.
+    ///
+    /// The `LazyDict` holds a [`DictSnapshot`] and decodes each code the first
+    /// time it is observed, interning the result — so a query pays one boundary
+    /// crossing per *distinct* term it actually reads, and a query that only
+    /// counts rows or compares terms by code pays none at all. Building it is
+    /// O(1): nothing is flattened or copied up front.
+    ///
+    /// Because the snapshot is immutable, `LazyQuad`s handed out before a
+    /// mutation keep decoding against the dictionary their codes address, even
+    /// though `self.dict_view` is dropped so later reads pick up the new one.
     fn dict_view(&self) -> Option<JsValue> {
         if let Some(dv) = self.dict_view.borrow().as_ref() {
             return Some(dv.clone());
         }
-        let (offsets, bytes) = self.inner.dictionary_buffers()?;
-        let offs = js_sys::Uint32Array::new_with_length(offsets.len() as u32);
-        offs.copy_from(&offsets);
-        let bys = js_sys::Uint8Array::new_with_length(bytes.len() as u32);
-        bys.copy_from(&bytes);
-        let dv = make_dict_view(offs, bys);
+        let dv = make_dict_view(TermDict {
+            snapshot: self.inner.dictionary_snapshot()?,
+        });
         *self.dict_view.borrow_mut() = Some(dv.clone());
         Some(dv)
+    }
+}
+
+/// An immutable handle on a store's term dictionary, decoding a `u32` term code
+/// to its N-Triples string.
+///
+/// Handed to the JS lazy read model so that codes produced by one read stay
+/// decodable after the store is mutated — a mutation re-encodes the store
+/// against a fresh dictionary, which would otherwise silently resolve old codes
+/// to the wrong terms. Retains the dictionary only, not the store's quad data.
+#[wasm_bindgen(skip_typescript)]
+pub struct TermDict {
+    snapshot: DictSnapshot,
+}
+
+#[wasm_bindgen]
+impl TermDict {
+    /// Decode a term code, or `undefined` when it is out of range.
+    #[wasm_bindgen(js_name = decode)]
+    pub fn decode(&self, code: u32) -> Option<String> {
+        self.snapshot.decode(code)
+    }
+
+    /// Number of terms in the dictionary.
+    #[wasm_bindgen(getter)]
+    pub fn size(&self) -> usize {
+        self.snapshot.len()
     }
 }
 
@@ -351,7 +390,9 @@ impl VortexRdfStore {
             .await
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
         // The dictionary may have changed (auto-compaction re-encodes); drop the
-        // cached view so the next read rebuilds it from the new base.
+        // cached view so the next read takes a snapshot of the new one. Rebuilding
+        // is O(1), and any `LazyQuad` already handed out keeps the snapshot its
+        // codes address alive, so it still decodes correctly.
         self.dict_view.replace(None);
         Ok(())
     }
@@ -726,7 +767,7 @@ impl Default for BuildConfig {
 /// This is the single place that monomorphizes the builders, so every entry
 /// point (`fromString`, `fromQuads`, `rdf_to_vortex`) offers the same choices.
 async fn build_array(
-    quads: impl Stream<Item = CoreResult<Quad>> + Unpin + Send + 'static,
+    quads: impl Stream<Item = CoreResult<RawQuad>> + Unpin + Send + 'static,
     config: BuildConfig,
 ) -> Result<ArrayRef, JsValue> {
     let BuildConfig {
@@ -854,17 +895,57 @@ fn layout_name(layout: LayoutStrategy) -> &'static str {
     }
 }
 
+/// Quads per `packQuads` call. The packed buffer is copied into linear memory
+/// and must stay live while the quads in it are decoded, so packing the whole
+/// array at once put a second full copy of the dataset's term bytes on the wasm
+/// high-water mark. Packing a range at a time bounds that to one chunk; the
+/// boundary crossing it saves is per-chunk rather than per-quad either way.
+const PACK_CHUNK: u32 = 1 << 16;
+
+/// Decode a JS quad array in `PACK_CHUNK`-sized ranges, converting with `emit`.
+fn js_array_decode<T>(
+    quads: &js_sys::Array,
+    mut emit: impl FnMut(Quad) -> T,
+) -> Result<Vec<T>, JsValue> {
+    let total = quads.length();
+    let mut out: Vec<T> = Vec::with_capacity(total as usize);
+    let mut start = 0u32;
+    while start < total {
+        let end = (start + PACK_CHUNK).min(total);
+        let packed = pack_quads(quads, start, end)?;
+        packed_to_quads_into(&packed.to_vec(), &mut emit, &mut out)?;
+        start = end;
+    }
+    Ok(out)
+}
+
+/// Ingest form: quads as [`RawQuad`], which is what every builder consumes.
+fn js_array_to_raw_quads(quads: js_sys::Array) -> Result<Vec<RawQuad>, JsValue> {
+    js_array_decode(&quads, |q| RawQuad::from_quad(&q))
+}
+
+/// Mutation form: quads as `oxrdf::Quad`, which `add_quads` needs because its
+/// duplicate check goes through `match_pattern` on the parsed terms. Bounded by
+/// the batch size, so the extra owned copy is not the ingest concern that
+/// [`js_array_to_raw_quads`] avoids.
 fn js_array_to_quads(quads: js_sys::Array) -> Result<Vec<Quad>, JsValue> {
-    // One host-side pass packs the quads into a single byte buffer (see
-    // packQuads in lazy-rdf.js); one boundary crossing brings it here.
-    let packed = pack_quads(&quads)?;
-    packed_to_quads(&packed.to_vec())
+    js_array_decode(&quads, |q| q)
 }
 
 /// Decode the buffer [`pack_quads`] produced back into owned quads. Term
 /// construction/validation mirrors [`js_to_quad`]: IRIs and language tags are
 /// validated, blank-node ids are taken as-is.
-fn packed_to_quads(bytes: &[u8]) -> Result<Vec<Quad>, JsValue> {
+///
+/// `emit` converts each decoded quad as it is produced, so on the ingest path
+/// the `oxrdf::Quad` dies inside the loop. Collecting `Vec<Quad>` and
+/// converting afterwards — which is what every builder did with it — held a
+/// second owned copy of every term in the dataset live at once, and that copy
+/// was a large part of the wasm ingest high-water mark.
+fn packed_to_quads_into<T>(
+    bytes: &[u8],
+    emit: &mut impl FnMut(Quad) -> T,
+    out: &mut Vec<T>,
+) -> Result<(), JsValue> {
     struct Cursor<'a> {
         bytes: &'a [u8],
         pos: usize,
@@ -902,7 +983,7 @@ fn packed_to_quads(bytes: &[u8]) -> Result<Vec<Quad>, JsValue> {
     let invalid = |i: usize| JsValue::from_str(&format!("Invalid quad object at index {}", i));
     let mut cur = Cursor { bytes, pos: 0 };
     let n = cur.u32()? as usize;
-    let mut out = Vec::with_capacity(n);
+    out.reserve(n);
     for i in 0..n {
         // subject: NamedNode | BlankNode
         let s = match cur.u8()? {
@@ -942,23 +1023,23 @@ fn packed_to_quads(bytes: &[u8]) -> Result<Vec<Quad>, JsValue> {
             5 => GraphName::DefaultGraph,
             _ => return Err(invalid(i)),
         };
-        out.push(Quad::new(s, p, o, g));
+        out.push(emit(Quad::new(s, p, o, g)));
     }
-    Ok(out)
+    Ok(())
 }
 
 /// A quad stream boxed for `build_array`, whichever of the two `fromQuads`
 /// input shapes it came from.
-type BoxedQuadStream = Box<dyn Stream<Item = CoreResult<Quad>> + Unpin + Send>;
+type BoxedQuadStream = Box<dyn Stream<Item = CoreResult<RawQuad>> + Unpin + Send>;
 
 /// Accept either shape `fromQuads` allows: a plain array (eagerly validated
 /// and wrapped in `stream::iter`), or an RDF/JS `Stream<Quad>` (consumed
 /// through its event-emitter interface).
 fn js_to_quad_stream(value: JsValue) -> Result<BoxedQuadStream, JsValue> {
     if js_sys::Array::is_array(&value) {
-        let quads = js_array_to_quads(js_sys::Array::from(&value))?;
+        let quads = js_array_to_raw_quads(js_sys::Array::from(&value))?;
         let stream: BoxedQuadStream = Box::new(stream::iter(
-            quads.into_iter().map(Ok::<Quad, VortexRdfError>),
+            quads.into_iter().map(Ok::<RawQuad, VortexRdfError>),
         ));
         return Ok(stream);
     }
@@ -987,13 +1068,16 @@ fn rdfjs_stream_to_quads(stream_val: JsValue) -> Result<BoxedQuadStream, JsValue
             )
         })?;
 
-    let (tx, rx) = mpsc::unbounded::<CoreResult<Quad>>();
+    let (tx, rx) = mpsc::unbounded::<CoreResult<RawQuad>>();
 
     let tx_data = tx.clone();
     let on_data = Closure::wrap(Box::new(move |quad_js: JsValue| {
-        let item = js_to_quad(quad_js).ok_or_else(|| {
-            VortexRdfError::Deserialization("Invalid quad object in RDF/JS stream".to_string())
-        });
+        let item = js_to_quad(quad_js)
+            .as_ref()
+            .map(RawQuad::from_quad)
+            .ok_or_else(|| {
+                VortexRdfError::Deserialization("Invalid quad object in RDF/JS stream".to_string())
+            });
         let _ = tx_data.unbounded_send(item);
     }) as Box<dyn FnMut(JsValue)>);
 

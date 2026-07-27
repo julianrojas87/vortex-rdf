@@ -10,7 +10,7 @@ pub use builders::{
 };
 pub use indexes::{IndexType, Indexes};
 pub use layouts::LayoutStrategy;
-pub use vortex_rdf_store::VortexRdfStore;
+pub use vortex_rdf_store::{DictSnapshot, VortexRdfStore};
 
 use oxrdf::Quad;
 use vortex_array::ArrayRef;

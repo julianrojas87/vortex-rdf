@@ -1,5 +1,6 @@
 use crate::error::{Result, VortexRdfError};
 use crate::io::VORTEX_LIGHT_SESSION;
+use crate::store::RawQuad;
 
 use futures::{Stream, stream};
 use oxrdf::{BlankNode, GraphName, Literal, NamedNode, NamedOrBlankNode, Quad, Term};
@@ -268,20 +269,26 @@ pub(crate) fn buf_as_str(buf: &[u8]) -> Result<&str> {
 }
 
 /// Parses a stream of RDF quads from any reader using the specified RDF format.
+///
+/// Yields [`RawQuad`] rather than `oxrdf::Quad`: every builder converts to
+/// `RawQuad` as its first act, so handing back the parsed `Quad` would keep a
+/// second owned copy of every term alive for no purpose. Converting here lets
+/// the `Quad` die inside the map.
 pub fn parse_quads_from_reader<R: std::io::Read + Send + 'static>(
     reader: R,
     format: RdfFormat,
-) -> impl Stream<Item = Result<Quad>> {
+) -> impl Stream<Item = Result<RawQuad>> {
     let parser = RdfParser::from_format(format);
-    let iter = parser
-        .for_reader(reader)
-        .map(|x| x.map_err(|e| VortexRdfError::Deserialization(format!("Parse error: {}", e))));
+    let iter = parser.for_reader(reader).map(|x| {
+        x.map(|q| RawQuad::from_quad(&q))
+            .map_err(|e| VortexRdfError::Deserialization(format!("Parse error: {}", e)))
+    });
     stream::iter(iter)
 }
 
 /// Helper function to generate a stream of mock RDF quads for benchmark and test workflows.
 /// Generates triples evenly distributed across 10 named graphs.
-pub fn generate_rdf_data_stream(size: usize) -> impl Stream<Item = Result<Quad>> {
+pub fn generate_rdf_data_stream(size: usize) -> impl Stream<Item = Result<RawQuad>> {
     const EX: &str = "http://example.org/";
     const NUM_GRAPHS: u64 = 10;
 
@@ -296,6 +303,8 @@ pub fn generate_rdf_data_stream(size: usize) -> impl Stream<Item = Result<Quad>>
             (i as u64) % NUM_GRAPHS
         )));
 
-        Ok(Quad::new(subject, predicate, object, graph))
+        Ok(RawQuad::from_quad(&Quad::new(
+            subject, predicate, object, graph,
+        )))
     }))
 }

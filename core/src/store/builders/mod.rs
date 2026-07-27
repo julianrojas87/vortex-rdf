@@ -5,7 +5,6 @@ use crate::store::RawQuad;
 use crate::store::indexes::{GlobalIndexes, IndexType, Indexes, unique_indexes};
 use crate::store::layouts::LayoutStrategy;
 use futures::{Stream, StreamExt, stream};
-use oxrdf::Quad;
 use std::future::Future;
 use vortex_array::arrays::StructArray;
 use vortex_array::arrays::struct_::StructArrayExt;
@@ -54,7 +53,7 @@ pub use unsorted_stream::UnsortedStreamBuilder;
 pub trait VortexArrayBuilder {
     /// Build the complete dataset as a single (possibly chunked) in-memory array.
     fn build_vortex_array(
-        quad_stream: Box<dyn Stream<Item = Result<Quad>> + Unpin + Send + 'static>,
+        quad_stream: Box<dyn Stream<Item = Result<RawQuad>> + Unpin + Send + 'static>,
         layout: LayoutStrategy,
         indexes: Indexes,
     ) -> impl Future<Output = Result<ArrayRef>> + Send;
@@ -67,7 +66,7 @@ pub trait VortexArrayBuilder {
     /// that can emit chunks incrementally should override this so that writing
     /// a file needs only O(chunk) memory instead of O(dataset).
     fn build_vortex_stream(
-        quad_stream: Box<dyn Stream<Item = Result<Quad>> + Unpin + Send + 'static>,
+        quad_stream: Box<dyn Stream<Item = Result<RawQuad>> + Unpin + Send + 'static>,
         layout: LayoutStrategy,
         indexes: Indexes,
     ) -> impl Future<Output = Result<(DType, ChunkStream)>> + Send {
