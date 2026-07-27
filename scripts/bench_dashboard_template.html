@@ -370,10 +370,7 @@
     </p>
     <p class="lede">
       Term cardinality matters because it is what exercises each library's dictionary and
-      string handling; the previous dataset drew all its rows from a namespace of only
-      <code>D</code> IRIs (128 distinct terms for 2,097,152 triples), which made that
-      dimension invisible. Query timings are therefore <strong>not comparable with runs
-      from before the cardinality switch</strong> — selectivity now follows the data, so
+      string handling; selectivity follows the data, so
       each pattern's matched-row count is recorded in <code>config.matchedRows</code>
       alongside its timing.
     </p>
