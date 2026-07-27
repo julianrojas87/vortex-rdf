@@ -214,6 +214,7 @@ const NATIVE_ARTIFACT_FORMAT: &str = "vortex-rdf-native-ids";
 const NATIVE_ARTIFACT_FORMAT_VERSION: u32 = 1;
 const NATIVE_ARTIFACT_METADATA_KEY: &str = "vortex.rdf.native-ids.manifest";
 const NATIVE_TRIPLES_LOGICAL_NAME: &str = "rdf.triples.native-ids.v1";
+const NATIVE_TERM_DIRECTORY_FENCE_ROWS: usize = 512;
 
 impl NativeComponent {
     const ALL: [Self; 11] = [
@@ -447,6 +448,32 @@ fn native_component_path(data_path: &Path, component: NativeComponent) -> PathBu
     NativeComponentResolver::new(data_path)
         .external_path(component)
         .expect("external component resolution is infallible before Phase C")
+}
+
+// VORTEX_RDF_COMPLETE_NATIVE_SERIALIZATION_V1
+fn validate_external_native_artifact_inventory(
+    data_path: &Path,
+    manifest: &NativeArtifactManifest,
+) -> Result<()> {
+    manifest.validate()?;
+    if !data_path.is_file() {
+        return Err(VortexRdfError::InvalidOperation(format!(
+            "required native triples component {} is missing at {:?}",
+            NATIVE_TRIPLES_LOGICAL_NAME, data_path
+        )));
+    }
+    for component in NativeComponent::ALL {
+        let path = component.external_path(data_path);
+        if !path.is_file() {
+            return Err(VortexRdfError::InvalidOperation(format!(
+                "required native artifact component {} is missing at {:?}",
+                component.logical_name(),
+                path
+            )));
+        }
+    }
+
+    Ok(())
 }
 
 fn require_vortex_component(
@@ -954,6 +981,12 @@ where
     Dict: RdfDictionary + Send + Sync + 'static,
     S: Stream<Item = Result<Quad>> + Unpin + Send + 'static,
 {
+    if config.ordering != TripleOrdering::SPO {
+        return Err(VortexRdfError::InvalidOperation(format!(
+            "complete cottas-native-ids serialization requires SPO ordering; got {:?}",
+            config.ordering
+        )));
+    }
     let row_group_size = config.row_group_size.max(1);
 
     let sort_batch_size = std::env::var("VORTEX_RDF_NATIVE_ID_SORT_BATCH_SIZE")
@@ -1030,6 +1063,15 @@ where
         config.dict_row_group_size,
     )
     .await?;
+    let term_directory_stats =
+        build_cottas_native_term_directory(output_path, NATIVE_TERM_DIRECTORY_FENCE_ROWS).await?;
+    log::info!(
+        "[cottas_native_ids] built sparse term directory during serialization: dictionary_rows={}, entries={}, fence_rows={}, total_ms={:.3}",
+        term_directory_stats.dictionary_rows,
+        term_directory_stats.directory_entries,
+        term_directory_stats.fence_rows,
+        term_directory_stats.total_ms
+    );
     if config.ordering == TripleOrdering::SPO {
         let subject_index_stats = build_cottas_native_subject_range_index(output_path).await?;
         log::info!(
@@ -1063,12 +1105,9 @@ where
             o_exact_stats.total_ms
         );
     } else {
-        log::info!(
-            "[cottas_native_ids] skipping subject range index for ordering {:?}; subject ranges require SPO ordering",
-            config.ordering
-        );
+        unreachable!("SPO ordering is enforced before serialization starts");
     }
-
+    validate_external_native_artifact_inventory(output_path, &manifest)?;
     Ok(())
 }
 
@@ -7237,6 +7276,35 @@ mod native_artifact_manifest_tests {
             NATIVE_ARTIFACT_METADATA_KEY,
             "vortex.rdf.native-ids.manifest"
         );
+    }
+
+    #[test]
+    fn production_external_inventory_covers_every_manifest_sidecar() {
+        let manifest = NativeArtifactManifest::production_defaults();
+        let manifest_names: BTreeSet<_> = manifest
+            .components
+            .iter()
+            .skip(1)
+            .map(|component| component.logical_name.as_str())
+            .collect();
+        let external_names: BTreeSet<_> = NativeComponent::ALL
+            .into_iter()
+            .map(NativeComponent::logical_name)
+            .collect();
+        assert_eq!(manifest_names, external_names);
+        assert!(!external_names.contains(NATIVE_TRIPLES_LOGICAL_NAME));
+        assert_eq!(NATIVE_TERM_DIRECTORY_FENCE_ROWS, 512);
+    }
+
+    #[test]
+    fn external_component_paths_are_unique_and_derived_from_the_artifact() {
+        let artifact = Path::new("fixture.vortex");
+        let paths: BTreeSet<_> = NativeComponent::ALL
+            .into_iter()
+            .map(|component| component.external_path(artifact))
+            .collect();
+        assert_eq!(paths.len(), NativeComponent::ALL.len());
+        assert!(paths.iter().all(|path| path != artifact));
     }
 
     #[test]
