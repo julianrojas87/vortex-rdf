@@ -72,9 +72,12 @@ const SLUGS = (process.env.DICT_MEM_SLUGS ?? 'vortex_sorted_dict').split(',');
 
 /** Subject ratio per point; object ratio tracks it at half.
  *
- *  One point by default, at the dataset's own defaults — ratio 1.0 is 300,037
- *  distinct terms at N=200k. Pass several to sweep cardinality and fit the
- *  per-term cost; two orders of magnitude is what the original fit used. */
+ *  One point by default, at ratio 1.0 — a distinct subject per row, which is
+ *  300,037 terms at N=200k. That is deliberately not the comparative
+ *  benchmark's default (0.1): this tool measures the dictionary, so it wants
+ *  the configuration that makes the dictionary largest. Pass several to sweep
+ *  cardinality and fit the per-term cost; two orders of magnitude is what the
+ *  original fit used. */
 const RATIOS = (process.env.DICT_MEM_RATIOS ?? '1.0').split(',').map(Number);
 
 /** Figures from the run that landed FSST — commit `perf!: hold and serialize

@@ -50,7 +50,7 @@ export const N_QUADS = DQ ** 4;
 const BASE = 'http://data.example.org';
 
 export interface DatasetOpts {
-    /** distinct subjects / n (default 1.0 — real RDF subjects are near-unique). */
+    /** distinct subjects / n (default 0.1 — see `SUBJECT_RATIO_DEFAULT`). */
     subjectRatio?: number;
     /** distinct predicates: a small closed vocabulary, as in real data (default 32). */
     predicates?: number;
@@ -62,10 +62,30 @@ export interface DatasetOpts {
     graphs?: number;
 }
 
+/** Distinct subjects per row, i.e. the reciprocal of how many triples describe
+ *  each resource. 0.1 is ten triples per subject.
+ *
+ *  This is the knob that decides how much of the dataset is *terms*: the
+ *  dictionary holds `subjectRatio + objectRatio` terms per quad, so the two
+ *  ratios alone say whether there are more distinct terms than rows.
+ *
+ *  It was 1.0 — a distinct subject for every row. That is not how RDF looks: a
+ *  resource is normally described by several properties, so its subject recurs
+ *  across that many triples. 1.0 also made `S` match exactly one row, and with
+ *  `PO`/`SPO`/`SPOG` matching one apiece, five of the seven probes returned two
+ *  rows or fewer — so the comparison measured query *setup* almost to the
+ *  exclusion of decoding, on a dictionary half again the size of the dataset.
+ *
+ *  Set `BENCH_SUBJ_RATIO=1.0` to get that back deliberately: it is a reasonable
+ *  dictionary-stress configuration, and `bench:dict-memory` asks for it
+ *  explicitly for exactly that reason. It is a poor default. */
+export const SUBJECT_RATIO_DEFAULT = 0.1;
+
 /** Env-overridable defaults, so a sweep can vary cardinality without new code. */
 export function datasetOpts(o: DatasetOpts = {}): Required<DatasetOpts> {
     return {
-        subjectRatio: o.subjectRatio ?? Number(process.env.BENCH_SUBJ_RATIO ?? 1),
+        subjectRatio:
+            o.subjectRatio ?? Number(process.env.BENCH_SUBJ_RATIO ?? SUBJECT_RATIO_DEFAULT),
         predicates: o.predicates ?? Number(process.env.BENCH_PREDICATES ?? 32),
         objectRatio: o.objectRatio ?? Number(process.env.BENCH_OBJ_RATIO ?? 0.5),
         literalFrac: o.literalFrac ?? Number(process.env.BENCH_LITERAL_FRAC ?? 0.4),
