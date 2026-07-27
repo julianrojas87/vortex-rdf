@@ -9,7 +9,7 @@ use vortex_array::scalar::Scalar;
 use vortex_array::validity::Validity;
 use vortex_array::{ArrayRef, IntoArray, VortexSessionExecute};
 
-use crate::common::utils::{StrColReader, graph_name_str};
+use crate::common::utils::StrColReader;
 use crate::error::{Result, VortexRdfError};
 use crate::io::VORTEX_LIGHT_SESSION;
 use crate::store::RawQuad;
@@ -149,15 +149,105 @@ pub(crate) enum Role {
     G,
 }
 
+/// A quad pattern: the four term positions, each bound or free.
+///
+/// Travels as one value because every stage of a match needs all four together
+/// — the fast paths clear whichever components they resolve, and whatever is
+/// still bound afterwards is exactly what the residual filter must compare.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct QuadPattern<'a> {
+    pub(crate) subject: Option<&'a NamedOrBlankNode>,
+    pub(crate) predicate: Option<&'a NamedNode>,
+    pub(crate) object: Option<&'a Term>,
+    pub(crate) graph: Option<&'a GraphName>,
+}
+
+impl<'a> QuadPattern<'a> {
+    pub(crate) fn new(
+        subject: Option<&'a NamedOrBlankNode>,
+        predicate: Option<&'a NamedNode>,
+        object: Option<&'a Term>,
+        graph: Option<&'a GraphName>,
+    ) -> Self {
+        Self {
+            subject,
+            predicate,
+            object,
+            graph,
+        }
+    }
+
+    /// Whether any component is still bound — i.e. whether there is anything
+    /// left for a residual filter to do.
+    pub(crate) fn any_bound(&self) -> bool {
+        self.subject.is_some()
+            || self.predicate.is_some()
+            || self.object.is_some()
+            || self.graph.is_some()
+    }
+}
+
+/// A bound term of a quad pattern, tagged with the role it occupies.
+///
+/// Carrying the role with the term is what makes [`PatternCodes`] safe to share
+/// across the match: a probe cannot be attributed to the wrong role, because
+/// there is no way to name one separately from its term.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum TermRef<'a> {
+    Subject(&'a NamedOrBlankNode),
+    Predicate(&'a NamedNode),
+    Object(&'a Term),
+    Graph(&'a GraphName),
+}
+
+/// The term's N-Triples form, as the columns store it.
+///
+/// The default graph renders as the empty string — matching the `g` column —
+/// rather than as oxrdf's own `Display`, which writes `DEFAULT`.
+impl std::fmt::Display for TermRef<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TermRef::Subject(s) => write!(f, "{s}"),
+            TermRef::Predicate(p) => write!(f, "{p}"),
+            TermRef::Object(o) => write!(f, "{o}"),
+            TermRef::Graph(GraphName::DefaultGraph) => Ok(()),
+            TermRef::Graph(g) => write!(f, "{g}"),
+        }
+    }
+}
+
+impl TermRef<'_> {
+    fn role(&self) -> Role {
+        match self {
+            TermRef::Subject(_) => Role::S,
+            TermRef::Predicate(_) => Role::P,
+            TermRef::Object(_) => Role::O,
+            TermRef::Graph(_) => Role::G,
+        }
+    }
+
+    /// Render into `out`, which is cleared first — the allocation-free form of
+    /// [`Display`](std::fmt::Display), which defines what is written.
+    fn write_nt(&self, out: &mut String) {
+        use std::fmt::Write as _;
+        out.clear();
+        write!(out, "{self}").expect("writing to a String cannot fail");
+    }
+}
+
 /// Memoizes a pattern's term → dictionary-code resolution across the stages of
-/// one match.
+/// one match, and owns the buffer those terms are rendered into.
 ///
 /// `match_base` derives the same mapping three times from the same terms — the
 /// unmatchable-pattern gate, the sorted-subject probe, and the residual
 /// constraints after the fast paths have cleared whatever they resolved — so a
 /// fully-bound pattern performed 8 dictionary binary searches (9 with
 /// `SecondaryByCopy`) to resolve 4 terms, each preceded by its own `to_string`.
-/// Caching per role makes that one search and one `to_string` per bound term.
+/// Caching per role makes that one search and one render per bound term.
+///
+/// The render goes into `scratch` rather than a fresh `String` per probe: a
+/// term's N-Triples form is only needed long enough to search the dictionary
+/// with it, so one buffer serves all four roles and every stage.
 ///
 /// Scoped to a single `match_base`: the tail is matched under a *different*
 /// layout (it stores terms as strings precisely so a term the base's dictionary
@@ -168,16 +258,35 @@ pub(crate) struct PatternCodes {
     /// Per role: `None` = not resolved yet, `Some(None)` = resolved and absent
     /// from the dictionary (so the pattern cannot match).
     roles: [Option<Option<u32>>; 4],
+    /// Reused render target for the bound terms; see the type docs.
+    scratch: String,
 }
 
 impl PatternCodes {
-    /// The code for `role`, resolving it through `f` the first time only.
-    pub(crate) fn resolve(&mut self, role: Role, f: impl FnOnce() -> Option<u32>) -> Option<u32> {
-        let slot = &mut self.roles[role as usize];
-        match slot {
-            Some(cached) => *cached,
-            None => *slot.insert(f()),
+    /// The code for `term`'s role, resolving it through `f` the first time
+    /// only. `term` is rendered into the shared scratch buffer on a miss, and
+    /// not rendered at all on a hit.
+    pub(crate) fn resolve(
+        &mut self,
+        term: TermRef<'_>,
+        f: impl FnOnce(&str) -> Option<u32>,
+    ) -> Option<u32> {
+        let role = term.role() as usize;
+        if let Some(cached) = self.roles[role] {
+            return cached;
         }
+        term.write_nt(&mut self.scratch);
+        let resolved = f(&self.scratch);
+        self.roles[role] = Some(resolved);
+        resolved
+    }
+
+    /// `term`'s N-Triples form in the shared scratch buffer — for the layouts
+    /// that probe with the string itself rather than a dictionary code, which
+    /// have nothing to cache but still benefit from not allocating.
+    pub(crate) fn render(&mut self, term: TermRef<'_>) -> &str {
+        term.write_nt(&mut self.scratch);
+        &self.scratch
     }
 }
 
@@ -269,29 +378,22 @@ impl ResolvedLayout {
     /// term is translated to its u32 code (sorted-dictionary codes preserve
     /// lexicographic order); `None` means the term is absent from the
     /// dictionary and matches nothing.
-    pub(crate) fn probe_scalar(&self, term_str: &str) -> Option<Scalar> {
-        match self {
-            ResolvedLayout::Dictionary(dict) => dict.get_id(term_str).map(Scalar::from),
-            _ => Some(Scalar::from(term_str)),
-        }
-    }
-
-    /// [`probe_scalar`](Self::probe_scalar) for one of the pattern's four
-    /// roles, reusing anything [`PatternCodes`] already resolved for it.
     ///
-    /// `term_str` is a closure so that a cache hit skips the caller's
-    /// `to_string` as well as the dictionary search.
+    /// Always goes through `cache`, which is what keeps one match to a single
+    /// dictionary search and a single render per bound term however many stages
+    /// and indexes ask for the same probe. There is deliberately no uncached
+    /// variant: every probe in a match is for one of the pattern's four terms,
+    /// so an uncached one could only ever repeat work already done.
     pub(crate) fn probe_scalar_cached(
         &self,
-        role: Role,
-        term_str: impl FnOnce() -> String,
+        term: TermRef<'_>,
         cache: &mut PatternCodes,
     ) -> Option<Scalar> {
         match self {
-            ResolvedLayout::Dictionary(dict) => cache
-                .resolve(role, || dict.get_id(&term_str()))
-                .map(Scalar::from),
-            _ => Some(Scalar::from(term_str().as_str())),
+            ResolvedLayout::Dictionary(dict) => {
+                cache.resolve(term, |s| dict.get_id(s)).map(Scalar::from)
+            }
+            _ => Some(Scalar::from(cache.render(term))),
         }
     }
 
@@ -393,24 +495,24 @@ impl ResolvedLayout {
         match self {
             ResolvedLayout::Default => {
                 if let Some(s) = subject {
-                    eqs.push(("s", Scalar::from(s.to_string().as_str())));
+                    eqs.push(("s", Scalar::from(cache.render(TermRef::Subject(s)))));
                 }
                 if let Some(p) = predicate {
-                    eqs.push(("p", Scalar::from(p.to_string().as_str())));
+                    eqs.push(("p", Scalar::from(cache.render(TermRef::Predicate(p)))));
                 }
                 if let Some(o) = object {
-                    eqs.push(("o", Scalar::from(o.to_string().as_str())));
+                    eqs.push(("o", Scalar::from(cache.render(TermRef::Object(o)))));
                 }
                 if let Some(g) = graph {
-                    eqs.push(("g", Scalar::from(graph_name_str(g).as_str())));
+                    eqs.push(("g", Scalar::from(cache.render(TermRef::Graph(g)))));
                 }
             }
             ResolvedLayout::TypedObject => {
                 if let Some(s) = subject {
-                    eqs.push(("s", Scalar::from(s.to_string().as_str())));
+                    eqs.push(("s", Scalar::from(cache.render(TermRef::Subject(s)))));
                 }
                 if let Some(p) = predicate {
-                    eqs.push(("p", Scalar::from(p.to_string().as_str())));
+                    eqs.push(("p", Scalar::from(cache.render(TermRef::Predicate(p)))));
                 }
                 if let Some(o) = object {
                     let (kind, value, dt, lang) = typed_object::decompose_object(o);
@@ -424,7 +526,7 @@ impl ResolvedLayout {
                     }
                 }
                 if let Some(g) = graph {
-                    eqs.push(("g", Scalar::from(graph_name_str(g).as_str())));
+                    eqs.push(("g", Scalar::from(cache.render(TermRef::Graph(g)))));
                 }
             }
             ResolvedLayout::Dictionary(dict) => {
@@ -434,20 +536,19 @@ impl ResolvedLayout {
                 // single binary search (and a single `to_string`) per role
                 // rather than repeating both.
                 macro_rules! bind {
-                    ($opt:expr, $role:expr, $field:literal, $to_str:expr) => {
+                    ($opt:expr, $ctor:expr, $field:literal) => {
                         if let Some(term) = $opt {
-                            let to_str = $to_str;
-                            match cache.resolve($role, || dict.get_id(&to_str(term))) {
+                            match cache.resolve($ctor(term), |s| dict.get_id(s)) {
                                 Some(id) => eqs.push(($field, Scalar::from(id))),
                                 None => return Constraints::AlwaysFalse,
                             }
                         }
                     };
                 }
-                bind!(subject, Role::S, "s", |s: &NamedOrBlankNode| s.to_string());
-                bind!(predicate, Role::P, "p", |p: &NamedNode| p.to_string());
-                bind!(object, Role::O, "o", |o: &Term| o.to_string());
-                bind!(graph, Role::G, "g", graph_name_str);
+                bind!(subject, TermRef::Subject, "s");
+                bind!(predicate, TermRef::Predicate, "p");
+                bind!(object, TermRef::Object, "o");
+                bind!(graph, TermRef::Graph, "g");
             }
         }
         Constraints::Eq(eqs)

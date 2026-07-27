@@ -189,15 +189,6 @@ pub fn parse_graph_name(s: &str) -> Result<GraphName> {
     }
 }
 
-/// Canonical N-Triples string for a graph name: the empty string denotes the
-/// default graph.
-pub(crate) fn graph_name_str(g: &GraphName) -> String {
-    match g {
-        GraphName::DefaultGraph => String::new(),
-        other => other.to_string(),
-    }
-}
-
 /// Reconstructs a full structural oxrdf `Term` from its raw serialized string representation.
 /// Handles URIs, Blank Nodes, simple literals, language-tagged literals, and typed literals.
 pub fn get_as_term(s: &str) -> Option<Term> {

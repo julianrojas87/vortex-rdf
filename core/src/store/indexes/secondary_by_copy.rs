@@ -40,7 +40,6 @@ use std::cmp::Ordering;
 use std::ops::Range;
 use std::sync::Arc;
 
-use oxrdf::{GraphName, NamedNode, NamedOrBlankNode, Term};
 use vortex_array::arrays::struct_::StructArrayExt;
 use vortex_array::arrays::{PrimitiveArray, StructArray};
 use vortex_array::dtype::DType;
@@ -51,12 +50,10 @@ use crate::common::utils::{
     column_is_sorted, make_string_array, search_sorted_bounds, stamp_is_sorted,
 };
 use crate::error::{Result, VortexRdfError};
-use crate::store::layouts::ResolvedLayout;
+use crate::store::layouts::{PatternCodes, QuadPattern, ResolvedLayout, TermRef};
 use crate::store::{QuadCodes, RawQuad};
 
 use super::ServePlan;
-#[cfg(feature = "file-io")]
-use crate::common::utils::graph_name_str;
 #[cfg(feature = "file-io")]
 use vortex_array::scalar::Scalar;
 #[cfg(feature = "file-io")]
@@ -215,38 +212,34 @@ pub(crate) fn is_present(dtype: &DType) -> bool {
 /// or zone-pruned) is the better access path there. A bound predicate *and*
 /// object take the POSG family's (p, o) prefix, resolving both components in
 /// one probe. `None` when nothing this index covers is bound.
-struct CopyProbe {
+struct CopyProbe<'a> {
     family: Family,
-    lead_term: String,
-    second_term: Option<String>,
+    lead: TermRef<'a>,
+    second: Option<TermRef<'a>>,
     resolves: IndexedComponent,
 }
 
-fn choose(
-    subject: Option<&NamedOrBlankNode>,
-    predicate: Option<&NamedNode>,
-    object: Option<&Term>,
-) -> Option<CopyProbe> {
-    if subject.is_some() {
+fn choose<'a>(pattern: QuadPattern<'a>) -> Option<CopyProbe<'a>> {
+    if pattern.subject.is_some() {
         return None;
     }
-    match (predicate, object) {
+    match (pattern.predicate, pattern.object) {
         (Some(predicate), Some(object)) => Some(CopyProbe {
             family: Family::Posg,
-            lead_term: predicate.to_string(),
-            second_term: Some(object.to_string()),
+            lead: TermRef::Predicate(predicate),
+            second: Some(TermRef::Object(object)),
             resolves: IndexedComponent::PredicateObject,
         }),
         (Some(predicate), None) => Some(CopyProbe {
             family: Family::Posg,
-            lead_term: predicate.to_string(),
-            second_term: None,
+            lead: TermRef::Predicate(predicate),
+            second: None,
             resolves: IndexedComponent::Predicate,
         }),
         (None, Some(object)) => Some(CopyProbe {
             family: Family::Ospg,
-            lead_term: object.to_string(),
-            second_term: None,
+            lead: TermRef::Object(object),
+            second: None,
             resolves: IndexedComponent::Object,
         }),
         (None, None) => None,
@@ -267,18 +260,18 @@ fn choose(
 pub(crate) fn resolve_in_memory(
     struct_arr: &StructArray,
     layout: &ResolvedLayout,
-    subject: Option<&NamedOrBlankNode>,
-    predicate: Option<&NamedNode>,
-    object: Option<&Term>,
-    _graph: Option<&GraphName>,
+    pattern: QuadPattern<'_>,
+    codes: &mut PatternCodes,
 ) -> Result<IndexResolution> {
     // Pick the family and probe(s) for this pattern shape, or decline it.
-    let Some(probe) = choose(subject, predicate, object) else {
+    let Some(probe) = choose(pattern) else {
         return Ok(IndexResolution::Declined);
     };
     // Translate the term to the value columns' native probe value (a string,
     // or a dictionary code). Absent from the dictionary ⇒ nothing can match.
-    let Some(lead_native) = layout.probe_scalar(&probe.lead_term) else {
+    // The probe terms are the pattern's own predicate/object, so this shares
+    // the match's resolution cache rather than searching the dictionary again.
+    let Some(lead_native) = layout.probe_scalar_cached(probe.lead, codes) else {
         return Ok(IndexResolution::Empty);
     };
     // Route through the index only when its lead column is actually usable:
@@ -300,8 +293,8 @@ pub(crate) fn resolve_in_memory(
     }
     // Prefix probe: narrow the run by the second sort key, which is sorted
     // within the run by the family's comparator.
-    if let Some(second_term) = &probe.second_term {
-        let Some(second_native) = layout.probe_scalar(second_term) else {
+    if let Some(second_term) = probe.second {
+        let Some(second_native) = layout.probe_scalar_cached(second_term, codes) else {
             return Ok(IndexResolution::Empty);
         };
         let Ok(second_col) = struct_arr.unmasked_field_by_name(probe.family.second_col()) else {
@@ -360,21 +353,19 @@ fn copy_decode_layout(layout: &ResolvedLayout) -> ResolvedLayout {
 pub(crate) async fn resolve_file(
     file: &VortexFile,
     layout: &ResolvedLayout,
-    subject: Option<&NamedOrBlankNode>,
-    predicate: Option<&NamedNode>,
-    object: Option<&Term>,
-    graph: Option<&GraphName>,
+    pattern: QuadPattern<'_>,
+    codes: &mut PatternCodes,
 ) -> Result<IndexResolution> {
-    let Some(probe) = choose(subject, predicate, object) else {
+    let Some(probe) = choose(pattern) else {
         return Ok(IndexResolution::Declined);
     };
     // Term absent from the dictionary ⇒ the pattern provably matches nothing.
-    let Some(lead_native) = layout.probe_scalar(&probe.lead_term) else {
+    let Some(lead_native) = layout.probe_scalar_cached(probe.lead, codes) else {
         return Ok(IndexResolution::Empty);
     };
     let mut constraints: Vec<(&'static str, Scalar)> = vec![(probe.family.lead_col(), lead_native)];
-    if let Some(second_term) = &probe.second_term {
-        let Some(second_native) = layout.probe_scalar(second_term) else {
+    if let Some(second_term) = probe.second {
+        let Some(second_native) = layout.probe_scalar_cached(second_term, codes) else {
             return Ok(IndexResolution::Empty);
         };
         constraints.push((probe.family.second_col(), second_native));
@@ -388,7 +379,7 @@ pub(crate) async fn resolve_file(
         resolves: probe.resolves,
         // The copies hold the whole quad in family order, so the matched rows
         // are a contiguous run the store can stream directly (see `ServePlan`).
-        serve: build_serve_plan(probe.family, layout, predicate, object, graph),
+        serve: build_serve_plan(probe.family, layout, pattern, codes),
     })
 }
 
@@ -407,18 +398,17 @@ pub(crate) async fn resolve_file(
 fn build_serve_plan(
     family: Family,
     layout: &ResolvedLayout,
-    predicate: Option<&NamedNode>,
-    object: Option<&Term>,
-    graph: Option<&GraphName>,
+    pattern: QuadPattern<'_>,
+    codes: &mut PatternCodes,
 ) -> Option<ServePlan> {
     let mut constraints: Vec<(&'static str, Scalar)> = Vec::new();
     for (column, term) in [
-        (family.p_col(), predicate.map(|p| p.to_string())),
-        (family.o_col(), object.map(|o| o.to_string())),
-        (family.g_col(), graph.map(graph_name_str)),
+        (family.p_col(), pattern.predicate.map(TermRef::Predicate)),
+        (family.o_col(), pattern.object.map(TermRef::Object)),
+        (family.g_col(), pattern.graph.map(TermRef::Graph)),
     ] {
         let Some(term) = term else { continue };
-        constraints.push((column, layout.probe_scalar(&term)?));
+        constraints.push((column, layout.probe_scalar_cached(term, codes)?));
     }
     Some(ServePlan::file(
         family.primary_columns(),
@@ -710,7 +700,7 @@ impl GlobalCopyArrays {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use oxrdf::Literal;
+    use oxrdf::{Literal, NamedNode, NamedOrBlankNode, Term};
 
     fn raw(s: &str, p: &str, o: &str, g: &str) -> RawQuad {
         RawQuad {
@@ -729,30 +719,30 @@ mod tests {
 
         // A bound subject declines: the primary sorted `s` column is the
         // better access path than this index.
-        assert!(choose(Some(&s), Some(&p), Some(&o)).is_none());
+        assert!(choose(QuadPattern::new(Some(&s), Some(&p), Some(&o), None)).is_none());
 
         // Predicate and object bound: (p, o) prefix probe on the POSG family,
         // resolving both components.
-        let probe = choose(None, Some(&p), Some(&o)).unwrap();
+        let probe = choose(QuadPattern::new(None, Some(&p), Some(&o), None)).unwrap();
         assert_eq!(probe.family, Family::Posg);
         assert_eq!(probe.resolves, IndexedComponent::PredicateObject);
-        assert_eq!(probe.lead_term, p.to_string());
-        assert_eq!(probe.second_term.as_deref(), Some(o.to_string().as_str()));
+        assert_eq!(probe.lead.to_string(), p.to_string());
+        assert_eq!(probe.second.map(|t| t.to_string()), Some(o.to_string()));
 
         // Predicate-only patterns probe the POSG lead alone.
-        let probe = choose(None, Some(&p), None).unwrap();
+        let probe = choose(QuadPattern::new(None, Some(&p), None, None)).unwrap();
         assert_eq!(probe.family, Family::Posg);
         assert_eq!(probe.resolves, IndexedComponent::Predicate);
-        assert!(probe.second_term.is_none());
+        assert!(probe.second.is_none());
 
         // Object-only patterns probe the OSPG lead.
-        let probe = choose(None, None, Some(&o)).unwrap();
+        let probe = choose(QuadPattern::new(None, None, Some(&o), None)).unwrap();
         assert_eq!(probe.family, Family::Ospg);
         assert_eq!(probe.resolves, IndexedComponent::Object);
-        assert!(probe.second_term.is_none());
+        assert!(probe.second.is_none());
 
         // Nothing this index covers is bound: declines.
-        assert!(choose(None, None, None).is_none());
+        assert!(choose(QuadPattern::new(None, None, None, None)).is_none());
     }
 
     #[test]

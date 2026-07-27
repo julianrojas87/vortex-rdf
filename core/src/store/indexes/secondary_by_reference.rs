@@ -34,7 +34,6 @@
 use std::ops::Range;
 use std::sync::Arc;
 
-use oxrdf::{GraphName, NamedNode, NamedOrBlankNode, Term};
 use vortex_array::arrays::struct_::StructArrayExt;
 use vortex_array::arrays::{PrimitiveArray, StructArray};
 use vortex_array::dtype::DType;
@@ -45,7 +44,7 @@ use crate::common::utils::{
     column_is_sorted, make_string_array, search_sorted_bounds, stamp_is_sorted,
 };
 use crate::error::{Result, VortexRdfError};
-use crate::store::layouts::ResolvedLayout;
+use crate::store::layouts::{PatternCodes, QuadPattern, ResolvedLayout, TermRef};
 use crate::store::{QuadCodes, RawQuad};
 
 #[cfg(feature = "file-io")]
@@ -65,10 +64,10 @@ pub(crate) fn is_present(dtype: &DType) -> bool {
 
 /// The sorted value column to probe, its paired row-id column, the term to
 /// probe for, and which pattern component a hit resolves.
-struct ColumnProbe {
+struct ColumnProbe<'a> {
     value_column: &'static str,
     row_id_column: &'static str,
-    probe_term: String,
+    probe_term: TermRef<'a>,
     resolves: IndexedComponent,
 }
 
@@ -80,27 +79,23 @@ struct ColumnProbe {
 /// predicate are bound, the object side is chosen — object equality is usually
 /// the more selective constraint. `None` when nothing this index covers is
 /// bound.
-fn choose(
-    subject: Option<&NamedOrBlankNode>,
-    predicate: Option<&NamedNode>,
-    object: Option<&Term>,
-) -> Option<ColumnProbe> {
-    if subject.is_some() {
+fn choose<'a>(pattern: QuadPattern<'a>) -> Option<ColumnProbe<'a>> {
+    if pattern.subject.is_some() {
         return None;
     }
-    if let Some(object) = object {
+    if let Some(object) = pattern.object {
         return Some(ColumnProbe {
             value_column: "_idx_o_val",
             row_id_column: "_idx_o_rid",
-            probe_term: object.to_string(),
+            probe_term: TermRef::Object(object),
             resolves: IndexedComponent::Object,
         });
     }
-    if let Some(predicate) = predicate {
+    if let Some(predicate) = pattern.predicate {
         return Some(ColumnProbe {
             value_column: "_idx_p_val",
             row_id_column: "_idx_p_rid",
-            probe_term: predicate.to_string(),
+            probe_term: TermRef::Predicate(predicate),
             resolves: IndexedComponent::Predicate,
         });
     }
@@ -117,18 +112,18 @@ fn choose(
 pub(crate) fn resolve_in_memory(
     struct_arr: &StructArray,
     layout: &ResolvedLayout,
-    subject: Option<&NamedOrBlankNode>,
-    predicate: Option<&NamedNode>,
-    object: Option<&Term>,
-    _graph: Option<&GraphName>,
+    pattern: QuadPattern<'_>,
+    codes: &mut PatternCodes,
 ) -> Result<IndexResolution> {
     // Pick the column pair for this pattern shape, or decline it entirely.
-    let Some(probe) = choose(subject, predicate, object) else {
+    let Some(probe) = choose(pattern) else {
         return Ok(IndexResolution::Declined);
     };
     // Translate the term to the value column's native probe value (a string, or
-    // a dictionary code). Absent from the dictionary ⇒ nothing can match.
-    let Some(native) = layout.probe_scalar(&probe.probe_term) else {
+    // a dictionary code). Absent from the dictionary ⇒ nothing can match. The
+    // probe term is the pattern's own predicate or object, so this shares the
+    // match's resolution cache rather than searching the dictionary again.
+    let Some(native) = layout.probe_scalar_cached(probe.probe_term, codes) else {
         return Ok(IndexResolution::Empty);
     };
     // Route through the index only when its value column is actually usable:
@@ -174,16 +169,14 @@ pub(crate) fn resolve_in_memory(
 pub(crate) async fn resolve_file(
     file: &VortexFile,
     layout: &ResolvedLayout,
-    subject: Option<&NamedOrBlankNode>,
-    predicate: Option<&NamedNode>,
-    object: Option<&Term>,
-    _graph: Option<&GraphName>,
+    pattern: QuadPattern<'_>,
+    codes: &mut PatternCodes,
 ) -> Result<IndexResolution> {
-    let Some(probe) = choose(subject, predicate, object) else {
+    let Some(probe) = choose(pattern) else {
         return Ok(IndexResolution::Declined);
     };
     // Term absent from the dictionary ⇒ the pattern provably matches nothing.
-    let Some(native) = layout.probe_scalar(&probe.probe_term) else {
+    let Some(native) = layout.probe_scalar_cached(probe.probe_term, codes) else {
         return Ok(IndexResolution::Empty);
     };
     let row_ids =
@@ -416,7 +409,7 @@ impl GlobalIndexArrays {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use oxrdf::Literal;
+    use oxrdf::{Literal, NamedNode, NamedOrBlankNode, Term};
 
     #[test]
     fn choose_component_selection() {
@@ -426,23 +419,23 @@ mod tests {
 
         // A bound subject declines: the primary sorted `s` column is the
         // better access path than this index.
-        assert!(choose(Some(&s), Some(&p), Some(&o)).is_none());
+        assert!(choose(QuadPattern::new(Some(&s), Some(&p), Some(&o), None)).is_none());
 
         // Object preferred over predicate when both are bound.
-        let probe = choose(None, Some(&p), Some(&o)).unwrap();
+        let probe = choose(QuadPattern::new(None, Some(&p), Some(&o), None)).unwrap();
         assert_eq!(probe.resolves, IndexedComponent::Object);
         assert_eq!(probe.value_column, "_idx_o_val");
         assert_eq!(probe.row_id_column, "_idx_o_rid");
-        assert_eq!(probe.probe_term, o.to_string());
+        assert_eq!(probe.probe_term.to_string(), o.to_string());
 
         // Predicate-only patterns use the predicate side.
-        let probe = choose(None, Some(&p), None).unwrap();
+        let probe = choose(QuadPattern::new(None, Some(&p), None, None)).unwrap();
         assert_eq!(probe.resolves, IndexedComponent::Predicate);
         assert_eq!(probe.value_column, "_idx_p_val");
         assert_eq!(probe.row_id_column, "_idx_p_rid");
-        assert_eq!(probe.probe_term, p.to_string());
+        assert_eq!(probe.probe_term.to_string(), p.to_string());
 
         // Nothing this index covers is bound: declines.
-        assert!(choose(None, None, None).is_none());
+        assert!(choose(QuadPattern::new(None, None, None, None)).is_none());
     }
 }

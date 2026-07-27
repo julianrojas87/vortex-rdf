@@ -14,7 +14,7 @@ use crate::store::indexes::{
 };
 use crate::store::layouts::term_dictionary::{self, DictSnapshot, TermDictionary};
 use crate::store::layouts::{
-    Constraints, LayoutStrategy, PatternCodes, ResolvedLayout, Role, dictionary,
+    Constraints, LayoutStrategy, PatternCodes, QuadPattern, ResolvedLayout, TermRef, dictionary,
 };
 use crate::store::selection::RowSelection;
 use crate::store::{QuadsSource, Tail};
@@ -1282,7 +1282,7 @@ impl VortexRdfStore {
                 let mut selection = selection.clone();
                 // The components still to be resolved. Each fast path below
                 // clears the one it answers, since its ids already satisfy it.
-                let (mut s, mut p, mut o, mut g) = (subject, predicate, object, graph);
+                let mut pat = QuadPattern::new(subject, predicate, object, graph);
                 let mut serve: Option<ServePlan> = None;
 
                 // ── Subject binary search on sorted s column ──────────────
@@ -1290,19 +1290,19 @@ impl VortexRdfStore {
                 // known to be sorted (stamped by sorted builders), binary
                 // search finds the exact [lo, hi) row range for that subject in
                 // O(log n) instead of scanning every row.
-                if let Some(subj) = s
+                if let Some(subj) = pat.subject
                     && let Ok(s_col) = struct_arr.unmasked_field_by_name("s")
                     && column_is_sorted(s_col)
-                    && let Some(probe) =
-                        self.layout
-                            .probe_scalar_cached(Role::S, || subj.to_string(), &mut codes)
+                    && let Some(probe) = self
+                        .layout
+                        .probe_scalar_cached(TermRef::Subject(subj), &mut codes)
                     && let Ok(scalar) = probe.cast(s_col.dtype())
                 {
                     // Left/right binary search bounds the run of rows equal to
                     // the probe value.
                     let (lo, hi) = search_sorted_bounds(s_col, &scalar)?;
                     selection = selection.intersect_range(lo as u64..hi as u64);
-                    s = None;
+                    pat.subject = None;
                     narrowed_elsewhere = true;
                     log::debug!("[match_pattern] s binary search {:?}", t.elapsed());
                 }
@@ -1318,10 +1318,8 @@ impl VortexRdfStore {
                         &self.indexes,
                         &struct_arr,
                         &self.layout,
-                        s,
-                        p,
-                        o,
-                        g,
+                        pat,
+                        &mut codes,
                     )? {
                         // The probed term is absent from the data — nothing matches.
                         IndexResolution::Empty => return Ok(self.empty_view()),
@@ -1334,7 +1332,7 @@ impl VortexRdfStore {
                             serve: candidate,
                         } => {
                             selection = selection.intersect_ids(row_ids);
-                            (s, p, o, g) = resolves.clear(s, p, o, g);
+                            pat = resolves.clear(pat);
                             serve = candidate;
                             log::debug!("[match_pattern] index (sorted search) {:?}", t.elapsed());
                         }
@@ -1353,15 +1351,19 @@ impl VortexRdfStore {
                 // arguments — `selection.apply` (a slice pushed through the
                 // array optimizer) and a struct canonicalization — are exactly
                 // the per-call cost this gate saves.
-                if !selection.is_empty(base.len())
-                    && (s.is_some() || p.is_some() || o.is_some() || g.is_some())
-                {
+                if !selection.is_empty(base.len()) && pat.any_bound() {
                     // Typed fast path: residual equalities over canonical u32
                     // code columns (Dictionary layout) become direct slice
                     // loops yielding exact base ids — no slice/compare/mask
                     // pipeline. Rows outside the selection are never tested,
                     // so the ids are already the intersection.
-                    let typed = match self.layout.constraints_cached(s, p, o, g, &mut codes) {
+                    let typed = match self.layout.constraints_cached(
+                        pat.subject,
+                        pat.predicate,
+                        pat.object,
+                        pat.graph,
+                        &mut codes,
+                    ) {
                         Constraints::AlwaysFalse => return Ok(self.empty_view()),
                         Constraints::Eq(eqs) => {
                             Self::typed_residual_ids(&struct_arr, &selection, base.len(), &eqs)
@@ -1374,9 +1376,14 @@ impl VortexRdfStore {
                             log::debug!("[match_pattern] typed residual scan {:?}", t.elapsed());
                         }
                         None => {
-                            if let Some(mask) =
-                                Self::mask_for(&self.layout, &selection.apply(base)?, s, p, o, g)?
-                            {
+                            if let Some(mask) = Self::mask_for(
+                                &self.layout,
+                                &selection.apply(base)?,
+                                pat.subject,
+                                pat.predicate,
+                                pat.object,
+                                pat.graph,
+                            )? {
                                 selection = selection.refine(&bool_array_to_mask(mask)?);
                                 narrowed_elsewhere = true;
                                 log::debug!("[match_pattern] mask scan {:?}", t.elapsed());
@@ -1434,10 +1441,8 @@ impl VortexRdfStore {
                     &self.indexes,
                     file,
                     &self.layout,
-                    subject,
-                    predicate,
-                    object,
-                    graph,
+                    QuadPattern::new(subject, predicate, object, graph),
+                    &mut codes,
                 )
                 .await?;
                 let (next_filter, index_ids, serve) = match resolution {
@@ -1452,7 +1457,9 @@ impl VortexRdfStore {
                         resolves,
                         serve,
                     } => {
-                        let (s, p, o, g) = resolves.clear(subject, predicate, object, graph);
+                        let pat =
+                            resolves.clear(QuadPattern::new(subject, predicate, object, graph));
+                        let (s, p, o, g) = (pat.subject, pat.predicate, pat.object, pat.graph);
                         // If the index handed back a serving plan, keep it only
                         // when this match is the view's sole restriction: the
                         // plan's filter selects exactly the matched rows over the
