@@ -362,11 +362,23 @@
       One <code>npm run bench</code> run of <code>js/bench/compare.bench.ts</code> — the
       <code>VortexRdfStore</code> WASM bindings compared against
       <a href="https://github.com/rubensworks/rdf-stores.js">rdf-stores.js</a> and
-      <a href="https://github.com/oxigraph/oxigraph/tree/main/js">oxigraph</a>, on an
-      rdf-stores.js-style synthetic dataset across four phases: ingest, query, add, delete.
-      Wall-clock (tinybench) — deliberately <em>not</em> uploaded to CodSpeed.
+      <a href="https://github.com/oxigraph/oxigraph/tree/main/js">oxigraph</a>, on a
+      synthetic dataset whose <em>distinct term count scales with the rows</em>
+      (near-unique subject IRIs, a small closed predicate vocabulary, a mix of IRI and
+      literal objects), across four phases: ingest, query, add, delete. Wall-clock
+      (tinybench) — deliberately <em>not</em> uploaded to CodSpeed.
+    </p>
+    <p class="lede">
+      Term cardinality matters because it is what exercises each library's dictionary and
+      string handling; the previous dataset drew all its rows from a namespace of only
+      <code>D</code> IRIs (128 distinct terms for 2,097,152 triples), which made that
+      dimension invisible. Query timings are therefore <strong>not comparable with runs
+      from before the cardinality switch</strong> — selectivity now follows the data, so
+      each pattern's matched-row count is recorded in <code>config.matchedRows</code>
+      alongside its timing.
     </p>
     <div class="kpi-row" id="js-kpi-row"></div>
+    <p class="lede mono" id="js-matched-rows"></p>
   </section>
 
   <section id="js-ingest" class="group">
@@ -750,6 +762,19 @@ function renderKpis(hostSel, tiles){
   }
 }
 
+// How many rows each query pattern actually matched. Selectivity is a property
+// of the dataset's term cardinality rather than a fixed dimension, so a timing
+// is only interpretable next to the number of rows it touched.
+function renderMatchedRows(matched){
+  const host = document.getElementById("js-matched-rows");
+  if (!host) return;
+  const entries = Object.entries(matched || {});
+  if (!entries.length){ host.textContent = ""; return; }
+  host.innerHTML = "Rows matched per pattern: " + entries
+    .map(([pat, n]) => `<strong>${pat}</strong> ${Number(n).toLocaleString()}`)
+    .join(" · ");
+}
+
 function makeTable(data, tableSel, filterSel, countSel){
   const tbody = document.querySelector(`${tableSel} tbody`);
   const countEl = document.querySelector(countSel);
@@ -971,8 +996,13 @@ function renderJs(){
     { label:"Vortex variants", value:String(JS_VORTEX.length), sub:"builder × layout × index" },
     { label:"Benchmarks", value:String(JS_DATA.length), sub:"leaf measurements" },
     { label:"Quads", value:(JS_CONFIG.triplesCount||0).toLocaleString(), sub:(JS_CONFIG.quadsCount||0).toLocaleString()+" named-graph quads" },
+    // Distinct terms is the dimension this dataset exists to exercise; without
+    // it a reader cannot tell whether a store's dictionary was under any load.
+    { label:"Distinct terms", value:(JS_CONFIG.cardinality?.triples?.terms||0).toLocaleString(),
+      sub:(JS_CONFIG.cardinality?.quads?.terms||0).toLocaleString()+" in the quads dataset" },
     { label:"Iterations", value:`${JS_CONFIG.queryIterations??"?"} / ${JS_CONFIG.heavyIterations??"?"}`, sub:"query / ingest·mutate" },
   ]);
+  renderMatchedRows(JS_CONFIG.matchedRows);
   makeTable(JS_DATA, "#js-data-table", "#js-table-filter", "#js-table-count");
   document.getElementById("js-provenance").textContent = JS_PROVENANCE;
 }

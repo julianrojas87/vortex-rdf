@@ -136,6 +136,22 @@ async function drain(stream: unknown): Promise<number> {
     return n;
 }
 
+/** Force every term of every quad to be materialized.
+ *
+ * Every other read benchmark here discards the result, and for the Dictionary
+ * layout that never decodes a single term — the lazy read model hands back term
+ * *codes* and only resolves them when `.value` is read. So without this, the
+ * whole term-decoding path (and the per-distinct-term boundary crossing the
+ * on-demand dictionary makes) is invisible to CodSpeed. */
+function decodeAll(quads: Quad[]): number {
+    let chars = 0;
+    for (const q of quads) {
+        chars += q.subject.value.length + q.predicate.value.length
+            + q.object.value.length + q.graph.value.length;
+    }
+    return chars;
+}
+
 // tinybench options (ignored under CodSpeed instrumentation, which measures each
 // task once; they only shape the local wall-clock run). Reads get a time budget;
 // the costly build/mutation phases get a low fixed iteration count.
@@ -209,17 +225,30 @@ async function benchQuery(triples: Quad[], quads: Quad[]): Promise<void> {
     }
 }
 
-/** readpath::<variant> — the three read entry points on the JS-default store
- * for one selective pattern (S), isolating the boundary cost each carries:
- * getQuads (materialized array), match (lazy stream drain), matchCodes
- * (zero-copy u32 columns, no term strings). Directly supports read-path tuning. */
+/** readpath::<variant> — the read entry points on the JS-default store for one
+ * selective pattern (S), isolating the boundary cost each carries: getQuads
+ * (materialized array), match (lazy stream drain), matchCodes (zero-copy u32
+ * columns, no term strings). Directly supports read-path tuning.
+ *
+ * The `_decoded` variants additionally read every term's `.value`. They are the
+ * only benchmarks in this file that exercise term decoding at all — the others
+ * stop at the lazy quads — so they are what guards the term dictionary's
+ * per-lookup cost against regressions. `full_decoded` is the worst case: every
+ * row, every term, i.e. every distinct code resolved once. */
 async function benchReadPath(triples: Quad[]): Promise<void> {
     const store = await VortexRdfStore.fromQuads(triples, { builder: 'Unsorted', layout: 'Dictionary' });
     const p = TRIPLE_PATTERNS[0]; // S
+    const f = FULL_SCAN_PATTERN;
     await runGroup(READ_OPTS, (b) => {
         b.add('readpath::getQuads', async () => { await store.getQuads(p.s, p.p, p.o, p.g); });
         b.add('readpath::match_stream', async () => { await drain(store.match(p.s, p.p, p.o, p.g)); });
         b.add('readpath::matchCodes', async () => { await store.matchCodes(p.s, p.p, p.o, p.g); });
+        b.add('readpath::getQuads_decoded', async () => {
+            decodeAll(await store.getQuads(p.s, p.p, p.o, p.g));
+        });
+        b.add('readpath::full_decoded', async () => {
+            decodeAll(await store.getQuads(f.s, f.p, f.o, f.g));
+        });
     });
     free(store);
 }
