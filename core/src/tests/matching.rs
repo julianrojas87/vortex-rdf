@@ -114,6 +114,7 @@ async fn run_match_pattern_file_typed_object_test<B: VortexArrayBuilder>() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[cfg(feature = "file-io")]
 async fn run_match_pattern_file_dictionary_test<B: VortexArrayBuilder>() {
     use crate::io::ser::quads_stream_to_vortex_writer_with_builder;
 

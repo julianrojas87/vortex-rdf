@@ -6,6 +6,7 @@ use futures::{StreamExt, TryStreamExt, stream};
 use oxrdf::{GraphName, Literal, NamedNode, NamedOrBlankNode, Quad, Term};
 
 mod dictionary;
+#[cfg(feature = "file-io")]
 mod file_backed;
 mod indexes;
 mod matching;

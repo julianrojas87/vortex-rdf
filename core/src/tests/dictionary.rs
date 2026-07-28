@@ -617,6 +617,7 @@ async fn test_sidecar_dictionary_file_roundtrip() {
 // ─── 7b) File-backed dictionary ─────────────────────────────────────────
 
 /// Sorted string forms of a pattern match on `store`.
+#[cfg(feature = "file-io")]
 async fn matched_strings(
     store: &VortexRdfStore,
     s: Option<&NamedOrBlankNode>,
@@ -631,6 +632,7 @@ async fn matched_strings(
 
 /// A store opened with the dictionary forced file-backed must answer every
 /// pattern family identically to the resident open of the same file.
+#[cfg(feature = "file-io")]
 async fn assert_file_backed_matches_resident(
     placement: crate::store::DictionaryPlacement,
     indexes: Indexes,
@@ -721,6 +723,7 @@ async fn assert_file_backed_matches_resident(
     std::fs::remove_dir_all(&dir).ok();
 }
 
+#[cfg(feature = "file-io")]
 #[tokio::test]
 async fn test_file_backed_dictionary_matches_resident_padded() {
     assert_file_backed_matches_resident(
@@ -731,6 +734,7 @@ async fn test_file_backed_dictionary_matches_resident_padded() {
     .await;
 }
 
+#[cfg(feature = "file-io")]
 #[tokio::test]
 async fn test_file_backed_dictionary_matches_resident_sidecar() {
     assert_file_backed_matches_resident(
@@ -743,6 +747,7 @@ async fn test_file_backed_dictionary_matches_resident_sidecar() {
 
 /// With a copy index present, an index-served read on a file-backed store
 /// must stream through the async decode path and still agree with resident.
+#[cfg(feature = "file-io")]
 #[tokio::test]
 async fn test_file_backed_dictionary_serves_from_copy_index() {
     assert_file_backed_matches_resident(
@@ -781,6 +786,7 @@ async fn test_file_backed_dictionary_serves_from_copy_index() {
 
 /// The residency threshold is inclusive: exactly at the term count the
 /// dictionary lifts resident, one below it stays file-backed.
+#[cfg(feature = "file-io")]
 #[tokio::test]
 async fn test_file_backed_dictionary_threshold_boundary() {
     let quads = dictionary_test_quads();
@@ -815,6 +821,7 @@ async fn test_file_backed_dictionary_threshold_boundary() {
 /// The operations that need the whole dictionary — serialization, mutation
 /// with its tail merge, compaction — lift a file-backed dictionary
 /// transiently and stay correct.
+#[cfg(feature = "file-io")]
 #[tokio::test]
 async fn test_file_backed_dictionary_serializes_and_mutates() {
     let quads = dictionary_test_quads();

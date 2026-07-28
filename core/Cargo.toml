@@ -65,3 +65,4 @@ tokio = { workspace = true, features = ["time", "rt-multi-thread"] }
 [[bench]]
 name = "benchmark"
 harness = false
+required-features = ["file-io"]
