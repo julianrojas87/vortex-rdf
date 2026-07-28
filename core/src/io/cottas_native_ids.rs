@@ -4,7 +4,8 @@ use crate::io::utils::CottasVortexCompressionProfile;
 use crate::store::layout::cottas::TripleOrdering;
 use async_trait::async_trait;
 
-use futures::{Stream, StreamExt};
+use futures::future::{self, BoxFuture};
+use futures::{FutureExt, Stream, StreamExt};
 use oxrdf::Quad;
 use std::cmp::Ordering;
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
@@ -21,12 +22,13 @@ use vortex_array::VortexSessionExecute;
 use vortex_array::arrays::chunked::ChunkedArrayExt;
 use vortex_array::arrays::struct_::StructArrayExt;
 use vortex_array::arrays::{Chunked, PrimitiveArray, StructArray, VarBinArray, VarBinViewArray};
+use vortex_array::buffer::BufferHandle;
 use vortex_array::stream::ArrayStreamAdapter;
 use vortex_array::{ArrayRef, IntoArray};
 use vortex_btrblocks::BtrBlocksCompressorBuilder;
-use vortex_buffer::Buffer;
+use vortex_buffer::{Alignment, Buffer};
 use vortex_file::{OpenOptionsSessionExt, WriteOptionsSessionExt, WriteStrategyBuilder};
-use vortex_io::VortexWrite;
+use vortex_io::{CoalesceConfig, VortexReadAt, VortexWrite};
 use vortex_layout::segments::{SegmentId, SegmentSource};
 use vortex_session::VortexSession;
 
@@ -490,6 +492,106 @@ async fn inspect_native_artifact(artifact_path: &Path) -> Result<NativeArtifactK
         .map_err(VortexRdfError::from)?;
     let manifest = NativeArtifactManifest::from_metadata_bytes(bytes.as_slice())?;
     Ok(NativeArtifactKind::ManifestExternal(manifest))
+}
+
+// VORTEX_RDF_BOUNDED_NATIVE_COMPONENT_READER_V1
+#[derive(Clone)]
+struct BoundedNativeComponentReader {
+    source: Arc<dyn VortexReadAt>,
+    base_offset: u64,
+    length: u64,
+}
+
+impl BoundedNativeComponentReader {
+    fn new(source: Arc<dyn VortexReadAt>, base_offset: u64, length: u64) -> Result<Self> {
+        if length == 0 {
+            return Err(VortexRdfError::InvalidOperation(
+                "bounded native component length must be positive".into(),
+            ));
+        }
+        base_offset.checked_add(length).ok_or_else(|| {
+            VortexRdfError::InvalidOperation(format!(
+                "bounded native component range overflows u64: offset={base_offset}, length={length}"
+            ))
+        })?;
+        Ok(Self {
+            source,
+            base_offset,
+            length,
+        })
+    }
+
+    fn absolute_read_offset(&self, offset: u64, length: usize) -> VortexResult<u64> {
+        let length = u64::try_from(length)
+            .map_err(|_| vortex_error::vortex_err!("bounded read length exceeds u64"))?;
+        let relative_end = offset.checked_add(length).ok_or_else(|| {
+            vortex_error::vortex_err!(
+                "bounded read range overflows u64: offset={}, length={}",
+                offset,
+                length
+            )
+        })?;
+        if relative_end > self.length {
+            return Err(vortex_error::vortex_err!(
+                "bounded read {}..{} exceeds component length {}",
+                offset,
+                relative_end,
+                self.length
+            ));
+        }
+        self.base_offset.checked_add(offset).ok_or_else(|| {
+            vortex_error::vortex_err!(
+                "bounded absolute read offset overflows u64: base={}, offset={}",
+                self.base_offset,
+                offset
+            )
+        })
+    }
+}
+
+impl VortexReadAt for BoundedNativeComponentReader {
+    fn uri(&self) -> Option<&Arc<str>> {
+        self.source.uri()
+    }
+
+    fn coalesce_config(&self) -> Option<CoalesceConfig> {
+        self.source.coalesce_config()
+    }
+
+    fn concurrency(&self) -> usize {
+        self.source.concurrency()
+    }
+
+    fn size(&self) -> BoxFuture<'static, VortexResult<u64>> {
+        future::ready(Ok(self.length)).boxed()
+    }
+
+    fn read_at(
+        &self,
+        offset: u64,
+        length: usize,
+        alignment: Alignment,
+    ) -> BoxFuture<'static, VortexResult<BufferHandle>> {
+        let absolute_offset = match self.absolute_read_offset(offset, length) {
+            Ok(offset) => offset,
+            Err(error) => return future::ready(Err(error)).boxed(),
+        };
+        self.source.read_at(absolute_offset, length, alignment)
+    }
+}
+
+async fn open_bounded_native_component(
+    source: Arc<dyn VortexReadAt>,
+    offset: u64,
+    length: u64,
+) -> Result<vortex_file::VortexFile> {
+    let reader = BoundedNativeComponentReader::new(source, offset, length)?;
+    NATIVE_FILE_SESSION
+        .open_options()
+        .with_file_size(length)
+        .open_read(reader)
+        .await
+        .map_err(VortexRdfError::from)
 }
 
 #[derive(Clone, Debug)]
@@ -7448,6 +7550,39 @@ mod native_artifact_manifest_tests {
             .collect();
         assert_eq!(paths.len(), NativeComponent::ALL.len());
         assert!(paths.iter().all(|path| path != artifact));
+    }
+
+    #[test]
+    fn bounded_component_reader_translates_relative_offsets() {
+        let source: Arc<dyn VortexReadAt> =
+            Arc::new(vortex_buffer::ByteBuffer::from(vec![0u8; 64]));
+        let reader = BoundedNativeComponentReader::new(source, 11, 20).unwrap();
+        assert_eq!(reader.absolute_read_offset(0, 1).unwrap(), 11);
+        assert_eq!(reader.absolute_read_offset(19, 1).unwrap(), 30);
+        assert_eq!(reader.absolute_read_offset(20, 0).unwrap(), 31);
+    }
+
+    #[test]
+    fn bounded_component_reader_rejects_invalid_ranges() {
+        let source: Arc<dyn VortexReadAt> =
+            Arc::new(vortex_buffer::ByteBuffer::from(vec![0u8; 64]));
+        assert!(BoundedNativeComponentReader::new(Arc::clone(&source), 0, 0).is_err());
+        assert!(BoundedNativeComponentReader::new(Arc::clone(&source), u64::MAX, 2).is_err());
+        let reader = BoundedNativeComponentReader::new(source, 11, 20).unwrap();
+        assert!(reader.absolute_read_offset(20, 1).is_err());
+        assert!(reader.absolute_read_offset(u64::MAX, 2).is_err());
+    }
+
+    #[tokio::test]
+    async fn bounded_component_reader_delegates_only_inside_its_window() {
+        let bytes: Vec<u8> = (0u8..64).collect();
+        let source: Arc<dyn VortexReadAt> = Arc::new(vortex_buffer::ByteBuffer::from(bytes));
+        let reader = BoundedNativeComponentReader::new(source, 10, 20).unwrap();
+        assert_eq!(reader.size().await.unwrap(), 20);
+        let handle = reader.read_at(3, 4, Alignment::none()).await.unwrap();
+        let host = handle.try_into_host().unwrap().await.unwrap();
+        assert_eq!(host.as_slice(), &[13, 14, 15, 16]);
+        assert!(reader.read_at(18, 3, Alignment::none()).await.is_err());
     }
 
     #[test]
