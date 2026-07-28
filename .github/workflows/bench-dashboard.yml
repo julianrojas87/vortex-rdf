@@ -28,7 +28,12 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Run benchmarks
-        run: cargo bench --bench benchmark | tee bench_output.txt
+        # Both targets feed one log: the render script keeps parsing across
+        # concatenated divan outputs. match_lazy is the local/dashboard-only
+        # lazy match matrix (never uploaded to CodSpeed).
+        run: |
+          cargo bench --bench benchmark | tee bench_output.txt
+          cargo bench --bench match_lazy | tee -a bench_output.txt
 
       - name: Setup Node
         uses: actions/setup-node@v4
