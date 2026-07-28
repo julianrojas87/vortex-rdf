@@ -40,238 +40,23 @@ use std::hint::black_box;
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
-use futures::{StreamExt, stream};
+use futures::stream;
 use oxrdf::{GraphName, NamedNode, NamedOrBlankNode, Term};
-use tokio::runtime::Runtime;
 
 use vortex_rdf_core::common::testing::generate_rdf_data_stream;
-use vortex_rdf_core::store::RawQuad;
 use vortex_rdf_core::{
-    DictionaryPlacement, IndexType, LayoutStrategy, SortedInMemoryBuilder, SortedStreamBuilder,
+    DictionaryPlacement, LayoutStrategy, SortedInMemoryBuilder, SortedStreamBuilder,
     UnsortedStreamBuilder, VortexRdfError, VortexRdfStore, io,
 };
+
+mod support;
+use support::*;
 
 fn main() {
     divan::main();
 }
 
-/// Single dataset size for the whole suite. In simulation mode CodSpeed counts
-/// instructions deterministically, so one representative size catches
-/// regressions in every path; larger sizes only multiply valgrind cost without
-/// adding signal (CodSpeed does not analyse scaling curves). Default matches
-/// CodSpeed CI; override locally (e.g. `BENCH_SIZE=2097152 cargo bench`, to
-/// match the JS comparative benchmark's default D=128 scale) to see how
-/// results shift at a larger size.
-fn bench_size() -> usize {
-    static SIZE: OnceLock<usize> = OnceLock::new();
-    *SIZE.get_or_init(|| {
-        std::env::var("BENCH_SIZE")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(100_000)
-    })
-}
-
-// ── shared tokio runtime ────────────────────────────────────────────────────
-
-static TOKIO_RUNTIME: OnceLock<Runtime> = OnceLock::new();
-
-fn rt() -> &'static Runtime {
-    TOKIO_RUNTIME.get_or_init(|| Runtime::new().unwrap())
-}
-
-// ── configuration axes ──────────────────────────────────────────────────────
-
-#[derive(Copy, Clone, PartialEq, Eq, Hash)]
-enum Builder {
-    Unsorted,
-    SortedInMemory,
-    SortedStream,
-}
-
-impl Builder {
-    fn short(self) -> &'static str {
-        match self {
-            Self::Unsorted => "unsorted",
-            Self::SortedInMemory => "sorted_in_memory",
-            Self::SortedStream => "sorted_stream",
-        }
-    }
-}
-
-#[derive(Copy, Clone, PartialEq, Eq, Hash)]
-enum Layout {
-    Default,
-    TypedObject,
-    Dictionary,
-}
-
-impl Layout {
-    fn strategy(self) -> LayoutStrategy {
-        match self {
-            Self::Default => LayoutStrategy::Default,
-            Self::TypedObject => LayoutStrategy::TypedObject,
-            Self::Dictionary => LayoutStrategy::Dictionary,
-        }
-    }
-    fn short(self) -> &'static str {
-        match self {
-            Self::Default => "default",
-            Self::TypedObject => "typed_object",
-            Self::Dictionary => "dictionary",
-        }
-    }
-}
-
-impl fmt::Debug for Layout {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.short())
-    }
-}
-
-#[derive(Copy, Clone, PartialEq, Eq, Hash)]
-enum Index {
-    None,
-    ByReference,
-    ByCopy,
-}
-
-impl Index {
-    fn types(self) -> Vec<IndexType> {
-        match self {
-            Self::None => vec![],
-            Self::ByReference => vec![IndexType::SecondaryByReference],
-            Self::ByCopy => vec![IndexType::SecondaryByCopy],
-        }
-    }
-    fn short(self) -> &'static str {
-        match self {
-            Self::None => "no_index",
-            Self::ByReference => "by_reference",
-            Self::ByCopy => "by_copy",
-        }
-    }
-}
-
-#[derive(Copy, Clone, PartialEq, Eq, Hash)]
-enum Source {
-    File,
-    InMemory,
-}
-
-impl Source {
-    fn short(self) -> &'static str {
-        match self {
-            Self::File => "file",
-            Self::InMemory => "in_memory",
-        }
-    }
-}
-
-impl fmt::Debug for Source {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.short())
-    }
-}
-
-// ── dataset + artifact construction (all untimed helpers) ────────────────────
-
-/// Materialize the generated quads into an owned `Vec`, eagerly. The generator
-/// is a *lazy* stream whose per-quad `format!` allocations would otherwise be
-/// polled — and charged — inside the timed serialization region; draining it
-/// here keeps those allocations out of the measurement.
-fn materialize_quads(size: usize) -> Vec<RawQuad> {
-    rt().block_on(async move {
-        generate_rdf_data_stream(size)
-            .map(|q| q.expect("quad generation is infallible"))
-            .collect()
-            .await
-    })
-}
-
-/// Build the in-memory store for a config, dispatching the generic builder on
-/// the runtime `Builder` enum. A store rather than a bare array: under the
-/// Dictionary layout the array holds only u32 codes, and the term dictionary
-/// travels beside it in the builder's `BuiltArray` — `from_built` is the one
-/// constructor that accepts that pair.
-fn build_store(builder: Builder, layout: Layout, index: Index, size: usize) -> VortexRdfStore {
-    rt().block_on(async move {
-        let stream = generate_rdf_data_stream(size);
-        let strategy = layout.strategy();
-        let indexes = index.types();
-        match builder {
-            Builder::Unsorted => {
-                VortexRdfStore::build_vortex_array_with_builder::<UnsortedStreamBuilder>(
-                    stream, strategy, indexes,
-                )
-                .await
-            }
-            Builder::SortedInMemory => {
-                VortexRdfStore::build_vortex_array_with_builder::<SortedInMemoryBuilder>(
-                    stream, strategy, indexes,
-                )
-                .await
-            }
-            Builder::SortedStream => {
-                VortexRdfStore::build_vortex_array_with_builder::<SortedStreamBuilder>(
-                    stream, strategy, indexes,
-                )
-                .await
-            }
-        }
-        .and_then(VortexRdfStore::from_built)
-        .expect("failed to build vortex store")
-    })
-}
-
-type CacheKey = (Builder, Layout, Index, usize);
-
-/// Cache of built in-memory stores (cheaply cloneable: Arc-shared internals).
-/// Under the star design only a handful of distinct configs are ever
-/// requested, so this stays naturally bounded (unlike the old full-factorial
-/// cache, which held every combination for the process lifetime).
-static STORE_CACHE: OnceLock<Mutex<HashMap<CacheKey, VortexRdfStore>>> = OnceLock::new();
-static FILE_CACHE: OnceLock<Mutex<HashMap<CacheKey, PathBuf>>> = OnceLock::new();
 static IPC_CACHE: OnceLock<Mutex<HashMap<CacheKey, Vec<u8>>>> = OnceLock::new();
-
-fn cached_store(builder: Builder, layout: Layout, index: Index, size: usize) -> VortexRdfStore {
-    let cache = STORE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    let key = (builder, layout, index, size);
-    if let Some(store) = cache.lock().unwrap().get(&key) {
-        return store.clone();
-    }
-    let store = build_store(builder, layout, index, size);
-    cache.lock().unwrap().insert(key, store.clone());
-    store
-}
-
-fn cached_file(builder: Builder, layout: Layout, index: Index, size: usize) -> PathBuf {
-    let cache = FILE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    let key = (builder, layout, index, size);
-    if let Some(path) = cache.lock().unwrap().get(&key) {
-        return path.clone();
-    }
-    let store = cached_store(builder, layout, index, size);
-    let dir = PathBuf::from("target/bench_vortex_files");
-    std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join(format!(
-        "{}_{}_{}_{}.vortex",
-        builder.short(),
-        layout.short(),
-        index.short(),
-        size
-    ));
-    rt().block_on(async {
-        let arr = store
-            .to_serializable_array()
-            .await
-            .expect("serializable array");
-        let writer = tokio::fs::File::create(&path).await.expect("create file");
-        io::serialize(arr, writer).await.expect("serialize file");
-    });
-    cache.lock().unwrap().insert(key, path.clone());
-    path
-}
 
 fn cached_ipc_bytes(builder: Builder, layout: Layout, index: Index, size: usize) -> Vec<u8> {
     let cache = IPC_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
@@ -285,29 +70,6 @@ fn cached_ipc_bytes(builder: Builder, layout: Layout, index: Index, size: usize)
     io::write_array_to_ipc(arr, &mut buf).expect("write ipc");
     cache.lock().unwrap().insert(key, buf.clone());
     buf
-}
-
-/// Construct a store over a config's data, from the requested source. Both are
-/// untimed: `from_file` reads the footer only, and the in-memory arm clones a
-/// cached (Arc-shared) store.
-fn make_store(
-    source: Source,
-    builder: Builder,
-    layout: Layout,
-    index: Index,
-    size: usize,
-) -> VortexRdfStore {
-    match source {
-        Source::File => {
-            let path = cached_file(builder, layout, index, size);
-            rt().block_on(async {
-                VortexRdfStore::from_file(path)
-                    .await
-                    .expect("open file store")
-            })
-        }
-        Source::InMemory => cached_store(builder, layout, index, size),
-    }
 }
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -448,56 +210,6 @@ fn serialize(bencher: divan::Bencher, cfg: &SerCfg) {
 // query-indistinguishable from SortedStream (identical stamped columns).
 // ══════════════════════════════════════════════════════════════════════════
 
-// Each variant names the bound components by letter (Subject/Predicate/
-// Object/Graph), so `SPOG` is consistent with its siblings, not a word to
-// re-case.
-#[allow(clippy::upper_case_acronyms)]
-#[derive(Copy, Clone, Debug)]
-enum Pattern {
-    S,
-    P,
-    O,
-    PO,
-    G,
-    SPOG,
-}
-
-const PATTERNS: &[Pattern] = &[
-    Pattern::S,
-    Pattern::P,
-    Pattern::O,
-    Pattern::PO,
-    Pattern::G,
-    Pattern::SPOG,
-];
-
-/// Probe terms, all chosen to hit rows the generator actually emits (see the
-/// module docs on selectivity).
-#[allow(clippy::type_complexity)]
-fn terms_for(
-    pattern: Pattern,
-) -> (
-    Option<NamedOrBlankNode>,
-    Option<NamedNode>,
-    Option<Term>,
-    Option<GraphName>,
-) {
-    let s =
-        || NamedOrBlankNode::NamedNode(NamedNode::new_unchecked("http://example.org/subject/0"));
-    let p = || NamedNode::new_unchecked("http://example.org/predicate/0");
-    let o = || Term::NamedNode(NamedNode::new_unchecked("http://example.org/object/0"));
-    let g = || GraphName::NamedNode(NamedNode::new_unchecked("http://example.org/graph/0"));
-
-    match pattern {
-        Pattern::S => (Some(s()), None, None, None),
-        Pattern::P => (None, Some(p()), None, None),
-        Pattern::O => (None, None, Some(o()), None),
-        Pattern::PO => (None, Some(p()), Some(o()), None),
-        Pattern::G => (None, None, None, Some(g())),
-        Pattern::SPOG => (Some(s()), Some(p()), Some(o()), Some(g())),
-    }
-}
-
 /// Run one match config across a pattern: build the store once (untimed), then
 /// time `match_pattern` plus materialization of the matched quads (so the lazy
 /// derived view is actually executed).
@@ -533,97 +245,81 @@ macro_rules! match_bench {
     };
 }
 
-// Baseline + source axis.
-match_bench!(
-    match_sorted_default_bycopy_file,
-    Builder::SortedStream,
-    Layout::Default,
-    Index::ByCopy,
-    Source::File
-);
-match_bench!(
-    match_sorted_default_bycopy_mem,
-    Builder::SortedStream,
-    Layout::Default,
-    Index::ByCopy,
-    Source::InMemory
-);
-// Layout axis (file).
-match_bench!(
-    match_sorted_typedobj_bycopy_file,
-    Builder::SortedStream,
-    Layout::TypedObject,
-    Index::ByCopy,
-    Source::File
-);
-match_bench!(
-    match_sorted_dict_bycopy_file,
-    Builder::SortedStream,
-    Layout::Dictionary,
-    Index::ByCopy,
-    Source::File
-);
-// Layout axis (in-memory): the same non-default layouts over a resident
-// store. With the default in-memory row above, these complete the
-// layout × source match matrix the dashboard consolidates into one table.
-// (Placement is a file-storage concept, so in-memory Dictionary is one row.)
-match_bench!(
-    match_sorted_typedobj_bycopy_mem,
-    Builder::SortedStream,
-    Layout::TypedObject,
-    Index::ByCopy,
-    Source::InMemory
-);
-match_bench!(
-    match_sorted_dict_bycopy_mem,
-    Builder::SortedStream,
-    Layout::Dictionary,
-    Index::ByCopy,
-    Source::InMemory
-);
-// Placement axis (Dictionary, file): the sidecar twin of
-// `match_sorted_dict_bycopy_file`. The padded tail taxes every file match —
-// extra rows/zones in the quads file, and at small scales the writer
-// co-compresses quad codes with the sentinel tail — so the two placements
-// are tracked side by side. Residency is the default (resident) for both.
-#[divan::bench(args = PATTERNS)]
-fn match_sorted_dict_bycopy_sidecar_file(bencher: divan::Bencher, pattern: &Pattern) {
-    bencher
-        .with_inputs(|| {
-            let path = cached_dict_indexed_file(DictionaryPlacement::Sidecar, bench_size());
-            rt().block_on(async {
-                VortexRdfStore::from_file(&path)
-                    .await
-                    .expect("open sidecar")
-            })
-        })
-        .bench_refs(|store| {
-            let (s, p, o, g) = terms_for(*pattern);
-            rt().block_on(async {
-                let matched = store
-                    .match_pattern(s.as_ref(), p.as_ref(), o.as_ref(), g.as_ref())
-                    .await
-                    .expect("match_pattern failed");
-                let quads = matched.quads_vec().await.expect("execute match");
-                black_box(quads)
-            })
-        });
+/// The sidecar twin of a padded `match_bench!` row: the dictionary lives in
+/// a companion file, so the store is opened from a path written by the
+/// path-based writer (`make_store`'s writer-generic path always pads). The
+/// padded tail taxes every file match — extra rows/zones in the quads file,
+/// and at small scales the writer co-compresses quad codes with the sentinel
+/// tail — so the two placements are tracked side by side. Residency is the
+/// default (resident) for both.
+macro_rules! match_sidecar_bench {
+    ($name:ident, $index:expr) => {
+        #[divan::bench(args = PATTERNS)]
+        fn $name(bencher: divan::Bencher, pattern: &Pattern) {
+            bencher
+                .with_inputs(|| {
+                    let path = cached_dict_indexed_file(
+                        DictionaryPlacement::Sidecar,
+                        $index,
+                        bench_size(),
+                    );
+                    rt().block_on(async {
+                        VortexRdfStore::from_file(&path)
+                            .await
+                            .expect("open sidecar")
+                    })
+                })
+                .bench_refs(|store| {
+                    let (s, p, o, g) = terms_for(*pattern);
+                    rt().block_on(async {
+                        let matched = store
+                            .match_pattern(s.as_ref(), p.as_ref(), o.as_ref(), g.as_ref())
+                            .await
+                            .expect("match_pattern failed");
+                        let quads = matched.quads_vec().await.expect("execute match");
+                        black_box(quads)
+                    })
+                });
+        }
+    };
 }
-// Index axis (file).
-match_bench!(
-    match_sorted_default_noindex_file,
-    Builder::SortedStream,
-    Layout::Default,
-    Index::None,
-    Source::File
+
+/// The full layout × source × index match matrix (sorted-stream builder
+/// throughout; the unsorted builder is its own axis below). One group per
+/// cell, named `match_sorted_{layout}_{index}_{source}`; the Dictionary
+/// layout contributes a padded and a sidecar file row per index because
+/// placement is a file-storage concept.
+macro_rules! match_matrix {
+    ($(($layout:expr, $index:expr, $source:expr) => $name:ident,)*) => {
+        $(match_bench!($name, Builder::SortedStream, $layout, $index, $source);)*
+    };
+}
+match_matrix!(
+    // No secondary index.
+    (Layout::Default, Index::None, Source::InMemory) => match_sorted_default_noindex_mem,
+    (Layout::Default, Index::None, Source::File) => match_sorted_default_noindex_file,
+    (Layout::TypedObject, Index::None, Source::InMemory) => match_sorted_typedobj_noindex_mem,
+    (Layout::TypedObject, Index::None, Source::File) => match_sorted_typedobj_noindex_file,
+    (Layout::Dictionary, Index::None, Source::InMemory) => match_sorted_dict_noindex_mem,
+    (Layout::Dictionary, Index::None, Source::File) => match_sorted_dict_noindex_file,
+    // Secondary by reference.
+    (Layout::Default, Index::ByReference, Source::InMemory) => match_sorted_default_byref_mem,
+    (Layout::Default, Index::ByReference, Source::File) => match_sorted_default_byref_file,
+    (Layout::TypedObject, Index::ByReference, Source::InMemory) => match_sorted_typedobj_byref_mem,
+    (Layout::TypedObject, Index::ByReference, Source::File) => match_sorted_typedobj_byref_file,
+    (Layout::Dictionary, Index::ByReference, Source::InMemory) => match_sorted_dict_byref_mem,
+    (Layout::Dictionary, Index::ByReference, Source::File) => match_sorted_dict_byref_file,
+    // Secondary by copy.
+    (Layout::Default, Index::ByCopy, Source::InMemory) => match_sorted_default_bycopy_mem,
+    (Layout::Default, Index::ByCopy, Source::File) => match_sorted_default_bycopy_file,
+    (Layout::TypedObject, Index::ByCopy, Source::InMemory) => match_sorted_typedobj_bycopy_mem,
+    (Layout::TypedObject, Index::ByCopy, Source::File) => match_sorted_typedobj_bycopy_file,
+    (Layout::Dictionary, Index::ByCopy, Source::InMemory) => match_sorted_dict_bycopy_mem,
+    (Layout::Dictionary, Index::ByCopy, Source::File) => match_sorted_dict_bycopy_file,
 );
-match_bench!(
-    match_sorted_default_byref_file,
-    Builder::SortedStream,
-    Layout::Default,
-    Index::ByReference,
-    Source::File
-);
+match_sidecar_bench!(match_sorted_dict_noindex_sidecar_file, Index::None);
+match_sidecar_bench!(match_sorted_dict_byref_sidecar_file, Index::ByReference);
+match_sidecar_bench!(match_sorted_dict_bycopy_sidecar_file, Index::ByCopy);
 // Sortedness axis: unsorted builder leaves nothing stamped, so indexes decline
 // and everything falls to the mask scan — the worst case, and the typical
 // in-memory (JS bindings) case.
@@ -714,6 +410,14 @@ const DECODE_CONFIGS: &[DecodeCfg] = &[
         layout: Layout::Default,
         source: Source::InMemory,
     }, // in-memory decode path
+    DecodeCfg {
+        layout: Layout::TypedObject,
+        source: Source::InMemory,
+    }, // in-memory object reassembly
+    DecodeCfg {
+        layout: Layout::Dictionary,
+        source: Source::InMemory,
+    }, // in-memory code → term
 ];
 
 /// Decode every quad in the store (`quads()` → `Vec`). Index is irrelevant to a
@@ -739,10 +443,10 @@ fn decode_all(bencher: divan::Bencher, cfg: &DecodeCfg) {
         });
 }
 
-/// Open a file-backed store. Default reads the footer only; Dictionary also
-/// reads its term dictionary up front (an extra single-column scan), so the two
-/// are worth distinguishing.
-#[divan::bench(args = [Layout::Default, Layout::Dictionary])]
+/// Open a file-backed store. Default and TypedObject read the footer only;
+/// Dictionary also reads its term dictionary up front (an extra single-column
+/// scan), so the layouts are worth distinguishing.
+#[divan::bench(args = [Layout::Default, Layout::TypedObject, Layout::Dictionary])]
 fn open_file(bencher: divan::Bencher, layout: &Layout) {
     let layout = *layout;
     bencher
@@ -879,39 +583,6 @@ fn cached_dict_file(placement: DictionaryPlacement, size: usize) -> PathBuf {
         )
         .await
         .expect("write dictionary bench file");
-    });
-    cache.lock().unwrap().insert(key, path.clone());
-    path
-}
-
-static DICT_INDEXED_FILE_CACHE: OnceLock<Mutex<HashMap<(DictionaryPlacement, usize), PathBuf>>> =
-    OnceLock::new();
-
-/// Like [`cached_dict_file`], but with the by-copy index — the file behind
-/// the placement axis of the match benches.
-fn cached_dict_indexed_file(placement: DictionaryPlacement, size: usize) -> PathBuf {
-    let cache = DICT_INDEXED_FILE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    let key = (placement, size);
-    if let Some(path) = cache.lock().unwrap().get(&key) {
-        return path.clone();
-    }
-    let dir = PathBuf::from("target/bench_vortex_files");
-    std::fs::create_dir_all(&dir).unwrap();
-    let placement_name = match placement {
-        DictionaryPlacement::Padded => "padded",
-        DictionaryPlacement::Sidecar => "sidecar",
-    };
-    let path = dir.join(format!("dict_{placement_name}_bycopy_{size}.vortex"));
-    rt().block_on(async {
-        io::quads_stream_to_vortex_file_with_builder::<SortedStreamBuilder, _>(
-            generate_rdf_data_stream(size),
-            &path,
-            LayoutStrategy::Dictionary,
-            Index::ByCopy.types(),
-            placement,
-        )
-        .await
-        .expect("write indexed dictionary bench file");
     });
     cache.lock().unwrap().insert(key, path.clone());
     path
