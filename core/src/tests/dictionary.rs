@@ -867,3 +867,160 @@ async fn test_file_backed_dictionary_serializes_and_mutates() {
     assert!(!compacted.contains(&doomed).await.unwrap());
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// Direct probe parity at multi-split scale: every sampled term must resolve
+/// to the same code through the fence-guided file probe as through the
+/// resident dictionary, and mutated absent terms must come back `None` —
+/// for both placements.
+#[cfg(feature = "file-io")]
+#[tokio::test]
+async fn test_file_backed_dictionary_fence_probe_parity() {
+    use crate::store::DictionaryPlacement;
+    use crate::store::layouts::term_dictionary::{FileBackedDict, padded_dict_extent};
+    use std::sync::Arc;
+
+    // Enough unique terms to spread the dictionary across several splits, so
+    // the fence's binary search genuinely selects between candidates.
+    let quads: Vec<Quad> = (0..20_000)
+        .map(|i| {
+            make_quad(
+                &format!("http://example.org/s{i:06}"),
+                &format!("http://example.org/p{}", i % 3),
+                &format!("object {i:06}"),
+                GraphName::DefaultGraph,
+            )
+        })
+        .collect();
+
+    let dir = std::env::temp_dir().join(format!("vortex_rdf_fence_test_{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    for (placement, name) in [
+        (DictionaryPlacement::Padded, "padded.vortex"),
+        (DictionaryPlacement::Sidecar, "sidecar.vortex"),
+    ] {
+        let path = dir.join(name);
+        crate::io::quads_stream_to_vortex_file_with_builder::<SortedStreamBuilder, _>(
+            quad_stream(quads.clone()),
+            &path,
+            LayoutStrategy::Dictionary,
+            vec![],
+            placement,
+        )
+        .await
+        .unwrap();
+
+        // The reference answers, from a resident open of the same file.
+        let resident = VortexRdfStore::from_file_with_dict_residency(&path, u64::MAX)
+            .await
+            .unwrap();
+        let dict = resident.dictionary_snapshot().unwrap().0;
+
+        // The probe target, built exactly as `from_file` does file-backed.
+        let (file, base_row) = match placement {
+            DictionaryPlacement::Padded => {
+                let file = Arc::new(crate::io::de::open_vortex_file(&path).await.unwrap());
+                let (base_row, _) = padded_dict_extent(&file).unwrap();
+                (file, base_row)
+            }
+            DictionaryPlacement::Sidecar => {
+                let file = crate::store::layouts::term_dictionary::open_sidecar_file(&path)
+                    .await
+                    .unwrap();
+                (file, 0)
+            }
+        };
+        let len = dict.len() as u64;
+        let dict_splits = file
+            .splits()
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.end > base_row && r.start < base_row + len)
+            .count();
+        assert!(
+            dict_splits > 1,
+            "{name}: expected a multi-split dictionary, got {dict_splits} split(s) \
+             for {len} terms"
+        );
+        let fb = FileBackedDict::new(file, base_row, len);
+
+        // Every ~97th term plus both extremes, probed twice (cold + memo).
+        let sample: Vec<u32> = (0..len as u32)
+            .step_by(397)
+            .chain([0, len as u32 - 1])
+            .collect();
+        for &code in &sample {
+            let term = dict.term_at(code).unwrap();
+            assert_eq!(fb.get_id(&term).await.unwrap(), Some(code), "{name}: {term}");
+            assert_eq!(fb.get_id(&term).await.unwrap(), Some(code), "{name}: {term}");
+
+            // A control character keeps the probe inside the same fence
+            // window but matches no stored term.
+            let absent = format!("{term}\u{1}");
+            assert_eq!(fb.get_id(&absent).await.unwrap(), None, "{name}: {absent}");
+        }
+        // Above every stored term: the last split is probed and misses.
+        assert_eq!(fb.get_id("\u{10FFFF}").await.unwrap(), None, "{name}");
+    }
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A probe sorting below the first dictionary term is answered absent by the
+/// fence alone (the `partition_point == 0` edge): a dataset whose lowest
+/// term is a literal (`"…`) probed with `!`, which sorts before `"`.
+#[cfg(feature = "file-io")]
+#[tokio::test]
+async fn test_file_backed_dictionary_fence_rejects_below_first_term() {
+    use crate::store::DictionaryPlacement;
+    use crate::store::layouts::term_dictionary::{FileBackedDict, padded_dict_extent};
+    use std::sync::Arc;
+
+    let g = GraphName::NamedNode(NamedNode::new("http://example.org/g").unwrap());
+    let quads: Vec<Quad> = (0..3)
+        .map(|i| {
+            make_quad(
+                &format!("http://example.org/s{i}"),
+                "http://example.org/p",
+                &format!("object {i}"),
+                g.clone(),
+            )
+        })
+        .collect();
+
+    let dir = std::env::temp_dir().join(format!(
+        "vortex_rdf_fence_edge_test_{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("edge.vortex");
+    crate::io::quads_stream_to_vortex_file_with_builder::<SortedInMemoryBuilder, _>(
+        quad_stream(quads),
+        &path,
+        LayoutStrategy::Dictionary,
+        vec![],
+        DictionaryPlacement::Padded,
+    )
+    .await
+    .unwrap();
+
+    let resident = VortexRdfStore::from_file_with_dict_residency(&path, u64::MAX)
+        .await
+        .unwrap();
+    let dict = resident.dictionary_snapshot().unwrap().0;
+    let first_term = dict.term_at(0).unwrap();
+    assert!(
+        first_term.as_str() > "!",
+        "fixture must have no term sorting at or below `!`, got {first_term:?}"
+    );
+
+    let file = Arc::new(crate::io::de::open_vortex_file(&path).await.unwrap());
+    let (base_row, dict_len) = padded_dict_extent(&file).unwrap();
+    let fb = FileBackedDict::new(file, base_row, dict_len);
+
+    assert_eq!(fb.get_id("!").await.unwrap(), None);
+    // And the ordinary path still resolves through the same fence.
+    assert_eq!(fb.get_id(&first_term).await.unwrap(), Some(0));
+
+    std::fs::remove_dir_all(&dir).ok();
+}

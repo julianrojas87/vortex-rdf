@@ -10,6 +10,10 @@
 //! [`LayoutStrategy::Dictionary`]: super::LayoutStrategy::Dictionary
 
 use std::collections::{HashMap, HashSet};
+#[cfg(feature = "file-io")]
+use std::ops::Range;
+#[cfg(feature = "file-io")]
+use std::sync::OnceLock;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use web_time::Instant;
@@ -935,17 +939,34 @@ impl DictAccess {
     }
 }
 
+/// The in-memory fence over a file-backed dictionary's splits: the first
+/// term of every dictionary-bearing split, in file order. The term column is
+/// sorted, so a probed term can only live in the last split whose first term
+/// is `<=` the probe — one in-RAM binary search replaces a per-split pruning
+/// loop, and a probe below the first fence term is absent without touching
+/// the file.
+///
+/// Built lazily on the first probe (one row-index scan of the per-split
+/// boundary rows), shared across clones, never persisted. It retains one
+/// term string per dictionary split — a few KB per file.
+#[cfg(feature = "file-io")]
+struct Fence {
+    /// First dictionary term of each split in `splits`, ascending.
+    first_terms: Vec<String>,
+    /// The dictionary-bearing splits, clamped to the dictionary rows.
+    splits: Vec<Range<u64>>,
+}
+
 /// A term dictionary left in its file: term→ID probes and ID→term decodes
 /// scan the sorted `_dict_term` column on demand instead of holding all terms
 /// resident.
 ///
 /// Both serialized placements collapse to `(file, base_row)`: the padded form
 /// probes the quads file's own trailing dictionary rows, the sidecar form its
-/// companion file from row 0. A term probe evaluates an equality filter over
-/// the dictionary rows split by split — the column is sorted, so zone
-/// pruning discards every split whose min/max range excludes the term without
-/// reading it — and memoizes the answer in a [`ProbeCache`]. ID→term reads
-/// are row-index scans (`base_row + code`).
+/// companion file from row 0. A term probe binary-searches the in-memory
+/// [`Fence`] for the one split that can hold the term, evaluates an equality
+/// filter over just that split, and memoizes the answer in a [`ProbeCache`].
+/// ID→term reads are row-index scans (`base_row + code`).
 #[cfg(feature = "file-io")]
 #[derive(Clone)]
 pub(crate) struct FileBackedDict {
@@ -960,6 +981,8 @@ pub(crate) struct FileBackedDict {
     /// term → code memo, shared across clones (every derived view of a store
     /// probes the same immutable dictionary).
     probes: Arc<ProbeCache>,
+    /// The probe fence, built on first use and shared across clones.
+    fence: Arc<OnceLock<Fence>>,
 }
 
 #[cfg(feature = "file-io")]
@@ -970,43 +993,79 @@ impl FileBackedDict {
             base_row,
             len,
             probes: Arc::new(ProbeCache::new()),
+            fence: Arc::new(OnceLock::new()),
         }
     }
 
-    /// Term→ID: one equality-filtered pass over the dictionary rows, zone
-    /// pruning first (the sorted column's min/max ranges rule out every split
-    /// but the term's), memoized across calls.
+    /// The fence, building it on first use. Concurrent first probes may race
+    /// to build; the loser's copy is dropped — the fence is derived
+    /// deterministically from the immutable file, so any winner is right.
+    async fn fence(&self) -> Result<&Fence> {
+        if self.fence.get().is_none() {
+            let built = self.build_fence().await?;
+            let _ = self.fence.set(built);
+        }
+        Ok(self
+            .fence
+            .get()
+            .expect("the fence was just initialized above"))
+    }
+
+    /// Collect the dictionary-bearing splits (clamped to the dictionary
+    /// rows) and resolve each one's first term with a single row-index scan.
+    async fn build_fence(&self) -> Result<Fence> {
+        let end = self.base_row + self.len;
+        let mut splits = Vec::new();
+        for split in self.file.splits().map_err(VortexRdfError::Vortex)? {
+            let start = split.start.max(self.base_row);
+            let stop = split.end.min(end);
+            if start < stop {
+                splits.push(start..stop);
+            }
+        }
+        let codes: Vec<u32> = splits
+            .iter()
+            .map(|range| (range.start - self.base_row) as u32)
+            .collect();
+        let first_terms = self.resolve_terms(&codes).await?;
+        Ok(Fence {
+            first_terms,
+            splits,
+        })
+    }
+
+    /// Term→ID: the fence's binary search picks the one split whose range
+    /// can hold the term (the column is sorted), a single equality-filtered
+    /// evaluation of that split decides, and the answer is memoized.
     pub(crate) async fn get_id(&self, term: &str) -> Result<Option<u32>> {
         if let Some(memo) = self.probes.get(term) {
             return Ok(memo);
         }
-        let filter = [eq(get_item(TERM_FIELD, root()), lit(term))];
-        let reader = self.file.layout_reader().map_err(VortexRdfError::Vortex)?;
-        let mut code = None;
-        for split in self.file.splits().map_err(VortexRdfError::Vortex)? {
-            let start = split.start.max(self.base_row);
-            let end = split.end.min(self.base_row + self.len);
-            if start >= end {
-                continue;
+        let fence = self.fence().await?;
+        // The candidate is the last split whose first term is <= the probe;
+        // index 0 means every dictionary term sorts above it — absent.
+        let idx = fence.first_terms.partition_point(|t| t.as_str() <= term);
+        let candidate = idx.checked_sub(1).map(|i| fence.splits[i].clone());
+        let code = match candidate {
+            None => None,
+            Some(range) => {
+                let filter = [eq(get_item(TERM_FIELD, root()), lit(term))];
+                let reader = self.file.layout_reader().map_err(VortexRdfError::Vortex)?;
+                let mask = crate::store::vortex_rdf_store::evaluate_filter_split(
+                    reader,
+                    &filter,
+                    &range,
+                    Mask::new_true((range.end - range.start) as usize),
+                )
+                .await?;
+                let row = match mask.indices() {
+                    AllOr::All => Some(range.start),
+                    AllOr::None => None,
+                    AllOr::Some(indices) => indices.first().map(|&i| range.start + i as u64),
+                };
+                row.map(|row| (row - self.base_row) as u32)
             }
-            let range = start..end;
-            let mask = crate::store::vortex_rdf_store::evaluate_filter_split(
-                Arc::clone(&reader),
-                &filter,
-                &range,
-                Mask::new_true((end - start) as usize),
-            )
-            .await?;
-            let row = match mask.indices() {
-                AllOr::All => Some(range.start),
-                AllOr::None => None,
-                AllOr::Some(indices) => indices.first().map(|&i| range.start + i as u64),
-            };
-            if let Some(row) = row {
-                code = Some((row - self.base_row) as u32);
-                break;
-            }
-        }
+        };
         self.probes.put(term, code);
         Ok(code)
     }

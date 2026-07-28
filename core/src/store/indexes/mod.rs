@@ -265,6 +265,10 @@ impl IndexedComponent {
 /// — so the store folds either one into a [`RowSelection`] the same way.
 ///
 /// [`RowSelection`]: crate::store::selection::RowSelection
+// `Resolved` dwarfs the dataless `Declined`, but the enum is a transient
+// per-match return value that is destructured immediately, never stored in
+// bulk — boxing its fields would buy nothing but an allocation per query.
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum IndexResolution {
     /// The index does not accelerate this pattern: either its shape isn't one
     /// this index covers, or (in memory) its value column isn't in a usable
