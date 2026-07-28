@@ -624,10 +624,7 @@ fn match_chained(bencher: divan::Bencher, source: &Source) {
                     .match_pattern(None, None, Some(&o), None)
                     .await
                     .expect("match O on view");
-                let quads = after_po
-                    .quads_vec()
-                    .await
-                    .expect("execute chained match");
+                let quads = after_po.quads_vec().await.expect("execute chained match");
                 black_box(quads)
             })
         });

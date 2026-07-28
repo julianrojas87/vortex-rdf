@@ -951,8 +951,16 @@ async fn test_file_backed_dictionary_fence_probe_parity() {
             .collect();
         for &code in &sample {
             let term = dict.term_at(code).unwrap();
-            assert_eq!(fb.get_id(&term).await.unwrap(), Some(code), "{name}: {term}");
-            assert_eq!(fb.get_id(&term).await.unwrap(), Some(code), "{name}: {term}");
+            assert_eq!(
+                fb.get_id(&term).await.unwrap(),
+                Some(code),
+                "{name}: {term}"
+            );
+            assert_eq!(
+                fb.get_id(&term).await.unwrap(),
+                Some(code),
+                "{name}: {term}"
+            );
 
             // A control character keeps the probe inside the same fence
             // window but matches no stored term.
