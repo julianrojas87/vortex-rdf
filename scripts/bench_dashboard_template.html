@@ -272,6 +272,7 @@
     <a href="#write">Write</a>
     <a href="#query">Query</a>
     <a href="#decode">Decode</a>
+    <a href="#dict">Dictionary</a>
     <a href="#data">Raw data</a>
   </nav>
   <section id="overview" class="group">
@@ -318,12 +319,30 @@
     <div class="panel-grid" id="decode-panels"></div>
   </section>
 
+  <section id="dict" class="group">
+    <div class="group-head">
+      <span class="chan-tag mono">DICT</span>
+      <h2>Dictionary — placement &amp; residency</h2>
+    </div>
+    <p class="group-desc">
+      The Dictionary layout's term dictionary has two independent knobs. <em>Placement</em>:
+      inside the quads file as trailing rows (<span class="mono">padded</span> — the
+      self-contained default and the IPC form) or in a companion file
+      (<span class="mono">sidecar</span>). <em>Residency</em>: lifted into memory at open
+      (<span class="mono">resident</span>) or left in the file and reached by pruned scans
+      (<span class="mono">file-backed</span>). These panels put both axes side by side: what
+      each placement costs a match, and which phase — open, cold probe, decode — the residency
+      choice moves the cost into.
+    </p>
+    <div class="panel-grid" id="dict-panels"></div>
+  </section>
+
   <section id="data" class="group">
     <div class="group-head">
       <span class="chan-tag mono">DATA</span>
       <h2>Every measured configuration</h2>
     </div>
-    <p class="group-desc">All 66 leaf benchmarks from this run. Click a column to sort.</p>
+    <p class="group-desc">Every leaf benchmark from this run. Click a column to sort.</p>
     <div class="table-toolbar">
       <input id="table-filter" type="text" placeholder="filter by name…" autocomplete="off" />
       <span class="count" id="table-count"></span>
@@ -747,6 +766,42 @@ const decodePanels = [
   ]},
 ];
 
+// The placement axis has a pattern dimension (it changes what every match
+// pays); the residency axis doesn't (it moves cost between fixed phases).
+const dictPlacementPanel = {
+  title:"Placement: padded vs sidecar, per match pattern",
+  note:"Sorted-stream builder, by-copy index, resident dictionary — placement is the only variable. The padded tail adds the dictionary's rows and zones to the quads file, and every match pays for them.",
+  wide: true,
+  series:[
+    {label:"Padded", color:"var(--c1)", group:"match_sorted_dict_bycopy_file"},
+    {label:"Sidecar", color:"var(--c2)", group:"match_sorted_dict_bycopy_sidecar_file"},
+  ]};
+
+const DICT_MATRIX = [
+  {label:"Padded / resident",     color:"var(--c1)", slug:"padded_resident"},
+  {label:"Padded / file-backed",  color:"var(--c2)", slug:"padded_file_backed"},
+  {label:"Sidecar / resident",    color:"var(--c3)", slug:"sidecar_resident"},
+  {label:"Sidecar / file-backed", color:"var(--c4)", slug:"sidecar_file_backed"},
+];
+function dictSeries(group, subset){
+  return (subset || DICT_MATRIX).map(v => ({ label:v.label, color:v.color, id:`${group}::${v.slug}` }));
+}
+
+const dictResidencyPanels = [
+  { title:"Open", logScale:true,
+    note:"Opening the store: resident lifts the whole term column at open; file-backed reads footer metadata only (the padded extent comes from the footer's null-count statistic).",
+    series: dictSeries("dict_open") },
+  { title:"Cold term probe (SPOG, fresh store)", logScale:true,
+    note:"Four bound terms resolved on a store that has never probed: resident binary-searches in memory; file-backed builds its fence (one boundary-row scan) and evaluates one pruned split per term.",
+    series: dictSeries("dict_probe_cold") },
+  { title:"Warm term probe (SPOG, shared store)",
+    note:"The same probe with the ProbeCache warm — residency stops mattering, which is the cache's job.",
+    series: dictSeries("dict_probe_warm", DICT_MATRIX.slice(0, 2)) },
+  { title:"Decode matched rows",
+    note:"Match a predicate, then materialize the ~1–2k matching quads: resident reads terms from memory; file-backed resolves each chunk's distinct codes with a row-index scan.",
+    series: dictSeries("dict_decode_matched") },
+];
+
 // ---- generic KPI + data table (used by both tabs) ----
 function renderKpis(hostSel, tiles){
   const host = document.querySelector(hostSel);
@@ -838,6 +893,10 @@ function renderRust(){
 
   const decodeHost = document.getElementById("decode-panels");
   decodePanels.forEach(cfg => renderSimplePanel(decodeHost, cfg, rustById));
+
+  const dictHost = document.getElementById("dict-panels");
+  renderPatternPanel(dictHost, dictPlacementPanel, rustById, RUST_PATTERNS);
+  dictResidencyPanels.forEach(cfg => renderSimplePanel(dictHost, cfg, rustById));
 
   // serialize interaction effects, folded into the write section as a table
   const panel = document.createElement("div");
