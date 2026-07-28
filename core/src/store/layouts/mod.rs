@@ -19,7 +19,7 @@ pub mod dictionary;
 pub mod term_dictionary;
 pub mod typed_object;
 
-use self::term_dictionary::{DICT_FIELD, TermDictionary};
+use self::term_dictionary::{DICT_FIELD, DictAccess};
 
 /// Determines the columnar schema used to store RDF quads in the Vortex StructArray.
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum, Debug)]
@@ -131,13 +131,15 @@ impl LayoutStrategy {
 
 /// Query-time layout: the build-time [`LayoutStrategy`] resolved against a
 /// constructed array, carrying any state intrinsic to the layout — for the
-/// Dictionary layout, the global term dictionary. Holding the state in the
-/// variant makes "Dictionary layout without a dictionary" unrepresentable.
+/// Dictionary layout, access to the global term dictionary. Holding the state
+/// in the variant makes "Dictionary layout without a dictionary"
+/// unrepresentable; [`DictAccess`] carries *how* the dictionary is reached
+/// (resident today, file-backed planned).
 #[derive(Clone)]
 pub(crate) enum ResolvedLayout {
     Default,
     TypedObject,
-    Dictionary(Arc<TermDictionary>),
+    Dictionary(DictAccess),
 }
 
 /// One of the four term positions of a quad pattern.
@@ -244,6 +246,12 @@ impl TermRef<'_> {
 /// fully-bound pattern performed 8 dictionary binary searches (9 with
 /// `SecondaryByCopy`) to resolve 4 terms, each preceded by its own `to_string`.
 /// Caching per role makes that one search and one render per bound term.
+///
+/// The [`prepare_pattern`](ResolvedLayout::prepare_pattern) prelude fills the
+/// cache for every bound role before the match core runs, so the per-stage
+/// `resolve` calls below it are reads — and the one place a dictionary may
+/// perform I/O to answer them is the prelude (see
+/// [`DictAccess::resolve_pattern`](term_dictionary::DictAccess::resolve_pattern)).
 ///
 /// The render goes into `scratch` rather than a fresh `String` per probe: a
 /// term's N-Triples form is only needed long enough to search the dictionary
@@ -353,7 +361,9 @@ impl ResolvedLayout {
         match self {
             ResolvedLayout::Default => default::decode_chunk(chunk),
             ResolvedLayout::TypedObject => typed_object::decode_chunk(chunk),
-            ResolvedLayout::Dictionary(dict) => dictionary::decode_chunk(chunk, dict),
+            ResolvedLayout::Dictionary(access) => {
+                dictionary::decode_chunk(chunk, access.resident())
+            }
         }
     }
 
@@ -369,7 +379,24 @@ impl ResolvedLayout {
     pub(crate) fn attach_intrinsic_state(&self, array: ArrayRef) -> Result<ArrayRef> {
         match self {
             ResolvedLayout::Default | ResolvedLayout::TypedObject => Ok(array),
-            ResolvedLayout::Dictionary(dict) => dictionary::attach_payload(array, dict),
+            ResolvedLayout::Dictionary(access) => {
+                dictionary::attach_payload(array, access.resident())
+            }
+        }
+    }
+
+    /// Pre-resolve a pattern's bound terms into `codes` before the
+    /// synchronous match core runs — the one point in a match where a
+    /// dictionary may perform I/O (see [`DictAccess::resolve_pattern`]).
+    /// A no-op for the layouts that probe with term strings directly.
+    pub(crate) async fn prepare_pattern(
+        &self,
+        pattern: QuadPattern<'_>,
+        codes: &mut PatternCodes,
+    ) -> Result<()> {
+        match self {
+            ResolvedLayout::Dictionary(access) => access.resolve_pattern(pattern, codes).await,
+            ResolvedLayout::Default | ResolvedLayout::TypedObject => Ok(()),
         }
     }
 
@@ -425,7 +452,8 @@ impl ResolvedLayout {
                 typed_object::object_terms(&struct_arr)?,
                 read_string_column(&struct_arr, "g")?,
             ),
-            ResolvedLayout::Dictionary(dict) => {
+            ResolvedLayout::Dictionary(access) => {
+                let dict = access.resident();
                 let term = |codes: Vec<u32>| -> Result<Vec<String>> {
                     let mut reader = dict.reader();
                     codes

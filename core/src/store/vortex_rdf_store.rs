@@ -12,7 +12,7 @@ use crate::store::indexes::{
     IndexResolution, IndexType, Indexes, ServePlan, detect_indexes, resolve_indexes_in_memory,
     strip_index_columns, unique_indexes,
 };
-use crate::store::layouts::term_dictionary::{self, DictSnapshot, TermDictionary};
+use crate::store::layouts::term_dictionary::{self, DictAccess, DictSnapshot, TermDictionary};
 use crate::store::layouts::{
     Constraints, LayoutStrategy, PatternCodes, QuadPattern, ResolvedLayout, TermRef, dictionary,
 };
@@ -116,9 +116,9 @@ impl VortexRdfStore {
                 // Dictionary layout stores terms as codes; eagerly pull the
                 // term dictionary out of row 0 so later queries can translate
                 // RDF terms to codes before comparing.
-                ResolvedLayout::Dictionary(Arc::new(term_dictionary::dict_from_array(
-                    &vortex_array,
-                )?))
+                ResolvedLayout::Dictionary(DictAccess::Resident(Arc::new(
+                    term_dictionary::dict_from_array(&vortex_array)?,
+                )))
             }
         };
         // Discover which secondary indexes the schema carries, so pattern
@@ -185,7 +185,9 @@ impl VortexRdfStore {
             LayoutStrategy::Dictionary => {
                 // Dictionary-layout files need their dictionary up front too;
                 // this is a single-column projection scan, not a full read.
-                ResolvedLayout::Dictionary(Arc::new(term_dictionary::dict_from_file(&file).await?))
+                ResolvedLayout::Dictionary(DictAccess::Resident(Arc::new(
+                    term_dictionary::dict_from_file(&file).await?,
+                )))
             }
         };
         // Discover which secondary indexes the file's schema carries.
@@ -374,14 +376,17 @@ impl VortexRdfStore {
     ) -> Result<Self> {
         let (layout, base) = match strategy {
             LayoutStrategy::Dictionary if raws.is_empty() => (
-                ResolvedLayout::Dictionary(Arc::new(TermDictionary::empty())),
+                ResolvedLayout::Dictionary(DictAccess::Resident(Arc::new(TermDictionary::empty()))),
                 dictionary::empty_struct(&indexes)?,
             ),
             LayoutStrategy::Dictionary => {
                 let (dict, id_map) = TermDictionary::from_quads_with_map(raws)?;
                 let base =
                     dictionary::build_chunk(raws, &dict, &id_map, &indexes, 0, sorted, true, true)?;
-                (ResolvedLayout::Dictionary(Arc::new(dict)), base)
+                (
+                    ResolvedLayout::Dictionary(DictAccess::Resident(Arc::new(dict))),
+                    base,
+                )
             }
             strategy => {
                 let base =
@@ -796,7 +801,7 @@ impl VortexRdfStore {
     /// to decode against.
     pub fn dictionary_snapshot(&self) -> Option<DictSnapshot> {
         match &self.layout {
-            ResolvedLayout::Dictionary(dict) => Some(DictSnapshot(Arc::clone(dict))),
+            ResolvedLayout::Dictionary(access) => Some(DictSnapshot(Arc::clone(access.resident()))),
             _ => None,
         }
     }
@@ -1237,7 +1242,17 @@ impl VortexRdfStore {
         // Resolve each bound term to its dictionary code at most once for this
         // whole match: the stages below each need the same mapping, and under
         // the Dictionary layout deriving it is a binary search per term.
+        //
+        // The prelude resolves them all up front — the one point where a
+        // dictionary may perform I/O (a file-backed one will scan here), so
+        // every stage below reads `codes` synchronously.
         let mut codes = PatternCodes::default();
+        self.layout
+            .prepare_pattern(
+                QuadPattern::new(subject, predicate, object, graph),
+                &mut codes,
+            )
+            .await?;
 
         match &self.quads {
             // Tombstones are deliberately not consulted here: they are applied

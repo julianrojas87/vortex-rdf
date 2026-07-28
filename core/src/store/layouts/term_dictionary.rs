@@ -745,6 +745,93 @@ impl DictSnapshot {
     }
 }
 
+/// How a resolved Dictionary layout reaches its term dictionary: the
+/// *residency* axis, sitting above [`TermStore`]'s encoding axis.
+///
+/// `Resident` holds the whole dictionary in memory — today's only variant. A
+/// planned file-backed variant will leave the terms in a scannable Vortex
+/// column and read them on demand, which makes term↔code translation
+/// asynchronous. The seam is drawn now so that variant lands as a new arm in
+/// these methods rather than a rework of their callers:
+///
+/// - [`resolve_pattern`](Self::resolve_pattern) is the **async prelude**: the
+///   one place a dictionary is allowed to perform I/O during a match. It runs
+///   before the synchronous match core and pre-resolves every bound term of
+///   the pattern into the match's [`PatternCodes`], so everything downstream
+///   resolves from that cache without touching the dictionary again.
+/// - The sync accessors ([`get_id`](Self::get_id), [`term_at`](Self::term_at))
+///   are total for `Resident`; a file-backed arm must answer them from
+///   memoized state filled by the prelude, or its caller must move to an
+///   async path.
+/// - [`resident`](Self::resident) hands out the in-memory dictionary itself,
+///   for the paths that genuinely need the whole column (reconstruction,
+///   serialization, snapshots). It is total today; the file-backed variant
+///   will change its signature, and the compile errors that causes are the
+///   audit of exactly those paths.
+#[derive(Clone)]
+pub(crate) enum DictAccess {
+    /// The whole dictionary in memory (FSST-compressed or canonical).
+    Resident(Arc<TermDictionary>),
+}
+
+impl DictAccess {
+    /// Pre-resolve every bound term of `pattern` into `codes` — the async
+    /// prelude run before the synchronous match core.
+    ///
+    /// For `Resident` the lookups are in-memory binary searches, resolved
+    /// eagerly rather than lazily at each use site: what this buys is the
+    /// invariant the match core is written against — *after the prelude,
+    /// every bound role is in `codes`* — which is what lets a file-backed
+    /// dictionary do its I/O here and nowhere else.
+    pub(crate) async fn resolve_pattern(
+        &self,
+        pattern: super::QuadPattern<'_>,
+        codes: &mut super::PatternCodes,
+    ) -> Result<()> {
+        use super::TermRef;
+        match self {
+            DictAccess::Resident(dict) => {
+                if let Some(s) = pattern.subject {
+                    codes.resolve(TermRef::Subject(s), |t| dict.get_id(t));
+                }
+                if let Some(p) = pattern.predicate {
+                    codes.resolve(TermRef::Predicate(p), |t| dict.get_id(t));
+                }
+                if let Some(o) = pattern.object {
+                    codes.resolve(TermRef::Object(o), |t| dict.get_id(t));
+                }
+                if let Some(g) = pattern.graph {
+                    codes.resolve(TermRef::Graph(g), |t| dict.get_id(t));
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Look up a term's code. Total for `Resident`; see the type docs for the
+    /// file-backed contract.
+    pub(crate) fn get_id(&self, term: &str) -> Option<u32> {
+        match self {
+            DictAccess::Resident(dict) => dict.get_id(term),
+        }
+    }
+
+    /// Decode a code back to its term string, or `None` when out of range.
+    pub(crate) fn term_at(&self, code: u32) -> Option<String> {
+        match self {
+            DictAccess::Resident(dict) => dict.term_at(code),
+        }
+    }
+
+    /// The in-memory dictionary, for paths that need the whole column —
+    /// reconstruction, serialization, snapshots.
+    pub(crate) fn resident(&self) -> &Arc<TermDictionary> {
+        match self {
+            DictAccess::Resident(dict) => dict,
+        }
+    }
+}
+
 /// Build the `_dict_terms` column for a chunk of `n_rows` quads.
 ///
 /// When `carry_payload` is set (the first chunk of a build), row 0 holds the
