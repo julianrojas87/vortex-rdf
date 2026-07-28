@@ -249,12 +249,45 @@ impl NativeComponent {
     }
 }
 
+// VORTEX_RDF_NATIVE_COMPONENT_LOCATOR_SCHEMA_V1
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+enum NativeComponentStorage {
+    #[default]
+    External,
+    Embedded {
+        offset: u64,
+        length: u64,
+    },
+}
+
+impl NativeComponentStorage {
+    fn embedded_range(&self) -> Result<Option<Range<u64>>> {
+        let Self::Embedded { offset, length } = self else {
+            return Ok(None);
+        };
+        if *length == 0 {
+            return Err(VortexRdfError::Deserialization(
+                "embedded native component has zero length".into(),
+            ));
+        }
+        let end = offset.checked_add(*length).ok_or_else(|| {
+            VortexRdfError::Deserialization(format!(
+                "embedded native component range overflows u64: offset={offset}, length={length}"
+            ))
+        })?;
+        Ok(Some(*offset..end))
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 struct NativeArtifactComponentManifest {
     logical_name: String,
     implementation: String,
     required: bool,
     row_count: Option<u64>,
+    #[serde(default)]
+    storage: NativeComponentStorage,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -272,6 +305,7 @@ impl NativeArtifactManifest {
             implementation: "spog-u32-v1".to_string(),
             required: true,
             row_count: None,
+            storage: NativeComponentStorage::External,
         });
         components.extend(NativeComponent::ALL.into_iter().map(|component| {
             NativeArtifactComponentManifest {
@@ -279,6 +313,7 @@ impl NativeArtifactManifest {
                 implementation: component.default_implementation().to_string(),
                 required: true,
                 row_count: None,
+                storage: NativeComponentStorage::External,
             }
         }));
         Self {
@@ -309,6 +344,7 @@ impl NativeArtifactManifest {
             )
             .collect();
         let mut actual = BTreeSet::new();
+        let mut embedded_ranges: Vec<(&str, Range<u64>)> = Vec::new();
         for component in &self.components {
             if component.logical_name.is_empty() {
                 return Err(VortexRdfError::Deserialization(
@@ -331,6 +367,25 @@ impl NativeArtifactManifest {
                 return Err(VortexRdfError::Deserialization(format!(
                     "native artifact manifest contains duplicate component {:?}",
                     component.logical_name
+                )));
+            }
+            if component.logical_name == NATIVE_TRIPLES_LOGICAL_NAME
+                && !matches!(component.storage, NativeComponentStorage::External)
+            {
+                return Err(VortexRdfError::Deserialization(
+                    "the triples component must remain the primary outer Vortex layout".into(),
+                ));
+            }
+            if let Some(range) = component.storage.embedded_range()? {
+                embedded_ranges.push((component.logical_name.as_str(), range));
+            }
+        }
+        embedded_ranges.sort_by_key(|(_, range)| range.start);
+        for pair in embedded_ranges.windows(2) {
+            if pair[1].1.start < pair[0].1.end {
+                return Err(VortexRdfError::Deserialization(format!(
+                    "embedded native component ranges overlap: {}={:?}, {}={:?}",
+                    pair[0].0, pair[0].1, pair[1].0, pair[1].1
                 )));
             }
         }
@@ -7393,6 +7448,100 @@ mod native_artifact_manifest_tests {
             .collect();
         assert_eq!(paths.len(), NativeComponent::ALL.len());
         assert!(paths.iter().all(|path| path != artifact));
+    }
+
+    #[test]
+    fn old_manifest_json_defaults_component_storage_to_external() {
+        let manifest = NativeArtifactManifest::production_defaults();
+        let mut value = serde_json::to_value(&manifest).unwrap();
+        for component in value["components"].as_array_mut().unwrap() {
+            component.as_object_mut().unwrap().remove("storage");
+        }
+        let decoded: NativeArtifactManifest = serde_json::from_value(value).unwrap();
+        decoded.validate().unwrap();
+        assert!(
+            decoded
+                .components
+                .iter()
+                .all(|component| { component.storage == NativeComponentStorage::External })
+        );
+    }
+
+    #[test]
+    fn manifest_rejects_zero_length_and_overflowing_embedded_ranges() {
+        let mut manifest = NativeArtifactManifest::production_defaults();
+        manifest.components[1].storage = NativeComponentStorage::Embedded {
+            offset: 100,
+            length: 0,
+        };
+        assert!(
+            manifest
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("zero length")
+        );
+        manifest.components[1].storage = NativeComponentStorage::Embedded {
+            offset: u64::MAX,
+            length: 2,
+        };
+        assert!(
+            manifest
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("overflows")
+        );
+    }
+
+    #[test]
+    fn manifest_rejects_overlapping_embedded_ranges() {
+        let mut manifest = NativeArtifactManifest::production_defaults();
+        manifest.components[1].storage = NativeComponentStorage::Embedded {
+            offset: 100,
+            length: 100,
+        };
+        manifest.components[2].storage = NativeComponentStorage::Embedded {
+            offset: 150,
+            length: 100,
+        };
+        assert!(
+            manifest
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("overlap")
+        );
+    }
+
+    #[test]
+    fn manifest_accepts_adjacent_embedded_ranges() {
+        let mut manifest = NativeArtifactManifest::production_defaults();
+        manifest.components[1].storage = NativeComponentStorage::Embedded {
+            offset: 100,
+            length: 50,
+        };
+        manifest.components[2].storage = NativeComponentStorage::Embedded {
+            offset: 150,
+            length: 75,
+        };
+        manifest.validate().unwrap();
+    }
+
+    #[test]
+    fn manifest_rejects_embedded_primary_triples() {
+        let mut manifest = NativeArtifactManifest::production_defaults();
+        manifest.components[0].storage = NativeComponentStorage::Embedded {
+            offset: 1,
+            length: 1,
+        };
+        assert!(
+            manifest
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("primary outer")
+        );
     }
 
     #[test]
