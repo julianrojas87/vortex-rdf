@@ -1,7 +1,7 @@
 use super::spill::{RunReader, RunWriter, TempRunsGuard, make_temp_dir};
 use super::{
-    ChunkStream, DEFAULT_CHUNK_SIZE, VortexArrayBuilder, assemble_chunks, build_struct_array,
-    ingest_interning, into_vortex_error, make_empty_struct,
+    BuiltArray, BuiltStream, ChunkStream, DEFAULT_CHUNK_SIZE, VortexArrayBuilder, assemble_chunks,
+    build_struct_array, ingest_interning, into_vortex_error, make_empty_struct,
 };
 use crate::error::{Result, VortexRdfError};
 use crate::store::RawQuad;
@@ -34,7 +34,7 @@ impl VortexArrayBuilder for UnsortedStreamBuilder {
         quad_stream: Box<dyn Stream<Item = Result<RawQuad>> + Unpin + Send + 'static>,
         layout: LayoutStrategy,
         indexes: Indexes,
-    ) -> Result<ArrayRef> {
+    ) -> Result<BuiltArray> {
         let start = Instant::now();
 
         // Dictionary layout: the result is materialized anyway, so intern
@@ -44,18 +44,25 @@ impl VortexArrayBuilder for UnsortedStreamBuilder {
         // binary-search routing; the quads keep arrival order.
         if layout == LayoutStrategy::Dictionary {
             let (dict, codes) = ingest_interning(quad_stream).await?.finish(false)?;
-            let result = dictionary::build_array(&codes, &dict, &indexes, false)?;
+            let array = dictionary::build_array(&codes, &indexes, false)?;
             log::debug!(
                 "[UnsortedStreamBuilder] Materialized {} dictionary-encoded quads in {:?}",
-                result.len(),
+                array.len(),
                 start.elapsed()
             );
-            return Ok(result);
+            return Ok(BuiltArray {
+                array,
+                dict: Some(Arc::new(dict)),
+            });
         }
 
-        let (_dtype, chunks) =
+        let built =
             build_chunk_stream(quad_stream, layout, indexes.clone(), DEFAULT_CHUNK_SIZE).await?;
-        let chunks: Vec<ArrayRef> = chunks.try_collect().await.map_err(VortexRdfError::Vortex)?;
+        let chunks: Vec<ArrayRef> = built
+            .chunks
+            .try_collect()
+            .await
+            .map_err(VortexRdfError::Vortex)?;
 
         let result = assemble_chunks(chunks, layout, &indexes)?;
         log::debug!(
@@ -63,7 +70,10 @@ impl VortexArrayBuilder for UnsortedStreamBuilder {
             result.len(),
             start.elapsed()
         );
-        Ok(result)
+        Ok(BuiltArray {
+            array: result,
+            dict: built.dict,
+        })
     }
 
     /// True streaming implementation: chunks are built on demand as the file
@@ -72,7 +82,7 @@ impl VortexArrayBuilder for UnsortedStreamBuilder {
         quad_stream: Box<dyn Stream<Item = Result<RawQuad>> + Unpin + Send + 'static>,
         layout: LayoutStrategy,
         indexes: Indexes,
-    ) -> Result<(DType, ChunkStream)> {
+    ) -> Result<BuiltStream> {
         build_chunk_stream(quad_stream, layout, indexes, DEFAULT_CHUNK_SIZE).await
     }
 }
@@ -89,7 +99,7 @@ pub(crate) async fn build_chunk_stream(
     layout: LayoutStrategy,
     indexes: Indexes,
     chunk_size: usize,
-) -> Result<(DType, ChunkStream)> {
+) -> Result<BuiltStream> {
     // Dictionary layout: the global dictionary must be complete before any
     // encoded chunk can be emitted, so this runs a two-pass spill pipeline.
     if layout == LayoutStrategy::Dictionary {
@@ -98,10 +108,16 @@ pub(crate) async fn build_chunk_stream(
     // Fast path: with the Default layout and no index columns, terms are
     // formatted straight into the column builders — no intermediate RawQuad
     // strings are allocated.
-    if layout == LayoutStrategy::Default && indexes.is_empty() {
-        return build_direct_chunk_stream(quads, chunk_size).await;
-    }
-    build_buffered_chunk_stream(quads, layout, indexes, chunk_size).await
+    let (dtype, chunks) = if layout == LayoutStrategy::Default && indexes.is_empty() {
+        build_direct_chunk_stream(quads, chunk_size).await?
+    } else {
+        build_buffered_chunk_stream(quads, layout, indexes, chunk_size).await?
+    };
+    Ok(BuiltStream {
+        dtype,
+        chunks,
+        dict: None,
+    })
 }
 
 /// Two-pass Dictionary-layout chunk stream.
@@ -114,7 +130,7 @@ async fn build_dict_chunk_stream(
     mut quads: Box<dyn Stream<Item = Result<RawQuad>> + Unpin + Send + 'static>,
     indexes: Indexes,
     chunk_size: usize,
-) -> Result<(DType, ChunkStream)> {
+) -> Result<BuiltStream> {
     // ── Pass 1: spill + incremental dictionary ──
     let temp_dir = make_temp_dir("unsorted_dict")?;
     let guard = TempRunsGuard {
@@ -162,7 +178,6 @@ async fn build_dict_chunk_stream(
             &indexes,
             0,
             false,
-            true,
             total <= chunk_size,
         )?
     };
@@ -170,8 +185,9 @@ async fn build_dict_chunk_stream(
     let next_row = buf.len() as u32;
     drop(buf);
 
+    let stream_dict = Arc::clone(&dict);
     let rest = stream::unfold(
-        (reader, dict, id_map, indexes, next_row, guard),
+        (reader, stream_dict, id_map, indexes, next_row, guard),
         move |(mut reader, dict, id_map, indexes, row, guard)| async move {
             let mut buf: Vec<RawQuad> = Vec::with_capacity(chunk_size.min(4096));
             while buf.len() < chunk_size {
@@ -190,15 +206,18 @@ async fn build_dict_chunk_stream(
                 return None;
             }
             let n = buf.len() as u32;
-            let chunk =
-                dictionary::build_chunk(&buf, &dict, &id_map, &indexes, row, false, false, false)
-                    .map_err(into_vortex_error);
+            let chunk = dictionary::build_chunk(&buf, &dict, &id_map, &indexes, row, false, false)
+                .map_err(into_vortex_error);
             Some((chunk, (reader, dict, id_map, indexes, row + n, guard)))
         },
     );
 
     let chunks: ChunkStream = stream::once(async move { Ok(first) }).chain(rest).boxed();
-    Ok((dtype, chunks))
+    Ok(BuiltStream {
+        dtype,
+        chunks,
+        dict: Some(dict),
+    })
 }
 
 /// General chunk-stream path: quads are buffered as `RawQuad`s per chunk, as

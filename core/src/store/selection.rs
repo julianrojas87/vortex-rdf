@@ -191,12 +191,21 @@ impl RowSelection {
         &self,
         scan: ScanBuilder<A>,
         deleted: Option<&Mask>,
+        quad_rows: u64,
     ) -> ScanBuilder<A> {
-        match (self, deleted) {
-            (RowSelection::All, None) => scan,
-            (RowSelection::All, Some(deleted)) => {
-                scan.with_selection(Selection::ExcludeByIndex(deleted_ids(deleted)))
+        // `All` means "all quad rows", which is narrower than the file when a
+        // padded Dictionary file carries trailing dictionary rows — so it is
+        // bounded explicitly rather than left to the scan's full row range.
+        let bounded;
+        let selection = match self {
+            RowSelection::All => {
+                bounded = RowSelection::Range(0..quad_rows);
+                &bounded
             }
+            other => other,
+        };
+        match (selection, deleted) {
+            (RowSelection::All, _) => unreachable!("All was just bounded to a Range"),
             (RowSelection::Range(range), None) => scan.with_row_range(range.clone()),
             (RowSelection::Range(range), Some(deleted)) => scan
                 .with_row_range(range.clone())

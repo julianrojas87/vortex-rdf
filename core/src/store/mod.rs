@@ -5,8 +5,8 @@ pub mod selection;
 pub mod vortex_rdf_store;
 
 pub use builders::{
-    BuilderStrategy, DictionaryQuadSink, SortedInMemoryBuilder, SortedStreamBuilder,
-    UnsortedStreamBuilder, VortexArrayBuilder,
+    BuilderStrategy, BuiltArray, BuiltStream, DictionaryQuadSink, SortedInMemoryBuilder,
+    SortedStreamBuilder, UnsortedStreamBuilder, VortexArrayBuilder,
 };
 pub use indexes::{IndexType, Indexes};
 pub use layouts::LayoutStrategy;
@@ -175,6 +175,13 @@ pub(crate) enum QuadsSource {
         /// The shared file handle, including its cached schema, metadata, and
         /// layout reader used by scans and pruning.
         file: Arc<VortexFile>,
+        /// The number of *quad* rows in the file. Equal to `file.row_count()`
+        /// except for padded Dictionary-layout files, whose trailing rows hold
+        /// the term dictionary: every row-space computation (selections,
+        /// masks, scan bounds, pruning) uses this instead of the file length,
+        /// so `RowSelection::All` always means "all quad rows" and the
+        /// dictionary tail can never surface as quads.
+        quad_rows: u64,
         /// Pattern components not resolved to row ids, pushed down to the scan.
         filter: Option<Expression>,
         /// The file row ids visible through this store or derived view,

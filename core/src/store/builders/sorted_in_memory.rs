@@ -1,6 +1,7 @@
 use super::{
-    ChunkStream, DEFAULT_CHUNK_SIZE, VortexArrayBuilder, build_struct_array,
-    build_struct_array_global, ingest_interning, into_vortex_error, make_empty_struct,
+    BuiltArray, BuiltStream, ChunkStream, DEFAULT_CHUNK_SIZE, VortexArrayBuilder,
+    build_struct_array, build_struct_array_global, ingest_interning, into_vortex_error,
+    make_empty_struct,
 };
 use crate::error::Result;
 use crate::store::indexes::{GlobalIndexes, Indexes};
@@ -11,9 +12,6 @@ use crate::store::{QuadCodes, RawQuad};
 use futures::{Stream, StreamExt, stream};
 use std::sync::Arc;
 use web_time::Instant;
-
-use vortex_array::ArrayRef;
-use vortex_array::dtype::DType;
 
 /// Fully in-memory, globally sorted Vortex RDF Array Builder.
 ///
@@ -28,7 +26,7 @@ impl VortexArrayBuilder for SortedInMemoryBuilder {
         quad_stream: Box<dyn Stream<Item = Result<RawQuad>> + Unpin + Send + 'static>,
         layout: LayoutStrategy,
         indexes: Indexes,
-    ) -> Result<ArrayRef> {
+    ) -> Result<BuiltArray> {
         let start = Instant::now();
 
         // Build a single contiguous StructArray: for in-memory stores this
@@ -37,17 +35,23 @@ impl VortexArrayBuilder for SortedInMemoryBuilder {
         // Dictionary layout interns terms as the stream drains, so the sort
         // runs over 16-byte coded rows and no `Vec<RawQuad>` (four owned
         // Strings per quad) ever accumulates.
-        let (n, build_start, struct_array);
+        let (n, build_start, built);
         if layout == LayoutStrategy::Dictionary {
             let (dict, codes) = ingest_interning(quad_stream).await?.finish(true)?;
             n = codes.s.len();
             build_start = Instant::now();
-            struct_array = dictionary::build_array(&codes, &dict, &indexes, true)?;
+            built = BuiltArray {
+                array: dictionary::build_array(&codes, &indexes, true)?,
+                dict: Some(Arc::new(dict)),
+            };
         } else {
             let quads = ingest_and_sort(quad_stream).await?;
             n = quads.len();
             build_start = Instant::now();
-            struct_array = build_struct_array(&quads, layout, &indexes, n, 0, true, true)?;
+            built = BuiltArray {
+                array: build_struct_array(&quads, layout, &indexes, n, 0, true, true)?,
+                dict: None,
+            };
         };
         log::debug!(
             "[SortedInMemoryBuilder] Constructed StructArray in {:?}",
@@ -59,7 +63,7 @@ impl VortexArrayBuilder for SortedInMemoryBuilder {
             start.elapsed()
         );
 
-        Ok(struct_array)
+        Ok(built)
     }
 
     /// Streaming override for file writes: the sort still requires the whole
@@ -70,7 +74,7 @@ impl VortexArrayBuilder for SortedInMemoryBuilder {
         quad_stream: Box<dyn Stream<Item = Result<RawQuad>> + Unpin + Send + 'static>,
         layout: LayoutStrategy,
         indexes: Indexes,
-    ) -> Result<(DType, ChunkStream)> {
+    ) -> Result<BuiltStream> {
         build_sorted_chunk_stream(quad_stream, layout, indexes, DEFAULT_CHUNK_SIZE).await
     }
 }
@@ -107,7 +111,7 @@ pub(crate) async fn build_sorted_chunk_stream(
     layout: LayoutStrategy,
     indexes: Indexes,
     chunk_size: usize,
-) -> Result<(DType, ChunkStream)> {
+) -> Result<BuiltStream> {
     if layout == LayoutStrategy::Dictionary {
         let (dict, codes) = ingest_interning(quad_stream).await?.finish(true)?;
         return emit_dict_chunks(codes, Arc::new(dict), indexes, chunk_size);
@@ -145,18 +149,22 @@ pub(crate) async fn build_sorted_chunk_stream(
     );
 
     let chunks: ChunkStream = stream::once(async move { Ok(first) }).chain(rest).boxed();
-    Ok((dtype, chunks))
+    Ok(BuiltStream {
+        dtype,
+        chunks,
+        dict: None,
+    })
 }
 
 /// Dictionary-layout emission over the interned codes: the index order is
-/// precomputed globally over the codes, and chunks are cut as ranges of both
-/// — with the dictionary payload carried only by the first chunk.
+/// precomputed globally over the codes, and chunks are cut as ranges of both.
+/// The dictionary rides beside the stream for the serializer to place.
 fn emit_dict_chunks(
     codes: QuadCodes,
     dict: Arc<TermDictionary>,
     indexes: Indexes,
     chunk_size: usize,
-) -> Result<(DType, ChunkStream)> {
+) -> Result<BuiltStream> {
     let global_idx = GlobalIndexes::from_codes(&indexes, &codes);
     let n = codes.s.len();
 
@@ -164,30 +172,27 @@ fn emit_dict_chunks(
     let first = if n == 0 {
         dictionary::empty_struct(&indexes)?
     } else {
-        dictionary::build_chunk_global(&codes, 0..n0, &dict, &global_idx, true, true)?
+        dictionary::build_chunk_global(&codes, 0..n0, &global_idx, true)?
     };
     let dtype = first.dtype().clone();
 
     let rest = stream::unfold(
-        (codes, dict, global_idx, n0),
-        move |(codes, dict, global_idx, offset)| async move {
+        (codes, global_idx, n0),
+        move |(codes, global_idx, offset)| async move {
             if offset >= n {
                 return None;
             }
             let end = (offset + chunk_size).min(n);
-            let chunk = dictionary::build_chunk_global(
-                &codes,
-                offset..end,
-                &dict,
-                &global_idx,
-                true,
-                false,
-            )
-            .map_err(into_vortex_error);
-            Some((chunk, (codes, dict, global_idx, end)))
+            let chunk = dictionary::build_chunk_global(&codes, offset..end, &global_idx, true)
+                .map_err(into_vortex_error);
+            Some((chunk, (codes, global_idx, end)))
         },
     );
 
     let chunks: ChunkStream = stream::once(async move { Ok(first) }).chain(rest).boxed();
-    Ok((dtype, chunks))
+    Ok(BuiltStream {
+        dtype,
+        chunks,
+        dict: Some(dict),
+    })
 }

@@ -4,7 +4,7 @@ use clap::ValueEnum;
 use oxrdf::{GraphName, NamedNode, NamedOrBlankNode, Quad, Term};
 use vortex_array::arrays::struct_::{StructArray, StructArrayExt};
 use vortex_array::arrays::{PrimitiveArray, VarBinViewArray};
-use vortex_array::dtype::{DType, FieldNames};
+use vortex_array::dtype::{DType, FieldNames, PType};
 use vortex_array::scalar::Scalar;
 use vortex_array::validity::Validity;
 use vortex_array::{ArrayRef, IntoArray, VortexSessionExecute};
@@ -19,7 +19,7 @@ pub mod dictionary;
 pub mod term_dictionary;
 pub mod typed_object;
 
-use self::term_dictionary::{DICT_FIELD, DictAccess};
+use self::term_dictionary::{DictAccess, LEGACY_DICT_FIELD, TERM_FIELD};
 
 /// Determines the columnar schema used to store RDF quads in the Vortex StructArray.
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum, Debug)]
@@ -82,12 +82,20 @@ pub enum LayoutStrategy {
 }
 
 impl LayoutStrategy {
-    /// Detect the column layout by inspecting the struct field names in the
-    /// dtype, without materializing the array.
+    /// Detect the column layout by inspecting the struct schema in the dtype,
+    /// without materializing the array.
     pub(crate) fn from_dtype(dtype: &DType) -> LayoutStrategy {
         if let DType::Struct(fields, _) = dtype {
-            // Presence of the intrinsic dictionary column means Dictionary layout.
-            if fields.names().iter().any(|n| n.as_ref() == DICT_FIELD) {
+            // A term column (padded serialized form), the retired list-cell
+            // column (rejected with an actionable error at open), or u32 code
+            // columns (a bare/sidecar quads schema) all mean Dictionary.
+            if fields.names().iter().any(|n| n.as_ref() == TERM_FIELD)
+                || fields
+                    .names()
+                    .iter()
+                    .any(|n| n.as_ref() == LEGACY_DICT_FIELD)
+                || matches!(fields.field("s"), Some(DType::Primitive(ptype, _)) if ptype == PType::U32)
+            {
                 return LayoutStrategy::Dictionary;
             }
             // Presence of the typed-object kind column means TypedObject layout.
@@ -370,17 +378,18 @@ impl ResolvedLayout {
     /// Write whatever state this layout holds intrinsically back into `array`,
     /// so that it can be serialized and read back without this layout's help.
     ///
-    /// This is the counterpart to the caching done when a layout is resolved:
-    /// state that lives in the array is hoisted into the variant at
-    /// construction, and derived arrays may no longer carry it. Only the
-    /// Dictionary layout has such state (its term dictionary); the other
-    /// layouts encode everything in the columns themselves and pass `array`
-    /// straight through.
+    /// This is the counterpart to the splitting done when a serialized form is
+    /// opened: state that lives in the array is hoisted into the variant at
+    /// construction, and derived arrays no longer carry it. Only the
+    /// Dictionary layout has such state (its term dictionary), appended as
+    /// trailing dictionary rows — the padded form (see
+    /// [`dictionary::pad_with_dictionary`]); the other layouts encode
+    /// everything in the columns themselves and pass `array` straight through.
     pub(crate) fn attach_intrinsic_state(&self, array: ArrayRef) -> Result<ArrayRef> {
         match self {
             ResolvedLayout::Default | ResolvedLayout::TypedObject => Ok(array),
             ResolvedLayout::Dictionary(access) => {
-                dictionary::attach_payload(array, access.resident())
+                dictionary::pad_with_dictionary(&array, access.resident())
             }
         }
     }

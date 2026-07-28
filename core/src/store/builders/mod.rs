@@ -4,8 +4,10 @@ use crate::io::VORTEX_LIGHT_SESSION;
 use crate::store::RawQuad;
 use crate::store::indexes::{GlobalIndexes, IndexType, Indexes, unique_indexes};
 use crate::store::layouts::LayoutStrategy;
+use crate::store::layouts::term_dictionary::TermDictionary;
 use futures::{Stream, StreamExt, stream};
 use std::future::Future;
+use std::sync::Arc;
 use vortex_array::arrays::StructArray;
 use vortex_array::arrays::struct_::StructArrayExt;
 use vortex_array::dtype::DType;
@@ -83,10 +85,34 @@ impl DictionaryQuadSink {
 
     /// Freeze the dictionary and build the single-chunk Dictionary-layout
     /// array, exactly as the corresponding stream builder would.
-    pub fn finish(self) -> Result<ArrayRef> {
+    pub fn finish(self) -> Result<BuiltArray> {
         let (dict, codes) = self.interner.finish(self.sorted)?;
-        crate::store::layouts::dictionary::build_array(&codes, &dict, &self.indexes, self.sorted)
+        let array =
+            crate::store::layouts::dictionary::build_array(&codes, &self.indexes, self.sorted)?;
+        Ok(BuiltArray {
+            array,
+            dict: Some(Arc::new(dict)),
+        })
     }
+}
+
+/// A built dataset: the quad array plus whatever layout state cannot be
+/// derived from the array alone — for the Dictionary layout, its term
+/// dictionary (the array holds only u32 code columns; the terms travel
+/// beside it and reach serialized forms as trailing dictionary rows or a
+/// sidecar file).
+pub struct BuiltArray {
+    pub array: ArrayRef,
+    pub(crate) dict: Option<Arc<TermDictionary>>,
+}
+
+/// The streaming counterpart of [`BuiltArray`]: the schema dtype, the lazy
+/// chunk stream, and the dictionary the serializer must place (trailing rows
+/// or sidecar).
+pub struct BuiltStream {
+    pub dtype: DType,
+    pub chunks: ChunkStream,
+    pub(crate) dict: Option<Arc<TermDictionary>>,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum, Debug)]
@@ -110,12 +136,14 @@ pub use sorted_stream::SortedStreamBuilder;
 pub use unsorted_stream::UnsortedStreamBuilder;
 
 pub trait VortexArrayBuilder {
-    /// Build the complete dataset as a single (possibly chunked) in-memory array.
+    /// Build the complete dataset as a single (possibly chunked) in-memory
+    /// array, together with the layout state the array alone cannot carry
+    /// (the Dictionary layout's term dictionary).
     fn build_vortex_array(
         quad_stream: Box<dyn Stream<Item = Result<RawQuad>> + Unpin + Send + 'static>,
         layout: LayoutStrategy,
         indexes: Indexes,
-    ) -> impl Future<Output = Result<ArrayRef>> + Send;
+    ) -> impl Future<Output = Result<BuiltArray>> + Send;
 
     /// Produce the schema dtype and a lazily-evaluated stream of StructArray
     /// chunks, for feeding directly into the Vortex file writer.
@@ -128,12 +156,17 @@ pub trait VortexArrayBuilder {
         quad_stream: Box<dyn Stream<Item = Result<RawQuad>> + Unpin + Send + 'static>,
         layout: LayoutStrategy,
         indexes: Indexes,
-    ) -> impl Future<Output = Result<(DType, ChunkStream)>> + Send {
+    ) -> impl Future<Output = Result<BuiltStream>> + Send {
         async move {
-            let array = Self::build_vortex_array(quad_stream, layout, indexes).await?;
-            let dtype = array.dtype().clone();
+            let built = Self::build_vortex_array(quad_stream, layout, indexes).await?;
+            let dtype = built.array.dtype().clone();
+            let array = built.array;
             let chunks: ChunkStream = futures::stream::once(async move { Ok(array) }).boxed();
-            Ok((dtype, chunks))
+            Ok(BuiltStream {
+                dtype,
+                chunks,
+                dict: built.dict,
+            })
         }
     }
 }

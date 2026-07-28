@@ -352,6 +352,7 @@ fn copy_decode_layout(layout: &ResolvedLayout) -> ResolvedLayout {
 #[cfg(feature = "file-io")]
 pub(crate) async fn resolve_file(
     file: &VortexFile,
+    quad_rows: u64,
     layout: &ResolvedLayout,
     pattern: QuadPattern<'_>,
     codes: &mut PatternCodes,
@@ -370,7 +371,8 @@ pub(crate) async fn resolve_file(
         };
         constraints.push((probe.family.second_col(), second_native));
     }
-    let row_ids = super::scan_index_row_ids(file, &constraints, probe.family.rid_col()).await?;
+    let row_ids =
+        super::scan_index_row_ids(file, quad_rows, &constraints, probe.family.rid_col()).await?;
     if row_ids.is_empty() {
         return Ok(IndexResolution::Empty);
     }

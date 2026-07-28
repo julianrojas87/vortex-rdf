@@ -208,16 +208,17 @@ impl IndexType {
     pub(crate) async fn resolve_file(
         self,
         file: &VortexFile,
+        quad_rows: u64,
         layout: &ResolvedLayout,
         pattern: QuadPattern<'_>,
         codes: &mut PatternCodes,
     ) -> Result<IndexResolution> {
         match self {
             IndexType::SecondaryByCopy => {
-                secondary_by_copy::resolve_file(file, layout, pattern, codes).await
+                secondary_by_copy::resolve_file(file, quad_rows, layout, pattern, codes).await
             }
             IndexType::SecondaryByReference => {
-                secondary_by_reference::resolve_file(file, layout, pattern, codes).await
+                secondary_by_reference::resolve_file(file, quad_rows, layout, pattern, codes).await
             }
         }
     }
@@ -538,6 +539,7 @@ pub(crate) fn sorted_row_ids(row_id_column: ArrayRef) -> Result<Buffer<u64>> {
 #[cfg(feature = "file-io")]
 pub(crate) async fn scan_index_row_ids(
     file: &VortexFile,
+    quad_rows: u64,
     value_constraints: &[(&'static str, Scalar)],
     row_id_column: &'static str,
 ) -> Result<Buffer<u64>> {
@@ -558,9 +560,12 @@ pub(crate) async fn scan_index_row_ids(
         return Ok(Buffer::empty());
     };
 
+    // Quad rows only: a padded file's dictionary tail carries zero sentinels
+    // in every index column, which a probe for term code 0 would match.
     let arr = file
         .scan()
         .map_err(VortexRdfError::Vortex)?
+        .with_row_range(0..quad_rows)
         .with_projection(select([row_id_column], root()))
         .with_filter(filter)
         .with_ordered(false)
@@ -636,12 +641,16 @@ pub(crate) fn resolve_indexes_in_memory(
 pub(crate) async fn resolve_indexes_file(
     indexes: &[IndexType],
     file: &VortexFile,
+    quad_rows: u64,
     layout: &ResolvedLayout,
     pattern: QuadPattern<'_>,
     codes: &mut PatternCodes,
 ) -> Result<IndexResolution> {
     for index in indexes {
-        match index.resolve_file(file, layout, pattern, codes).await? {
+        match index
+            .resolve_file(file, quad_rows, layout, pattern, codes)
+            .await?
+        {
             IndexResolution::Declined => continue,
             resolved => return Ok(resolved),
         }

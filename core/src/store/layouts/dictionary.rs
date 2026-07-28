@@ -20,14 +20,15 @@ use std::sync::Arc;
 use web_time::Instant;
 
 use oxrdf::Quad;
-use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::struct_::{StructArray, StructArrayExt};
-use vortex_array::dtype::DType;
+use vortex_array::arrays::{ChunkedArray, ConstantArray, MaskedArray, PrimitiveArray};
+use vortex_array::dtype::{DType, Nullability};
+use vortex_array::scalar::Scalar;
 use vortex_array::validity::Validity;
 use vortex_array::{ArrayRef, IntoArray, VortexSessionExecute};
 
 use super::default::decode_spog;
-use super::term_dictionary::{self, DICT_FIELD, DictReader, TermDictionary, TermIdMap};
+use super::term_dictionary::{DictReader, TERM_FIELD, TermDictionary, TermIdMap};
 use crate::common::utils::stamp_is_sorted;
 use crate::error::{Result, VortexRdfError};
 use crate::io::VORTEX_LIGHT_SESSION;
@@ -87,23 +88,23 @@ where
 }
 
 /// Build the primary part of a Dictionary-layout chunk — the four u32 code
-/// columns plus the `_dict_terms` column — returning the open field vectors
-/// so the caller can append index columns before finalizing.
+/// columns — returning the open field vectors so the caller can append index
+/// columns before finalizing.
 ///
-/// `carry_dict` must be set on exactly the first chunk of a build — it stores
-/// the dictionary payload in row 0 of `_dict_terms`; later chunks carry empty
-/// lists (same dtype). `s_sorted` stamps the `IsSorted` statistic on the `s`
-/// column; valid because sorted-dictionary codes preserve lexicographic order.
+/// The term dictionary is *not* a column of the chunk: in memory it lives in
+/// the layout ([`DictAccess`]), and serialized forms carry it as trailing
+/// dictionary rows or a sidecar file (see [`pad_with_dictionary`]).
+/// `s_sorted` stamps the `IsSorted` statistic on the `s` column; valid
+/// because sorted-dictionary codes preserve lexicographic order.
+///
+/// [`DictAccess`]: super::term_dictionary::DictAccess
 fn chunk_parts(
     codes: &QuadCodes,
     range: Range<usize>,
-    dict: &TermDictionary,
     s_sorted: bool,
-    carry_dict: bool,
-) -> Result<(Vec<Arc<str>>, Vec<ArrayRef>)> {
-    let n = range.len();
-    let mut names = field_names();
-    let mut arrays: Vec<ArrayRef> = vec![
+) -> (Vec<Arc<str>>, Vec<ArrayRef>) {
+    let names = field_names();
+    let arrays: Vec<ArrayRef> = vec![
         PrimitiveArray::from_iter(codes.s[range.clone()].iter().copied()).into_array(),
         PrimitiveArray::from_iter(codes.p[range.clone()].iter().copied()).into_array(),
         PrimitiveArray::from_iter(codes.o[range.clone()].iter().copied()).into_array(),
@@ -114,10 +115,7 @@ fn chunk_parts(
         stamp_is_sorted(&arrays[0]);
     }
 
-    names.push(DICT_FIELD.into());
-    arrays.push(term_dictionary::dict_column(dict, n, carry_dict)?);
-
-    Ok((names, arrays))
+    (names, arrays)
 }
 
 fn finish_chunk(names: Vec<Arc<str>>, arrays: Vec<ArrayRef>, n: usize) -> Result<ArrayRef> {
@@ -135,7 +133,6 @@ fn finish_chunk(names: Vec<Arc<str>>, arrays: Vec<ArrayRef>, n: usize) -> Result
 /// and `whole_dataset` the same index-stamping semantics: pass `true` only
 /// when `quads` is the entire dataset, so the per-chunk index sort is the
 /// global order.
-#[allow(clippy::too_many_arguments)] // each input is distinct; bundling would only add ceremony
 pub(crate) fn build_chunk<K>(
     quads: &[RawQuad],
     dict: &TermDictionary,
@@ -143,7 +140,6 @@ pub(crate) fn build_chunk<K>(
     indexes: &[IndexType],
     start_row: u32,
     s_sorted: bool,
-    carry_dict: bool,
     whole_dataset: bool,
 ) -> Result<ArrayRef>
 where
@@ -155,7 +151,7 @@ where
     let codes = encode_quads(quads, dict, id_map)?;
     let encode_elapsed = encode_start.elapsed();
     let primary_start = Instant::now();
-    let (mut names, mut arrays) = chunk_parts(&codes, 0..n, dict, s_sorted, carry_dict)?;
+    let (mut names, mut arrays) = chunk_parts(&codes, 0..n, s_sorted);
     let primary_elapsed = primary_start.elapsed();
 
     let indexes_start = Instant::now();
@@ -190,7 +186,6 @@ where
 /// [`InterningQuadBuilder`]: super::term_dictionary::InterningQuadBuilder
 pub(crate) fn build_array(
     codes: &QuadCodes,
-    dict: &TermDictionary,
     indexes: &[IndexType],
     s_sorted: bool,
 ) -> Result<ArrayRef> {
@@ -199,7 +194,7 @@ pub(crate) fn build_array(
     }
     let n = codes.s.len();
     let global_idx = GlobalIndexes::from_codes(indexes, codes);
-    build_chunk_global(codes, 0..n, dict, &global_idx, s_sorted, true)
+    build_chunk_global(codes, 0..n, &global_idx, s_sorted)
 }
 
 /// Build a Dictionary-layout chunk for rows `range` of a fully encoded
@@ -208,20 +203,17 @@ pub(crate) fn build_array(
 pub(crate) fn build_chunk_global(
     codes: &QuadCodes,
     range: Range<usize>,
-    dict: &TermDictionary,
     global_indexes: &GlobalIndexes,
     s_sorted: bool,
-    carry_dict: bool,
 ) -> Result<ArrayRef> {
     let start = Instant::now();
     let n = range.len();
-    let (mut names, mut arrays) = chunk_parts(codes, range.clone(), dict, s_sorted, carry_dict)?;
+    let (mut names, mut arrays) = chunk_parts(codes, range.clone(), s_sorted);
     global_indexes.append_slice(&mut names, &mut arrays, range)?;
     let chunk = finish_chunk(names, arrays, n)?;
     log::debug!(
-        "[Dictionary] Built globally encoded chunk of {} rows (carry_payload={}) in {:?}",
+        "[Dictionary] Built globally encoded chunk of {} rows in {:?}",
         n,
-        carry_dict,
         start.elapsed()
     );
     Ok(chunk)
@@ -245,7 +237,6 @@ pub(crate) fn build_chunk_presorted_indexes(
     ref_pairs: Option<RefPairSlices<'_>>,
     copy_keys: Option<CopyKeySlices<'_>>,
     s_sorted: bool,
-    carry_dict: bool,
 ) -> Result<ArrayRef> {
     use crate::store::indexes::secondary_by_copy::append_sorted_code_keys;
     use crate::store::indexes::secondary_by_reference::append_sorted_code_pairs;
@@ -255,7 +246,7 @@ pub(crate) fn build_chunk_presorted_indexes(
     let encode_start = Instant::now();
     let codes = encode_quads(quads, dict, id_map)?;
     let encode_elapsed = encode_start.elapsed();
-    let (mut names, mut arrays) = chunk_parts(&codes, 0..n, dict, s_sorted, carry_dict)?;
+    let (mut names, mut arrays) = chunk_parts(&codes, 0..n, s_sorted);
     if let Some((posg, ospg)) = copy_keys {
         append_sorted_code_keys(&mut names, &mut arrays, posg, ospg, true);
     }
@@ -284,44 +275,76 @@ pub(crate) fn empty_struct(indexes: &[IndexType]) -> Result<ArrayRef> {
         0,
         false,
         false,
-        false,
     )
 }
 
-/// Rewrite `array`'s `_dict_terms` column so that it carries `dict` as its
-/// payload, leaving every other column untouched.
+/// Make a Dictionary-layout array self-describing for serialization by
+/// appending its term dictionary as trailing rows — the *padded* form.
 ///
-/// The payload lives in row 0 alone (see [`term_dictionary::dict_column`]), so
-/// an array derived by slicing or filtering may have dropped it, and a
-/// file-backed scan projects it away entirely. Such an array still decodes
-/// through the store's cached dictionary, but on its own — once written out and
-/// read back — its codes would resolve against an empty dictionary. Re-attaching
-/// the payload makes the array self-describing again.
-pub(crate) fn attach_payload(array: ArrayRef, dict: &TermDictionary) -> Result<ArrayRef> {
-    // Read the field names before executing: `dtype()` is metadata, so this
-    // avoids caring whether the array is still a lazy expression.
-    let existing: Vec<Arc<str>> = match array.dtype() {
-        DType::Struct(fields, _) => fields
-            .names()
-            .iter()
-            .filter(|n| n.as_ref() != DICT_FIELD)
-            .map(|n| n.inner().clone())
-            .collect(),
+/// The quad columns keep their dtypes; one nullable utf8 column
+/// ([`TERM_FIELD`]) is added, null on every quad row and holding the sorted
+/// terms on the `dict.len()` dictionary rows appended after them (where every
+/// quad/index column is a constant zero — a sentinel, not null, so those
+/// columns stay non-nullable). A term's ID is its position among the
+/// dictionary rows; the split point is recovered from the term column's
+/// validity, whose valid run is exactly the tail ([`split_padded`]).
+///
+/// Readers must never surface the dictionary rows as quads: opens split them
+/// off ([`split_padded`]) or restrict scans to the quad rows.
+pub(crate) fn pad_with_dictionary(array: &ArrayRef, dict: &TermDictionary) -> Result<ArrayRef> {
+    let quad_chunk = append_null_term_column(array)?;
+    if dict.len() == 0 {
+        return Ok(quad_chunk);
+    }
+    let tail = dict_tail_chunk(array.dtype(), dict)?;
+    ChunkedArray::try_new(vec![quad_chunk.clone(), tail], quad_chunk.dtype().clone())
+        .map_err(VortexRdfError::Vortex)
+        .map(|a| a.into_array())
+}
+
+/// The padded schema for a quads schema: the same fields plus the nullable
+/// term column.
+pub(crate) fn padded_dtype(quad_dtype: &DType) -> Result<DType> {
+    let DType::Struct(fields, nullability) = quad_dtype else {
+        return Err(VortexRdfError::Serialization(
+            "Dictionary-layout schema is not a struct".to_string(),
+        ));
+    };
+    let mut names: Vec<Arc<str>> = fields.names().iter().map(|n| n.inner().clone()).collect();
+    let mut dtypes: Vec<DType> = names
+        .iter()
+        .map(|n| {
+            fields.field(n.as_ref()).ok_or_else(|| {
+                VortexRdfError::Serialization(format!("schema field {n} has no dtype"))
+            })
+        })
+        .collect::<Result<_>>()?;
+    names.push(TERM_FIELD.into());
+    dtypes.push(DType::Utf8(Nullability::Nullable));
+    Ok(DType::Struct(
+        vortex_array::dtype::StructFields::new(names.into_iter().collect(), dtypes),
+        *nullability,
+    ))
+}
+
+/// Append an all-null term column to one quads chunk — the per-chunk half of
+/// the padded form.
+pub(crate) fn append_null_term_column(chunk: &ArrayRef) -> Result<ArrayRef> {
+    let mut ctx = VORTEX_LIGHT_SESSION.create_execution_ctx();
+    let struct_arr = chunk
+        .clone()
+        .execute::<StructArray>(&mut ctx)
+        .map_err(VortexRdfError::Vortex)?;
+    let n = struct_arr.len();
+    let names: Vec<Arc<str>> = match chunk.dtype() {
+        DType::Struct(fields, _) => fields.names().iter().map(|f| f.inner().clone()).collect(),
         _ => {
             return Err(VortexRdfError::Serialization(
-                "Dictionary-layout array is not a struct".to_string(),
+                "Dictionary-layout chunk is not a struct".to_string(),
             ));
         }
     };
-
-    let mut ctx = VORTEX_LIGHT_SESSION.create_execution_ctx();
-    let struct_arr = array
-        .execute::<StructArray>(&mut ctx)
-        .map_err(VortexRdfError::Vortex)?;
-    let len = struct_arr.len();
-
-    // Carry over every column except the payload, which is rebuilt from `dict`.
-    let mut arrays: Vec<ArrayRef> = existing
+    let mut fields: Vec<ArrayRef> = names
         .iter()
         .map(|name| {
             struct_arr
@@ -330,12 +353,132 @@ pub(crate) fn attach_payload(array: ArrayRef, dict: &TermDictionary) -> Result<A
                 .map_err(VortexRdfError::Vortex)
         })
         .collect::<Result<_>>()?;
+    let mut names = names;
+    names.push(TERM_FIELD.into());
+    fields
+        .push(ConstantArray::new(Scalar::null(DType::Utf8(Nullability::Nullable)), n).into_array());
+    finish_chunk(names, fields, n)
+}
 
-    let mut names = existing;
-    names.push(DICT_FIELD.into());
-    arrays.push(term_dictionary::dict_column(dict, len, true)?);
+/// The trailing dictionary chunk for a quads schema: a zero sentinel for
+/// every quad/index column (not null — those columns stay non-nullable) and
+/// the sorted terms, wrapped nullable and all valid, for the term column.
+pub(crate) fn dict_tail_chunk(quad_dtype: &DType, dict: &TermDictionary) -> Result<ArrayRef> {
+    let m = dict.len();
+    let DType::Struct(fields, _) = quad_dtype else {
+        return Err(VortexRdfError::Serialization(
+            "Dictionary-layout schema is not a struct".to_string(),
+        ));
+    };
+    let mut names: Vec<Arc<str>> = fields.names().iter().map(|f| f.inner().clone()).collect();
+    let mut arrays: Vec<ArrayRef> = names
+        .iter()
+        .map(|name| {
+            let dtype = fields.field(name.as_ref()).ok_or_else(|| {
+                VortexRdfError::Serialization(format!("schema field {name} has no dtype"))
+            })?;
+            Ok(ConstantArray::new(Scalar::default_value(&dtype), m).into_array())
+        })
+        .collect::<Result<_>>()?;
+    let terms = MaskedArray::try_new(dict.terms_array(), Validity::AllValid)
+        .map_err(VortexRdfError::Vortex)?
+        .into_array();
+    names.push(TERM_FIELD.into());
+    arrays.push(terms);
+    finish_chunk(names, arrays, m)
+}
 
-    finish_chunk(names, arrays, len)
+/// Split a padded array ([`pad_with_dictionary`]) back into its pure quad
+/// rows (term column dropped) and its term dictionary.
+///
+/// The split point comes from the term column's validity: the valid rows are
+/// the dictionary tail, and this validates that they form exactly one run at
+/// the end.
+pub(crate) fn split_padded(array: &ArrayRef) -> Result<(ArrayRef, TermDictionary)> {
+    let mut ctx = VORTEX_LIGHT_SESSION.create_execution_ctx();
+    let struct_arr = array
+        .clone()
+        .execute::<StructArray>(&mut ctx)
+        .map_err(VortexRdfError::Vortex)?;
+
+    let term_col = struct_arr
+        .unmasked_field_by_name(TERM_FIELD)
+        .map_err(VortexRdfError::Vortex)?
+        .clone();
+    let (n, dict) = split_term_column(&term_col, &mut ctx)?;
+
+    // The quad rows, with the term column dropped.
+    let names: Vec<Arc<str>> = match array.dtype() {
+        DType::Struct(fields, _) => fields
+            .names()
+            .iter()
+            .filter(|f| f.as_ref() != TERM_FIELD)
+            .map(|f| f.inner().clone())
+            .collect(),
+        _ => unreachable!("struct execution above guarantees a struct dtype"),
+    };
+    let quad_fields: Vec<ArrayRef> = names
+        .iter()
+        .map(|name| {
+            struct_arr
+                .unmasked_field_by_name(name.as_ref())
+                .map_err(VortexRdfError::Vortex)?
+                .slice(0..n)
+                .map_err(VortexRdfError::Vortex)
+        })
+        .collect::<Result<_>>()?;
+    let quads = finish_chunk(names, quad_fields, n)?;
+    Ok((quads, dict))
+}
+
+/// Split a serialized term column into the quad row count and the lifted
+/// dictionary: the valid rows are the dictionary tail (validated to be
+/// exactly one run at the end), and everything before them is quads.
+pub(crate) fn split_term_column(
+    term_col: &ArrayRef,
+    ctx: &mut vortex_array::ExecutionCtx,
+) -> Result<(usize, TermDictionary)> {
+    let total = term_col.len();
+    let mask = term_col
+        .validity()
+        .map_err(VortexRdfError::Vortex)?
+        .execute_mask(total, ctx)
+        .map_err(VortexRdfError::Vortex)?;
+    let m = mask.true_count();
+    let n = total - m;
+    // The valid run must be exactly the tail — anything else is corrupt.
+    if mask.to_bit_buffer().iter().take(n).any(|v| v) {
+        return Err(VortexRdfError::Deserialization(
+            "padded dictionary rows are not a contiguous tail".to_string(),
+        ));
+    }
+    let dict = if m == 0 {
+        TermDictionary::empty()
+    } else {
+        TermDictionary::from_terms_array(term_tail(term_col, n, total)?, ctx)?
+    };
+    Ok((n, dict))
+}
+
+/// The dictionary tail of a serialized term column.
+///
+/// When the tail is exactly the column's final chunk — the shape
+/// [`pad_with_dictionary`] writes — that chunk is taken directly: a
+/// `slice(n..total)` would wrap it in a lazy slice node, which defeats the
+/// FSST downcast on open and canonicalizes (decompresses) the dictionary.
+pub(crate) fn term_tail(term_col: &ArrayRef, n: usize, total: usize) -> Result<ArrayRef> {
+    use vortex_array::arrays::chunked::ChunkedArrayExt as _;
+    if let Ok(chunked) = term_col
+        .clone()
+        .try_downcast::<vortex_array::arrays::Chunked>()
+        && let Some(last) = chunked.nchunks().checked_sub(1)
+    {
+        let chunk = chunked.chunk(last);
+        if chunk.len() == total - n {
+            return Ok(chunk.clone());
+        }
+    }
+    term_col.slice(n..total).map_err(VortexRdfError::Vortex)
 }
 
 /// Decode a Dictionary-layout StructArray chunk into Quads using the given

@@ -7,7 +7,7 @@ use std::cell::RefCell;
 use std::io::Cursor;
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::struct_::{StructArray, StructArrayExt};
-use vortex_array::{ArrayRef, VortexSessionExecute};
+use vortex_array::VortexSessionExecute;
 use vortex_rdf_core::common::utils::parse_quads_from_reader;
 use vortex_rdf_core::error::{Result as CoreResult, VortexRdfError};
 use vortex_rdf_core::io::{
@@ -282,9 +282,9 @@ impl VortexRdfStore {
         let format = parse_format(format_name)?;
         let config = parse_build_options(options)?;
         let quads_stream = parse_quads_from_reader(Cursor::new(input), format);
-        let vortex_array = build_array(quads_stream, config).await?;
+        let built = build_array(quads_stream, config).await?;
 
-        let inner = CoreStore::new(vortex_array).map_err(|e| JsValue::from_str(&e.to_string()))?;
+        let inner = CoreStore::from_built(built).map_err(|e| JsValue::from_str(&e.to_string()))?;
         Ok(VortexRdfStore::wrap(inner))
     }
 
@@ -301,17 +301,17 @@ impl VortexRdfStore {
         // four owned Strings per quad on the ingest high-water mark.
         if config.layout == LayoutStrategy::Dictionary && js_sys::Array::is_array(&quads) {
             let sorted = config.builder == BuilderStrategy::SortedInMemory;
-            let vortex_array =
+            let built =
                 js_array_to_dictionary_array(js_sys::Array::from(&quads), sorted, config.indexes)?;
             let inner =
-                CoreStore::new(vortex_array).map_err(|e| JsValue::from_str(&e.to_string()))?;
+                CoreStore::from_built(built).map_err(|e| JsValue::from_str(&e.to_string()))?;
             return Ok(VortexRdfStore::wrap(inner));
         }
 
         let quad_stream = js_to_quad_stream(quads)?;
-        let vortex_array = build_array(quad_stream, config).await?;
+        let built = build_array(quad_stream, config).await?;
 
-        let inner = CoreStore::new(vortex_array).map_err(|e| JsValue::from_str(&e.to_string()))?;
+        let inner = CoreStore::from_built(built).map_err(|e| JsValue::from_str(&e.to_string()))?;
         Ok(VortexRdfStore::wrap(inner))
     }
 
@@ -700,7 +700,14 @@ pub async fn rdf_to_vortex(
     let format = parse_format(format_name)?;
     let config = parse_build_options(options)?;
     let quads_stream = parse_quads_from_reader(Cursor::new(input), format);
-    let vortex_array = build_array(quads_stream, config).await?;
+    let built = build_array(quads_stream, config).await?;
+    // Route through the store so the written bytes carry the term dictionary
+    // (the padded form) and stay self-describing.
+    let store = CoreStore::from_built(built).map_err(|e| JsValue::from_str(&e.to_string()))?;
+    let vortex_array = store
+        .to_ipc_array()
+        .await
+        .map_err(|e| JsValue::from_str(&format!("Vortex read error: {}", e)))?;
 
     let mut buffer = Vec::new();
     write_array_to_ipc(vortex_array, &mut buffer)
@@ -772,7 +779,7 @@ impl Default for BuildConfig {
 async fn build_array(
     quads: impl Stream<Item = CoreResult<RawQuad>> + Unpin + Send + 'static,
     config: BuildConfig,
-) -> Result<ArrayRef, JsValue> {
+) -> Result<vortex_rdf_core::store::BuiltArray, JsValue> {
     let BuildConfig {
         builder,
         layout,
@@ -938,7 +945,7 @@ fn js_array_to_dictionary_array(
     quads: js_sys::Array,
     sorted: bool,
     indexes: Indexes,
-) -> Result<ArrayRef, JsValue> {
+) -> Result<vortex_rdf_core::store::BuiltArray, JsValue> {
     let mut sink = DictionaryQuadSink::new(sorted, indexes);
     let total = quads.length();
     let mut start = 0u32;

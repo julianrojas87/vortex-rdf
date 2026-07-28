@@ -57,9 +57,9 @@ pub use io::{
 };
 
 pub use store::{
-    BuilderStrategy, DictSnapshot, DictionaryQuadSink, IndexType, Indexes, LayoutStrategy,
-    SortedInMemoryBuilder, SortedStreamBuilder, UnsortedStreamBuilder, VortexArrayBuilder,
-    VortexRdfStore,
+    BuilderStrategy, BuiltArray, BuiltStream, DictSnapshot, DictionaryQuadSink, IndexType, Indexes,
+    LayoutStrategy, SortedInMemoryBuilder, SortedStreamBuilder, UnsortedStreamBuilder,
+    VortexArrayBuilder, VortexRdfStore,
 };
 
 #[cfg(all(feature = "mimalloc", not(target_arch = "wasm32")))]
@@ -137,7 +137,7 @@ mod tests {
         .await
         .expect("build failed");
 
-        let store = VortexRdfStore::new(arr).unwrap();
+        let store = VortexRdfStore::from_built(arr).unwrap();
         let decoded: Vec<Quad> = store.quads().unwrap().try_collect().await.unwrap();
         assert_eq!(decoded.len(), 1);
         assert_eq!(decoded[0].subject.to_string(), quad.subject.to_string());
@@ -183,7 +183,7 @@ mod tests {
         )
         .await
         .expect("build failed");
-        let store = VortexRdfStore::new(arr).unwrap();
+        let store = VortexRdfStore::from_built(arr).unwrap();
 
         let p1 = NamedNode::new("http://example.org/p1").unwrap();
         let filtered = store
@@ -318,6 +318,63 @@ mod tests {
     }
 
     #[cfg(feature = "file-io")]
+    /// The sidecar placement round-trip: a quads file with bare code columns
+    /// plus the `<stem>.dict.vortex` companion written beside it must reopen
+    /// with identical match results — the sidecar branch of `from_file`.
+    #[cfg(feature = "file-io")]
+    #[tokio::test]
+    async fn test_sidecar_dictionary_file_roundtrip() {
+        let quads = dictionary_test_quads();
+        let built = VortexRdfStore::build_vortex_array_with_builder::<SortedInMemoryBuilder>(
+            quad_stream(quads.clone()),
+            LayoutStrategy::Dictionary,
+            dictionary_indexes(),
+        )
+        .await
+        .unwrap();
+        let store = VortexRdfStore::from_built(built).unwrap();
+
+        let dir = std::env::temp_dir().join(format!(
+            "vortex_rdf_sidecar_dict_test_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("quads.vortex");
+
+        // Bare code columns (with index columns) to the quads file...
+        let bare = store.get_quads_array().await.unwrap();
+        let file = tokio::fs::File::create(&path).await.unwrap();
+        crate::io::serialize(bare, file).await.unwrap();
+        // ...and the dictionary to the companion beside it.
+        let sidecar =
+            crate::io::write_sidecar_dictionary(&store.dictionary_snapshot().unwrap(), &path)
+                .await
+                .unwrap();
+        assert_eq!(sidecar, dir.join("quads.dict.vortex"));
+
+        let reopened = VortexRdfStore::from_file(&path).await.unwrap();
+        assert_eq!(reopened.layout(), LayoutStrategy::Dictionary);
+        assert_eq!(reopened.size().await.unwrap(), quads.len());
+
+        let p0 = NamedNode::new("http://example.org/p0").unwrap();
+        let (a, b) = (
+            store
+                .match_pattern(None, Some(&p0), None, None)
+                .await
+                .unwrap(),
+            reopened
+                .match_pattern(None, Some(&p0), None, None)
+                .await
+                .unwrap(),
+        );
+        assert_eq!(a.size().await.unwrap(), b.size().await.unwrap());
+        let decoded: Vec<Quad> = b.quads().unwrap().try_collect().await.unwrap();
+        let direct: Vec<Quad> = a.quads().unwrap().try_collect().await.unwrap();
+        assert_eq!(quad_strings(&decoded), quad_strings(&direct));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     async fn run_match_pattern_file_dictionary_test<B: VortexArrayBuilder>() {
         use crate::io::ser::quads_stream_to_vortex_writer_with_builder;
 
@@ -439,7 +496,7 @@ mod tests {
             .collect();
 
         // chunk_size = 3 over 10 quads → chunks of 3, 3, 3, 1.
-        let (dtype, chunks) = build_chunk_stream(
+        let built = build_chunk_stream(
             Box::new(quad_stream(quads)),
             LayoutStrategy::Default,
             vec![],
@@ -447,6 +504,7 @@ mod tests {
         )
         .await
         .unwrap();
+        let (dtype, chunks) = (built.dtype, built.chunks);
 
         if let vortex_array::dtype::DType::Struct(fields, _) = &dtype {
             let names: Vec<&str> = fields.names().iter().map(|n| n.as_ref()).collect();
@@ -535,7 +593,7 @@ mod tests {
                 .await,
             ),
         ] {
-            let (_dtype, chunks) = result.unwrap_or_else(|e| panic!("{name}: {e}"));
+            let chunks = result.unwrap_or_else(|e| panic!("{name}: {e}")).chunks;
             let collected: Vec<_> = chunks.collect().await;
 
             let lens: Vec<usize> = collected
@@ -586,14 +644,15 @@ mod tests {
             })
             .collect();
 
-        let (_dtype, chunks) = build_sorted_stream_chunk_stream(
+        let chunks = build_sorted_stream_chunk_stream(
             Box::new(quad_stream(quads.clone())),
             LayoutStrategy::Default,
             indexes.clone(),
             3,
         )
         .await
-        .expect("spilled build");
+        .expect("spilled build")
+        .chunks;
         let chunks: Vec<_> = chunks
             .collect::<Vec<_>>()
             .await
@@ -787,7 +846,7 @@ mod tests {
         )
         .await
         .unwrap();
-        check(sorted, true, "sorted_in_memory");
+        check(sorted.array, true, "sorted_in_memory");
 
         let unsorted = VortexRdfStore::build_vortex_array_with_builder::<UnsortedStreamBuilder>(
             quad_stream(quads),
@@ -796,7 +855,7 @@ mod tests {
         )
         .await
         .unwrap();
-        check(unsorted, false, "unsorted");
+        check(unsorted.array, false, "unsorted");
     }
 
     #[tokio::test]
@@ -822,7 +881,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let store = VortexRdfStore::new(arr).unwrap();
+        let store = VortexRdfStore::from_built(arr).unwrap();
 
         let s5 = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/s05").unwrap());
         let matched = store
@@ -878,7 +937,7 @@ mod tests {
         .expect("build failed");
 
         // Schema: 4 primary columns + 4 reference index columns, exactly once.
-        if let vortex_array::dtype::DType::Struct(fields, _) = arr.dtype() {
+        if let vortex_array::dtype::DType::Struct(fields, _) = arr.array.dtype() {
             let names: Vec<&str> = fields.names().iter().map(|n| n.as_ref()).collect();
             assert_eq!(
                 names,
@@ -898,7 +957,7 @@ mod tests {
         }
 
         // Index-routed matching still works.
-        let store = VortexRdfStore::new(arr).unwrap();
+        let store = VortexRdfStore::from_built(arr).unwrap();
         let p1 = NamedNode::new("http://example.org/p1").unwrap();
         let matched = store
             .match_pattern(None, Some(&p1), None, None)
@@ -931,7 +990,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let store = VortexRdfStore::new(arr).unwrap();
+        let store = VortexRdfStore::from_built(arr).unwrap();
         assert_eq!(store.indexes(), &vec![IndexType::SecondaryByReference]);
 
         // Match on the object index: 24 quads over 4 objects ⇒ 6 rows.
@@ -1015,7 +1074,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let store = VortexRdfStore::new(arr).unwrap();
+        let store = VortexRdfStore::from_built(arr).unwrap();
 
         // A view over the object index: i = 1, 5, 9, 13, 17, 21 ⇒ 6 rows.
         let object = Term::Literal(Literal::new_simple_literal("object 1"));
@@ -1066,7 +1125,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let bare = VortexRdfStore::new(bare).unwrap();
+        let bare = VortexRdfStore::from_built(bare).unwrap();
         assert!(bare.indexes().is_empty());
         assert!(
             bare.compact_with_indexes(vec![])
@@ -1110,7 +1169,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let store = VortexRdfStore::new(arr).unwrap();
+        let store = VortexRdfStore::from_built(arr).unwrap();
 
         let object = Term::Literal(Literal::new_simple_literal("object 1"));
         let indexed = store
@@ -1194,7 +1253,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let store = VortexRdfStore::new(arr).unwrap();
+        let store = VortexRdfStore::from_built(arr).unwrap();
 
         // Drop one quad: subject s0, which also carries object "object 0".
         let after = store.delete_quad(&quads[0]).await.unwrap();
@@ -1259,7 +1318,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let store = VortexRdfStore::new(arr).unwrap();
+        let store = VortexRdfStore::from_built(arr).unwrap();
 
         // Delete every quad with predicate p0 (i even): 6 of the 12.
         let p0 = NamedNode::new("http://example.org/p0").unwrap();
@@ -1510,7 +1569,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let store = VortexRdfStore::new(arr).unwrap();
+        let store = VortexRdfStore::from_built(arr).unwrap();
 
         let object = Term::Literal(Literal::new_simple_literal("object 0"));
         let view = store
@@ -1579,7 +1638,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let store = VortexRdfStore::new(arr).unwrap();
+        let store = VortexRdfStore::from_built(arr).unwrap();
 
         let object = Term::Literal(Literal::new_simple_literal("object 0"));
         let matched = store
@@ -1640,7 +1699,7 @@ mod tests {
                     )
                 });
 
-                if let vortex_array::dtype::DType::Struct(fields, _) = arr.dtype() {
+                if let vortex_array::dtype::DType::Struct(fields, _) = arr.array.dtype() {
                     let names: Vec<&str> = fields.names().iter().map(|n| n.as_ref()).collect();
                     let ref_cols = ["_idx_o_val", "_idx_o_rid", "_idx_p_val", "_idx_p_rid"];
                     let copy_cols = [
@@ -1668,7 +1727,7 @@ mod tests {
                     );
                 }
 
-                let store = VortexRdfStore::new(arr).unwrap();
+                let store = VortexRdfStore::from_built(arr).unwrap();
                 assert_eq!(
                     store.size().await.unwrap(),
                     quads.len(),
@@ -1759,7 +1818,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let store = VortexRdfStore::new(arr).unwrap();
+        let store = VortexRdfStore::from_built(arr).unwrap();
         assert_eq!(store.indexes(), &[IndexType::SecondaryByCopy]);
 
         // Predicate p1 marks i ≡ 1 (mod 3): 8 rows, via the POSG lead search.
@@ -1859,7 +1918,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let store = VortexRdfStore::new(arr).unwrap();
+        let store = VortexRdfStore::from_built(arr).unwrap();
         assert_eq!(store.indexes(), &[IndexType::SecondaryByCopy]);
 
         // Predicate-bound: served from the POSG family's contiguous run — the
@@ -2118,7 +2177,7 @@ mod tests {
         )
         .await
         .expect("build failed");
-        let store = VortexRdfStore::new(arr).unwrap();
+        let store = VortexRdfStore::from_built(arr).unwrap();
         assert_eq!(store.size().await.unwrap(), 1);
 
         let q2 = make_quad(
@@ -2204,7 +2263,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let store = VortexRdfStore::new(arr).unwrap();
+        let store = VortexRdfStore::from_built(arr).unwrap();
 
         let added = store
             .add_quads([
@@ -2337,7 +2396,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let store = VortexRdfStore::new(arr).unwrap();
+        let store = VortexRdfStore::from_built(arr).unwrap();
 
         // Adding an existing quad is a no-op.
         let same = store.add_quad(q1.clone()).await.unwrap();
@@ -2386,7 +2445,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let store = VortexRdfStore::new(arr).unwrap();
+        let store = VortexRdfStore::from_built(arr).unwrap();
 
         // Below the floor the tail simply accumulates.
         let small = store.add_quads(batch(10..110)).await.unwrap();
@@ -2547,7 +2606,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let store = VortexRdfStore::new(arr).unwrap();
+        let store = VortexRdfStore::from_built(arr).unwrap();
 
         // Every term of the appended quad is absent from the dictionary.
         let novel = make_quad(
@@ -2658,7 +2717,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let store = VortexRdfStore::new(arr).unwrap();
+        let store = VortexRdfStore::from_built(arr).unwrap();
 
         let added = store
             .add_quads([
@@ -3125,7 +3184,7 @@ mod tests {
         )
         .await
         .expect("build failed");
-        let store = VortexRdfStore::new(arr).unwrap();
+        let store = VortexRdfStore::from_built(arr).unwrap();
         assert_eq!(store.layout(), LayoutStrategy::TypedObject);
 
         // Match by object literal — exercises the typed o_kind/o_value columns.
@@ -3196,7 +3255,7 @@ mod tests {
         .await
         .expect("dictionary build failed");
 
-        let store = VortexRdfStore::new(arr).unwrap();
+        let store = VortexRdfStore::from_built(arr).unwrap();
         assert_eq!(store.layout(), LayoutStrategy::Dictionary);
 
         let decoded: Vec<Quad> = store.quads().unwrap().try_collect().await.unwrap();
@@ -3257,21 +3316,25 @@ mod tests {
                 .await,
             ),
         ] {
-            let (_dtype, chunks) = result.unwrap_or_else(|e| panic!("{name}: {e}"));
-            let collected: Vec<_> = chunks.collect().await;
+            let built = result.unwrap_or_else(|e| panic!("{name}: {e}"));
+            let dict = built.dict.clone();
+            let collected: Vec<_> = built.chunks.collect().await;
             let lens: Vec<usize> = collected
                 .iter()
                 .map(|c| c.as_ref().unwrap().len())
                 .collect();
             assert_eq!(lens, [3, 3, 3, 1], "{name}: unexpected chunk sizes");
 
-            // Reassemble and decode through a store: this fails unless chunk 0
-            // carries the dictionary payload (row 0 of the assembled array)
-            // and all chunks' codes reference the same global dictionary.
+            // Reassemble and decode through a store: the chunks hold bare
+            // codes, and the dictionary the stream carried beside them is
+            // handed back with the reassembled array — all chunks' codes must
+            // reference that same global dictionary.
             let chunks: Vec<_> = collected.into_iter().map(|c| c.unwrap()).collect();
             let arr =
                 assemble_chunks(chunks, LayoutStrategy::Dictionary, &dictionary_indexes()).unwrap();
-            let store = VortexRdfStore::new(arr).unwrap();
+            let store =
+                VortexRdfStore::from_built(crate::store::builders::BuiltArray { array: arr, dict })
+                    .unwrap();
             assert_eq!(store.layout(), LayoutStrategy::Dictionary, "{name}");
             let decoded: Vec<Quad> = store.quads().unwrap().try_collect().await.unwrap();
             assert_eq!(
@@ -3292,7 +3355,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let store = VortexRdfStore::new(arr).unwrap();
+        let store = VortexRdfStore::from_built(arr).unwrap();
 
         // Subject match: hits the IsSorted binary-search fast path on the u32 column.
         let s3 = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/s03").unwrap());
@@ -3372,7 +3435,7 @@ mod tests {
         // Deduped index columns appear exactly once, and under the Dictionary
         // layout the index value columns hold u32 codes — same dtype as the
         // primary code columns — instead of strings.
-        if let vortex_array::dtype::DType::Struct(fields, _) = arr.dtype() {
+        if let vortex_array::dtype::DType::Struct(fields, _) = arr.array.dtype() {
             let names: Vec<&str> = fields.names().iter().map(|n| n.as_ref()).collect();
             assert_eq!(
                 names,
@@ -3381,7 +3444,6 @@ mod tests {
                     "p",
                     "o",
                     "g",
-                    "_dict_terms",
                     "_idx_o_val",
                     "_idx_o_rid",
                     "_idx_p_val",
@@ -3394,7 +3456,7 @@ mod tests {
             panic!("expected StructArray dtype");
         }
 
-        let store = VortexRdfStore::new(arr).unwrap();
+        let store = VortexRdfStore::from_built(arr).unwrap();
 
         // Full roundtrip decode with the index columns present.
         let decoded: Vec<Quad> = store.quads().unwrap().try_collect().await.unwrap();
@@ -3481,7 +3543,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let store = VortexRdfStore::new(arr).unwrap();
+        let store = VortexRdfStore::from_built(arr).unwrap();
 
         let decoded: Vec<Quad> = store.quads().unwrap().try_collect().await.unwrap();
         assert_eq!(quad_strings(&decoded), quad_strings(&quads));
@@ -3521,9 +3583,9 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(arr.len(), 0);
+        assert_eq!(arr.array.len(), 0);
 
-        let store = VortexRdfStore::new(arr).unwrap();
+        let store = VortexRdfStore::from_built(arr).unwrap();
         assert_eq!(store.layout(), LayoutStrategy::Dictionary);
         assert_eq!(store.size().await.unwrap(), 0);
         let decoded: Vec<Quad> = store.quads().unwrap().try_collect().await.unwrap();
@@ -3555,22 +3617,46 @@ mod tests {
         )
         .await
         .unwrap();
-        let store = VortexRdfStore::new(arr).unwrap();
+        let store = VortexRdfStore::from_built(arr).unwrap();
 
         let encoding_of_dict_terms = |array: &vortex_array::ArrayRef| -> String {
+            use vortex_array::IntoArray as _;
             use vortex_array::VortexSessionExecute as _;
-            use vortex_array::arrays::listview::ListViewArrayExt as _;
+            use vortex_array::arrays::chunked::ChunkedArrayExt as _;
+            use vortex_array::arrays::masked::MaskedArraySlotsExt as _;
             use vortex_array::arrays::struct_::StructArrayExt as _;
             let mut ctx = crate::io::VORTEX_LIGHT_SESSION.create_execution_ctx();
             let sa = array
                 .clone()
                 .execute::<vortex_array::arrays::struct_::StructArray>(&mut ctx)
                 .unwrap();
-            let col = sa.unmasked_field_by_name("_dict_terms").unwrap().clone();
-            let list = col
-                .execute::<vortex_array::arrays::ListViewArray>(&mut ctx)
+            // The dictionary rows are the term column's valid tail; peel the
+            // padded form's wrappers (chunk container, nullability mask) down
+            // to the leaf term encoding.
+            let col = sa.unmasked_field_by_name("_dict_term").unwrap().clone();
+            let total = col.len();
+            let mask = col
+                .validity()
+                .unwrap()
+                .execute_mask(total, &mut ctx)
                 .unwrap();
-            list.list_elements_at(0).unwrap().encoding_id().to_string()
+            let m = mask.true_count();
+            let mut tail =
+                crate::store::layouts::dictionary::term_tail(&col, total - m, total).unwrap();
+            loop {
+                tail = match tail.try_downcast::<vortex_array::arrays::Masked>() {
+                    Ok(masked) => masked.child().clone(),
+                    Err(not_masked) => {
+                        match not_masked.try_downcast::<vortex_array::arrays::Chunked>() {
+                            Ok(chunked) if chunked.nchunks() == 1 => chunked.chunk(0).clone(),
+                            Ok(chunked) => break chunked.into_array(),
+                            Err(other) => break other,
+                        }
+                    }
+                };
+            }
+            .encoding_id()
+            .to_string()
         };
 
         // Written out compressed...

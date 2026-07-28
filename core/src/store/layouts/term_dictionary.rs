@@ -14,9 +14,8 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use web_time::Instant;
 
-use vortex_array::arrays::listview::ListViewArrayExt as _;
 use vortex_array::arrays::struct_::{StructArray, StructArrayExt};
-use vortex_array::arrays::{ListArray, ListViewArray, PrimitiveArray, VarBinViewArray};
+use vortex_array::arrays::{PrimitiveArray, VarBinViewArray};
 #[cfg(feature = "file-io")]
 use vortex_array::expr::{root, select};
 use vortex_array::match_each_integer_ptype;
@@ -33,9 +32,16 @@ use crate::error::{Result, VortexRdfError};
 use crate::io::VORTEX_LIGHT_SESSION;
 use crate::store::{QuadCodes, RawQuad};
 
-/// Name of the dictionary column: a `list<utf8>` root column where row 0 holds
-/// the entire sorted dictionary as one list and every other row is an empty list.
-pub(crate) const DICT_FIELD: &str = "_dict_terms";
+/// Name of the term column in serialized Dictionary-layout forms: nullable
+/// `utf8`, null on every quad row, holding the sorted terms on the dictionary
+/// rows appended after them (padded form) or on every row of a sidecar
+/// dictionary file. A term's ID is its position among the dictionary rows.
+pub(crate) const TERM_FIELD: &str = "_dict_term";
+
+/// Name of the retired list-cell dictionary column (`list<utf8>` with the
+/// whole dictionary packed into row 0). Kept only so opens can recognize a
+/// legacy array and fail with an actionable error instead of a decode error.
+pub(crate) const LEGACY_DICT_FIELD: &str = "_dict_terms";
 
 /// Build-only term-to-ID lookup table, keyed by owned terms. It is deliberately
 /// kept separate from [`TermDictionary`] so stores retain only the compact
@@ -311,7 +317,33 @@ impl TermDictionary {
     /// cost a full plaintext copy of its dictionary. Any other encoding is
     /// canonicalized: the write path compresses, but nothing in the format
     /// obliges a producer to have done so.
-    fn from_terms_array(elements: ArrayRef, ctx: &mut vortex_array::ExecutionCtx) -> Result<Self> {
+    pub(crate) fn from_terms_array(
+        elements: ArrayRef,
+        ctx: &mut vortex_array::ExecutionCtx,
+    ) -> Result<Self> {
+        // Peel the structural wrappers a serialized term column can arrive
+        // in: the padded form's all-valid nullability wrapper (`Masked`), and
+        // a chunk-aligned slice still riding in a one-chunk `Chunked`
+        // container. Without this the FSST downcast below would miss and the
+        // dictionary would be canonicalized — decompressed — on open, which
+        // is exactly the copy holding it compressed exists to avoid.
+        let elements = {
+            use vortex_array::arrays::chunked::ChunkedArrayExt as _;
+            use vortex_array::arrays::masked::MaskedArraySlotsExt as _;
+            let mut cur = elements;
+            loop {
+                cur = match cur.try_downcast::<vortex_array::arrays::Masked>() {
+                    Ok(masked) => masked.child().clone(),
+                    Err(not_masked) => {
+                        match not_masked.try_downcast::<vortex_array::arrays::Chunked>() {
+                            Ok(chunked) if chunked.nchunks() == 1 => chunked.chunk(0).clone(),
+                            Ok(chunked) => break chunked.into_array(),
+                            Err(other) => break other,
+                        }
+                    }
+                };
+            }
+        };
         let elements = match elements.try_downcast::<FSST>() {
             Ok(fsst) => {
                 return Ok(Self::new(TermStore::Fsst(FsstTerms::new(fsst)?)));
@@ -832,107 +864,23 @@ impl DictAccess {
     }
 }
 
-/// Build the `_dict_terms` column for a chunk of `n_rows` quads.
+/// Read the term dictionary from a padded Dictionary-layout file: a
+/// single-column projection scan of [`TERM_FIELD`] (the quad columns are
+/// never touched). Returns the quad row count (the split point) alongside the
+/// dictionary.
 ///
-/// When `carry_payload` is set (the first chunk of a build), row 0 holds the
-/// entire dictionary as one list; otherwise every row is an empty list. Either
-/// way the column dtype is identical across chunks.
-pub(crate) fn dict_column(
-    dict: &TermDictionary,
-    n_rows: usize,
-    carry_payload: bool,
-) -> Result<ArrayRef> {
-    let start = Instant::now();
-    let m = dict.len() as i32;
-    let (elements, offsets): (ArrayRef, Vec<i32>) = if carry_payload && n_rows > 0 {
-        (
-            dict.terms_array(),
-            std::iter::once(0)
-                .chain(std::iter::repeat_n(m, n_rows))
-                .collect(),
-        )
-    } else {
-        (
-            VarBinViewArray::from_iter_str(std::iter::empty::<&str>()).into_array(),
-            vec![0; n_rows + 1],
-        )
-    };
-
-    let column = ListArray::try_new(
-        elements,
-        PrimitiveArray::from_iter(offsets).into_array(),
-        Validity::NonNullable,
-    )
-    .map(|a| a.into_array())
-    .map_err(VortexRdfError::Vortex)?;
-    log::debug!(
-        "[Dictionary] Built dictionary payload column for {} rows ({} terms, carry_payload={}) in {:?}",
-        n_rows,
-        dict.len(),
-        carry_payload,
-        start.elapsed()
-    );
-    Ok(column)
-}
-
-/// Recover the dictionary from a complete `_dict_terms` column: by
-/// construction only row 0 can be non-empty, so its list is the dictionary.
-///
-/// Must be called on the full column as built/written — derived (sliced or
-/// filtered) arrays may have lost row 0; stores cache the dictionary at
-/// construction instead of re-reading it from derived data.
-pub(crate) fn dict_from_list_column(col: &ArrayRef) -> Result<TermDictionary> {
-    if col.is_empty() {
-        return Ok(TermDictionary::empty());
-    }
-    let mut ctx = VORTEX_LIGHT_SESSION.create_execution_ctx();
-    let list = col
-        .clone()
-        .execute::<ListViewArray>(&mut ctx)
-        .map_err(VortexRdfError::Vortex)?;
-    let elements = list.list_elements_at(0).map_err(VortexRdfError::Vortex)?;
-    TermDictionary::from_terms_array(elements, &mut ctx)
-}
-
-/// Extract the term dictionary from an in-memory Dictionary-layout array.
-///
-/// Only row 0 carries the payload, so slice to a single row first — this keeps
-/// the extraction cheap (no canonicalization of the full, possibly chunked,
-/// array) and zero-copy into the existing buffers.
-pub(crate) fn dict_from_array(array: &ArrayRef) -> Result<TermDictionary> {
-    let head = if array.is_empty() {
-        array.clone()
-    } else {
-        array.slice(0..1).map_err(VortexRdfError::Vortex)?
-    };
-    let mut ctx = VORTEX_LIGHT_SESSION.create_execution_ctx();
-    let struct_arr = head
-        .execute::<StructArray>(&mut ctx)
-        .map_err(VortexRdfError::Vortex)?;
-    let col = struct_arr
-        .unmasked_field_by_name(DICT_FIELD)
-        .map_err(VortexRdfError::Vortex)?
-        .clone();
-    dict_from_list_column(&col)
-}
-
-/// Read the term dictionary from a Dictionary-layout file: a single-column
-/// projection scan of `_dict_terms` (the quad columns are never touched).
-///
-/// The scan is restricted to row 0 — by construction the only row carrying the
-/// payload (mirroring `dict_from_array`'s `slice(0..1)`). Without the
-/// restriction the scan decodes every row block of the column just to hold
-/// empty lists, which profiling showed dominating Dictionary-layout file opens.
+/// The quad rows' term values are one all-null run, which decodes to almost
+/// nothing; the dictionary tail is lifted resident exactly as
+/// [`super::dictionary::split_padded`] does for in-memory arrays.
 #[cfg(feature = "file-io")]
-pub(crate) async fn dict_from_file(file: &VortexFile) -> Result<TermDictionary> {
+pub(crate) async fn dict_from_padded_file(file: &VortexFile) -> Result<(u64, TermDictionary)> {
     if file.row_count() == 0 {
-        return Ok(TermDictionary::empty());
+        return Ok((0, TermDictionary::empty()));
     }
     let arr = file
         .scan()
         .map_err(VortexRdfError::Vortex)?
-        .with_projection(select([DICT_FIELD], root()))
-        .with_row_range(0..1)
+        .with_projection(select([TERM_FIELD], root()))
         .into_array_stream()
         .map_err(VortexRdfError::Vortex)?
         .read_all()
@@ -943,10 +891,72 @@ pub(crate) async fn dict_from_file(file: &VortexFile) -> Result<TermDictionary> 
         .execute::<StructArray>(&mut ctx)
         .map_err(VortexRdfError::Vortex)?;
     let col = struct_arr
-        .unmasked_field_by_name(DICT_FIELD)
+        .unmasked_field_by_name(TERM_FIELD)
         .map_err(VortexRdfError::Vortex)?
         .clone();
-    dict_from_list_column(&col)
+    let (n_quads, dict) = super::dictionary::split_term_column(&col, &mut ctx)?;
+    Ok((n_quads as u64, dict))
+}
+
+/// The sidecar dictionary path for a quads file: `<stem>.dict.vortex` beside
+/// it (`data.vortex` → `data.dict.vortex`).
+#[cfg(feature = "file-io")]
+pub(crate) fn sidecar_dict_path(quads_path: &std::path::Path) -> std::path::PathBuf {
+    let stem = quads_path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "quads".to_string());
+    quads_path.with_file_name(format!("{stem}.dict.vortex"))
+}
+
+/// Read the term dictionary from the sidecar file beside `quads_path`: a
+/// one-column `{_dict_term: utf8}` file whose row `i` is the term with ID `i`.
+#[cfg(feature = "file-io")]
+pub(crate) async fn dict_from_sidecar_file(quads_path: &std::path::Path) -> Result<TermDictionary> {
+    let path = sidecar_dict_path(quads_path);
+    if !path.is_file() {
+        return Err(VortexRdfError::Deserialization(format!(
+            "Dictionary-layout file {:?} has bare code columns and no sidecar \
+             dictionary at {:?}; the sidecar must travel with the quads file",
+            quads_path, path
+        )));
+    }
+    let file = crate::io::de::open_vortex_file(&path).await?;
+    if file.row_count() == 0 {
+        return Ok(TermDictionary::empty());
+    }
+    let arr = file
+        .scan()
+        .map_err(VortexRdfError::Vortex)?
+        .with_projection(select([TERM_FIELD], root()))
+        .into_array_stream()
+        .map_err(VortexRdfError::Vortex)?
+        .read_all()
+        .await
+        .map_err(VortexRdfError::Vortex)?;
+    let mut ctx = VORTEX_LIGHT_SESSION.create_execution_ctx();
+    let struct_arr = arr
+        .execute::<StructArray>(&mut ctx)
+        .map_err(VortexRdfError::Vortex)?;
+    let col = struct_arr
+        .unmasked_field_by_name(TERM_FIELD)
+        .map_err(VortexRdfError::Vortex)?
+        .clone();
+    TermDictionary::from_terms_array(col, &mut ctx)
+}
+
+/// The sidecar dictionary as a one-column `{_dict_term: utf8}` array, ready
+/// to serialize beside a bare-code quads file. Terms keep the encoding the
+/// dictionary is held in (FSST when compressed at the source).
+pub(crate) fn sidecar_dict_array(dict: &TermDictionary) -> Result<ArrayRef> {
+    StructArray::try_new(
+        [TERM_FIELD].into(),
+        vec![dict.terms_array()],
+        dict.len(),
+        Validity::NonNullable,
+    )
+    .map_err(VortexRdfError::Vortex)
+    .map(|a| a.into_array())
 }
 
 #[cfg(test)]
