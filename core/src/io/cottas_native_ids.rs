@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Instant;
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use vortex::VortexSessionDefault;
 use vortex_error::{VortexError, VortexResult};
 
@@ -792,6 +793,334 @@ fn native_component_path(data_path: &Path, component: NativeComponent) -> PathBu
 }
 
 // VORTEX_RDF_COMPLETE_NATIVE_SERIALIZATION_V1
+// VORTEX_RDF_TRANSACTIONAL_NATIVE_CONSOLIDATION_WRITER_V1
+const NATIVE_CONSOLIDATION_MAX_LAYOUT_PASSES: usize = 4;
+
+fn native_consolidation_staging_path(output_path: &Path) -> PathBuf {
+    let name = output_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("native.vortex");
+    output_path.with_file_name(format!(".{name}.consolidating.{}.tmp", std::process::id()))
+}
+
+fn embedded_native_manifest(
+    outer_vortex_length: u64,
+    component_lengths: &[(NativeComponent, u64)],
+) -> Result<NativeArtifactManifest> {
+    let mut manifest = NativeArtifactManifest::production_defaults();
+    let mut offset = outer_vortex_length;
+    for (component, length) in component_lengths {
+        if *length == 0 {
+            return Err(VortexRdfError::Serialization(format!(
+                "native component {} is empty",
+                component.logical_name()
+            )));
+        }
+        let entry = manifest
+            .components
+            .iter_mut()
+            .find(|entry| entry.logical_name == component.logical_name())
+            .ok_or_else(|| {
+                VortexRdfError::Serialization(format!(
+                    "default manifest has no entry for {}",
+                    component.logical_name()
+                ))
+            })?;
+        entry.storage = NativeComponentStorage::Embedded {
+            offset,
+            length: *length,
+        };
+        offset = offset.checked_add(*length).ok_or_else(|| {
+            VortexRdfError::Serialization("consolidated native artifact length overflow".into())
+        })?;
+    }
+    manifest.validate()?;
+    Ok(manifest)
+}
+
+async fn read_vortex_terminal_tail(path: &Path) -> Result<Vec<u8>> {
+    const EOF_SIZE: u64 = 8;
+    let file_size = tokio::fs::metadata(path)
+        .await
+        .map_err(|error| VortexRdfError::Serialization(error.to_string()))?
+        .len();
+    if file_size < EOF_SIZE {
+        return Err(VortexRdfError::Deserialization(format!(
+            "Vortex file {:?} is shorter than its EOF marker",
+            path
+        )));
+    }
+    let mut file = tokio::fs::File::open(path)
+        .await
+        .map_err(|error| VortexRdfError::Serialization(error.to_string()))?;
+    file.seek(std::io::SeekFrom::End(-(EOF_SIZE as i64)))
+        .await
+        .map_err(|error| VortexRdfError::Serialization(error.to_string()))?;
+    let mut eof = [0u8; EOF_SIZE as usize];
+    file.read_exact(&mut eof)
+        .await
+        .map_err(|error| VortexRdfError::Serialization(error.to_string()))?;
+    if &eof[4..] != b"VTXF" {
+        return Err(VortexRdfError::Deserialization(format!(
+            "Vortex file {:?} has invalid terminal magic",
+            path
+        )));
+    }
+    let postscript_size = u64::from(u16::from_le_bytes([eof[2], eof[3]]));
+    let tail_size = postscript_size.checked_add(EOF_SIZE).ok_or_else(|| {
+        VortexRdfError::Deserialization("Vortex terminal tail length overflow".into())
+    })?;
+    let tail_size_usize = usize::try_from(tail_size).map_err(|_| {
+        VortexRdfError::Deserialization("Vortex terminal tail does not fit usize".into())
+    })?;
+    let tail_offset = file_size.checked_sub(tail_size).ok_or_else(|| {
+        VortexRdfError::Deserialization(format!(
+            "Vortex postscript in {:?} exceeds the file length",
+            path
+        ))
+    })?;
+    file.seek(std::io::SeekFrom::Start(tail_offset))
+        .await
+        .map_err(|error| VortexRdfError::Serialization(error.to_string()))?;
+    let mut tail = vec![0u8; tail_size_usize];
+    file.read_exact(&mut tail)
+        .await
+        .map_err(|error| VortexRdfError::Serialization(error.to_string()))?;
+    Ok(tail)
+}
+
+async fn write_consolidated_outer_vortex(
+    source_path: &Path,
+    staging_path: &Path,
+    manifest: &NativeArtifactManifest,
+    row_group_size: usize,
+    compression_profile: CottasVortexCompressionProfile,
+) -> Result<u64> {
+    let source = NATIVE_FILE_SESSION
+        .open_options()
+        .open_path(source_path)
+        .await
+        .map_err(VortexRdfError::from)?;
+    let arrays = source
+        .scan()
+        .map_err(VortexRdfError::from)?
+        .into_array_stream()
+        .map_err(VortexRdfError::from)?;
+    let mut staging = tokio::fs::File::create(staging_path)
+        .await
+        .map_err(|error| VortexRdfError::Serialization(error.to_string()))?;
+    write_array_stream_to_vortex_file_streaming(
+        &mut staging,
+        Box::pin(arrays),
+        row_group_size,
+        compression_profile,
+        manifest,
+    )
+    .await?;
+    staging
+        .sync_all()
+        .await
+        .map_err(|error| VortexRdfError::Serialization(error.to_string()))?;
+    drop(staging);
+    tokio::fs::metadata(staging_path)
+        .await
+        .map(|metadata| metadata.len())
+        .map_err(|error| VortexRdfError::Serialization(error.to_string()))
+}
+
+async fn validate_consolidated_native_artifact(
+    artifact_path: &Path,
+    expected_manifest: &NativeArtifactManifest,
+) -> Result<()> {
+    let kind = inspect_native_artifact(artifact_path).await?;
+    let actual_manifest = kind.manifest().ok_or_else(|| {
+        VortexRdfError::Deserialization(format!(
+            "consolidated native artifact {:?} has no manifest",
+            artifact_path
+        ))
+    })?;
+    if actual_manifest != expected_manifest {
+        return Err(VortexRdfError::Deserialization(format!(
+            "consolidated native artifact manifest mismatch for {:?}",
+            artifact_path
+        )));
+    }
+
+    let outer = NATIVE_FILE_SESSION
+        .open_options()
+        .open_path(artifact_path)
+        .await
+        .map_err(VortexRdfError::from)?;
+    outer.scan().map_err(VortexRdfError::from)?;
+
+    let resolver = NativeComponentResolver {
+        artifact_path: artifact_path.to_path_buf(),
+        artifact_kind: NativeArtifactKind::ManifestExternal(actual_manifest.clone()),
+    };
+    for component in NativeComponent::ALL {
+        match resolver.location(component)? {
+            ComponentLocation::Embedded { .. } => {}
+            ComponentLocation::External(path) => {
+                return Err(VortexRdfError::Deserialization(format!(
+                    "consolidated component {} unexpectedly resolves externally at {:?}",
+                    component.logical_name(),
+                    path
+                )));
+            }
+        }
+        let file = resolver.open(component).await?;
+        file.scan().map_err(VortexRdfError::from)?;
+    }
+    Ok(())
+}
+
+async fn consolidate_native_artifact(
+    output_path: &Path,
+    row_group_size: usize,
+    compression_profile: CottasVortexCompressionProfile,
+) -> Result<()> {
+    let staging_path = native_consolidation_staging_path(output_path);
+    if staging_path.exists() {
+        return Err(VortexRdfError::InvalidOperation(format!(
+            "native consolidation staging path already exists: {:?}",
+            staging_path
+        )));
+    }
+
+    let result: Result<()> = async {
+        let mut component_lengths = Vec::with_capacity(NativeComponent::ALL.len());
+        for component in NativeComponent::ALL {
+            let path = component.external_path(output_path);
+            let length = std::fs::metadata(&path)
+                .map_err(|error| {
+                    VortexRdfError::Serialization(format!(
+                        "cannot stat native component {} at {:?}: {error}",
+                        component.logical_name(),
+                        path
+                    ))
+                })?
+                .len();
+            component_lengths.push((component, length));
+        }
+
+        // The JSON manifest contains decimal offsets, so its byte length can change the
+        // outer Vortex length which, in turn, changes those offsets. Resolve that tiny
+        // fixed point before copying multi-gigabyte components. Normally this converges
+        // after the first pass because the existing external and embedded manifests have
+        // offsets with the same decimal width.
+        let mut outer_length = std::fs::metadata(output_path)
+            .map_err(|error| VortexRdfError::Serialization(error.to_string()))?
+            .len();
+        let mut final_manifest = None;
+        for pass in 0..NATIVE_CONSOLIDATION_MAX_LAYOUT_PASSES {
+            let manifest = embedded_native_manifest(outer_length, &component_lengths)?;
+            let actual_length = write_consolidated_outer_vortex(
+                output_path,
+                &staging_path,
+                &manifest,
+                row_group_size,
+                compression_profile,
+            )
+            .await?;
+            if actual_length == outer_length {
+                final_manifest = Some(manifest);
+                break;
+            }
+            log::debug!(
+                "[cottas_native_ids] consolidation layout pass {} adjusted outer length {} -> {}",
+                pass + 1,
+                outer_length,
+                actual_length
+            );
+            outer_length = actual_length;
+        }
+        let manifest = final_manifest.ok_or_else(|| {
+            VortexRdfError::Serialization(format!(
+                "native consolidation layout did not stabilize after {} passes",
+                NATIVE_CONSOLIDATION_MAX_LAYOUT_PASSES
+            ))
+        })?;
+
+        let terminal_tail = read_vortex_terminal_tail(&staging_path).await?;
+        let mut staging = tokio::fs::OpenOptions::new()
+            .append(true)
+            .open(&staging_path)
+            .await
+            .map_err(|error| VortexRdfError::Serialization(error.to_string()))?;
+        let mut expected_offset = outer_length;
+        for (component, expected_length) in &component_lengths {
+            let entry = manifest
+                .components
+                .iter()
+                .find(|entry| entry.logical_name == component.logical_name())
+                .ok_or_else(|| {
+                    VortexRdfError::Serialization(format!(
+                        "embedded manifest has no entry for {}",
+                        component.logical_name()
+                    ))
+                })?;
+            if entry.storage
+                != (NativeComponentStorage::Embedded {
+                    offset: expected_offset,
+                    length: *expected_length,
+                })
+            {
+                return Err(VortexRdfError::Serialization(format!(
+                    "embedded locator mismatch for {}",
+                    component.logical_name()
+                )));
+            }
+            let source_path = component.external_path(output_path);
+            let mut source = tokio::fs::File::open(&source_path)
+                .await
+                .map_err(|error| VortexRdfError::Serialization(error.to_string()))?;
+            let copied = tokio::io::copy(&mut source, &mut staging)
+                .await
+                .map_err(|error| VortexRdfError::Serialization(error.to_string()))?;
+            if copied != *expected_length {
+                return Err(VortexRdfError::Serialization(format!(
+                    "native component {} changed while consolidating: expected {} bytes, copied {}",
+                    component.logical_name(),
+                    expected_length,
+                    copied
+                )));
+            }
+            expected_offset = expected_offset.checked_add(copied).ok_or_else(|| {
+                VortexRdfError::Serialization("consolidated artifact offset overflow".into())
+            })?;
+        }
+
+        // A Vortex reader discovers its postscript at physical EOF. Re-emitting the
+        // already-validated terminal postscript keeps all outer footer offsets pointing
+        // at the original outer Vortex footer while the opaque component byte ranges sit
+        // between that footer and the final postscript.
+        tokio::io::AsyncWriteExt::write_all(&mut staging, &terminal_tail)
+            .await
+            .map_err(|error| VortexRdfError::Serialization(error.to_string()))?;
+        staging
+            .sync_all()
+            .await
+            .map_err(|error| VortexRdfError::Serialization(error.to_string()))?;
+        drop(staging);
+
+        validate_consolidated_native_artifact(&staging_path, &manifest).await?;
+        std::fs::rename(&staging_path, output_path)
+            .map_err(|error| VortexRdfError::Serialization(error.to_string()))?;
+        runtime_resolver_cache_lock()?.remove(output_path);
+
+        // Intentionally retain sidecars for A/B verification. They are no longer required
+        // by the published artifact and can be removed after equivalence testing.
+        Ok(())
+    }
+    .await;
+
+    if result.is_err() {
+        let _ = std::fs::remove_file(&staging_path);
+    }
+    result
+}
+
 fn validate_external_native_artifact_inventory(
     data_path: &Path,
     manifest: &NativeArtifactManifest,
@@ -1440,6 +1769,7 @@ where
         unreachable!("SPO ordering is enforced before serialization starts");
     }
     validate_external_native_artifact_inventory(output_path, &manifest)?;
+    consolidate_native_artifact(output_path, row_group_size, config.compression_profile).await?;
     Ok(())
 }
 
