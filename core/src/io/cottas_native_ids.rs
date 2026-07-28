@@ -27,6 +27,7 @@ use vortex_btrblocks::BtrBlocksCompressorBuilder;
 use vortex_buffer::Buffer;
 use vortex_file::{OpenOptionsSessionExt, WriteOptionsSessionExt, WriteStrategyBuilder};
 use vortex_io::VortexWrite;
+use vortex_layout::segments::{SegmentId, SegmentSource};
 use vortex_session::VortexSession;
 
 use oxrdf::{GraphName, NamedNode, NamedOrBlankNode, Term};
@@ -387,19 +388,53 @@ impl NativeArtifactKind {
 }
 
 // VORTEX_RDF_NATIVE_ARTIFACT_INSPECTION_V1
+fn metadata_segment_id(data_segment_count: usize, metadata_index: usize) -> Result<SegmentId> {
+    let absolute_index = data_segment_count
+        .checked_add(metadata_index)
+        .ok_or_else(|| {
+            VortexRdfError::Deserialization(
+                "native artifact metadata segment index overflow".to_string(),
+            )
+        })?;
+    let id = u32::try_from(absolute_index).map_err(|_| {
+        VortexRdfError::Deserialization(format!(
+            "native artifact metadata segment index {absolute_index} exceeds u32"
+        ))
+    })?;
+    Ok(SegmentId::from(id))
+}
+
+// VORTEX_RDF_SELECTIVE_NATIVE_MANIFEST_LOADING_V1
 async fn inspect_native_artifact(artifact_path: &Path) -> Result<NativeArtifactKind> {
+    // Do not use include_metadata(): consolidated artifacts may contain large
+    // auxiliary payloads, and Vortex 0.83 resolves every metadata segment when
+    // that option is enabled. Resolve only the small manifest segment instead.
     let file = NATIVE_FILE_SESSION
         .open_options()
-        .include_metadata()
         .open_path(artifact_path)
         .await
         .map_err(VortexRdfError::from)?;
 
-    let manifest = file
-        .metadata_segment(NATIVE_ARTIFACT_METADATA_KEY)
-        .map(|bytes| NativeArtifactManifest::from_metadata_bytes(bytes.as_slice()))
-        .transpose()?;
-    Ok(NativeArtifactKind::from_optional_manifest(manifest))
+    let metadata_index = file
+        .footer()
+        .metadata_segments()
+        .position(|(key, _)| key == NATIVE_ARTIFACT_METADATA_KEY);
+    let Some(metadata_index) = metadata_index else {
+        return Ok(NativeArtifactKind::LegacyExternal);
+    };
+    let segment_id = metadata_segment_id(file.footer().segment_map().len(), metadata_index)?;
+    let handle = file
+        .segment_source()
+        .request(segment_id)
+        .await
+        .map_err(VortexRdfError::from)?;
+    let bytes = handle
+        .try_into_host()
+        .map_err(VortexRdfError::from)?
+        .await
+        .map_err(VortexRdfError::from)?;
+    let manifest = NativeArtifactManifest::from_metadata_bytes(bytes.as_slice())?;
+    Ok(NativeArtifactKind::ManifestExternal(manifest))
 }
 
 #[derive(Clone, Debug)]
@@ -7358,6 +7393,19 @@ mod native_artifact_manifest_tests {
             .collect();
         assert_eq!(paths.len(), NativeComponent::ALL.len());
         assert!(paths.iter().all(|path| path != artifact));
+    }
+
+    #[test]
+    fn metadata_segment_ids_follow_data_segments() {
+        assert_eq!(*metadata_segment_id(7, 0).unwrap(), 7);
+        assert_eq!(*metadata_segment_id(7, 3).unwrap(), 10);
+    }
+
+    #[test]
+    fn metadata_segment_id_rejects_overflow() {
+        assert!(metadata_segment_id(usize::MAX, 1).is_err());
+        #[cfg(target_pointer_width = "64")]
+        assert!(metadata_segment_id(u32::MAX as usize, 1).is_err());
     }
 
     #[test]
