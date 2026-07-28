@@ -30,7 +30,7 @@ use crate::io::de;
 #[cfg(feature = "file-io")]
 use vortex_file::VortexFile;
 
-use futures::{Stream, stream};
+use futures::{Stream, StreamExt, stream};
 use oxrdf::{GraphName, NamedNode, NamedOrBlankNode, Quad, Term};
 use std::collections::HashSet;
 use std::iter;
@@ -50,8 +50,6 @@ use vortex_array::validity::Validity;
 use vortex_array::{ArrayRef, IntoArray, RecursiveCanonical, VortexSessionExecute};
 use vortex_mask::Mask;
 
-#[cfg(feature = "file-io")]
-use futures::StreamExt;
 #[cfg(feature = "file-io")]
 use std::ops::BitAnd;
 #[cfg(feature = "file-io")]
@@ -1179,7 +1177,39 @@ impl VortexRdfStore {
 
     // ── quads streaming ───────────────────────────────────────────────────────
 
+    /// Stream every quad this view covers, one at a time.
     pub fn quads(&self) -> Result<Box<dyn Stream<Item = Result<Quad>> + Unpin + Send + '_>> {
+        Ok(Box::new(self.quad_chunks()?.flat_map(stream::iter)))
+    }
+
+    /// Every quad this view covers, materialized into one exactly-sized
+    /// `Vec`.
+    ///
+    /// Prefer this over `quads().try_collect()` when the whole result is
+    /// wanted: `try_collect` grows its `Vec` one quad at a time (doubling
+    /// reallocation copies), which measured at roughly a fifth of a full
+    /// 100k-row match-and-materialize. Collecting the decoded chunks first
+    /// makes the total length known before a single quad is moved.
+    pub async fn quads_vec(&self) -> Result<Vec<Quad>> {
+        let chunks: Vec<Vec<Result<Quad>>> = self.quad_chunks()?.collect().await;
+        let total = chunks.iter().map(Vec::len).sum();
+        let mut quads = Vec::with_capacity(total);
+        for chunk in chunks {
+            for quad in chunk {
+                quads.push(quad?);
+            }
+        }
+        Ok(quads)
+    }
+
+    /// The decode-granularity stream behind [`quads`](Self::quads) and
+    /// [`quads_vec`](Self::quads_vec): each item is one decoded chunk (a
+    /// scan split, the in-memory base, or the tail), so consumers that want
+    /// whole batches can take them without paying per-quad stream overhead.
+    /// A chunk-level scan error arrives as a one-element `vec![Err(..)]`.
+    pub(crate) fn quad_chunks(
+        &self,
+    ) -> Result<Box<dyn Stream<Item = Vec<Result<Quad>>> + Unpin + Send + '_>> {
         let layout = self.layout.clone();
         // Tail rows are in memory and few: decode them eagerly, to be appended
         // after whatever the base yields.
@@ -1209,7 +1239,7 @@ impl VortexRdfStore {
                     None => layout.decode_chunk(&gather_live(base, selection, deleted.as_ref())?),
                 };
                 quads.extend(tail_quads);
-                Ok(Box::new(stream::iter(quads)))
+                Ok(Box::new(stream::iter([quads])))
             }
             #[cfg(feature = "file-io")]
             QuadsSource::File {
@@ -1244,7 +1274,7 @@ impl VortexRdfStore {
                     // map function.
                     if self.has_file_backed_dictionary() {
                         let stream = scan.into_stream().map_err(VortexRdfError::Vortex)?;
-                        let quad_stream = stream
+                        let chunk_stream = stream
                             .then(move |chunk_res| {
                                 let serve = serve.clone();
                                 let deleted = deleted.clone();
@@ -1260,24 +1290,20 @@ impl VortexRdfStore {
                                 }
                             })
                             .boxed()
-                            .flat_map(stream::iter)
-                            .chain(stream::iter(tail_quads));
-                        return Ok(Box::new(quad_stream));
+                            .chain(stream::iter([tail_quads]));
+                        return Ok(Box::new(chunk_stream));
                     }
                     let stream = scan
                         .map(move |chunk| Ok(serve.decode_columns(&chunk, deleted.as_ref())))
                         .into_stream()
                         .map_err(VortexRdfError::Vortex)?;
-                    let quad_stream = stream
-                        .flat_map(|chunk_res| {
-                            let quads = match chunk_res {
-                                Err(e) => vec![Err(VortexRdfError::Vortex(e))],
-                                Ok(quads) => quads,
-                            };
-                            stream::iter(quads)
+                    let chunk_stream = stream
+                        .map(|chunk_res| match chunk_res {
+                            Err(e) => vec![Err(VortexRdfError::Vortex(e))],
+                            Ok(quads) => quads,
                         })
-                        .chain(stream::iter(tail_quads));
-                    return Ok(Box::new(quad_stream));
+                        .chain(stream::iter([tail_quads]));
+                    return Ok(Box::new(chunk_stream));
                 }
                 // Same restriction setup as `get_quads_array`: project only
                 // the primary columns and apply any pending filter/selection
@@ -1296,7 +1322,7 @@ impl VortexRdfStore {
                 // stream, not inside the scan's sync map function.
                 if self.has_file_backed_dictionary() {
                     let stream = scan.into_stream().map_err(VortexRdfError::Vortex)?;
-                    let quad_stream = stream
+                    let chunk_stream = stream
                         .then(move |chunk_res| {
                             let layout = layout.clone();
                             async move {
@@ -1307,9 +1333,8 @@ impl VortexRdfStore {
                             }
                         })
                         .boxed()
-                        .flat_map(stream::iter)
-                        .chain(stream::iter(tail_quads));
-                    return Ok(Box::new(quad_stream));
+                        .chain(stream::iter([tail_quads]));
+                    return Ok(Box::new(chunk_stream));
                 }
                 // Decode chunks inside the scan's spawned split tasks (via the
                 // scan's map function) so decoding runs concurrently across the
@@ -1318,19 +1343,15 @@ impl VortexRdfStore {
                     .map(move |chunk| Ok(layout.decode_chunk(&chunk)))
                     .into_stream()
                     .map_err(VortexRdfError::Vortex)?;
-                // Each polled item is now a `Vec<Result<Quad>>` (one decoded
-                // chunk); flatten it back into a stream of individual quads,
-                // propagating any per-chunk scan error as a single quad error.
-                let quad_stream = stream
-                    .flat_map(|chunk_res| {
-                        let quads = match chunk_res {
-                            Err(e) => vec![Err(VortexRdfError::Vortex(e))],
-                            Ok(quads) => quads,
-                        };
-                        stream::iter(quads)
+                // Each polled item is one decoded chunk; a per-chunk scan
+                // error becomes a one-element error chunk.
+                let chunk_stream = stream
+                    .map(|chunk_res| match chunk_res {
+                        Err(e) => vec![Err(VortexRdfError::Vortex(e))],
+                        Ok(quads) => quads,
                     })
-                    .chain(stream::iter(tail_quads));
-                Ok(Box::new(quad_stream))
+                    .chain(stream::iter([tail_quads]));
+                Ok(Box::new(chunk_stream))
             }
         }
     }

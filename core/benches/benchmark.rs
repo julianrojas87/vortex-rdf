@@ -40,7 +40,7 @@ use std::hint::black_box;
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
-use futures::{StreamExt, TryStreamExt, stream};
+use futures::{StreamExt, stream};
 use oxrdf::{GraphName, NamedNode, NamedOrBlankNode, Term};
 use tokio::runtime::Runtime;
 
@@ -518,12 +518,7 @@ fn run_match(
                     .match_pattern(s.as_ref(), p.as_ref(), o.as_ref(), g.as_ref())
                     .await
                     .expect("match_pattern failed");
-                let quads: Vec<_> = matched
-                    .quads()
-                    .expect("quad stream")
-                    .try_collect()
-                    .await
-                    .expect("execute match");
+                let quads = matched.quads_vec().await.expect("execute match");
                 black_box(quads)
             })
         });
@@ -629,10 +624,8 @@ fn match_chained(bencher: divan::Bencher, source: &Source) {
                     .match_pattern(None, None, Some(&o), None)
                     .await
                     .expect("match O on view");
-                let quads: Vec<_> = after_po
-                    .quads()
-                    .expect("quad stream")
-                    .try_collect()
+                let quads = after_po
+                    .quads_vec()
                     .await
                     .expect("execute chained match");
                 black_box(quads)
@@ -697,12 +690,7 @@ fn decode_all(bencher: divan::Bencher, cfg: &DecodeCfg) {
         })
         .bench_refs(|store| {
             rt().block_on(async {
-                let quads: Vec<_> = store
-                    .quads()
-                    .expect("quad stream")
-                    .try_collect()
-                    .await
-                    .expect("decode all");
+                let quads = store.quads_vec().await.expect("decode all");
                 black_box(quads.len())
             })
         });
@@ -946,12 +934,7 @@ fn dict_decode_matched(bencher: divan::Bencher, cfg: &DictCfg) {
                 .match_pattern(None, Some(&p), None, None)
                 .await
                 .expect("match P");
-            let quads: Vec<_> = matched
-                .quads()
-                .expect("quad stream")
-                .try_collect()
-                .await
-                .expect("decode matched");
+            let quads = matched.quads_vec().await.expect("decode matched");
             black_box(quads.len())
         })
     });

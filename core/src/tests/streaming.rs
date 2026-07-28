@@ -422,3 +422,53 @@ async fn test_sorted_subject_binary_search() {
         .unwrap();
     assert_eq!(empty.size().await.unwrap(), 0);
 }
+
+/// `quads_vec` (the exact-size materialization) must yield the same quads,
+/// in the same order, as one-at-a-time stream collection — for a plain
+/// store, a matched view, and a mutated store with a tail.
+#[cfg(feature = "file-io")]
+#[tokio::test]
+async fn test_quads_vec_matches_stream_collection() {
+    let quads = dictionary_test_quads();
+    let dir = std::env::temp_dir().join(format!(
+        "vortex_rdf_quads_vec_test_{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("data.vortex");
+    crate::io::quads_stream_to_vortex_file_with_builder::<SortedInMemoryBuilder, _>(
+        quad_stream(quads.clone()),
+        &path,
+        LayoutStrategy::Dictionary,
+        dictionary_indexes(),
+        crate::store::DictionaryPlacement::Padded,
+    )
+    .await
+    .unwrap();
+    let store = VortexRdfStore::from_file(&path).await.unwrap();
+
+    let p0 = NamedNode::new("http://example.org/p0").unwrap();
+    let extra = make_quad(
+        "http://example.org/tail-subject",
+        "http://example.org/p0",
+        "tail object",
+        GraphName::DefaultGraph,
+    );
+    let views = [
+        ("full", store.clone()),
+        (
+            "matched",
+            store
+                .match_pattern(None, Some(&p0), None, None)
+                .await
+                .unwrap(),
+        ),
+        ("tailed", store.add_quad(extra).await.unwrap()),
+    ];
+    for (tag, view) in views {
+        let streamed: Vec<Quad> = view.quads().unwrap().try_collect().await.unwrap();
+        let collected = view.quads_vec().await.unwrap();
+        assert_eq!(collected, streamed, "{tag}");
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
