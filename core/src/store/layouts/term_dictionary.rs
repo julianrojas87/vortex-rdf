@@ -18,7 +18,7 @@ use web_time::Instant;
 use vortex_array::arrays::struct_::{StructArray, StructArrayExt};
 use vortex_array::arrays::{PrimitiveArray, VarBinViewArray};
 #[cfg(feature = "file-io")]
-use vortex_array::expr::{eq, get_item, gt_eq, lit, root, select};
+use vortex_array::expr::{eq, get_item, lit, root, select};
 use vortex_array::match_each_integer_ptype;
 #[cfg(feature = "file-io")]
 use vortex_array::stream::ArrayStreamExt as _;
@@ -1178,66 +1178,63 @@ pub(crate) async fn dict_from_term_rows(
     TermDictionary::from_terms_array(col, &mut ctx)
 }
 
-/// Locate a padded file's dictionary rows without reading their terms:
-/// `(quad_rows, term_count)`, discovered from the term column's validity (a
-/// valid term row is a dictionary row) and validated to be one contiguous
-/// tail run.
+/// Locate a padded file's dictionary rows without reading any row data:
+/// `(quad_rows, term_count)`, derived arithmetically from the footer's
+/// per-field file statistics. The term column is null on exactly the quad
+/// rows, so `quad_rows = null_count(_dict_term)` and the dictionary length
+/// is the remainder of the file's row count.
 ///
-/// This is the open-time split that decides residency before anything is
-/// lifted: per split, only the term column's zone stats and its (mostly
-/// constant-null) validity are evaluated.
+/// vortex-rdf writers always stamp file statistics (see
+/// `ser::write_options_with_subject_stats`, whose stat set includes
+/// `NullCount`); a padded file without an exact null count is rejected
+/// rather than scanned. The contiguous-tail invariant is the writer's
+/// (`pad_chunk_stream` appends the dictionary after every quad chunk) and is
+/// not re-validated here.
 #[cfg(feature = "file-io")]
-pub(crate) async fn padded_dict_extent(file: &VortexFile) -> Result<(u64, u64)> {
+pub(crate) fn padded_dict_extent(file: &VortexFile) -> Result<(u64, u64)> {
+    use vortex_array::dtype::DType;
+    use vortex_array::expr::stats::Stat;
+
     let total = file.row_count();
     if total == 0 {
         return Ok((0, 0));
     }
-    // Any non-null utf8 value satisfies `>= ""`; null (quad) rows never do —
-    // so the mask is exactly the dictionary rows.
-    let filter = [gt_eq(get_item(TERM_FIELD, root()), lit(""))];
-    let reader = file.layout_reader().map_err(VortexRdfError::Vortex)?;
-    let mut count = 0u64;
-    let mut first: Option<u64> = None;
-    let mut last = 0u64;
-    for range in file.splits().map_err(VortexRdfError::Vortex)? {
-        let mask = crate::store::vortex_rdf_store::evaluate_filter_split(
-            Arc::clone(&reader),
-            &filter,
-            &range,
-            Mask::new_true((range.end - range.start) as usize),
-        )
-        .await?;
-        match mask.indices() {
-            AllOr::All => {
-                count += range.end - range.start;
-                first.get_or_insert(range.start);
-                last = range.end - 1;
-            }
-            AllOr::None => {}
-            AllOr::Some(indices) => {
-                count += indices.len() as u64;
-                if let Some(&i) = indices.first() {
-                    first.get_or_insert(range.start + i as u64);
-                }
-                if let Some(&i) = indices.last() {
-                    last = range.start + i as u64;
-                }
-            }
-        }
-    }
-    let Some(first) = first else {
-        // No dictionary rows: an empty dictionary (only reachable with an
-        // empty dataset, but well-defined regardless).
-        return Ok((total, 0));
-    };
-    if last != total - 1 || count != total - first {
+    let DType::Struct(fields, _) = file.dtype() else {
         return Err(VortexRdfError::Deserialization(
-            "padded Dictionary file is malformed: its dictionary rows do not \
-             form one contiguous tail run"
-                .to_string(),
+            "padded Dictionary file does not hold a struct array".to_string(),
         ));
+    };
+    let field_idx = fields
+        .names()
+        .iter()
+        .position(|n| n.as_ref() == TERM_FIELD)
+        .ok_or_else(|| {
+            VortexRdfError::Deserialization(format!(
+                "padded Dictionary file has no `{TERM_FIELD}` column"
+            ))
+        })?;
+    let missing_stats = || {
+        VortexRdfError::Deserialization(format!(
+            "padded Dictionary file has no exact null-count statistic for \
+             `{TERM_FIELD}`; re-serialize it with a current vortex-rdf build"
+        ))
+    };
+    let statistics = file.footer().statistics().ok_or_else(missing_stats)?;
+    let (stats_set, field_dtype) = statistics.get(field_idx);
+    let null_count_dtype = Stat::NullCount
+        .dtype(field_dtype)
+        .ok_or_else(missing_stats)?;
+    let null_count = stats_set
+        .get_as::<u64>(Stat::NullCount, &null_count_dtype)
+        .as_exact()
+        .ok_or_else(missing_stats)?;
+    if null_count > total {
+        return Err(VortexRdfError::Deserialization(format!(
+            "padded Dictionary file is malformed: `{TERM_FIELD}` null count \
+             {null_count} exceeds row count {total}"
+        )));
     }
-    Ok((first, count))
+    Ok((null_count, total - null_count))
 }
 
 #[cfg(feature = "file-io")]

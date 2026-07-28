@@ -265,7 +265,7 @@ impl VortexRdfStore {
                 // them without reading their terms, then lift the dictionary
                 // resident only when it fits the residency threshold —
                 // otherwise it stays in the file, probed and decoded by scans.
-                let (quad_rows, dict_len) = term_dictionary::padded_dict_extent(&file).await?;
+                let (quad_rows, dict_len) = term_dictionary::padded_dict_extent(&file)?;
                 let access = if dict_len <= max_resident_terms {
                     let (_, dict) = term_dictionary::dict_from_padded_file(&file).await?;
                     DictAccess::Resident(Arc::new(dict))
