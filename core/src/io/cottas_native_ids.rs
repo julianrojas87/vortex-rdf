@@ -28,8 +28,10 @@ use vortex_array::{ArrayRef, IntoArray};
 use vortex_btrblocks::BtrBlocksCompressorBuilder;
 use vortex_buffer::{Alignment, Buffer};
 use vortex_file::{OpenOptionsSessionExt, WriteOptionsSessionExt, WriteStrategyBuilder};
+use vortex_io::session::RuntimeSessionExt;
+use vortex_io::std_file::FileReadAt;
 use vortex_io::{CoalesceConfig, VortexReadAt, VortexWrite};
-use vortex_layout::segments::{SegmentId, SegmentSource};
+use vortex_layout::segments::SegmentId;
 use vortex_session::VortexSession;
 
 use oxrdf::{GraphName, NamedNode, NamedOrBlankNode, Term};
@@ -594,13 +596,34 @@ async fn open_bounded_native_component(
         .map_err(VortexRdfError::from)
 }
 
-#[derive(Clone, Debug)]
+// VORTEX_RDF_EMBEDDED_COMPONENT_RESOLUTION_V1
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 enum ComponentLocation {
     External(PathBuf),
     Embedded {
         artifact_path: PathBuf,
         component: NativeComponent,
+        offset: u64,
+        length: u64,
     },
+}
+
+impl ComponentLocation {
+    fn cache_key(&self) -> String {
+        match self {
+            Self::External(path) => format!("external:{}", path.display()),
+            Self::Embedded {
+                artifact_path,
+                component,
+                offset,
+                length,
+            } => format!(
+                "embedded:{}:{}:{offset}:{length}",
+                artifact_path.display(),
+                component.logical_name()
+            ),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -628,30 +651,138 @@ impl NativeComponentResolver {
         &self.artifact_kind
     }
 
-    fn location(&self, component: NativeComponent) -> ComponentLocation {
-        // VORTEX_RDF_MANIFEST_AWARE_RESOLVER_V1
-        // Both legacy and manifest-bearing Phase-B artifacts still use the
-        // proven external components. Phase C changes only this decision.
+    fn location(&self, component: NativeComponent) -> Result<ComponentLocation> {
         match self.artifact_kind() {
-            NativeArtifactKind::LegacyExternal | NativeArtifactKind::ManifestExternal(_) => {
-                ComponentLocation::External(component.external_path(&self.artifact_path))
+            NativeArtifactKind::LegacyExternal => Ok(ComponentLocation::External(
+                component.external_path(&self.artifact_path),
+            )),
+            NativeArtifactKind::ManifestExternal(manifest) => {
+                let entry = manifest
+                    .components
+                    .iter()
+                    .find(|entry| entry.logical_name == component.logical_name())
+                    .ok_or_else(|| {
+                        VortexRdfError::Deserialization(format!(
+                            "native artifact manifest has no entry for {}",
+                            component.logical_name()
+                        ))
+                    })?;
+                if entry.implementation != component.default_implementation() {
+                    return Err(VortexRdfError::Deserialization(format!(
+                        "native artifact component {} uses unsupported implementation {:?}; expected {:?}",
+                        component.logical_name(),
+                        entry.implementation,
+                        component.default_implementation()
+                    )));
+                }
+                match entry.storage {
+                    NativeComponentStorage::External => Ok(ComponentLocation::External(
+                        component.external_path(&self.artifact_path),
+                    )),
+                    NativeComponentStorage::Embedded { offset, length } => {
+                        let artifact_len = std::fs::metadata(&self.artifact_path)
+                            .map_err(|error| {
+                                VortexRdfError::InvalidOperation(format!(
+                                    "cannot stat native artifact {:?}: {error}",
+                                    self.artifact_path
+                                ))
+                            })?
+                            .len();
+                        let end = offset.checked_add(length).ok_or_else(|| {
+                            VortexRdfError::Deserialization(
+                                "embedded component range overflow".into(),
+                            )
+                        })?;
+                        if end > artifact_len {
+                            return Err(VortexRdfError::Deserialization(format!(
+                                "embedded component {} range {offset}..{end} exceeds artifact length {artifact_len}",
+                                component.logical_name()
+                            )));
+                        }
+                        Ok(ComponentLocation::Embedded {
+                            artifact_path: self.artifact_path.clone(),
+                            component,
+                            offset,
+                            length,
+                        })
+                    }
+                }
+            }
+        }
+    }
+
+    async fn open(&self, component: NativeComponent) -> Result<vortex_file::VortexFile> {
+        match self.location(component)? {
+            ComponentLocation::External(path) => {
+                if !path.is_file() {
+                    return Err(VortexRdfError::InvalidOperation(format!(
+                        "required native component {} is missing at {:?}",
+                        component.logical_name(),
+                        path
+                    )));
+                }
+                NATIVE_FILE_SESSION
+                    .open_options()
+                    .open_path(path)
+                    .await
+                    .map_err(VortexRdfError::from)
+            }
+            ComponentLocation::Embedded {
+                artifact_path,
+                offset,
+                length,
+                ..
+            } => {
+                let source: Arc<dyn VortexReadAt> = Arc::new(
+                    FileReadAt::open(&artifact_path, NATIVE_FILE_SESSION.handle())
+                        .map_err(VortexRdfError::from)?,
+                );
+                open_bounded_native_component(source, offset, length).await
             }
         }
     }
 
     fn external_path(&self, component: NativeComponent) -> Result<PathBuf> {
-        match self.location(component) {
+        match self.location(component)? {
             ComponentLocation::External(path) => Ok(path),
             ComponentLocation::Embedded {
                 artifact_path,
                 component,
+                offset,
+                length,
             } => Err(VortexRdfError::InvalidOperation(format!(
-                "embedded component {} in {:?} requires the Phase-C component reader",
+                "embedded component {} in {:?} at {}..{} has no external path",
                 component.logical_name(),
-                artifact_path
+                artifact_path,
+                offset,
+                offset + length
             ))),
         }
     }
+}
+
+// VORTEX_RDF_RUNTIME_COMPONENT_READ_SIDE_V1
+static NATIVE_RUNTIME_RESOLVER_CACHE: LazyLock<
+    Mutex<HashMap<PathBuf, Arc<NativeComponentResolver>>>,
+> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn runtime_resolver_cache_lock()
+-> Result<std::sync::MutexGuard<'static, HashMap<PathBuf, Arc<NativeComponentResolver>>>> {
+    NATIVE_RUNTIME_RESOLVER_CACHE.lock().map_err(|_| {
+        VortexRdfError::Deserialization("native runtime resolver cache mutex was poisoned".into())
+    })
+}
+
+async fn runtime_component_resolver(data_path: &Path) -> Result<Arc<NativeComponentResolver>> {
+    if let Some(resolver) = runtime_resolver_cache_lock()?.get(data_path).cloned() {
+        return Ok(resolver);
+    }
+    let inspected = Arc::new(NativeComponentResolver::inspect(data_path).await?);
+    let mut cache = runtime_resolver_cache_lock()?;
+    Ok(cache
+        .entry(data_path.to_path_buf())
+        .or_insert_with(|| Arc::clone(&inspected))
+        .clone())
 }
 
 fn native_component_path(data_path: &Path, component: NativeComponent) -> PathBuf {
@@ -1039,20 +1170,11 @@ async fn projected_native_id_rows_as_compact_triples_direct_v1_impl(
     timings.unique_ids = requested.len();
 
     // Resolve through the same override-aware path used by production ID-to-term lookup.
-    let path = native_dict_path(data_path);
-    if !path.is_file() {
-        return Err(VortexRdfError::InvalidOperation(format!(
-            "Vortex ID-to-term dictionary is missing at {:?}",
-            path
-        )));
-    }
-    timings.dictionary_path = path.display().to_string();
+    let resolver = runtime_component_resolver(data_path).await?;
+    let location = resolver.location(NativeComponent::DictionaryVortex)?;
+    timings.dictionary_path = location.cache_key();
     let stage = Instant::now();
-    let file = NATIVE_FILE_SESSION
-        .open_options()
-        .open_path(&path)
-        .await
-        .map_err(VortexRdfError::from)?;
+    let file = resolver.open(NativeComponent::DictionaryVortex).await?;
     timings.dictionary_open_ms = elapsed_ms(stage);
     let stage = Instant::now();
     let indices = Buffer::from(
@@ -2014,9 +2136,10 @@ impl NativeRdfProviders {
     }
 
     async fn inspect(data_path: &Path) -> Result<Self> {
+        let resolver = runtime_component_resolver(data_path).await?;
         Ok(Self {
             data_path: data_path.to_path_buf(),
-            resolver: NativeComponentResolver::inspect(data_path).await?,
+            resolver: (*resolver).clone(),
         })
     }
 
@@ -2053,39 +2176,14 @@ impl NativeDictionaryProvider for NativeRdfProviders {
 #[async_trait]
 impl NativeIndexProvider for NativeRdfProviders {
     async fn subject_range(&self, subject_id: u32) -> Result<Option<Range<u64>>> {
-        require_vortex_component(
-            &self.data_path,
-            NativeComponent::SubjectRangesVortex,
-            "subject index",
-        )?;
         lookup_subject_range_from_vortex(&self.data_path, subject_id).await
     }
 
     async fn po_access(&self, predicate_id: u32, object_id: u32) -> Result<Option<NativePoAccess>> {
-        require_vortex_component(
-            &self.data_path,
-            NativeComponent::PredicateObjectDirectoryVortexV2,
-            "PO v2 directory",
-        )?;
-        require_vortex_component(
-            &self.data_path,
-            NativeComponent::PredicateObjectRangesVortexV2,
-            "PO v2 payload",
-        )?;
         lookup_po_access_from_vortex_v2(&self.data_path, predicate_id, object_id).await
     }
 
     async fn predicate_access(&self, predicate_id: u32) -> Result<Option<NativePredicateAccess>> {
-        require_vortex_component(
-            &self.data_path,
-            NativeComponent::PredicateDirectoryVortexV2,
-            "predicate v2 directory",
-        )?;
-        require_vortex_component(
-            &self.data_path,
-            NativeComponent::PredicateRangesVortexV2,
-            "predicate v2 payload",
-        )?;
         lookup_predicate_access_from_vortex_v2(&self.data_path, predicate_id).await
     }
 
@@ -2970,19 +3068,9 @@ async fn lookup_terms_by_ids_from_sidecar_with_stats(
     requested.dedup();
     stats.sort_dedup_ms = elapsed_ms(sort_start);
     stats.requested_ids_unique = requested.len();
-    let path = native_dict_path(data_path);
-    if !path.is_file() {
-        return Err(VortexRdfError::InvalidOperation(format!(
-            "Vortex id_to_term dictionary component is missing at {:?}",
-            path
-        )));
-    }
+    let resolver = runtime_component_resolver(data_path).await?;
     let open_start = Instant::now();
-    let file = NATIVE_FILE_SESSION
-        .open_options()
-        .open_path(&path)
-        .await
-        .map_err(VortexRdfError::from)?;
+    let file = resolver.open(NativeComponent::DictionaryVortex).await?;
     stats.open_files_ms = elapsed_ms(open_start);
     let indices = Buffer::from(
         requested
@@ -3502,13 +3590,8 @@ pub async fn load_cottas_native_simple_dictionary_view(
 ) -> Result<SimpleDictionaryView> {
     let read_dict_start: Instant = Instant::now();
 
-    let dict_path = native_dict_path(data_path);
-
-    let file = NATIVE_FILE_SESSION
-        .open_options()
-        .open_path(&dict_path)
-        .await
-        .map_err(VortexRdfError::from)?;
+    let resolver = runtime_component_resolver(data_path).await?;
+    let file = resolver.open(NativeComponent::DictionaryVortex).await?;
 
     let stream = file
         .scan()
@@ -3535,12 +3618,10 @@ async fn lookup_subject_range_from_vortex(
     data_path: &Path,
     subject_id: u32,
 ) -> Result<Option<Range<u64>>> {
-    let path = native_subject_range_vortex_path(data_path);
-    let file = NATIVE_FILE_SESSION
-        .open_options()
-        .open_path(&path)
-        .await
-        .map_err(VortexRdfError::from)?;
+    let resolver = runtime_component_resolver(data_path).await?;
+    let location = resolver.location(NativeComponent::SubjectRangesVortex)?;
+    let component_label = location.cache_key();
+    let file = resolver.open(NativeComponent::SubjectRangesVortex).await?;
     let stream = file
         .scan()
         .map_err(VortexRdfError::from)?
@@ -3558,7 +3639,7 @@ async fn lookup_subject_range_from_vortex(
     if result.len() != 1 {
         return Err(VortexRdfError::Deserialization(format!(
             "Vortex subject index {:?} returned {} rows for subject ID {}; expected at most one",
-            path,
+            component_label,
             result.len(),
             subject_id
         )));
@@ -3570,7 +3651,7 @@ async fn lookup_subject_range_from_vortex(
     if start > end {
         return Err(VortexRdfError::Deserialization(format!(
             "Vortex subject index {:?} contains invalid range {}..{} for subject ID {}",
-            path, start, end, subject_id
+            component_label, start, end, subject_id
         )));
     }
     Ok(Some(start..end))
@@ -3604,11 +3685,11 @@ struct NativePoPredicatePartition {
 }
 
 static NATIVE_PO_PREDICATE_PARTITION_CACHE: LazyLock<
-    Mutex<HashMap<PathBuf, Arc<[NativePoPredicatePartition]>>>,
+    Mutex<HashMap<String, Arc<[NativePoPredicatePartition]>>>,
 > = LazyLock::new(|| Mutex::new(HashMap::new()));
 
 fn po_partition_cache_lock()
--> Result<std::sync::MutexGuard<'static, HashMap<PathBuf, Arc<[NativePoPredicatePartition]>>>> {
+-> Result<std::sync::MutexGuard<'static, HashMap<String, Arc<[NativePoPredicatePartition]>>>> {
     NATIVE_PO_PREDICATE_PARTITION_CACHE.lock().map_err(|_| {
         VortexRdfError::Deserialization("PO predicate partition cache mutex was poisoned".into())
     })
@@ -3617,18 +3698,15 @@ fn po_partition_cache_lock()
 async fn po_predicate_partitions(
     data_path: &Path,
 ) -> Result<Option<Arc<[NativePoPredicatePartition]>>> {
-    let path = native_po_predicate_partitions_v2_path(data_path);
-    if !path.is_file() {
-        return Ok(None);
-    }
-    if let Some(cached) = po_partition_cache_lock()?.get(&path).cloned() {
+    let resolver = runtime_component_resolver(data_path).await?;
+    let location = resolver.location(NativeComponent::PredicateObjectPartitionsVortexV2)?;
+    let cache_key = location.cache_key();
+    if let Some(cached) = po_partition_cache_lock()?.get(&cache_key).cloned() {
         return Ok(Some(cached));
     }
-    let file = NATIVE_FILE_SESSION
-        .open_options()
-        .open_path(&path)
-        .await
-        .map_err(VortexRdfError::from)?;
+    let file = resolver
+        .open(NativeComponent::PredicateObjectPartitionsVortexV2)
+        .await?;
     let array = file
         .scan()
         .map_err(VortexRdfError::from)?
@@ -3647,7 +3725,7 @@ async fn po_predicate_partitions(
     if ids.len() != array.len() || starts.len() != array.len() || ends.len() != array.len() {
         return Err(VortexRdfError::Deserialization(format!(
             "PO predicate partition {:?} has inconsistent column lengths",
-            path
+            cache_key
         )));
     }
     let mut entries = Vec::with_capacity(array.len());
@@ -3655,7 +3733,7 @@ async fn po_predicate_partitions(
         if starts[index] >= ends[index] {
             return Err(VortexRdfError::Deserialization(format!(
                 "PO predicate partition {:?} has invalid range {}..{} for predicate {}",
-                path, starts[index], ends[index], ids[index]
+                cache_key, starts[index], ends[index], ids[index]
             )));
         }
         entries.push(NativePoPredicatePartition {
@@ -3670,20 +3748,20 @@ async fn po_predicate_partitions(
     }) {
         return Err(VortexRdfError::Deserialization(format!(
             "PO predicate partition {:?} is not strictly sorted and contiguous",
-            path
+            cache_key
         )));
     }
     if entries.first().map(|entry| entry.directory_start) != Some(0) {
         return Err(VortexRdfError::Deserialization(format!(
             "PO predicate partition {:?} does not start at directory row zero",
-            path
+            cache_key
         )));
     }
     let entries: Arc<[NativePoPredicatePartition]> = entries.into();
     let mut cache = po_partition_cache_lock()?;
     Ok(Some(
         cache
-            .entry(path)
+            .entry(cache_key)
             .or_insert_with(|| Arc::clone(&entries))
             .clone(),
     ))
@@ -3829,7 +3907,7 @@ pub async fn build_cottas_native_po_predicate_partitions_v2(
     drop(output_file);
     std::fs::rename(&temporary_path, &output_path)
         .map_err(|error| VortexRdfError::Serialization(error.to_string()))?;
-    po_partition_cache_lock()?.remove(&output_path);
+    po_partition_cache_lock()?.remove(&format!("external:{}", output_path.display()));
     let write_ms = elapsed_ms(write_start);
     let total_ms = elapsed_ms(total_start);
     log::info!(
@@ -3856,16 +3934,16 @@ async fn lookup_po_directory_entry_from_vortex_v2(
     predicate_id: u32,
     object_id: u32,
 ) -> Result<Option<NativePoDirectoryEntry>> {
-    let path = native_po_exact_directory_v2_path(data_path);
+    let resolver = runtime_component_resolver(data_path).await?;
+    let location = resolver.location(NativeComponent::PredicateObjectDirectoryVortexV2)?;
+    let component_label = location.cache_key();
     let partition = po_predicate_partition(data_path, predicate_id).await?;
-    if native_po_predicate_partitions_v2_path(data_path).is_file() && partition.is_none() {
+    if partition.is_none() {
         return Ok(None);
     }
-    let file = NATIVE_FILE_SESSION
-        .open_options()
-        .open_path(&path)
-        .await
-        .map_err(VortexRdfError::from)?;
+    let file = resolver
+        .open(NativeComponent::PredicateObjectDirectoryVortexV2)
+        .await?;
     let scan = file.scan().map_err(VortexRdfError::from)?;
     let scan = match partition {
         Some(entry) => scan.with_row_range(entry.directory_start..entry.directory_end),
@@ -3891,7 +3969,7 @@ async fn lookup_po_directory_entry_from_vortex_v2(
     if result.len() != 1 {
         return Err(VortexRdfError::Deserialization(format!(
             "PO v2 directory {:?} returned {} rows for ({}, {}); expected one",
-            path,
+            component_label,
             result.len(),
             predicate_id,
             object_id
@@ -3903,7 +3981,7 @@ async fn lookup_po_directory_entry_from_vortex_v2(
     if offsets.len() != 1 || counts.len() != 1 || rows.len() != 1 {
         return Err(VortexRdfError::Deserialization(format!(
             "PO v2 directory {:?} returned inconsistent metadata columns",
-            path
+            component_label
         )));
     }
     Ok(Some(NativePoDirectoryEntry {
@@ -3965,12 +4043,12 @@ async fn read_po_v2_payload(
         .range_offset
         .checked_add(u64::from(entry.range_count))
         .ok_or_else(|| VortexRdfError::Deserialization("PO v2 payload slice overflow".into()))?;
-    let path = native_po_exact_ranges_v2_path(data_path);
-    let file = NATIVE_FILE_SESSION
-        .open_options()
-        .open_path(&path)
-        .await
-        .map_err(VortexRdfError::from)?;
+    let resolver = runtime_component_resolver(data_path).await?;
+    let location = resolver.location(NativeComponent::PredicateObjectRangesVortexV2)?;
+    let component_label = location.cache_key();
+    let file = resolver
+        .open(NativeComponent::PredicateObjectRangesVortexV2)
+        .await?;
     let payload = file
         .scan()
         .map_err(VortexRdfError::from)?
@@ -3990,7 +4068,7 @@ async fn read_po_v2_payload(
         entry.candidate_rows,
         &format!(
             "PO v2 payload {:?} slice {}..{}",
-            path, entry.range_offset, range_end
+            component_label, entry.range_offset, range_end
         ),
     )
 }
@@ -4099,27 +4177,26 @@ struct NativePredicateDirectoryEntry {
 }
 
 static NATIVE_PREDICATE_V2_DIRECTORY_CACHE: LazyLock<
-    Mutex<HashMap<PathBuf, Arc<[NativePredicateDirectoryEntry]>>>,
+    Mutex<HashMap<String, Arc<[NativePredicateDirectoryEntry]>>>,
 > = LazyLock::new(|| Mutex::new(HashMap::new()));
 
 fn predicate_v2_cache_lock()
--> Result<std::sync::MutexGuard<'static, HashMap<PathBuf, Arc<[NativePredicateDirectoryEntry]>>>> {
+-> Result<std::sync::MutexGuard<'static, HashMap<String, Arc<[NativePredicateDirectoryEntry]>>>> {
     NATIVE_PREDICATE_V2_DIRECTORY_CACHE.lock().map_err(|_| {
         VortexRdfError::Deserialization("predicate v2 directory cache mutex was poisoned".into())
     })
 }
 
 async fn predicate_v2_directory(data_path: &Path) -> Result<Arc<[NativePredicateDirectoryEntry]>> {
-    let path = native_p_exact_directory_v2_path(data_path);
-    if let Some(cached) = predicate_v2_cache_lock()?.get(&path).cloned() {
+    let resolver = runtime_component_resolver(data_path).await?;
+    let location = resolver.location(NativeComponent::PredicateDirectoryVortexV2)?;
+    let cache_key = location.cache_key();
+    if let Some(cached) = predicate_v2_cache_lock()?.get(&cache_key).cloned() {
         return Ok(cached);
     }
-
-    let file = NATIVE_FILE_SESSION
-        .open_options()
-        .open_path(&path)
-        .await
-        .map_err(VortexRdfError::from)?;
+    let file = resolver
+        .open(NativeComponent::PredicateDirectoryVortexV2)
+        .await?;
     let array = file
         .scan()
         .map_err(VortexRdfError::from)?
@@ -4149,7 +4226,7 @@ async fn predicate_v2_directory(data_path: &Path) -> Result<Arc<[NativePredicate
     {
         return Err(VortexRdfError::Deserialization(format!(
             "predicate v2 directory {:?} has inconsistent column lengths",
-            path
+            cache_key
         )));
     }
 
@@ -4168,14 +4245,14 @@ async fn predicate_v2_directory(data_path: &Path) -> Result<Arc<[NativePredicate
     {
         return Err(VortexRdfError::Deserialization(format!(
             "predicate v2 directory {:?} is not strictly sorted by predicate_id",
-            path
+            cache_key
         )));
     }
 
     let entries: Arc<[NativePredicateDirectoryEntry]> = entries.into();
     let mut cache = predicate_v2_cache_lock()?;
     Ok(cache
-        .entry(path)
+        .entry(cache_key)
         .or_insert_with(|| Arc::clone(&entries))
         .clone())
 }
@@ -4211,12 +4288,12 @@ async fn read_predicate_v2_payload(
         .ok_or_else(|| {
             VortexRdfError::Deserialization("predicate v2 payload row range overflow".into())
         })?;
-    let path = native_p_exact_ranges_v2_path(data_path);
-    let file = NATIVE_FILE_SESSION
-        .open_options()
-        .open_path(&path)
-        .await
-        .map_err(VortexRdfError::from)?;
+    let resolver = runtime_component_resolver(data_path).await?;
+    let location = resolver.location(NativeComponent::PredicateRangesVortexV2)?;
+    let component_label = location.cache_key();
+    let file = resolver
+        .open(NativeComponent::PredicateRangesVortexV2)
+        .await?;
     let payload = file
         .scan()
         .map_err(VortexRdfError::from)?
@@ -4236,7 +4313,7 @@ async fn read_predicate_v2_payload(
         entry.candidate_rows,
         &format!(
             "predicate v2 payload {:?} slice {}..{}",
-            path, entry.range_offset, range_end
+            component_label, entry.range_offset, range_end
         ),
     )
 }
@@ -4726,12 +4803,12 @@ async fn lookup_object_v2_directory_entry(
     data_path: &Path,
     object_id: u32,
 ) -> Result<Option<NativeObjectDirectoryEntry>> {
-    let path = native_o_exact_directory_v2_path(data_path);
-    let file = NATIVE_FILE_SESSION
-        .open_options()
-        .open_path(&path)
-        .await
-        .map_err(VortexRdfError::from)?;
+    let resolver = runtime_component_resolver(data_path).await?;
+    let location = resolver.location(NativeComponent::ObjectDirectoryVortexV2)?;
+    let component_label = location.cache_key();
+    let file = resolver
+        .open(NativeComponent::ObjectDirectoryVortexV2)
+        .await?;
     let result = file
         .scan()
         .map_err(VortexRdfError::from)?
@@ -4752,7 +4829,7 @@ async fn lookup_object_v2_directory_entry(
     if result.len() != 1 {
         return Err(VortexRdfError::Deserialization(format!(
             "object v2 directory {:?} returned {} rows for object ID {}; expected at most one",
-            path,
+            component_label,
             result.len(),
             object_id
         )));
@@ -4764,7 +4841,7 @@ async fn lookup_object_v2_directory_entry(
     if offsets.len() != 1 || counts.len() != 1 || rows.len() != 1 {
         return Err(VortexRdfError::Deserialization(format!(
             "object v2 directory {:?} returned inconsistent metadata columns for object ID {}",
-            path, object_id
+            component_label, object_id
         )));
     }
 
@@ -4806,12 +4883,10 @@ async fn read_object_v2_payload(
         .ok_or_else(|| {
             VortexRdfError::Deserialization("object v2 payload row range overflow".into())
         })?;
-    let path = native_o_exact_ranges_v2_path(data_path);
-    let file = NATIVE_FILE_SESSION
-        .open_options()
-        .open_path(&path)
-        .await
-        .map_err(VortexRdfError::from)?;
+    let resolver = runtime_component_resolver(data_path).await?;
+    let location = resolver.location(NativeComponent::ObjectRangesVortexV2)?;
+    let component_label = location.cache_key();
+    let file = resolver.open(NativeComponent::ObjectRangesVortexV2).await?;
     let payload = file
         .scan()
         .map_err(VortexRdfError::from)?
@@ -4831,7 +4906,7 @@ async fn read_object_v2_payload(
         entry.candidate_rows,
         &format!(
             "object v2 payload {:?} slice {}..{}",
-            path, entry.range_offset, range_end
+            component_label, entry.range_offset, range_end
         ),
     )
 }
@@ -5203,7 +5278,7 @@ pub async fn build_cottas_native_p_exact_ranges_index(
     std::fs::rename(&directory_tmp, &directory_path)
         .map_err(|e| VortexRdfError::Serialization(e.to_string()))?;
     // A rebuild in the same process must not retain old directory metadata.
-    predicate_v2_cache_lock()?.remove(&directory_path);
+    predicate_v2_cache_lock()?.remove(&format!("external:{}", directory_path.display()));
 
     let total_ms = elapsed_ms(total_start);
     log::info!(
@@ -6113,11 +6188,11 @@ struct NativeTermDirectoryEntry {
 }
 
 static NATIVE_TERM_DIRECTORY_CACHE: LazyLock<
-    Mutex<HashMap<PathBuf, Arc<[NativeTermDirectoryEntry]>>>,
+    Mutex<HashMap<String, Arc<[NativeTermDirectoryEntry]>>>,
 > = LazyLock::new(|| Mutex::new(HashMap::new()));
 
 fn term_directory_cache_lock()
--> Result<std::sync::MutexGuard<'static, HashMap<PathBuf, Arc<[NativeTermDirectoryEntry]>>>> {
+-> Result<std::sync::MutexGuard<'static, HashMap<String, Arc<[NativeTermDirectoryEntry]>>>> {
     NATIVE_TERM_DIRECTORY_CACHE.lock().map_err(|_| {
         VortexRdfError::Deserialization("term directory cache mutex was poisoned".into())
     })
@@ -6268,7 +6343,7 @@ pub async fn build_cottas_native_term_directory(
     drop(output);
     std::fs::rename(&temporary_path, &output_path)
         .map_err(|e| VortexRdfError::Serialization(e.to_string()))?;
-    term_directory_cache_lock()?.remove(&output_path);
+    term_directory_cache_lock()?.remove(&format!("external:{}", output_path.display()));
     let write_ms = elapsed_ms(write_start);
     Ok(NativeTermDirectoryBuildStats {
         data_path: data_path.display().to_string(),
@@ -6285,19 +6360,15 @@ pub async fn build_cottas_native_term_directory(
 }
 
 async fn native_term_directory(data_path: &Path) -> Result<Arc<[NativeTermDirectoryEntry]>> {
-    let path = require_vortex_component(
-        data_path,
-        NativeComponent::DictionaryTermDirectoryVortex,
-        "sparse term directory",
-    )?;
-    if let Some(v) = term_directory_cache_lock()?.get(&path).cloned() {
+    let resolver = runtime_component_resolver(data_path).await?;
+    let location = resolver.location(NativeComponent::DictionaryTermDirectoryVortex)?;
+    let cache_key = location.cache_key();
+    if let Some(v) = term_directory_cache_lock()?.get(&cache_key).cloned() {
         return Ok(v);
     }
-    let file = NATIVE_FILE_SESSION
-        .open_options()
-        .open_path(&path)
-        .await
-        .map_err(VortexRdfError::from)?;
+    let file = resolver
+        .open(NativeComponent::DictionaryTermDirectoryVortex)
+        .await?;
     let a = file
         .scan()
         .map_err(VortexRdfError::from)?
@@ -6347,7 +6418,7 @@ async fn native_term_directory(data_path: &Path) -> Result<Arc<[NativeTermDirect
     let entries: Arc<[NativeTermDirectoryEntry]> = entries.into();
     let mut cache = term_directory_cache_lock()?;
     Ok(cache
-        .entry(path)
+        .entry(cache_key)
         .or_insert_with(|| Arc::clone(&entries))
         .clone())
 }
@@ -6421,17 +6492,11 @@ async fn lookup_bound_term_ids_sparse_directory(
         stats[0].total_ms = ms;
         return Ok((HashMap::new(), stats, ms));
     }
-    let path = require_vortex_component(
-        data_path,
-        NativeComponent::DictionaryTermToIdVortex,
-        "term-to-ID dictionary",
-    )?;
+    let resolver = runtime_component_resolver(data_path).await?;
     let open_start = Instant::now();
-    let file = NATIVE_FILE_SESSION
-        .open_options()
-        .open_path(&path)
-        .await
-        .map_err(VortexRdfError::from)?;
+    let file = resolver
+        .open(NativeComponent::DictionaryTermToIdVortex)
+        .await?;
     let open_ms = elapsed_ms(open_start);
     let (mut scan_ms, mut read_ms, mut extract_ms) = (0.0, 0.0, 0.0);
     let mut found = HashMap::with_capacity(terms.len());
@@ -7000,13 +7065,7 @@ async fn lookup_bound_term_ids_batched_or(
         return Ok((HashMap::new(), Vec::new(), elapsed_ms(total_start)));
     }
 
-    let path = native_dict_term_to_id_path(data_path);
-    if !path.is_file() {
-        return Err(VortexRdfError::InvalidOperation(format!(
-            "Vortex term_to_id dictionary component is missing at {:?}",
-            path
-        )));
-    }
+    let resolver = runtime_component_resolver(data_path).await?;
 
     let mut stats: Vec<NativeTermToIdLookupStats> = terms
         .iter()
@@ -7020,11 +7079,9 @@ async fn lookup_bound_term_ids_batched_or(
         .collect();
 
     let open_start = Instant::now();
-    let file = NATIVE_FILE_SESSION
-        .open_options()
-        .open_path(&path)
-        .await
-        .map_err(VortexRdfError::from)?;
+    let file = resolver
+        .open(NativeComponent::DictionaryTermToIdVortex)
+        .await?;
     let open_ms = elapsed_ms(open_start);
     let expr = terms
         .iter()
@@ -7093,20 +7150,12 @@ async fn lookup_bound_term_ids_shared_open_equalities(
         return Ok((HashMap::new(), Vec::new(), elapsed_ms(total_start)));
     }
 
-    let path = native_dict_term_to_id_path(data_path);
-    if !path.is_file() {
-        return Err(VortexRdfError::InvalidOperation(format!(
-            "Vortex term_to_id dictionary component is missing at {:?}",
-            path
-        )));
-    }
+    let resolver = runtime_component_resolver(data_path).await?;
 
     let open_start = Instant::now();
-    let file = NATIVE_FILE_SESSION
-        .open_options()
-        .open_path(&path)
-        .await
-        .map_err(VortexRdfError::from)?;
+    let file = resolver
+        .open(NativeComponent::DictionaryTermToIdVortex)
+        .await?;
     let open_ms = elapsed_ms(open_start);
 
     let mut out = HashMap::with_capacity(terms.len());
@@ -7435,19 +7484,11 @@ async fn lookup_term_id_from_sidecar_with_stats(
         strategy: "vortex-term-filter".to_string(),
         ..NativeTermToIdLookupStats::default()
     };
-    let path = native_dict_term_to_id_path(data_path);
-    if !path.is_file() {
-        return Err(VortexRdfError::InvalidOperation(format!(
-            "Vortex term_to_id dictionary component is missing at {:?}",
-            path
-        )));
-    }
+    let resolver = runtime_component_resolver(data_path).await?;
     let open_start = Instant::now();
-    let file = NATIVE_FILE_SESSION
-        .open_options()
-        .open_path(&path)
-        .await
-        .map_err(VortexRdfError::from)?;
+    let file = resolver
+        .open(NativeComponent::DictionaryTermToIdVortex)
+        .await?;
     stats.open_ms = elapsed_ms(open_start);
     let expr = eq(col("term"), lit(term));
     let can_prune_start = Instant::now();
@@ -7550,6 +7591,63 @@ mod native_artifact_manifest_tests {
             .collect();
         assert_eq!(paths.len(), NativeComponent::ALL.len());
         assert!(paths.iter().all(|path| path != artifact));
+    }
+
+    #[test]
+    fn manifest_resolver_activates_external_and_embedded_locations() {
+        let artifact = Path::new("artifact.vortex");
+        let external = NativeComponentResolver {
+            artifact_path: artifact.to_path_buf(),
+            artifact_kind: NativeArtifactKind::ManifestExternal(
+                NativeArtifactManifest::production_defaults(),
+            ),
+        };
+        assert!(matches!(
+            external
+                .location(NativeComponent::DictionaryVortex)
+                .unwrap(),
+            ComponentLocation::External(_)
+        ));
+
+        let mut manifest = NativeArtifactManifest::production_defaults();
+        let entry = manifest
+            .components
+            .iter_mut()
+            .find(|entry| entry.logical_name == NativeComponent::DictionaryVortex.logical_name())
+            .unwrap();
+        entry.storage = NativeComponentStorage::Embedded {
+            offset: 10,
+            length: 20,
+        };
+        let resolver = NativeComponentResolver {
+            artifact_path: artifact.to_path_buf(),
+            artifact_kind: NativeArtifactKind::ManifestExternal(manifest),
+        };
+        // Missing artifact is rejected before an embedded location can be trusted.
+        assert!(
+            resolver
+                .location(NativeComponent::DictionaryVortex)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn component_location_cache_keys_distinguish_storage_and_ranges() {
+        let external = ComponentLocation::External(PathBuf::from("x.vortex.dict.vortex"));
+        let embedded_a = ComponentLocation::Embedded {
+            artifact_path: PathBuf::from("x.vortex"),
+            component: NativeComponent::DictionaryVortex,
+            offset: 100,
+            length: 10,
+        };
+        let embedded_b = ComponentLocation::Embedded {
+            artifact_path: PathBuf::from("x.vortex"),
+            component: NativeComponent::DictionaryVortex,
+            offset: 110,
+            length: 10,
+        };
+        assert_ne!(external.cache_key(), embedded_a.cache_key());
+        assert_ne!(embedded_a.cache_key(), embedded_b.cache_key());
     }
 
     #[test]
