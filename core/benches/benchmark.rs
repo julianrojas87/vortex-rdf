@@ -563,6 +563,24 @@ match_bench!(
     Index::ByCopy,
     Source::File
 );
+// Layout axis (in-memory): the same non-default layouts over a resident
+// store. With the default in-memory row above, these complete the
+// layout × source match matrix the dashboard consolidates into one table.
+// (Placement is a file-storage concept, so in-memory Dictionary is one row.)
+match_bench!(
+    match_sorted_typedobj_bycopy_mem,
+    Builder::SortedStream,
+    Layout::TypedObject,
+    Index::ByCopy,
+    Source::InMemory
+);
+match_bench!(
+    match_sorted_dict_bycopy_mem,
+    Builder::SortedStream,
+    Layout::Dictionary,
+    Index::ByCopy,
+    Source::InMemory
+);
 // Placement axis (Dictionary, file): the sidecar twin of
 // `match_sorted_dict_bycopy_file`. The padded tail taxes every file match —
 // extra rows/zones in the quads file, and at small scales the writer
