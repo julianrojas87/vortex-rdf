@@ -712,6 +712,18 @@ impl NativeComponentResolver {
         }
     }
 
+    // VORTEX_RDF_RESOLVER_BASED_COMPONENT_AVAILABILITY_V1
+    fn components_available(&self, components: &[NativeComponent]) -> Result<bool> {
+        for &component in components {
+            match self.location(component)? {
+                ComponentLocation::Embedded { .. } => {}
+                ComponentLocation::External(path) if path.is_file() => {}
+                ComponentLocation::External(_) => return Ok(false),
+            }
+        }
+        Ok(true)
+    }
+
     async fn open(&self, component: NativeComponent) -> Result<vortex_file::VortexFile> {
         match self.location(component)? {
             ComponentLocation::External(path) => {
@@ -2518,21 +2530,21 @@ impl NativeIndexProvider for NativeRdfProviders {
     }
 
     async fn object_access(&self, object_id: u32) -> Result<Option<NativeObjectAccess>> {
-        let directory = native_o_exact_directory_v2_path(&self.data_path);
-        let payload = native_o_exact_ranges_v2_path(&self.data_path);
         let configured = std::env::var("VORTEX_RDF_NATIVE_OBJECT_INDEX_BACKEND")
             .unwrap_or_else(|_| "auto".to_string());
+        let components = [
+            NativeComponent::ObjectDirectoryVortexV2,
+            NativeComponent::ObjectRangesVortexV2,
+        ];
         match configured.as_str() {
-            "auto" if directory.is_file() && payload.is_file() => {
-                lookup_object_access_from_vortex_v2(&self.data_path, object_id).await
-            }
-            "auto" | "none" => Ok(None),
-            "vortex-v2" if directory.is_file() && payload.is_file() => {
+            "none" => Ok(None),
+            "auto" if !self.resolver.components_available(&components)? => Ok(None),
+            "auto" | "vortex-v2" if self.resolver.components_available(&components)? => {
                 lookup_object_access_from_vortex_v2(&self.data_path, object_id).await
             }
             "vortex-v2" => Err(VortexRdfError::InvalidOperation(format!(
-                "Vortex object v2 directory {:?} or payload {:?} is missing",
-                directory, payload
+                "required Vortex object v2 components are unavailable for artifact {:?}",
+                self.data_path
             ))),
             other => Err(VortexRdfError::InvalidOperation(format!(
                 "Unsupported VORTEX_RDF_NATIVE_OBJECT_INDEX_BACKEND={other:?}; expected auto, none, or vortex-v2"
