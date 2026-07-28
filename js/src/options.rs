@@ -5,6 +5,7 @@
 use futures::Stream;
 use js_sys::Reflect;
 use oxrdfio::RdfFormat;
+use vortex_rdf_core::common::formats::format_from_name;
 use vortex_rdf_core::error::Result as CoreResult;
 use vortex_rdf_core::store::{BuiltArray, RawQuad};
 use vortex_rdf_core::{
@@ -14,22 +15,13 @@ use vortex_rdf_core::{
 use wasm_bindgen::prelude::*;
 
 pub(crate) fn parse_format(format_name: &str) -> Result<RdfFormat, JsValue> {
-    match format_name.to_lowercase().as_str() {
-        "nt" | "ntriples" => Ok(RdfFormat::NTriples),
-        "nq" | "nquads" => Ok(RdfFormat::NQuads),
-        "ttl" | "turtle" => Ok(RdfFormat::Turtle),
-        "trig" => Ok(RdfFormat::TriG),
-        "n3" => Ok(RdfFormat::N3),
-        "rdf" | "rdfxml" | "xml" => Ok(RdfFormat::RdfXml),
-        "jsonld" => Ok(RdfFormat::JsonLd {
-            profile: Default::default(),
-        }),
-        other => Err(JsValue::from_str(&format!(
+    format_from_name(format_name).ok_or_else(|| {
+        JsValue::from_str(&format!(
             "Unsupported format: {}. Supported formats are 'ntriples', 'nquads', 'turtle', \
              'trig', 'n3', 'rdfxml' and 'jsonld'.",
-            other
-        ))),
-    }
+            format_name
+        ))
+    })
 }
 
 /// Build-time configuration resolved from the JS `BuildOptions` object.
