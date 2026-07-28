@@ -137,6 +137,27 @@ impl LayoutStrategy {
     }
 }
 
+/// Where a serialized Dictionary-layout dataset keeps its term dictionary.
+///
+/// Both forms hold the same scannable sorted term column ([`TERM_FIELD`]);
+/// they differ in which file it lives in. Non-Dictionary layouts carry no
+/// dictionary, so the placement is a no-op for them.
+#[derive(Copy, Clone, PartialEq, Eq, ValueEnum, Debug, Default)]
+pub enum DictionaryPlacement {
+    /// One self-contained file: the dictionary rides as trailing rows of the
+    /// quads file, in a nullable term column that is null on every quad row
+    /// (see [`dictionary::pad_with_dictionary`]). The default, and the only
+    /// form IPC bytes use.
+    #[default]
+    Padded,
+    /// Two files: the quads file keeps bare code columns, and the dictionary
+    /// lives in a `<stem>.dict.vortex` companion beside it. The companion
+    /// must travel with the quads file — without it the codes cannot be
+    /// decoded — but it can be rebuilt or re-compressed without touching the
+    /// quads.
+    Sidecar,
+}
+
 /// Query-time layout: the build-time [`LayoutStrategy`] resolved against a
 /// constructed array, carrying any state intrinsic to the layout — for the
 /// Dictionary layout, access to the global term dictionary. Holding the state

@@ -50,6 +50,7 @@ pub use de::{load_vortex_file_ref, open_vortex_file};
 pub use ser::write_array_to_ipc;
 #[cfg(feature = "file-io")]
 pub use ser::{
-    quads_stream_to_vortex, quads_stream_to_vortex_writer,
-    quads_stream_to_vortex_writer_with_builder, serialize, write_sidecar_dictionary,
+    quads_stream_to_vortex, quads_stream_to_vortex_file_with_builder,
+    quads_stream_to_vortex_writer, quads_stream_to_vortex_writer_with_builder, serialize,
+    write_sidecar_dictionary,
 };

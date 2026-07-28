@@ -57,9 +57,9 @@ pub use io::{
 };
 
 pub use store::{
-    BuilderStrategy, BuiltArray, BuiltStream, DictSnapshot, DictionaryQuadSink, IndexType, Indexes,
-    LayoutStrategy, SortedInMemoryBuilder, SortedStreamBuilder, UnsortedStreamBuilder,
-    VortexArrayBuilder, VortexRdfStore,
+    BuilderStrategy, BuiltArray, BuiltStream, DictSnapshot, DictionaryPlacement,
+    DictionaryQuadSink, IndexType, Indexes, LayoutStrategy, SortedInMemoryBuilder,
+    SortedStreamBuilder, UnsortedStreamBuilder, VortexArrayBuilder, VortexRdfStore,
 };
 
 #[cfg(all(feature = "mimalloc", not(target_arch = "wasm32")))]
@@ -318,6 +318,67 @@ mod tests {
     }
 
     #[cfg(feature = "file-io")]
+    /// The placement knob end to end: the same dataset written through the
+    /// path-based entry in both placements must reopen with identical
+    /// results — padded as one self-containing file, sidecar as quads +
+    /// companion.
+    #[cfg(feature = "file-io")]
+    #[tokio::test]
+    async fn test_dictionary_placement_file_roundtrips() {
+        use crate::store::DictionaryPlacement;
+
+        let quads = dictionary_test_quads();
+        let dir = std::env::temp_dir().join(format!(
+            "vortex_rdf_placement_test_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        for (placement, name) in [
+            (DictionaryPlacement::Padded, "padded.vortex"),
+            (DictionaryPlacement::Sidecar, "sidecar.vortex"),
+        ] {
+            let path = dir.join(name);
+            crate::io::quads_stream_to_vortex_file_with_builder::<SortedInMemoryBuilder, _>(
+                quad_stream(quads.clone()),
+                &path,
+                LayoutStrategy::Dictionary,
+                dictionary_indexes(),
+                placement,
+            )
+            .await
+            .unwrap();
+
+            // The sidecar form leaves the quads schema bare and writes the
+            // companion; the padded form is one file with the term column.
+            let companion = dir.join(name.replace(".vortex", ".dict.vortex"));
+            assert_eq!(
+                companion.is_file(),
+                placement == DictionaryPlacement::Sidecar,
+                "{name}: unexpected companion presence"
+            );
+
+            let store = VortexRdfStore::from_file(&path).await.unwrap();
+            assert_eq!(store.layout(), LayoutStrategy::Dictionary, "{name}");
+            assert_eq!(store.size().await.unwrap(), quads.len(), "{name}");
+
+            let p0 = NamedNode::new("http://example.org/p0").unwrap();
+            let matched = store
+                .match_pattern(None, Some(&p0), None, None)
+                .await
+                .unwrap();
+            assert_eq!(matched.size().await.unwrap(), 4, "{name}");
+            let decoded: Vec<Quad> = store.quads().unwrap().try_collect().await.unwrap();
+            assert_eq!(
+                quad_strings(&decoded),
+                quad_strings(&quads),
+                "{name}: bad roundtrip"
+            );
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// The sidecar placement round-trip: a quads file with bare code columns
     /// plus the `<stem>.dict.vortex` companion written beside it must reopen
     /// with identical match results — the sidecar branch of `from_file`.

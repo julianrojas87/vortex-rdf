@@ -9,8 +9,8 @@ pub use builders::{
     SortedStreamBuilder, UnsortedStreamBuilder, VortexArrayBuilder,
 };
 pub use indexes::{IndexType, Indexes};
-pub use layouts::LayoutStrategy;
 pub use layouts::term_dictionary::DictSnapshot;
+pub use layouts::{DictionaryPlacement, LayoutStrategy};
 pub use vortex_rdf_store::VortexRdfStore;
 
 use oxrdf::Quad;

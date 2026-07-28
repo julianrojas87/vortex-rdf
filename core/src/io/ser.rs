@@ -170,6 +170,72 @@ where
     Ok(())
 }
 
+/// Serialize a quad stream to a Vortex file at `path`, with the Dictionary
+/// layout's term dictionary placed per `placement` — the path-based entry
+/// that can write the two-file sidecar form.
+///
+/// [`quads_stream_to_vortex_writer_with_builder`] (writer-generic) always
+/// pads: a bare writer has no path for a companion to live beside.
+#[cfg(feature = "file-io")]
+pub async fn quads_stream_to_vortex_file_with_builder<B, S>(
+    quads: S,
+    path: &std::path::Path,
+    layout: LayoutStrategy,
+    indexes: Indexes,
+    placement: crate::store::DictionaryPlacement,
+) -> Result<()>
+where
+    B: VortexArrayBuilder,
+    S: Stream<Item = error::Result<RawQuad>> + Unpin + Send + 'static,
+{
+    use crate::store::DictionaryPlacement;
+    use crate::store::layouts::term_dictionary;
+
+    let start = Instant::now();
+    let built = B::build_vortex_stream(Box::new(quads), layout, indexes).await?;
+
+    let mut writer = tokio::fs::File::create(path)
+        .await
+        .map_err(|e| VortexRdfError::Serialization(format!("create {:?}: {}", path, e)))?;
+
+    // Which file the dictionary goes to. `sidecar` holds it across the quads
+    // write when the companion is written after.
+    let (dtype, chunks, sidecar) = match (built.dict, placement) {
+        (Some(dict), DictionaryPlacement::Padded) => {
+            let (dtype, chunks) = pad_chunk_stream(built.dtype, built.chunks, &dict)?;
+            (dtype, chunks, None)
+        }
+        (Some(dict), DictionaryPlacement::Sidecar) => (built.dtype, built.chunks, Some(dict)),
+        (None, _) => (built.dtype, built.chunks, None),
+    };
+
+    let vortex_stream = ArrayStreamAdapter::new(dtype, chunks);
+    let _summary = write_options_with_subject_stats()
+        .write(&mut writer, vortex_stream)
+        .await
+        .map_err(VortexRdfError::Vortex)?;
+    writer
+        .shutdown()
+        .await
+        .map_err(|e| VortexRdfError::Serialization(format!("Failed to shutdown writer: {}", e)))?;
+
+    if let Some(dict) = sidecar {
+        let array = term_dictionary::sidecar_dict_array(&dict)?;
+        let sidecar_path = term_dictionary::sidecar_dict_path(path);
+        let file = tokio::fs::File::create(&sidecar_path).await.map_err(|e| {
+            VortexRdfError::Serialization(format!("create {:?}: {}", sidecar_path, e))
+        })?;
+        serialize(array, file).await?;
+    }
+
+    log::debug!(
+        "[ser::quads_stream_to_vortex_file_with_builder] Streaming write ({:?}) took {:?}",
+        placement,
+        start.elapsed()
+    );
+    Ok(())
+}
+
 /// Write a store's term dictionary as the sidecar file beside `quads_path`
 /// (`data.vortex` → `data.dict.vortex`): a one-column `{_dict_term: utf8}`
 /// file whose row `i` is the term with ID `i`, kept in the encoding the
