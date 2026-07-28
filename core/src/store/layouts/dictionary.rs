@@ -409,6 +409,7 @@ pub(crate) fn pad_chunk_stream(
     Ok((padded, chunks))
 }
 
+#[cfg(feature = "file-io")]
 /// The padded schema for a quads schema: the same fields plus the nullable
 /// term column.
 pub(crate) fn padded_dtype(quad_dtype: &DType) -> Result<DType> {

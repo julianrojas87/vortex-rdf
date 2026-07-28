@@ -12,7 +12,9 @@ use crate::store::indexes::{
     IndexResolution, IndexType, Indexes, ServePlan, detect_indexes, resolve_indexes_in_memory,
     strip_index_columns, unique_indexes,
 };
-use crate::store::layouts::term_dictionary::{self, DictAccess, DictSnapshot, TermDictionary};
+#[cfg(feature = "file-io")]
+use crate::store::layouts::term_dictionary;
+use crate::store::layouts::term_dictionary::{DictAccess, DictSnapshot, TermDictionary};
 use crate::store::layouts::{
     Constraints, LayoutStrategy, PatternCodes, QuadPattern, ResolvedLayout, TermRef, dictionary,
 };

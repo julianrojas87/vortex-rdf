@@ -14,6 +14,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use web_time::Instant;
 
+#[cfg(feature = "file-io")]
 use vortex_array::arrays::struct_::{StructArray, StructArrayExt};
 use vortex_array::arrays::{PrimitiveArray, VarBinViewArray};
 #[cfg(feature = "file-io")]
@@ -21,6 +22,7 @@ use vortex_array::expr::{root, select};
 use vortex_array::match_each_integer_ptype;
 #[cfg(feature = "file-io")]
 use vortex_array::stream::ArrayStreamExt as _;
+#[cfg(feature = "file-io")]
 use vortex_array::validity::Validity;
 use vortex_array::{ArrayRef, IntoArray, VortexSessionExecute};
 #[cfg(feature = "file-io")]
@@ -32,6 +34,7 @@ use crate::error::{Result, VortexRdfError};
 use crate::io::VORTEX_LIGHT_SESSION;
 use crate::store::RawQuad;
 use crate::store::layouts::dictionary::QuadCodes;
+#[cfg(feature = "file-io")]
 use crate::store::schema::TERM_FIELD;
 
 /// Build-only term-to-ID lookup table, keyed by owned terms. It is deliberately
@@ -936,6 +939,7 @@ pub(crate) async fn dict_from_sidecar_file(quads_path: &std::path::Path) -> Resu
     TermDictionary::from_terms_array(col, &mut ctx)
 }
 
+#[cfg(feature = "file-io")]
 /// The sidecar dictionary as a one-column `{_dict_term: utf8}` array, ready
 /// to serialize beside a bare-code quads file. Terms keep the encoding the
 /// dictionary is held in (FSST when compressed at the source).
