@@ -34,8 +34,3 @@ pub(crate) const COL_O_LANG: &str = "o_lang";
 /// ID = position among them). Also the single column of a sidecar dictionary
 /// file. Its presence in a schema is what marks a padded file.
 pub(crate) const TERM_FIELD: &str = "_dict_term";
-
-/// The retired list-cell dictionary column (dictionary serialized as one
-/// opaque `ListArray<utf8>` value in row 0). Recognized only to reject such
-/// files with an actionable error — no back-compat.
-pub(crate) const LEGACY_DICT_FIELD: &str = "_dict_terms";

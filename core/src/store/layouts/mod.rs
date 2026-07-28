@@ -22,7 +22,7 @@ pub mod typed_object;
 use self::term_dictionary::DictAccess;
 use crate::store::schema::{
     COL_G, COL_O, COL_O_DATATYPE, COL_O_KIND, COL_O_LANG, COL_O_VALUE, COL_P, COL_S,
-    LEGACY_DICT_FIELD, PRIMARY_COLUMNS, TERM_FIELD,
+    PRIMARY_COLUMNS, TERM_FIELD,
 };
 
 /// Determines the columnar schema used to store RDF quads in the Vortex StructArray.
@@ -66,14 +66,14 @@ pub enum LayoutStrategy {
 
     /// ### `LayoutStrategy::Dictionary` column schema
     /// All four quad fields stored as u32 codes into a single global term
-    /// dictionary. The dictionary is intrinsic to the layout: it lives in the
-    /// `_dict_terms` column, always emitted alongside the code columns (see
-    /// [`term_dictionary`]).
+    /// dictionary. In memory the dictionary lives beside the columns (see
+    /// [`term_dictionary`]); serialized forms carry it as the `_dict_term`
+    /// column's trailing rows (padded) or as a sidecar file.
     ///
     /// | Column        | Type                  | Content                                             |
     /// |---------------|-----------------------|-----------------------------------------------------|
     /// | `s`,`p`,`o`,`g` | `PrimitiveArray<u32>` | code = position of the term in the sorted dictionary |
-    /// | `_dict_terms` | `list<utf8>`          | row 0 = the sorted unique terms as one list; all other rows empty |
+    /// | `_dict_term`  | `utf8` (nullable, padded serialized form only) | null on quad rows; the sorted terms on the trailing dictionary rows |
     ///
     /// Term IDs are lexicographic ranks, so code comparisons are
     /// order-isomorphic to string comparisons (sorted builders keep the
@@ -90,14 +90,9 @@ impl LayoutStrategy {
     /// without materializing the array.
     pub(crate) fn from_dtype(dtype: &DType) -> LayoutStrategy {
         if let DType::Struct(fields, _) = dtype {
-            // A term column (padded serialized form), the retired list-cell
-            // column (rejected with an actionable error at open), or u32 code
-            // columns (a bare/sidecar quads schema) all mean Dictionary.
+            // A term column (padded serialized form) or u32 code columns (a
+            // bare/sidecar quads schema) both mean Dictionary.
             if fields.names().iter().any(|n| n.as_ref() == TERM_FIELD)
-                || fields
-                    .names()
-                    .iter()
-                    .any(|n| n.as_ref() == LEGACY_DICT_FIELD)
                 || matches!(fields.field(COL_S), Some(DType::Primitive(ptype, _)) if ptype == PType::U32)
             {
                 return LayoutStrategy::Dictionary;
@@ -396,8 +391,8 @@ impl ResolvedLayout {
     }
 
     /// Decode a StructArray chunk into quads. Dictionary chunks are decoded
-    /// through the layout's own dictionary (their `_dict_terms` payload may
-    /// have been lost to slicing/filtering/file re-blocking).
+    /// through the layout's own dictionary (any padded `_dict_term` column
+    /// was split off at open or lost to slicing/filtering/file re-blocking).
     pub(crate) fn decode_chunk(&self, chunk: &ArrayRef) -> Vec<Result<Quad>> {
         match self {
             ResolvedLayout::Default => default::decode_chunk(chunk),

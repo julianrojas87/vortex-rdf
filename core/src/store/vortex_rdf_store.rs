@@ -121,13 +121,6 @@ impl VortexRdfStore {
                     matches!(vortex_array.dtype(), DType::Struct(fields, _)
                         if fields.names().iter().any(|n| n.as_ref() == name))
                 };
-                if has_field(schema::LEGACY_DICT_FIELD) {
-                    return Err(VortexRdfError::Deserialization(
-                        "this array uses the retired `_dict_terms` list-cell dictionary \
-                         format; re-serialize it with a current build"
-                            .to_string(),
-                    ));
-                }
                 if !has_field(schema::TERM_FIELD) {
                     return Err(VortexRdfError::Deserialization(
                         "Dictionary-layout array carries no term dictionary (bare code \
@@ -253,13 +246,6 @@ impl VortexRdfStore {
         let (layout, quad_rows) = match LayoutStrategy::from_dtype(file.dtype()) {
             LayoutStrategy::Default => (ResolvedLayout::Default, file.row_count()),
             LayoutStrategy::TypedObject => (ResolvedLayout::TypedObject, file.row_count()),
-            LayoutStrategy::Dictionary if has_field(schema::LEGACY_DICT_FIELD) => {
-                return Err(VortexRdfError::Deserialization(
-                    "this file uses the retired `_dict_terms` list-cell dictionary \
-                     format; re-serialize it with a current build"
-                        .to_string(),
-                ));
-            }
             LayoutStrategy::Dictionary if has_field(schema::TERM_FIELD) => {
                 // Padded file: trailing rows hold the term dictionary. Locate
                 // them without reading their terms, then lift the dictionary
@@ -1049,8 +1035,8 @@ impl VortexRdfStore {
     /// appended as a second chunk. Under the Dictionary layout the tail holds
     /// strings the base's codes can't express, so the combined rows are
     /// re-encoded against a fresh term dictionary, and the result carries its
-    /// own `_dict_terms` payload (it is self-describing, no longer decoding
-    /// through this store's cached dictionary).
+    /// own padded `_dict_term` rows (it is self-describing, no longer
+    /// decoding through this store's cached dictionary).
     async fn selected_rows(&self) -> Result<ArrayRef> {
         let base = self.base_selected_rows().await?;
         let Some(tail) = &self.tail else {

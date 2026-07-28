@@ -374,7 +374,7 @@ async fn test_dictionary_terms_are_fsst_through_ipc() {
     .unwrap();
     let store = VortexRdfStore::from_built(arr).unwrap();
 
-    let encoding_of_dict_terms = |array: &vortex_array::ArrayRef| -> String {
+    let encoding_of_dict_term = |array: &vortex_array::ArrayRef| -> String {
         use vortex_array::IntoArray as _;
         use vortex_array::VortexSessionExecute as _;
         use vortex_array::arrays::chunked::ChunkedArrayExt as _;
@@ -417,7 +417,7 @@ async fn test_dictionary_terms_are_fsst_through_ipc() {
     // Written out compressed...
     let written = store.to_ipc_array().await.unwrap();
     assert_eq!(
-        encoding_of_dict_terms(&written),
+        encoding_of_dict_term(&written),
         "vortex.fsst",
         "toBytes must not expand the dictionary to plaintext"
     );
@@ -426,7 +426,7 @@ async fn test_dictionary_terms_are_fsst_through_ipc() {
     let mut buf = Vec::new();
     crate::io::write_array_to_ipc(written, &mut buf).unwrap();
     let read_back = crate::io::array_from_ipc_bytes(&buf).unwrap();
-    assert_eq!(encoding_of_dict_terms(&read_back), "vortex.fsst");
+    assert_eq!(encoding_of_dict_term(&read_back), "vortex.fsst");
 
     // And the terms still resolve, through the compressed representation.
     let reread = VortexRdfStore::new(read_back).unwrap();

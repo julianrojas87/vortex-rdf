@@ -205,9 +205,9 @@ fn finish_chunk(names: Vec<Arc<str>>, arrays: Vec<ArrayRef>, n: usize) -> Result
 }
 
 /// Build a complete Dictionary-layout StructArray chunk: four u32 code columns
-/// encoded against the global dictionary, the `_dict_terms` column, and the
-/// columns of every requested secondary index (deduplicated, built over the
-/// same codes by sorting this chunk's quads).
+/// encoded against the global dictionary, plus the columns of every requested
+/// secondary index (deduplicated, built over the same codes by sorting this
+/// chunk's quads).
 ///
 /// `start_row` has the same global-row-ID semantics as `build_struct_array`,
 /// and `whole_dataset` the same index-stamping semantics: pass `true` only
@@ -590,8 +590,8 @@ pub(crate) fn term_tail(term_col: &ArrayRef, n: usize, total: usize) -> Result<A
 }
 
 /// Decode a Dictionary-layout StructArray chunk into Quads using the given
-/// (store-cached) dictionary. The chunk's own `_dict_terms` column is ignored —
-/// derived chunks (sliced/filtered/file-scanned) may have lost the payload row.
+/// (store-cached) dictionary. Any padded `_dict_term` column is ignored —
+/// derived chunks (sliced/filtered/file-scanned) may have lost it anyway.
 pub(crate) fn decode_chunk(chunk: &ArrayRef, dict: &TermDictionary) -> Vec<Result<Quad>> {
     let mut ctx = VORTEX_LIGHT_SESSION.create_execution_ctx();
 

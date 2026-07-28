@@ -788,7 +788,7 @@ impl GlobalIndexes {
 }
 
 /// Project away secondary-index columns (`_idx_*`), keeping the layout's
-/// primary and intrinsic columns (e.g. `_dict_terms`). Returns the array
+/// primary and intrinsic columns (e.g. `_dict_term`). Returns the array
 /// unchanged when it carries no index columns.
 pub(crate) fn strip_index_columns(arr: ArrayRef) -> Result<ArrayRef> {
     // Figure out which field names to keep; bail out unchanged if there are
