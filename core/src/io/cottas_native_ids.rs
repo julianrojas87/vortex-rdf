@@ -465,22 +465,24 @@ fn metadata_segment_id(data_segment_count: usize, metadata_index: usize) -> Resu
 }
 
 // VORTEX_RDF_SELECTIVE_NATIVE_MANIFEST_LOADING_V1
-async fn inspect_native_artifact(artifact_path: &Path) -> Result<NativeArtifactKind> {
-    // Do not use include_metadata(): consolidated artifacts may contain large
-    // auxiliary payloads, and Vortex 0.83 resolves every metadata segment when
-    // that option is enabled. Resolve only the small manifest segment instead.
+// VORTEX_RDF_CACHED_OPENED_VORTEX_HANDLES_V1
+async fn open_and_inspect_native_artifact(
+    artifact_path: &Path,
+) -> Result<(NativeArtifactKind, vortex_file::VortexFile)> {
+    // Keep the opened outer file: manifest inspection and the triples scan must
+    // share one footer, segment source, and cached layout-reader tree.
     let file = NATIVE_FILE_SESSION
         .open_options()
+        .with_layout_reader_cache()
         .open_path(artifact_path)
         .await
         .map_err(VortexRdfError::from)?;
-
     let metadata_index = file
         .footer()
         .metadata_segments()
         .position(|(key, _)| key == NATIVE_ARTIFACT_METADATA_KEY);
     let Some(metadata_index) = metadata_index else {
-        return Ok(NativeArtifactKind::LegacyExternal);
+        return Ok((NativeArtifactKind::LegacyExternal, file));
     };
     let segment_id = metadata_segment_id(file.footer().segment_map().len(), metadata_index)?;
     let handle = file
@@ -494,7 +496,13 @@ async fn inspect_native_artifact(artifact_path: &Path) -> Result<NativeArtifactK
         .await
         .map_err(VortexRdfError::from)?;
     let manifest = NativeArtifactManifest::from_metadata_bytes(bytes.as_slice())?;
-    Ok(NativeArtifactKind::ManifestExternal(manifest))
+    Ok((NativeArtifactKind::ManifestExternal(manifest), file))
+}
+
+async fn inspect_native_artifact(artifact_path: &Path) -> Result<NativeArtifactKind> {
+    open_and_inspect_native_artifact(artifact_path)
+        .await
+        .map(|(kind, _)| kind)
 }
 
 // VORTEX_RDF_BOUNDED_NATIVE_COMPONENT_READER_V1
@@ -634,6 +642,8 @@ struct NativeComponentResolver {
     artifact_kind: NativeArtifactKind,
     artifact_len: Option<u64>,
     embedded_source: Option<Arc<dyn VortexReadAt>>,
+    outer_file: Option<vortex_file::VortexFile>,
+    opened_components: Arc<Mutex<HashMap<NativeComponent, vortex_file::VortexFile>>>,
 }
 
 impl NativeComponentResolver {
@@ -643,10 +653,20 @@ impl NativeComponentResolver {
             artifact_kind: NativeArtifactKind::LegacyExternal,
             artifact_len: None,
             embedded_source: None,
+            outer_file: None,
+            opened_components: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
     fn from_kind(artifact_path: &Path, artifact_kind: NativeArtifactKind) -> Result<Self> {
+        Self::from_kind_and_outer_file(artifact_path, artifact_kind, None)
+    }
+
+    fn from_kind_and_outer_file(
+        artifact_path: &Path,
+        artifact_kind: NativeArtifactKind,
+        outer_file: Option<vortex_file::VortexFile>,
+    ) -> Result<Self> {
         let has_embedded_components = artifact_kind.manifest().is_some_and(|manifest| {
             manifest
                 .components
@@ -675,11 +695,32 @@ impl NativeComponentResolver {
             artifact_kind,
             artifact_len,
             embedded_source,
+            outer_file,
+            opened_components: Arc::new(Mutex::new(HashMap::new())),
+        })
+    }
+    async fn inspect(artifact_path: &Path) -> Result<Self> {
+        let (artifact_kind, outer_file) = open_and_inspect_native_artifact(artifact_path).await?;
+        Self::from_kind_and_outer_file(artifact_path, artifact_kind, Some(outer_file))
+    }
+
+    fn outer_file(&self) -> Result<vortex_file::VortexFile> {
+        self.outer_file.clone().ok_or_else(|| {
+            VortexRdfError::InvalidOperation(format!(
+                "native artifact {:?} has no retained outer Vortex file",
+                self.artifact_path
+            ))
         })
     }
 
-    async fn inspect(artifact_path: &Path) -> Result<Self> {
-        Self::from_kind(artifact_path, inspect_native_artifact(artifact_path).await?)
+    fn opened_components_lock(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, HashMap<NativeComponent, vortex_file::VortexFile>>> {
+        self.opened_components.lock().map_err(|_| {
+            VortexRdfError::Deserialization(
+                "native opened-component cache mutex was poisoned".into(),
+            )
+        })
     }
 
     fn artifact_kind(&self) -> &NativeArtifactKind {
@@ -757,7 +798,10 @@ impl NativeComponentResolver {
     }
 
     async fn open(&self, component: NativeComponent) -> Result<vortex_file::VortexFile> {
-        match self.location(component)? {
+        if let Some(file) = self.opened_components_lock()?.get(&component).cloned() {
+            return Ok(file);
+        }
+        let file = match self.location(component)? {
             ComponentLocation::External(path) => {
                 if !path.is_file() {
                     return Err(VortexRdfError::InvalidOperation(format!(
@@ -768,9 +812,10 @@ impl NativeComponentResolver {
                 }
                 NATIVE_FILE_SESSION
                     .open_options()
+                    .with_layout_reader_cache()
                     .open_path(path)
                     .await
-                    .map_err(VortexRdfError::from)
+                    .map_err(VortexRdfError::from)?
             }
             ComponentLocation::Embedded {
                 artifact_path,
@@ -785,11 +830,22 @@ impl NativeComponentResolver {
                         artifact_path
                     ))
                 })?;
-                open_bounded_native_component(source, offset, length).await
+                let reader = BoundedNativeComponentReader::new(source, offset, length)?;
+                NATIVE_FILE_SESSION
+                    .open_options()
+                    .with_file_size(length)
+                    .with_layout_reader_cache()
+                    .open_read(reader)
+                    .await
+                    .map_err(VortexRdfError::from)?
             }
-        }
+        };
+        let mut cache = self.opened_components_lock()?;
+        Ok(cache
+            .entry(component)
+            .or_insert_with(|| file.clone())
+            .clone())
     }
-
     fn external_path(&self, component: NativeComponent) -> Result<PathBuf> {
         match self.location(component)? {
             ComponentLocation::External(path) => Ok(path),
@@ -2523,6 +2579,10 @@ impl NativeRdfProviders {
     fn resolver(&self) -> &NativeComponentResolver {
         &self.resolver
     }
+
+    fn outer_file(&self) -> Result<vortex_file::VortexFile> {
+        self.resolver.outer_file()
+    }
 }
 
 #[async_trait]
@@ -3533,11 +3593,7 @@ async fn execute_cottas_native_match(
     let filter = resolved.filter();
 
     let open_start = Instant::now();
-    let file = NATIVE_FILE_SESSION
-        .open_options()
-        .open_path(input_path)
-        .await
-        .map_err(VortexRdfError::from)?;
+    let file = providers.outer_file()?;
     diagnostics.open_ms = elapsed_ms(open_start);
 
     if let NativePatternFilter::Expr(expr) = &filter {
@@ -7928,10 +7984,7 @@ mod native_artifact_manifest_tests {
             NativeArtifactKind::LegacyExternal,
             NativeArtifactKind::ManifestExternal(manifest),
         ] {
-            let resolver = NativeComponentResolver {
-                artifact_path: artifact.to_path_buf(),
-                artifact_kind,
-            };
+            let resolver = NativeComponentResolver::from_kind(artifact, artifact_kind).unwrap();
             for component in NativeComponent::ALL {
                 assert_eq!(
                     resolver.external_path(component).unwrap(),
@@ -7973,12 +8026,11 @@ mod native_artifact_manifest_tests {
     #[test]
     fn manifest_resolver_activates_external_and_embedded_locations() {
         let artifact = Path::new("artifact.vortex");
-        let external = NativeComponentResolver {
-            artifact_path: artifact.to_path_buf(),
-            artifact_kind: NativeArtifactKind::ManifestExternal(
-                NativeArtifactManifest::production_defaults(),
-            ),
-        };
+        let external = NativeComponentResolver::from_kind(
+            artifact,
+            NativeArtifactKind::ManifestExternal(NativeArtifactManifest::production_defaults()),
+        )
+        .unwrap();
         assert!(matches!(
             external
                 .location(NativeComponent::DictionaryVortex)
@@ -7996,15 +8048,13 @@ mod native_artifact_manifest_tests {
             offset: 10,
             length: 20,
         };
-        let resolver = NativeComponentResolver {
-            artifact_path: artifact.to_path_buf(),
-            artifact_kind: NativeArtifactKind::ManifestExternal(manifest),
-        };
         // Missing artifact is rejected before an embedded location can be trusted.
         assert!(
-            resolver
-                .location(NativeComponent::DictionaryVortex)
-                .is_err()
+            NativeComponentResolver::from_kind(
+                artifact,
+                NativeArtifactKind::ManifestExternal(manifest),
+            )
+            .is_err()
         );
     }
 
