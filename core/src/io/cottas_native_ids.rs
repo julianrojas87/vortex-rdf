@@ -627,10 +627,13 @@ impl ComponentLocation {
     }
 }
 
-#[derive(Clone, Debug)]
+// VORTEX_RDF_SHARED_EMBEDDED_ARTIFACT_READER_V1
+#[derive(Clone)]
 struct NativeComponentResolver {
     artifact_path: PathBuf,
     artifact_kind: NativeArtifactKind,
+    artifact_len: Option<u64>,
+    embedded_source: Option<Arc<dyn VortexReadAt>>,
 }
 
 impl NativeComponentResolver {
@@ -638,14 +641,45 @@ impl NativeComponentResolver {
         Self {
             artifact_path: artifact_path.to_path_buf(),
             artifact_kind: NativeArtifactKind::LegacyExternal,
+            artifact_len: None,
+            embedded_source: None,
         }
     }
 
-    async fn inspect(artifact_path: &Path) -> Result<Self> {
+    fn from_kind(artifact_path: &Path, artifact_kind: NativeArtifactKind) -> Result<Self> {
+        let has_embedded_components = artifact_kind.manifest().is_some_and(|manifest| {
+            manifest
+                .components
+                .iter()
+                .any(|entry| matches!(entry.storage, NativeComponentStorage::Embedded { .. }))
+        });
+        let (artifact_len, embedded_source) = if has_embedded_components {
+            let artifact_len = std::fs::metadata(artifact_path)
+                .map_err(|error| {
+                    VortexRdfError::InvalidOperation(format!(
+                        "cannot stat native artifact {:?}: {error}",
+                        artifact_path
+                    ))
+                })?
+                .len();
+            let source: Arc<dyn VortexReadAt> = Arc::new(
+                FileReadAt::open(artifact_path, NATIVE_FILE_SESSION.handle())
+                    .map_err(VortexRdfError::from)?,
+            );
+            (Some(artifact_len), Some(source))
+        } else {
+            (None, None)
+        };
         Ok(Self {
             artifact_path: artifact_path.to_path_buf(),
-            artifact_kind: inspect_native_artifact(artifact_path).await?,
+            artifact_kind,
+            artifact_len,
+            embedded_source,
         })
+    }
+
+    async fn inspect(artifact_path: &Path) -> Result<Self> {
+        Self::from_kind(artifact_path, inspect_native_artifact(artifact_path).await?)
     }
 
     fn artifact_kind(&self) -> &NativeArtifactKind {
@@ -681,14 +715,12 @@ impl NativeComponentResolver {
                         component.external_path(&self.artifact_path),
                     )),
                     NativeComponentStorage::Embedded { offset, length } => {
-                        let artifact_len = std::fs::metadata(&self.artifact_path)
-                            .map_err(|error| {
-                                VortexRdfError::InvalidOperation(format!(
-                                    "cannot stat native artifact {:?}: {error}",
-                                    self.artifact_path
-                                ))
-                            })?
-                            .len();
+                        let artifact_len = self.artifact_len.ok_or_else(|| {
+                            VortexRdfError::Deserialization(format!(
+                                "embedded component {} has no cached artifact length",
+                                component.logical_name()
+                            ))
+                        })?;
                         let end = offset.checked_add(length).ok_or_else(|| {
                             VortexRdfError::Deserialization(
                                 "embedded component range overflow".into(),
@@ -742,14 +774,17 @@ impl NativeComponentResolver {
             }
             ComponentLocation::Embedded {
                 artifact_path,
+                component,
                 offset,
                 length,
-                ..
             } => {
-                let source: Arc<dyn VortexReadAt> = Arc::new(
-                    FileReadAt::open(&artifact_path, NATIVE_FILE_SESSION.handle())
-                        .map_err(VortexRdfError::from)?,
-                );
+                let source = self.embedded_source.as_ref().cloned().ok_or_else(|| {
+                    VortexRdfError::Deserialization(format!(
+                        "embedded component {} in {:?} has no shared artifact reader",
+                        component.logical_name(),
+                        artifact_path
+                    ))
+                })?;
                 open_bounded_native_component(source, offset, length).await
             }
         }
@@ -966,10 +1001,10 @@ async fn validate_consolidated_native_artifact(
         .map_err(VortexRdfError::from)?;
     outer.scan().map_err(VortexRdfError::from)?;
 
-    let resolver = NativeComponentResolver {
-        artifact_path: artifact_path.to_path_buf(),
-        artifact_kind: NativeArtifactKind::ManifestExternal(actual_manifest.clone()),
-    };
+    let resolver = NativeComponentResolver::from_kind(
+        artifact_path,
+        NativeArtifactKind::ManifestExternal(actual_manifest.clone()),
+    )?;
     for component in NativeComponent::ALL {
         match resolver.location(component)? {
             ComponentLocation::Embedded { .. } => {}
@@ -2463,7 +2498,7 @@ pub struct NativePredicateAccess {
 }
 pub type NativeObjectAccess = NativePredicateAccess;
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct NativeRdfProviders {
     data_path: PathBuf,
     resolver: NativeComponentResolver,
