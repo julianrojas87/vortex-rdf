@@ -179,6 +179,29 @@ where
     Ok(chunk)
 }
 
+/// Build the whole dataset as one contiguous Dictionary-layout chunk from its
+/// codes — the in-memory builders' construction path, fed by the interning
+/// ingest ([`InterningQuadBuilder`]) so no owned quad strings are involved.
+///
+/// `s_sorted` follows the builder: the sorted builder passes codes in global
+/// (s, p, o, g) order, the unsorted builder in arrival order. Index columns
+/// are globally sorted either way (`GlobalIndexes::from_codes` sorts pairs).
+///
+/// [`InterningQuadBuilder`]: super::term_dictionary::InterningQuadBuilder
+pub(crate) fn build_array(
+    codes: &QuadCodes,
+    dict: &TermDictionary,
+    indexes: &[IndexType],
+    s_sorted: bool,
+) -> Result<ArrayRef> {
+    if codes.s.is_empty() {
+        return empty_struct(indexes);
+    }
+    let n = codes.s.len();
+    let global_idx = GlobalIndexes::from_codes(indexes, codes);
+    build_chunk_global(codes, 0..n, dict, &global_idx, s_sorted, true)
+}
+
 /// Build a Dictionary-layout chunk for rows `range` of a fully encoded
 /// dataset, with index columns sliced from the precomputed global order —
 /// the sorted in-memory builders' chunked emission path.

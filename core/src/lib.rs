@@ -57,8 +57,9 @@ pub use io::{
 };
 
 pub use store::{
-    BuilderStrategy, DictSnapshot, IndexType, Indexes, LayoutStrategy, SortedInMemoryBuilder,
-    SortedStreamBuilder, UnsortedStreamBuilder, VortexArrayBuilder, VortexRdfStore,
+    BuilderStrategy, DictSnapshot, DictionaryQuadSink, IndexType, Indexes, LayoutStrategy,
+    SortedInMemoryBuilder, SortedStreamBuilder, UnsortedStreamBuilder, VortexArrayBuilder,
+    VortexRdfStore,
 };
 
 #[cfg(all(feature = "mimalloc", not(target_arch = "wasm32")))]

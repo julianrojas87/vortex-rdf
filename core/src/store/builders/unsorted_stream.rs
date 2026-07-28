@@ -1,13 +1,13 @@
 use super::spill::{RunReader, RunWriter, TempRunsGuard, make_temp_dir};
 use super::{
     ChunkStream, DEFAULT_CHUNK_SIZE, VortexArrayBuilder, assemble_chunks, build_struct_array,
-    into_vortex_error, make_empty_struct,
+    ingest_interning, into_vortex_error, make_empty_struct,
 };
 use crate::error::{Result, VortexRdfError};
 use crate::store::RawQuad;
 use crate::store::indexes::Indexes;
 use crate::store::layouts::default::DirectChunkBuilder;
-use crate::store::layouts::term_dictionary::{TermDictionary, TermDictionaryBuilder};
+use crate::store::layouts::term_dictionary::TermDictionaryBuilder;
 use crate::store::layouts::{LayoutStrategy, dictionary};
 
 use futures::{Stream, StreamExt, TryStreamExt, stream};
@@ -37,19 +37,14 @@ impl VortexArrayBuilder for UnsortedStreamBuilder {
     ) -> Result<ArrayRef> {
         let start = Instant::now();
 
-        // Dictionary layout: the result is materialized anyway, so buffer the
-        // quads in memory (no disk spill) and build one contiguous chunk.
+        // Dictionary layout: the result is materialized anyway, so intern
+        // terms as the stream drains (each unique term held once, 16 bytes
+        // per quad — no `Vec<RawQuad>` accumulates) and build one contiguous
+        // chunk. Index columns are globally sorted and stamped for
+        // binary-search routing; the quads keep arrival order.
         if layout == LayoutStrategy::Dictionary {
-            let mut quads = quad_stream;
-            let mut buf: Vec<RawQuad> = Vec::new();
-            while let Some(res) = quads.next().await {
-                buf.push(res?);
-            }
-            let (dict, id_map) = TermDictionary::from_quads_with_map(&buf)?;
-            // Single contiguous chunk == whole dataset: index columns are
-            // globally sorted and stamped for binary-search routing.
-            let result =
-                dictionary::build_chunk(&buf, &dict, &id_map, &indexes, 0, false, true, true)?;
+            let (dict, codes) = ingest_interning(quad_stream).await?.finish(false)?;
+            let result = dictionary::build_array(&codes, &dict, &indexes, false)?;
             log::debug!(
                 "[UnsortedStreamBuilder] Materialized {} dictionary-encoded quads in {:?}",
                 result.len(),

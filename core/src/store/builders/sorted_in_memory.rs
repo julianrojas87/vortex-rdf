@@ -1,12 +1,12 @@
 use super::{
     ChunkStream, DEFAULT_CHUNK_SIZE, VortexArrayBuilder, build_struct_array,
-    build_struct_array_global, into_vortex_error, make_empty_struct,
+    build_struct_array_global, ingest_interning, into_vortex_error, make_empty_struct,
 };
 use crate::error::Result;
-use crate::store::RawQuad;
 use crate::store::indexes::{GlobalIndexes, Indexes};
 use crate::store::layouts::term_dictionary::TermDictionary;
 use crate::store::layouts::{LayoutStrategy, dictionary};
+use crate::store::{QuadCodes, RawQuad};
 
 use futures::{Stream, StreamExt, stream};
 use std::sync::Arc;
@@ -31,17 +31,23 @@ impl VortexArrayBuilder for SortedInMemoryBuilder {
     ) -> Result<ArrayRef> {
         let start = Instant::now();
 
-        let quads = ingest_and_sort(quad_stream).await?;
-
         // Build a single contiguous StructArray: for in-memory stores this
         // keeps index columns global and the s column monotonically sorted.
-        let n = quads.len();
-        let build_start = Instant::now();
-        let struct_array = if layout == LayoutStrategy::Dictionary {
-            let (dict, id_map) = TermDictionary::from_quads_with_map(&quads)?;
-            dictionary::build_chunk(&quads, &dict, &id_map, &indexes, 0, true, true, true)?
+        //
+        // Dictionary layout interns terms as the stream drains, so the sort
+        // runs over 16-byte coded rows and no `Vec<RawQuad>` (four owned
+        // Strings per quad) ever accumulates.
+        let (n, build_start, struct_array);
+        if layout == LayoutStrategy::Dictionary {
+            let (dict, codes) = ingest_interning(quad_stream).await?.finish(true)?;
+            n = codes.s.len();
+            build_start = Instant::now();
+            struct_array = dictionary::build_array(&codes, &dict, &indexes, true)?;
         } else {
-            build_struct_array(&quads, layout, &indexes, n, 0, true, true)?
+            let quads = ingest_and_sort(quad_stream).await?;
+            n = quads.len();
+            build_start = Instant::now();
+            struct_array = build_struct_array(&quads, layout, &indexes, n, 0, true, true)?;
         };
         log::debug!(
             "[SortedInMemoryBuilder] Constructed StructArray in {:?}",
@@ -102,13 +108,12 @@ pub(crate) async fn build_sorted_chunk_stream(
     indexes: Indexes,
     chunk_size: usize,
 ) -> Result<(DType, ChunkStream)> {
-    let quads = ingest_and_sort(quad_stream).await?;
-
     if layout == LayoutStrategy::Dictionary {
-        let dict = Arc::new(TermDictionary::from_quads(&quads)?);
-        let id_map = Arc::new(dict.build_id_map());
-        return emit_dict_chunks(quads, dict, id_map, indexes, chunk_size);
+        let (dict, codes) = ingest_interning(quad_stream).await?.finish(true)?;
+        return emit_dict_chunks(codes, Arc::new(dict), indexes, chunk_size);
     }
+
+    let quads = ingest_and_sort(quad_stream).await?;
 
     let global_idx = Arc::new(GlobalIndexes::from_quads(&indexes, &quads));
 
@@ -143,19 +148,15 @@ pub(crate) async fn build_sorted_chunk_stream(
     Ok((dtype, chunks))
 }
 
-/// Dictionary-layout emission over the sorted vec: the dataset is encoded to
-/// u32 codes once, the index order is precomputed globally over those codes,
-/// and chunks are cut as ranges of both — with the dictionary payload carried
-/// only by the first chunk.
+/// Dictionary-layout emission over the interned codes: the index order is
+/// precomputed globally over the codes, and chunks are cut as ranges of both
+/// — with the dictionary payload carried only by the first chunk.
 fn emit_dict_chunks(
-    quads: Vec<RawQuad>,
+    codes: QuadCodes,
     dict: Arc<TermDictionary>,
-    id_map: Arc<crate::store::layouts::term_dictionary::TermIdMap>,
     indexes: Indexes,
     chunk_size: usize,
 ) -> Result<(DType, ChunkStream)> {
-    let codes = dictionary::encode_quads(&quads, &dict, &id_map)?;
-    drop(quads); // chunks are built from the codes alone
     let global_idx = GlobalIndexes::from_codes(&indexes, &codes);
     let n = codes.s.len();
 

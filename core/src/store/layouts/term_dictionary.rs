@@ -31,7 +31,7 @@ use vortex_fsst::{FSST, FSSTArray, FSSTArraySlotsExt as _, fsst_compress, fsst_t
 use crate::common::utils::{StrColReader, buf_as_str};
 use crate::error::{Result, VortexRdfError};
 use crate::io::VORTEX_LIGHT_SESSION;
-use crate::store::RawQuad;
+use crate::store::{QuadCodes, RawQuad};
 
 /// Name of the dictionary column: a `list<utf8>` root column where row 0 holds
 /// the entire sorted dictionary as one list and every other row is an empty list.
@@ -94,6 +94,130 @@ impl TermDictionaryBuilder {
             total_start.elapsed()
         );
         Ok(dict)
+    }
+}
+
+/// Ingest-time interner producing the dictionary and the coded quads in one
+/// pass: quads are consumed as they arrive, each unique term is held once, and
+/// each quad is kept as four u32 ids.
+///
+/// This replaces buffering the whole stream as a `Vec<RawQuad>` — four owned
+/// `String`s per quad, held live until the dictionary and codes were derived
+/// from them — which was the measured wasm ingest high-water mark (~377 B/row).
+/// The per-quad Strings still exist transiently (the stream hands them over),
+/// but they die inside [`push`](Self::push); what accumulates is one copy of
+/// each distinct term plus 16 bytes per quad.
+///
+/// Ids handed out during ingest are provisional (insertion order).
+/// [`finish`](Self::finish) sorts the unique terms, freezes them into the
+/// [`TermDictionary`], and remaps every quad id to its term's sorted rank —
+/// which *is* the dictionary code, since codes are lexicographic ranks. For
+/// sorted builders it then sorts the coded quads directly: `[u32; 4]`
+/// lexicographic order equals (s, p, o, g) term order (order-isomorphism
+/// again), and sorting 16-byte rows is far cheaper than sorting four-String
+/// structs.
+pub(crate) struct InterningQuadBuilder {
+    /// term → provisional id, owning each distinct term exactly once.
+    ids: HashMap<Box<str>, u32>,
+    /// One `[s, p, o, g]` of provisional ids per quad, in arrival order.
+    quads: Vec<[u32; 4]>,
+}
+
+impl InterningQuadBuilder {
+    pub(crate) fn new() -> Self {
+        Self {
+            ids: HashMap::new(),
+            quads: Vec::new(),
+        }
+    }
+
+    fn intern(&mut self, term: String) -> u32 {
+        let next = self.ids.len() as u32;
+        // `into_boxed_str` is free for exact-capacity Strings (the common
+        // case from `RawQuad::from_quad`) and shrinks the rest.
+        *self.ids.entry(term.into_boxed_str()).or_insert(next)
+    }
+
+    /// Consume one quad: intern its four terms, keep only their ids.
+    pub(crate) fn push(&mut self, q: RawQuad) {
+        let quad = [
+            self.intern(q.s),
+            self.intern(q.p),
+            self.intern(q.o),
+            self.intern(q.g),
+        ];
+        self.quads.push(quad);
+    }
+
+    /// Freeze the dictionary and produce the dataset's codes, sorted by
+    /// (s, p, o, g) when `sort` is set.
+    pub(crate) fn finish(mut self, sort: bool) -> Result<(TermDictionary, QuadCodes)> {
+        let total_start = Instant::now();
+        let n = self.quads.len();
+
+        let sort_start = Instant::now();
+        // Unique terms, so the tuple Ord never reaches the id.
+        let mut entries: Vec<(Box<str>, u32)> = self.ids.into_iter().collect();
+        entries.sort_unstable();
+        let sort_terms_elapsed = sort_start.elapsed();
+
+        // provisional id → sorted rank == dictionary code.
+        let mut rank_of = vec![0u32; entries.len()];
+        for (rank, (_, pid)) in entries.iter().enumerate() {
+            rank_of[*pid as usize] = rank as u32;
+        }
+
+        // Freeze by *consuming* the boxes: each term is freed as it is copied
+        // into the plain column, so the boxes and the column never coexist in
+        // full — that stacking was the finish-phase memory peak.
+        let freeze_start = Instant::now();
+        // List offsets are i32, so the term count must fit in one (the same
+        // guard as `from_sorted`).
+        if entries.len() > i32::MAX as usize {
+            return Err(VortexRdfError::Serialization(format!(
+                "Dictionary of {} unique terms exceeds the supported maximum ({})",
+                entries.len(),
+                i32::MAX
+            )));
+        }
+        let plain = VarBinViewArray::from_iter_str(entries.into_iter().map(|(t, _)| t));
+        let dict = TermDictionary::compress(plain)?;
+        let freeze_elapsed = freeze_start.elapsed();
+
+        let remap_start = Instant::now();
+        for quad in &mut self.quads {
+            for id in quad.iter_mut() {
+                *id = rank_of[*id as usize];
+            }
+        }
+        if sort {
+            self.quads.sort_unstable();
+        }
+        let remap_elapsed = remap_start.elapsed();
+
+        let mut codes = QuadCodes {
+            s: Vec::with_capacity(n),
+            p: Vec::with_capacity(n),
+            o: Vec::with_capacity(n),
+            g: Vec::with_capacity(n),
+        };
+        for [s, p, o, g] in self.quads {
+            codes.s.push(s);
+            codes.p.push(p);
+            codes.o.push(o);
+            codes.g.push(g);
+        }
+
+        log::debug!(
+            "[Dictionary] Interned {} quads ({} unique terms): sort terms {:?}, freeze {:?}, remap+sort quads {:?}, total {:?}",
+            n,
+            dict.len(),
+            sort_terms_elapsed,
+            freeze_elapsed,
+            remap_elapsed,
+            total_start.elapsed()
+        );
+        Ok((dict, codes))
     }
 }
 
@@ -218,8 +342,7 @@ impl TermDictionary {
         Ok(Self::new(TermStore::Fsst(terms)))
     }
 
-    /// The dataset's unique terms, sorted — the raw material of both
-    /// [`from_quads`](Self::from_quads) and
+    /// The dataset's unique terms, sorted — the raw material of
     /// [`from_quads_with_map`](Self::from_quads_with_map). Terms borrow from
     /// `quads`, so nothing is copied.
     fn sorted_unique_terms(quads: &[RawQuad]) -> (Vec<&str>, Duration, Duration) {
@@ -236,29 +359,6 @@ impl TermDictionary {
         let mut terms: Vec<&str> = set.into_iter().collect();
         terms.sort_unstable();
         (terms, collect_elapsed, sort_start.elapsed())
-    }
-
-    /// Build from a complete in-memory quad slice (single-pass builders).
-    ///
-    /// Callers that also need a term→ID map should use
-    /// [`from_quads_with_map`](Self::from_quads_with_map) instead — it hands
-    /// back the sorted term list this would otherwise discard, avoiding a
-    /// second owned copy of every term.
-    pub(crate) fn from_quads(quads: &[RawQuad]) -> Result<Self> {
-        let total_start = Instant::now();
-        let (terms, collect_elapsed, sort_elapsed) = Self::sorted_unique_terms(quads);
-        let freeze_start = Instant::now();
-        let dict = Self::from_sorted(terms.into_iter())?;
-        log::debug!(
-            "[Dictionary] Built dictionary from {} quads ({} unique terms): collect {:?}, sort {:?}, freeze {:?}, total {:?}",
-            quads.len(),
-            dict.len(),
-            collect_elapsed,
-            sort_elapsed,
-            freeze_start.elapsed(),
-            total_start.elapsed()
-        );
-        Ok(dict)
     }
 
     /// Build the dictionary *and* its term→ID map in one pass, with the map

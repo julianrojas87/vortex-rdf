@@ -80,12 +80,17 @@ const SLUGS = (process.env.DICT_MEM_SLUGS ?? 'vortex_sorted_dict').split(',');
  *  original fit used. */
 const RATIOS = (process.env.DICT_MEM_RATIOS ?? '1.0').split(',').map(Number);
 
-/** Figures from the run that landed FSST — commit `perf!: hold and serialize
- *  the term dictionary FSST-compressed`, at the default config above.
+/** Figures from the run that landed the interning ingest — commit
+ *  `perf: intern terms at ingest ...`, at the default config above. (The FSST
+ *  run this replaced measured retained 12.0 / first 93 / last 129.)
  *
  *  Memory is reproducible for a given wasm build and dataset, so drift here is
- *  a real regression. Timings are not compared: they track the host. */
-const REFERENCE = { retainedPerStoreMb: 12.0, firstStoreMb: 93, lastStoreMb: 129, stores: 4 };
+ *  a real regression. Timings are not compared: they track the host.
+ *
+ *  retainedPerStoreMb is a 4-point slope fit and carries ±2-3 MB of
+ *  fragmentation noise between runs with identical store content; the
+ *  high-water figures are the stable ones. */
+const REFERENCE = { retainedPerStoreMb: 15.0, firstStoreMb: 51, lastStoreMb: 97, stores: 4 };
 
 interface Point {
     slug: string; n: number; terms: number; stores: number;

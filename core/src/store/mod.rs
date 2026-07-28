@@ -5,8 +5,8 @@ pub mod selection;
 pub mod vortex_rdf_store;
 
 pub use builders::{
-    BuilderStrategy, SortedInMemoryBuilder, SortedStreamBuilder, UnsortedStreamBuilder,
-    VortexArrayBuilder,
+    BuilderStrategy, DictionaryQuadSink, SortedInMemoryBuilder, SortedStreamBuilder,
+    UnsortedStreamBuilder, VortexArrayBuilder,
 };
 pub use indexes::{IndexType, Indexes};
 pub use layouts::LayoutStrategy;

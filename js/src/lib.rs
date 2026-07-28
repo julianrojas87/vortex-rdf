@@ -15,8 +15,8 @@ use vortex_rdf_core::io::{
 };
 use vortex_rdf_core::store::RawQuad;
 use vortex_rdf_core::{
-    BuilderStrategy, DictSnapshot, IndexType, Indexes, LayoutStrategy, SortedInMemoryBuilder,
-    UnsortedStreamBuilder, VortexRdfStore as CoreStore,
+    BuilderStrategy, DictSnapshot, DictionaryQuadSink, IndexType, Indexes, LayoutStrategy,
+    SortedInMemoryBuilder, UnsortedStreamBuilder, VortexRdfStore as CoreStore,
 };
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::future_to_promise;
@@ -293,6 +293,21 @@ impl VortexRdfStore {
     #[wasm_bindgen(js_name = fromQuads, skip_typescript)]
     pub async fn from_quads(quads: JsValue, options: JsValue) -> Result<VortexRdfStore, JsValue> {
         let config = parse_build_options(options)?;
+
+        // Array + Dictionary layout: push each quad straight into the
+        // interning sink as its packed chunk is decoded. The stream path
+        // below would first collect the whole array into a `Vec<RawQuad>`
+        // (a `'static` stream cannot borrow from the decode loop), putting
+        // four owned Strings per quad on the ingest high-water mark.
+        if config.layout == LayoutStrategy::Dictionary && js_sys::Array::is_array(&quads) {
+            let sorted = config.builder == BuilderStrategy::SortedInMemory;
+            let vortex_array =
+                js_array_to_dictionary_array(js_sys::Array::from(&quads), sorted, config.indexes)?;
+            let inner =
+                CoreStore::new(vortex_array).map_err(|e| JsValue::from_str(&e.to_string()))?;
+            return Ok(VortexRdfStore::wrap(inner));
+        }
+
         let quad_stream = js_to_quad_stream(quads)?;
         let vortex_array = build_array(quad_stream, config).await?;
 
@@ -910,6 +925,37 @@ fn js_array_decode<T>(
 /// Ingest form: quads as [`RawQuad`], which is what every builder consumes.
 fn js_array_to_raw_quads(quads: js_sys::Array) -> Result<Vec<RawQuad>, JsValue> {
     js_array_decode(&quads, |q| RawQuad::from_quad(&q))
+}
+
+/// Dictionary-layout ingest: decode each packed chunk straight into the
+/// interning [`DictionaryQuadSink`] and build the array from it.
+///
+/// Unlike [`js_array_to_raw_quads`], nothing accumulates per quad but four
+/// u32 ids — each `RawQuad`'s Strings die inside `push` — so the ingest
+/// high-water holds one packed chunk plus one copy of every distinct term
+/// instead of four owned Strings per quad.
+fn js_array_to_dictionary_array(
+    quads: js_sys::Array,
+    sorted: bool,
+    indexes: Indexes,
+) -> Result<ArrayRef, JsValue> {
+    let mut sink = DictionaryQuadSink::new(sorted, indexes);
+    let total = quads.length();
+    let mut start = 0u32;
+    // `packed_to_quads_into` emits per quad; collect only unit results.
+    let mut sunk: Vec<()> = Vec::new();
+    while start < total {
+        let end = (start + PACK_CHUNK).min(total);
+        let packed = pack_quads(&quads, start, end)?;
+        packed_to_quads_into(
+            &packed.to_vec(),
+            &mut |q| sink.push(RawQuad::from_quad(&q)),
+            &mut sunk,
+        )?;
+        sunk.clear();
+        start = end;
+    }
+    sink.finish().map_err(|e| JsValue::from_str(&e.to_string()))
 }
 
 /// Mutation form: quads as `oxrdf::Quad`, which `add_quads` needs because its
