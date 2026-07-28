@@ -402,10 +402,32 @@ impl ResolvedLayout {
         match self {
             ResolvedLayout::Default => default::decode_chunk(chunk),
             ResolvedLayout::TypedObject => typed_object::decode_chunk(chunk),
-            ResolvedLayout::Dictionary(access) => {
-                dictionary::decode_chunk(chunk, access.resident())
-            }
+            ResolvedLayout::Dictionary(access) => match access.resident() {
+                Some(dict) => dictionary::decode_chunk(chunk, dict),
+                // Defensive: the read paths route file-backed stores through
+                // `decode_chunk_async`, which resolves each chunk's codes with
+                // a scan; reaching here means one of them didn't.
+                None => vec![Err(VortexRdfError::Deserialization(
+                    "a file-backed dictionary decodes chunks through the async read path"
+                        .to_string(),
+                ))],
+            },
         }
+    }
+
+    /// [`decode_chunk`](Self::decode_chunk) with the file-backed Dictionary
+    /// case handled: the chunk's distinct codes are resolved to terms with one
+    /// dictionary scan, and the chunk decodes against that map. Every other
+    /// layout (and a resident dictionary) takes the sync path unchanged.
+    #[cfg(feature = "file-io")]
+    pub(crate) async fn decode_chunk_async(&self, chunk: &ArrayRef) -> Vec<Result<Quad>> {
+        if let ResolvedLayout::Dictionary(DictAccess::FileBacked(fb)) = self {
+            return match fb.chunk_term_map(chunk).await {
+                Ok(terms) => dictionary::decode_chunk_mapped(chunk, &terms),
+                Err(e) => vec![Err(e)],
+            };
+        }
+        self.decode_chunk(chunk)
     }
 
     /// Write whatever state this layout holds intrinsically back into `array`,
@@ -418,11 +440,14 @@ impl ResolvedLayout {
     /// trailing dictionary rows — the padded form (see
     /// [`dictionary::pad_with_dictionary`]); the other layouts encode
     /// everything in the columns themselves and pass `array` straight through.
-    pub(crate) fn attach_intrinsic_state(&self, array: ArrayRef) -> Result<ArrayRef> {
+    pub(crate) async fn attach_intrinsic_state(&self, array: ArrayRef) -> Result<ArrayRef> {
         match self {
             ResolvedLayout::Default | ResolvedLayout::TypedObject => Ok(array),
             ResolvedLayout::Dictionary(access) => {
-                dictionary::pad_with_dictionary(&array, access.resident())
+                // A file-backed dictionary is lifted resident transiently for
+                // the write — the serialized form must carry the whole column.
+                let dict = access.ensure_resident().await?;
+                dictionary::pad_with_dictionary(&array, &dict)
             }
         }
     }
@@ -460,7 +485,11 @@ impl ResolvedLayout {
     ) -> Option<Scalar> {
         match self {
             ResolvedLayout::Dictionary(dict) => {
-                cache.resolve(term, |s| dict.get_id(s)).map(Scalar::from)
+                // Post-prelude, every bound role is already cached; the
+                // closure only ever runs for a resident dictionary.
+                cache
+                    .resolve(term, |s| dict.get_id_resolved(s))
+                    .map(Scalar::from)
             }
             _ => Some(Scalar::from(cache.render(term))),
         }
@@ -495,7 +524,12 @@ impl ResolvedLayout {
                 read_string_column(&struct_arr, COL_G)?,
             ),
             ResolvedLayout::Dictionary(access) => {
-                let dict = access.resident();
+                let dict = access.resident().ok_or_else(|| {
+                    VortexRdfError::Deserialization(
+                        "a file-backed dictionary reconstructs rows through raw_quads_async"
+                            .to_string(),
+                    )
+                })?;
                 let term = |codes: Vec<u32>| -> Result<Vec<String>> {
                     let mut reader = dict.reader();
                     codes
@@ -526,6 +560,22 @@ impl ResolvedLayout {
             .zip(g)
             .map(|(((s, p), o), g)| RawQuad { s, p, o, g })
             .collect())
+    }
+
+    /// [`raw_quads`](Self::raw_quads) with the file-backed Dictionary case
+    /// handled: the whole dictionary is lifted resident transiently (the
+    /// callers — compaction and tail-merge re-encoding — touch most of it
+    /// anyway), then the sync decode runs unchanged.
+    #[cfg(feature = "file-io")]
+    pub(crate) async fn raw_quads_async(&self, rows: &ArrayRef) -> Result<Vec<RawQuad>> {
+        if let ResolvedLayout::Dictionary(access) = self
+            && access.is_file_backed()
+        {
+            let dict = access.ensure_resident().await?;
+            let resident = ResolvedLayout::Dictionary(DictAccess::Resident(dict));
+            return resident.raw_quads(rows);
+        }
+        self.raw_quads(rows)
     }
 
     /// Compile a quad pattern into per-column equality constraints: the
@@ -608,7 +658,7 @@ impl ResolvedLayout {
                 macro_rules! bind {
                     ($opt:expr, $ctor:expr, $field:expr) => {
                         if let Some(term) = $opt {
-                            match cache.resolve($ctor(term), |s| dict.get_id(s)) {
+                            match cache.resolve($ctor(term), |s| dict.get_id_resolved(s)) {
                                 Some(id) => eqs.push(($field, Scalar::from(id))),
                                 None => return Constraints::AlwaysFalse,
                             }

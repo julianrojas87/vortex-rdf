@@ -18,7 +18,7 @@ use web_time::Instant;
 use vortex_array::arrays::struct_::{StructArray, StructArrayExt};
 use vortex_array::arrays::{PrimitiveArray, VarBinViewArray};
 #[cfg(feature = "file-io")]
-use vortex_array::expr::{root, select};
+use vortex_array::expr::{eq, get_item, gt_eq, lit, root, select};
 use vortex_array::match_each_integer_ptype;
 #[cfg(feature = "file-io")]
 use vortex_array::stream::ArrayStreamExt as _;
@@ -28,6 +28,8 @@ use vortex_array::{ArrayRef, IntoArray, VortexSessionExecute};
 #[cfg(feature = "file-io")]
 use vortex_file::VortexFile;
 use vortex_fsst::{FSST, FSSTArray, FSSTArraySlotsExt as _, fsst_compress, fsst_train_compressor};
+#[cfg(feature = "file-io")]
+use vortex_mask::{AllOr, Mask};
 
 use crate::common::array::{StrColReader, buf_as_str};
 use crate::error::{Result, VortexRdfError};
@@ -798,6 +800,11 @@ impl DictSnapshot {
 pub(crate) enum DictAccess {
     /// The whole dictionary in memory (FSST-compressed or canonical).
     Resident(Arc<TermDictionary>),
+    /// The dictionary left in its file, probed and decoded by scans on
+    /// demand — chosen at open when the term count exceeds the residency
+    /// threshold (see `VortexRdfStore::from_file`).
+    #[cfg(feature = "file-io")]
+    FileBacked(FileBackedDict),
 }
 
 impl DictAccess {
@@ -831,29 +838,249 @@ impl DictAccess {
                 }
                 Ok(())
             }
+            // Each bound role costs one filtered probe of the term column
+            // (memoized in the probe cache); the resolved code is then seeded
+            // into `codes` so the sync match core never reaches back here.
+            #[cfg(feature = "file-io")]
+            DictAccess::FileBacked(fb) => {
+                if let Some(s) = pattern.subject {
+                    let id = fb.get_id(codes.render(TermRef::Subject(s))).await?;
+                    codes.resolve(TermRef::Subject(s), |_| id);
+                }
+                if let Some(p) = pattern.predicate {
+                    let id = fb.get_id(codes.render(TermRef::Predicate(p))).await?;
+                    codes.resolve(TermRef::Predicate(p), |_| id);
+                }
+                if let Some(o) = pattern.object {
+                    let id = fb.get_id(codes.render(TermRef::Object(o))).await?;
+                    codes.resolve(TermRef::Object(o), |_| id);
+                }
+                if let Some(g) = pattern.graph {
+                    let id = fb.get_id(codes.render(TermRef::Graph(g))).await?;
+                    codes.resolve(TermRef::Graph(g), |_| id);
+                }
+                Ok(())
+            }
         }
     }
 
-    /// Look up a term's code. Total for `Resident`; see the type docs for the
-    /// file-backed contract.
+    /// Look up a term's code through the *synchronous* surface
+    /// (`VortexRdfStore::encode_code`). A file-backed dictionary cannot probe
+    /// its file without I/O, so it answers `None` — callers needing
+    /// file-backed lookups go through the async prelude instead.
     pub(crate) fn get_id(&self, term: &str) -> Option<u32> {
         match self {
             DictAccess::Resident(dict) => dict.get_id(term),
+            #[cfg(feature = "file-io")]
+            DictAccess::FileBacked(_) => None,
         }
     }
 
-    /// Decode a code back to its term string, or `None` when out of range.
+    /// [`get_id`](Self::get_id) for the match core's probe closures, which run
+    /// strictly after [`resolve_pattern`](Self::resolve_pattern) has seeded
+    /// every bound role into the pattern's code cache — so a call ever
+    /// reaching a file-backed dictionary is a broken prelude, not a miss.
+    pub(crate) fn get_id_resolved(&self, term: &str) -> Option<u32> {
+        match self {
+            DictAccess::Resident(dict) => dict.get_id(term),
+            #[cfg(feature = "file-io")]
+            DictAccess::FileBacked(_) => unreachable!(
+                "the async prelude resolves every bound role before the sync match core runs"
+            ),
+        }
+    }
+
+    /// Decode a code back to its term string through the *synchronous*
+    /// surface (`VortexRdfStore::decode_code`), or `None` when out of range —
+    /// or when the dictionary is file-backed (same contract as
+    /// [`get_id`](Self::get_id)).
     pub(crate) fn term_at(&self, code: u32) -> Option<String> {
         match self {
             DictAccess::Resident(dict) => dict.term_at(code),
+            #[cfg(feature = "file-io")]
+            DictAccess::FileBacked(_) => None,
         }
     }
 
-    /// The in-memory dictionary, for paths that need the whole column —
-    /// reconstruction, serialization, snapshots.
-    pub(crate) fn resident(&self) -> &Arc<TermDictionary> {
+    /// The in-memory dictionary, or `None` when it is file-backed — sync
+    /// callers (snapshots, in-memory chunk decode) treat `None` as "not
+    /// available here"; paths that genuinely need the whole column go through
+    /// [`ensure_resident`](Self::ensure_resident).
+    pub(crate) fn resident(&self) -> Option<&Arc<TermDictionary>> {
         match self {
-            DictAccess::Resident(dict) => dict,
+            DictAccess::Resident(dict) => Some(dict),
+            #[cfg(feature = "file-io")]
+            DictAccess::FileBacked(_) => None,
+        }
+    }
+
+    /// The whole dictionary in memory, lifting a file-backed one with a single
+    /// term-column scan — for the operations that need the full column
+    /// (serialization, compaction, tail-merge re-encoding). The lift is
+    /// transient: it is not cached back into the access, so a store's steady
+    /// state keeps the file-backed footprint.
+    pub(crate) async fn ensure_resident(&self) -> Result<Arc<TermDictionary>> {
+        match self {
+            DictAccess::Resident(dict) => Ok(Arc::clone(dict)),
+            #[cfg(feature = "file-io")]
+            DictAccess::FileBacked(fb) => Ok(Arc::new(fb.load_resident().await?)),
+        }
+    }
+
+    /// Whether reconstruction must decode through the file (async) rather
+    /// than the resident dictionary.
+    #[cfg(feature = "file-io")]
+    pub(crate) fn is_file_backed(&self) -> bool {
+        matches!(self, DictAccess::FileBacked(_))
+    }
+}
+
+/// A term dictionary left in its file: term→ID probes and ID→term decodes
+/// scan the sorted `_dict_term` column on demand instead of holding all terms
+/// resident.
+///
+/// Both serialized placements collapse to `(file, base_row)`: the padded form
+/// probes the quads file's own trailing dictionary rows, the sidecar form its
+/// companion file from row 0. A term probe evaluates an equality filter over
+/// the dictionary rows split by split — the column is sorted, so zone
+/// pruning discards every split whose min/max range excludes the term without
+/// reading it — and memoizes the answer in a [`ProbeCache`]. ID→term reads
+/// are row-index scans (`base_row + code`).
+#[cfg(feature = "file-io")]
+#[derive(Clone)]
+pub(crate) struct FileBackedDict {
+    /// The file holding the term column: the quads file itself (padded) or
+    /// the sidecar companion.
+    file: Arc<VortexFile>,
+    /// Absolute file row of term ID 0: the quad-row count (padded) or 0
+    /// (sidecar).
+    base_row: u64,
+    /// Number of terms.
+    len: u64,
+    /// term → code memo, shared across clones (every derived view of a store
+    /// probes the same immutable dictionary).
+    probes: Arc<ProbeCache>,
+}
+
+#[cfg(feature = "file-io")]
+impl FileBackedDict {
+    pub(crate) fn new(file: Arc<VortexFile>, base_row: u64, len: u64) -> Self {
+        Self {
+            file,
+            base_row,
+            len,
+            probes: Arc::new(ProbeCache::new()),
+        }
+    }
+
+    /// Term→ID: one equality-filtered pass over the dictionary rows, zone
+    /// pruning first (the sorted column's min/max ranges rule out every split
+    /// but the term's), memoized across calls.
+    pub(crate) async fn get_id(&self, term: &str) -> Result<Option<u32>> {
+        if let Some(memo) = self.probes.get(term) {
+            return Ok(memo);
+        }
+        let filter = [eq(get_item(TERM_FIELD, root()), lit(term))];
+        let reader = self.file.layout_reader().map_err(VortexRdfError::Vortex)?;
+        let mut code = None;
+        for split in self.file.splits().map_err(VortexRdfError::Vortex)? {
+            let start = split.start.max(self.base_row);
+            let end = split.end.min(self.base_row + self.len);
+            if start >= end {
+                continue;
+            }
+            let range = start..end;
+            let mask = crate::store::vortex_rdf_store::evaluate_filter_split(
+                Arc::clone(&reader),
+                &filter,
+                &range,
+                Mask::new_true((end - start) as usize),
+            )
+            .await?;
+            let row = match mask.indices() {
+                AllOr::All => Some(range.start),
+                AllOr::None => None,
+                AllOr::Some(indices) => indices.first().map(|&i| range.start + i as u64),
+            };
+            if let Some(row) = row {
+                code = Some((row - self.base_row) as u32);
+                break;
+            }
+        }
+        self.probes.put(term, code);
+        Ok(code)
+    }
+
+    /// ID→terms for reconstruction: resolve `codes` (ascending, unique) to
+    /// their term strings with a single row-index scan.
+    pub(crate) async fn resolve_terms(&self, codes: &[u32]) -> Result<Vec<String>> {
+        if codes.is_empty() {
+            return Ok(Vec::new());
+        }
+        if let Some(&max) = codes.last()
+            && max as u64 >= self.len
+        {
+            return Err(VortexRdfError::Deserialization(format!(
+                "Term code {} out of dictionary bounds ({})",
+                max, self.len
+            )));
+        }
+        let rows: vortex_buffer::Buffer<u64> = codes
+            .iter()
+            .map(|&code| self.base_row + code as u64)
+            .collect();
+        let arr = self
+            .file
+            .scan()
+            .map_err(VortexRdfError::Vortex)?
+            .with_row_indices(rows)
+            .with_projection(select([TERM_FIELD], root()))
+            .into_array_stream()
+            .map_err(VortexRdfError::Vortex)?
+            .read_all()
+            .await
+            .map_err(VortexRdfError::Vortex)?;
+        let mut ctx = VORTEX_LIGHT_SESSION.create_execution_ctx();
+        let struct_arr = arr
+            .execute::<StructArray>(&mut ctx)
+            .map_err(VortexRdfError::Vortex)?;
+        let col = struct_arr
+            .unmasked_field_by_name(TERM_FIELD)
+            .map_err(VortexRdfError::Vortex)?
+            .clone()
+            .execute::<VarBinViewArray>(&mut ctx)
+            .map_err(VortexRdfError::Vortex)?;
+        if col.len() != codes.len() {
+            return Err(VortexRdfError::Deserialization(format!(
+                "Dictionary row-index scan returned {} rows for {} codes",
+                col.len(),
+                codes.len()
+            )));
+        }
+        let reader = StrColReader::new(&col);
+        (0..col.len())
+            .map(|i| reader.str_at(i).map(str::to_string))
+            .collect()
+    }
+
+    /// The terms a chunk of code columns needs, as a code→term map: gather the
+    /// chunk's distinct codes, resolve them in one scan.
+    pub(crate) async fn chunk_term_map(&self, chunk: &ArrayRef) -> Result<HashMap<u32, String>> {
+        let codes = super::dictionary::unique_codes(chunk)?;
+        let terms = self.resolve_terms(&codes).await?;
+        Ok(codes.into_iter().zip(terms).collect())
+    }
+
+    /// Lift the whole dictionary resident — the transient full-column read
+    /// behind [`DictAccess::ensure_resident`]. A padded file goes through the
+    /// aligned-tail extraction (which keeps the stored FSST encoding); a
+    /// sidecar file is one term-column range scan.
+    pub(crate) async fn load_resident(&self) -> Result<TermDictionary> {
+        if self.base_row > 0 {
+            let (_, dict) = dict_from_padded_file(&self.file).await?;
+            Ok(dict)
+        } else {
+            dict_from_term_rows(&self.file, self.base_row, self.len).await
         }
     }
 }
@@ -903,10 +1130,10 @@ pub(crate) fn sidecar_dict_path(quads_path: &std::path::Path) -> std::path::Path
     quads_path.with_file_name(format!("{stem}.dict.vortex"))
 }
 
-/// Read the term dictionary from the sidecar file beside `quads_path`: a
-/// one-column `{_dict_term: utf8}` file whose row `i` is the term with ID `i`.
+/// Open the sidecar dictionary file beside `quads_path`, erroring when the
+/// companion is missing (a bare-code quads file cannot decode without it).
 #[cfg(feature = "file-io")]
-pub(crate) async fn dict_from_sidecar_file(quads_path: &std::path::Path) -> Result<TermDictionary> {
+pub(crate) async fn open_sidecar_file(quads_path: &std::path::Path) -> Result<Arc<VortexFile>> {
     let path = sidecar_dict_path(quads_path);
     if !path.is_file() {
         return Err(VortexRdfError::Deserialization(format!(
@@ -915,13 +1142,25 @@ pub(crate) async fn dict_from_sidecar_file(quads_path: &std::path::Path) -> Resu
             quads_path, path
         )));
     }
-    let file = crate::io::de::open_vortex_file(&path).await?;
-    if file.row_count() == 0 {
+    Ok(Arc::new(crate::io::de::open_vortex_file(&path).await?))
+}
+
+/// Read `len` dictionary rows starting at `base_row` into a resident
+/// [`TermDictionary`] — the whole term column of a sidecar file
+/// (`base_row == 0`), or a lift of any file-backed range.
+#[cfg(feature = "file-io")]
+pub(crate) async fn dict_from_term_rows(
+    file: &VortexFile,
+    base_row: u64,
+    len: u64,
+) -> Result<TermDictionary> {
+    if len == 0 {
         return Ok(TermDictionary::empty());
     }
     let arr = file
         .scan()
         .map_err(VortexRdfError::Vortex)?
+        .with_row_range(base_row..base_row + len)
         .with_projection(select([TERM_FIELD], root()))
         .into_array_stream()
         .map_err(VortexRdfError::Vortex)?
@@ -937,6 +1176,68 @@ pub(crate) async fn dict_from_sidecar_file(quads_path: &std::path::Path) -> Resu
         .map_err(VortexRdfError::Vortex)?
         .clone();
     TermDictionary::from_terms_array(col, &mut ctx)
+}
+
+/// Locate a padded file's dictionary rows without reading their terms:
+/// `(quad_rows, term_count)`, discovered from the term column's validity (a
+/// valid term row is a dictionary row) and validated to be one contiguous
+/// tail run.
+///
+/// This is the open-time split that decides residency before anything is
+/// lifted: per split, only the term column's zone stats and its (mostly
+/// constant-null) validity are evaluated.
+#[cfg(feature = "file-io")]
+pub(crate) async fn padded_dict_extent(file: &VortexFile) -> Result<(u64, u64)> {
+    let total = file.row_count();
+    if total == 0 {
+        return Ok((0, 0));
+    }
+    // Any non-null utf8 value satisfies `>= ""`; null (quad) rows never do —
+    // so the mask is exactly the dictionary rows.
+    let filter = [gt_eq(get_item(TERM_FIELD, root()), lit(""))];
+    let reader = file.layout_reader().map_err(VortexRdfError::Vortex)?;
+    let mut count = 0u64;
+    let mut first: Option<u64> = None;
+    let mut last = 0u64;
+    for range in file.splits().map_err(VortexRdfError::Vortex)? {
+        let mask = crate::store::vortex_rdf_store::evaluate_filter_split(
+            Arc::clone(&reader),
+            &filter,
+            &range,
+            Mask::new_true((range.end - range.start) as usize),
+        )
+        .await?;
+        match mask.indices() {
+            AllOr::All => {
+                count += range.end - range.start;
+                first.get_or_insert(range.start);
+                last = range.end - 1;
+            }
+            AllOr::None => {}
+            AllOr::Some(indices) => {
+                count += indices.len() as u64;
+                if let Some(&i) = indices.first() {
+                    first.get_or_insert(range.start + i as u64);
+                }
+                if let Some(&i) = indices.last() {
+                    last = range.start + i as u64;
+                }
+            }
+        }
+    }
+    let Some(first) = first else {
+        // No dictionary rows: an empty dictionary (only reachable with an
+        // empty dataset, but well-defined regardless).
+        return Ok((total, 0));
+    };
+    if last != total - 1 || count != total - first {
+        return Err(VortexRdfError::Deserialization(
+            "padded Dictionary file is malformed: its dictionary rows do not \
+             form one contiguous tail run"
+                .to_string(),
+        ));
+    }
+    Ok((first, count))
 }
 
 #[cfg(feature = "file-io")]

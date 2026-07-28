@@ -39,7 +39,7 @@ use crate::store::RawQuad;
 use crate::store::builders::BuiltArray;
 use crate::store::indexes::secondary_by_copy::CopyKey;
 use crate::store::indexes::{GlobalIndexes, IndexType, Indexes, unique_indexes};
-use crate::store::schema::{PRIMARY_COLUMNS, TERM_FIELD};
+use crate::store::schema::{COL_G, COL_O, COL_P, COL_S, PRIMARY_COLUMNS, TERM_FIELD};
 
 /// Field names of the primary columns: `s`, `p`, `o`, `g` (all u32 codes).
 pub(crate) fn field_names() -> Vec<Arc<str>> {
@@ -618,10 +618,10 @@ pub(crate) fn decode_chunk(chunk: &ArrayRef, dict: &TermDictionary) -> Vec<Resul
         };
     }
 
-    let s_col = get_u32_col!("s");
-    let p_col = get_u32_col!("p");
-    let o_col = get_u32_col!("o");
-    let g_col = get_u32_col!("g");
+    let s_col = get_u32_col!(COL_S);
+    let p_col = get_u32_col!(COL_P);
+    let o_col = get_u32_col!(COL_O);
+    let g_col = get_u32_col!(COL_G);
 
     let s_ids = s_col.as_slice::<u32>();
     let p_ids = p_col.as_slice::<u32>();
@@ -653,6 +653,94 @@ pub(crate) fn decode_chunk(chunk: &ArrayRef, dict: &TermDictionary) -> Vec<Resul
                 &term_at(&mut rp, p_ids[i])?,
                 &term_at(&mut ro, o_ids[i])?,
                 &term_at(&mut rg, g_ids[i])?,
+            )
+        })
+        .collect()
+}
+
+/// The distinct term codes a chunk's four code columns reference, ascending —
+/// what a file-backed dictionary must resolve to decode the chunk.
+#[cfg(feature = "file-io")]
+pub(crate) fn unique_codes(chunk: &ArrayRef) -> Result<Vec<u32>> {
+    let mut ctx = VORTEX_LIGHT_SESSION.create_execution_ctx();
+    let struct_arr = chunk
+        .clone()
+        .execute::<StructArray>(&mut ctx)
+        .map_err(VortexRdfError::Vortex)?;
+    let mut codes: Vec<u32> = Vec::with_capacity(struct_arr.len().saturating_mul(4));
+    for name in PRIMARY_COLUMNS {
+        let col = struct_arr
+            .unmasked_field_by_name(name)
+            .map_err(VortexRdfError::Vortex)?
+            .clone()
+            .execute::<PrimitiveArray>(&mut ctx)
+            .map_err(VortexRdfError::Vortex)?;
+        codes.extend_from_slice(col.as_slice::<u32>());
+    }
+    codes.sort_unstable();
+    codes.dedup();
+    Ok(codes)
+}
+
+/// [`decode_chunk`] against a pre-resolved code→term map instead of a
+/// resident dictionary — the file-backed reconstruction path: the caller
+/// resolves the chunk's [`unique_codes`] with one scan and decodes with the
+/// resulting map.
+#[cfg(feature = "file-io")]
+pub(crate) fn decode_chunk_mapped(
+    chunk: &ArrayRef,
+    terms: &HashMap<u32, String>,
+) -> Vec<Result<Quad>> {
+    let mut ctx = VORTEX_LIGHT_SESSION.create_execution_ctx();
+
+    let struct_arr = match chunk.clone().execute::<StructArray>(&mut ctx) {
+        Ok(a) => a,
+        Err(e) => return vec![Err(VortexRdfError::Vortex(e))],
+    };
+    let n = struct_arr.len();
+
+    macro_rules! get_u32_col {
+        ($name:expr) => {
+            match struct_arr
+                .unmasked_field_by_name($name)
+                .map_err(VortexRdfError::Vortex)
+                .and_then(|c| {
+                    c.clone()
+                        .execute::<PrimitiveArray>(&mut ctx)
+                        .map_err(VortexRdfError::Vortex)
+                }) {
+                Ok(arr) => arr,
+                Err(e) => return vec![Err(e)],
+            }
+        };
+    }
+
+    let s_col = get_u32_col!(COL_S);
+    let p_col = get_u32_col!(COL_P);
+    let o_col = get_u32_col!(COL_O);
+    let g_col = get_u32_col!(COL_G);
+
+    let s_ids = s_col.as_slice::<u32>();
+    let p_ids = p_col.as_slice::<u32>();
+    let o_ids = o_col.as_slice::<u32>();
+    let g_ids = g_col.as_slice::<u32>();
+
+    let term_of = |id: u32| -> Result<&String> {
+        terms.get(&id).ok_or_else(|| {
+            VortexRdfError::Deserialization(format!(
+                "Term code {} missing from the chunk's resolved term map",
+                id
+            ))
+        })
+    };
+
+    (0..n)
+        .map(|i| {
+            decode_spog(
+                term_of(s_ids[i])?,
+                term_of(p_ids[i])?,
+                term_of(o_ids[i])?,
+                term_of(g_ids[i])?,
             )
         })
         .collect()

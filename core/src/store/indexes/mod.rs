@@ -416,6 +416,21 @@ impl ServePlan {
         }
     }
 
+    /// [`decode_columns`](Self::decode_columns) through the layout's async
+    /// decode — for serving a store whose term dictionary is file-backed,
+    /// where each chunk's codes are resolved with a dictionary scan.
+    #[cfg(feature = "file-io")]
+    pub(crate) async fn decode_columns_async(
+        &self,
+        chunk: &ArrayRef,
+        deleted: Option<&Mask>,
+    ) -> Vec<Result<Quad>> {
+        match self.chunk_rows(chunk, deleted) {
+            Ok(rows) => self.decode_layout.decode_chunk_async(&rows).await,
+            Err(e) => vec![Err(e)],
+        }
+    }
+
     /// A chunk's live rows as a primary-named `(s, p, o, g)` struct: relabel the
     /// source columns, then drop any whose primary row id is tombstoned.
     fn chunk_rows(&self, chunk: &ArrayRef, deleted: Option<&Mask>) -> Result<ArrayRef> {
