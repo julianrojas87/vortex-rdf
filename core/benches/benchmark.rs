@@ -43,9 +43,8 @@ use std::sync::{Mutex, OnceLock};
 use futures::{StreamExt, TryStreamExt, stream};
 use oxrdf::{GraphName, NamedNode, NamedOrBlankNode, Term};
 use tokio::runtime::Runtime;
-use vortex_array::ArrayRef;
 
-use vortex_rdf_core::common::utils::generate_rdf_data_stream;
+use vortex_rdf_core::common::testing::generate_rdf_data_stream;
 use vortex_rdf_core::store::RawQuad;
 use vortex_rdf_core::{
     IndexType, LayoutStrategy, SortedInMemoryBuilder, SortedStreamBuilder, UnsortedStreamBuilder,
@@ -190,9 +189,12 @@ fn materialize_quads(size: usize) -> Vec<RawQuad> {
     })
 }
 
-/// Build the in-memory Vortex array for a config, dispatching the generic
-/// builder on the runtime `Builder` enum.
-fn build_array(builder: Builder, layout: Layout, index: Index, size: usize) -> ArrayRef {
+/// Build the in-memory store for a config, dispatching the generic builder on
+/// the runtime `Builder` enum. A store rather than a bare array: under the
+/// Dictionary layout the array holds only u32 codes, and the term dictionary
+/// travels beside it in the builder's `BuiltArray` — `from_built` is the one
+/// constructor that accepts that pair.
+fn build_store(builder: Builder, layout: Layout, index: Index, size: usize) -> VortexRdfStore {
     rt().block_on(async move {
         let stream = generate_rdf_data_stream(size);
         let strategy = layout.strategy();
@@ -217,29 +219,30 @@ fn build_array(builder: Builder, layout: Layout, index: Index, size: usize) -> A
                 .await
             }
         }
-        .expect("failed to build vortex array")
+        .and_then(VortexRdfStore::from_built)
+        .expect("failed to build vortex store")
     })
 }
 
 type CacheKey = (Builder, Layout, Index, usize);
 
-/// Cache of built in-memory arrays. Under the star design only a handful of
-/// distinct configs are ever requested, so this stays naturally bounded (unlike
-/// the old full-factorial cache, which held every combination for the process
-/// lifetime).
-static ARRAY_CACHE: OnceLock<Mutex<HashMap<CacheKey, ArrayRef>>> = OnceLock::new();
+/// Cache of built in-memory stores (cheaply cloneable: Arc-shared internals).
+/// Under the star design only a handful of distinct configs are ever
+/// requested, so this stays naturally bounded (unlike the old full-factorial
+/// cache, which held every combination for the process lifetime).
+static STORE_CACHE: OnceLock<Mutex<HashMap<CacheKey, VortexRdfStore>>> = OnceLock::new();
 static FILE_CACHE: OnceLock<Mutex<HashMap<CacheKey, PathBuf>>> = OnceLock::new();
 static IPC_CACHE: OnceLock<Mutex<HashMap<CacheKey, Vec<u8>>>> = OnceLock::new();
 
-fn cached_array(builder: Builder, layout: Layout, index: Index, size: usize) -> ArrayRef {
-    let cache = ARRAY_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+fn cached_store(builder: Builder, layout: Layout, index: Index, size: usize) -> VortexRdfStore {
+    let cache = STORE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     let key = (builder, layout, index, size);
-    if let Some(arr) = cache.lock().unwrap().get(&key) {
-        return arr.clone();
+    if let Some(store) = cache.lock().unwrap().get(&key) {
+        return store.clone();
     }
-    let arr = build_array(builder, layout, index, size);
-    cache.lock().unwrap().insert(key, arr.clone());
-    arr
+    let store = build_store(builder, layout, index, size);
+    cache.lock().unwrap().insert(key, store.clone());
+    store
 }
 
 fn cached_file(builder: Builder, layout: Layout, index: Index, size: usize) -> PathBuf {
@@ -248,7 +251,7 @@ fn cached_file(builder: Builder, layout: Layout, index: Index, size: usize) -> P
     if let Some(path) = cache.lock().unwrap().get(&key) {
         return path.clone();
     }
-    let arr = cached_array(builder, layout, index, size);
+    let store = cached_store(builder, layout, index, size);
     let dir = PathBuf::from("target/bench_vortex_files");
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join(format!(
@@ -259,6 +262,10 @@ fn cached_file(builder: Builder, layout: Layout, index: Index, size: usize) -> P
         size
     ));
     rt().block_on(async {
+        let arr = store
+            .to_serializable_array()
+            .await
+            .expect("serializable array");
         let writer = tokio::fs::File::create(&path).await.expect("create file");
         io::serialize(arr, writer).await.expect("serialize file");
     });
@@ -272,7 +279,8 @@ fn cached_ipc_bytes(builder: Builder, layout: Layout, index: Index, size: usize)
     if let Some(bytes) = cache.lock().unwrap().get(&key) {
         return bytes.clone();
     }
-    let arr = cached_array(builder, layout, index, size);
+    let store = cached_store(builder, layout, index, size);
+    let arr = rt().block_on(store.to_ipc_array()).expect("ipc array");
     let mut buf = Vec::new();
     io::write_array_to_ipc(arr, &mut buf).expect("write ipc");
     cache.lock().unwrap().insert(key, buf.clone());
@@ -280,8 +288,8 @@ fn cached_ipc_bytes(builder: Builder, layout: Layout, index: Index, size: usize)
 }
 
 /// Construct a store over a config's data, from the requested source. Both are
-/// untimed: `from_file` reads the footer only, and `new` wraps a cached
-/// (Arc-shared) array.
+/// untimed: `from_file` reads the footer only, and the in-memory arm clones a
+/// cached (Arc-shared) store.
 fn make_store(
     source: Source,
     builder: Builder,
@@ -298,8 +306,7 @@ fn make_store(
                     .expect("open file store")
             })
         }
-        Source::InMemory => VortexRdfStore::new(cached_array(builder, layout, index, size))
-            .expect("build in-memory store"),
+        Source::InMemory => cached_store(builder, layout, index, size),
     }
 }
 

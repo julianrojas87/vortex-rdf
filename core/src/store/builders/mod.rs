@@ -1,4 +1,4 @@
-use crate::common::utils::stamp_is_sorted;
+use crate::common::array::stamp_is_sorted;
 use crate::error::{Result, VortexRdfError};
 use crate::io::VORTEX_LIGHT_SESSION;
 use crate::store::RawQuad;
@@ -29,70 +29,6 @@ pub(crate) fn into_vortex_error(e: VortexRdfError) -> vortex_error::VortexError 
     match e {
         VortexRdfError::Vortex(v) => v,
         other => vortex_error::vortex_err!("{}", other),
-    }
-}
-
-/// Drain a quad stream into an [`InterningQuadBuilder`]: each quad's Strings
-/// die here, leaving one copy of every distinct term plus 16 bytes per quad.
-///
-/// The Dictionary-layout in-memory ingest for both the sorted and unsorted
-/// builders; `finish(sort)` then yields the dictionary and the coded quads.
-///
-/// [`InterningQuadBuilder`]: crate::store::layouts::term_dictionary::InterningQuadBuilder
-pub(crate) async fn ingest_interning(
-    mut quads_in: Box<dyn Stream<Item = Result<RawQuad>> + Unpin + Send + 'static>,
-) -> Result<crate::store::layouts::term_dictionary::InterningQuadBuilder> {
-    let mut interner = crate::store::layouts::term_dictionary::InterningQuadBuilder::new();
-    while let Some(res) = quads_in.next().await {
-        interner.push(res?);
-    }
-    Ok(interner)
-}
-
-/// Push-based Dictionary-layout ingest for callers that produce quads one at
-/// a time rather than as a `'static` stream — the wasm array path, whose
-/// quads are decoded chunk-by-chunk from a packed JS buffer.
-///
-/// Feeding those quads through the stream builders would require collecting
-/// them into a full `Vec<RawQuad>` first (a `'static` stream cannot borrow
-/// from the decode loop), resurrecting exactly the four-Strings-per-quad
-/// ingest high-water the interning ingest removes. Pushing into the sink
-/// instead lets each quad's Strings die on arrival; `finish` builds the same
-/// single-chunk array [`SortedInMemoryBuilder`]/[`UnsortedStreamBuilder`]
-/// produce for the Dictionary layout.
-pub struct DictionaryQuadSink {
-    interner: crate::store::layouts::term_dictionary::InterningQuadBuilder,
-    indexes: Indexes,
-    /// Sort the coded quads by (s, p, o, g) in `finish` —
-    /// [`BuilderStrategy::SortedInMemory`]'s semantics; `false` keeps arrival
-    /// order ([`BuilderStrategy::UnsortedStream`]).
-    sorted: bool,
-}
-
-impl DictionaryQuadSink {
-    pub fn new(sorted: bool, indexes: Indexes) -> Self {
-        Self {
-            interner: crate::store::layouts::term_dictionary::InterningQuadBuilder::new(),
-            indexes,
-            sorted,
-        }
-    }
-
-    /// Consume one quad: intern its four terms, keep only their ids.
-    pub fn push(&mut self, quad: RawQuad) {
-        self.interner.push(quad);
-    }
-
-    /// Freeze the dictionary and build the single-chunk Dictionary-layout
-    /// array, exactly as the corresponding stream builder would.
-    pub fn finish(self) -> Result<BuiltArray> {
-        let (dict, codes) = self.interner.finish(self.sorted)?;
-        let array =
-            crate::store::layouts::dictionary::build_array(&codes, &self.indexes, self.sorted)?;
-        Ok(BuiltArray {
-            array,
-            dict: Some(Arc::new(dict)),
-        })
     }
 }
 
@@ -264,13 +200,9 @@ pub(crate) fn canonicalize_sorted(arr: ArrayRef) -> Result<ArrayRef> {
         .execute::<StructArray>(&mut ctx)
         .map_err(VortexRdfError::Vortex)?;
 
-    for field in [
-        "s",
-        "_idx_o_val",
-        "_idx_p_val",
-        "_idx_posg_p",
-        "_idx_ospg_o",
-    ] {
+    for field in std::iter::once(crate::store::schema::COL_S)
+        .chain(crate::store::indexes::globally_sorted_columns())
+    {
         if let Ok(col) = struct_arr.unmasked_field_by_name(field) {
             stamp_is_sorted(col);
         }

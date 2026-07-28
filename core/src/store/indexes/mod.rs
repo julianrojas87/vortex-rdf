@@ -21,8 +21,9 @@ use vortex_mask::Mask;
 
 use crate::error::{Result, VortexRdfError};
 use crate::io::VORTEX_LIGHT_SESSION;
+use crate::store::RawQuad;
+use crate::store::layouts::dictionary::QuadCodes;
 use crate::store::layouts::{PatternCodes, QuadPattern, ResolvedLayout};
-use crate::store::{QuadCodes, RawQuad};
 
 pub mod secondary_by_copy;
 pub mod secondary_by_reference;
@@ -432,7 +433,7 @@ impl ServePlan {
         let [s, p, o, g] = self.primary_columns;
         let len = struct_arr.len();
         let rows = StructArray::try_new(
-            FieldNames::from(["s", "p", "o", "g"]),
+            FieldNames::from(crate::store::schema::PRIMARY_COLUMNS),
             vec![col(s)?, col(p)?, col(o)?, col(g)?],
             len,
             Validity::NonNullable,
@@ -675,6 +676,19 @@ pub(crate) fn indexes_need_global_sorted_emission(indexes: &[IndexType]) -> bool
 /// for the compact (value, row-id) predicate/object indexes, or
 /// `vec![IndexType::SecondaryByCopy]` for the full sorted quad copies.
 pub type Indexes = Vec<IndexType>;
+
+/// The index value columns a globally sorted emission guarantees sorted —
+/// what the sorted builders (re-)stamp `IsSorted` after canonicalization,
+/// which drops per-chunk stats. Sourced from the index modules' own name
+/// accessors so the names live in exactly one place each.
+pub(crate) fn globally_sorted_columns() -> [&'static str; 4] {
+    [
+        secondary_by_reference::O_VAL_COL,
+        secondary_by_reference::P_VAL_COL,
+        secondary_by_copy::Family::Posg.lead_col(),
+        secondary_by_copy::Family::Ospg.lead_col(),
+    ]
+}
 
 /// Deduplicate the requested indexes, preserving first-seen order, so a
 /// repeated index (e.g. the same `--indexes` flag passed twice) cannot

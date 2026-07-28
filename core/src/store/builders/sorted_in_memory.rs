@@ -1,13 +1,13 @@
 use super::{
     BuiltArray, BuiltStream, ChunkStream, DEFAULT_CHUNK_SIZE, VortexArrayBuilder,
-    build_struct_array, build_struct_array_global, ingest_interning, into_vortex_error,
-    make_empty_struct,
+    build_struct_array, build_struct_array_global, into_vortex_error, make_empty_struct,
 };
 use crate::error::Result;
+use crate::store::RawQuad;
 use crate::store::indexes::{GlobalIndexes, Indexes};
+use crate::store::layouts::dictionary::{QuadCodes, ingest_interning};
 use crate::store::layouts::term_dictionary::TermDictionary;
 use crate::store::layouts::{LayoutStrategy, dictionary};
-use crate::store::{QuadCodes, RawQuad};
 
 use futures::{Stream, StreamExt, stream};
 use std::sync::Arc;

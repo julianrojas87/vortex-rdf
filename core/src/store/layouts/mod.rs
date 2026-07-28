@@ -9,7 +9,7 @@ use vortex_array::scalar::Scalar;
 use vortex_array::validity::Validity;
 use vortex_array::{ArrayRef, IntoArray, VortexSessionExecute};
 
-use crate::common::utils::StrColReader;
+use crate::common::array::StrColReader;
 use crate::error::{Result, VortexRdfError};
 use crate::io::VORTEX_LIGHT_SESSION;
 use crate::store::RawQuad;
@@ -19,7 +19,11 @@ pub mod dictionary;
 pub mod term_dictionary;
 pub mod typed_object;
 
-use self::term_dictionary::{DictAccess, LEGACY_DICT_FIELD, TERM_FIELD};
+use self::term_dictionary::DictAccess;
+use crate::store::schema::{
+    COL_G, COL_O, COL_O_DATATYPE, COL_O_KIND, COL_O_LANG, COL_O_VALUE, COL_P, COL_S,
+    LEGACY_DICT_FIELD, PRIMARY_COLUMNS, TERM_FIELD,
+};
 
 /// Determines the columnar schema used to store RDF quads in the Vortex StructArray.
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum, Debug)]
@@ -94,12 +98,12 @@ impl LayoutStrategy {
                     .names()
                     .iter()
                     .any(|n| n.as_ref() == LEGACY_DICT_FIELD)
-                || matches!(fields.field("s"), Some(DType::Primitive(ptype, _)) if ptype == PType::U32)
+                || matches!(fields.field(COL_S), Some(DType::Primitive(ptype, _)) if ptype == PType::U32)
             {
                 return LayoutStrategy::Dictionary;
             }
             // Presence of the typed-object kind column means TypedObject layout.
-            if fields.names().iter().any(|n| n.as_ref() == "o_kind") {
+            if fields.names().iter().any(|n| n.as_ref() == COL_O_KIND) {
                 return LayoutStrategy::TypedObject;
             }
         }
@@ -350,9 +354,17 @@ impl ResolvedLayout {
     /// Field names of the primary (non-index) columns.
     pub(crate) fn primary_column_names(&self) -> Vec<&'static str> {
         match self {
-            ResolvedLayout::Default | ResolvedLayout::Dictionary(_) => vec!["s", "p", "o", "g"],
+            ResolvedLayout::Default | ResolvedLayout::Dictionary(_) => PRIMARY_COLUMNS.to_vec(),
             ResolvedLayout::TypedObject => {
-                vec!["s", "p", "o_kind", "o_value", "o_datatype", "o_lang", "g"]
+                vec![
+                    COL_S,
+                    COL_P,
+                    COL_O_KIND,
+                    COL_O_VALUE,
+                    COL_O_DATATYPE,
+                    COL_O_LANG,
+                    COL_G,
+                ]
             }
         }
     }
@@ -471,16 +483,16 @@ impl ResolvedLayout {
             .map_err(VortexRdfError::Vortex)?;
         let (s, p, o, g) = match self {
             ResolvedLayout::Default => (
-                read_string_column(&struct_arr, "s")?,
-                read_string_column(&struct_arr, "p")?,
-                read_string_column(&struct_arr, "o")?,
-                read_string_column(&struct_arr, "g")?,
+                read_string_column(&struct_arr, COL_S)?,
+                read_string_column(&struct_arr, COL_P)?,
+                read_string_column(&struct_arr, COL_O)?,
+                read_string_column(&struct_arr, COL_G)?,
             ),
             ResolvedLayout::TypedObject => (
-                read_string_column(&struct_arr, "s")?,
-                read_string_column(&struct_arr, "p")?,
+                read_string_column(&struct_arr, COL_S)?,
+                read_string_column(&struct_arr, COL_P)?,
                 typed_object::object_terms(&struct_arr)?,
-                read_string_column(&struct_arr, "g")?,
+                read_string_column(&struct_arr, COL_G)?,
             ),
             ResolvedLayout::Dictionary(access) => {
                 let dict = access.resident();
@@ -501,10 +513,10 @@ impl ResolvedLayout {
                         .collect()
                 };
                 (
-                    term(read_u32_column(&struct_arr, "s")?)?,
-                    term(read_u32_column(&struct_arr, "p")?)?,
-                    term(read_u32_column(&struct_arr, "o")?)?,
-                    term(read_u32_column(&struct_arr, "g")?)?,
+                    term(read_u32_column(&struct_arr, COL_S)?)?,
+                    term(read_u32_column(&struct_arr, COL_P)?)?,
+                    term(read_u32_column(&struct_arr, COL_O)?)?,
+                    term(read_u32_column(&struct_arr, COL_G)?)?,
                 )
             }
         };
@@ -553,38 +565,38 @@ impl ResolvedLayout {
         match self {
             ResolvedLayout::Default => {
                 if let Some(s) = subject {
-                    eqs.push(("s", Scalar::from(cache.render(TermRef::Subject(s)))));
+                    eqs.push((COL_S, Scalar::from(cache.render(TermRef::Subject(s)))));
                 }
                 if let Some(p) = predicate {
-                    eqs.push(("p", Scalar::from(cache.render(TermRef::Predicate(p)))));
+                    eqs.push((COL_P, Scalar::from(cache.render(TermRef::Predicate(p)))));
                 }
                 if let Some(o) = object {
-                    eqs.push(("o", Scalar::from(cache.render(TermRef::Object(o)))));
+                    eqs.push((COL_O, Scalar::from(cache.render(TermRef::Object(o)))));
                 }
                 if let Some(g) = graph {
-                    eqs.push(("g", Scalar::from(cache.render(TermRef::Graph(g)))));
+                    eqs.push((COL_G, Scalar::from(cache.render(TermRef::Graph(g)))));
                 }
             }
             ResolvedLayout::TypedObject => {
                 if let Some(s) = subject {
-                    eqs.push(("s", Scalar::from(cache.render(TermRef::Subject(s)))));
+                    eqs.push((COL_S, Scalar::from(cache.render(TermRef::Subject(s)))));
                 }
                 if let Some(p) = predicate {
-                    eqs.push(("p", Scalar::from(cache.render(TermRef::Predicate(p)))));
+                    eqs.push((COL_P, Scalar::from(cache.render(TermRef::Predicate(p)))));
                 }
                 if let Some(o) = object {
                     let (kind, value, dt, lang) = typed_object::decompose_object(o);
-                    eqs.push(("o_kind", Scalar::from(kind)));
-                    eqs.push(("o_value", Scalar::from(value.as_str())));
+                    eqs.push((COL_O_KIND, Scalar::from(kind)));
+                    eqs.push((COL_O_VALUE, Scalar::from(value.as_str())));
                     if let Some(dt_str) = dt {
-                        eqs.push(("o_datatype", Scalar::from(dt_str.as_str())));
+                        eqs.push((COL_O_DATATYPE, Scalar::from(dt_str.as_str())));
                     }
                     if let Some(lang_str) = lang {
-                        eqs.push(("o_lang", Scalar::from(lang_str.as_str())));
+                        eqs.push((COL_O_LANG, Scalar::from(lang_str.as_str())));
                     }
                 }
                 if let Some(g) = graph {
-                    eqs.push(("g", Scalar::from(cache.render(TermRef::Graph(g)))));
+                    eqs.push((COL_G, Scalar::from(cache.render(TermRef::Graph(g)))));
                 }
             }
             ResolvedLayout::Dictionary(dict) => {
@@ -594,7 +606,7 @@ impl ResolvedLayout {
                 // single binary search (and a single `to_string`) per role
                 // rather than repeating both.
                 macro_rules! bind {
-                    ($opt:expr, $ctor:expr, $field:literal) => {
+                    ($opt:expr, $ctor:expr, $field:expr) => {
                         if let Some(term) = $opt {
                             match cache.resolve($ctor(term), |s| dict.get_id(s)) {
                                 Some(id) => eqs.push(($field, Scalar::from(id))),
@@ -603,10 +615,10 @@ impl ResolvedLayout {
                         }
                     };
                 }
-                bind!(subject, TermRef::Subject, "s");
-                bind!(predicate, TermRef::Predicate, "p");
-                bind!(object, TermRef::Object, "o");
-                bind!(graph, TermRef::Graph, "g");
+                bind!(subject, TermRef::Subject, COL_S);
+                bind!(predicate, TermRef::Predicate, COL_P);
+                bind!(object, TermRef::Object, COL_O);
+                bind!(graph, TermRef::Graph, COL_G);
             }
         }
         Constraints::Eq(eqs)

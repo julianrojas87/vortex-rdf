@@ -46,12 +46,13 @@ use vortex_array::dtype::DType;
 use vortex_array::{ArrayRef, IntoArray};
 
 use super::{IndexResolution, IndexedComponent, sorted_row_ids};
-use crate::common::utils::{
+use crate::common::array::{
     column_is_sorted, make_string_array, search_sorted_bounds, stamp_is_sorted,
 };
 use crate::error::{Result, VortexRdfError};
+use crate::store::RawQuad;
+use crate::store::layouts::dictionary::QuadCodes;
 use crate::store::layouts::{PatternCodes, QuadPattern, ResolvedLayout, TermRef};
-use crate::store::{QuadCodes, RawQuad};
 
 use super::ServePlan;
 #[cfg(feature = "file-io")]
@@ -128,7 +129,7 @@ impl Family {
 
     /// The column holding this family's leading sort key — the one binary
     /// searches probe and builders stamp `IsSorted`.
-    fn lead_col(self) -> &'static str {
+    pub(crate) fn lead_col(self) -> &'static str {
         match self {
             Family::Posg => self.p_col(),
             Family::Ospg => self.o_col(),

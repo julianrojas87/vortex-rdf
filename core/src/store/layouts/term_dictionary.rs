@@ -27,21 +27,12 @@ use vortex_array::{ArrayRef, IntoArray, VortexSessionExecute};
 use vortex_file::VortexFile;
 use vortex_fsst::{FSST, FSSTArray, FSSTArraySlotsExt as _, fsst_compress, fsst_train_compressor};
 
-use crate::common::utils::{StrColReader, buf_as_str};
+use crate::common::array::{StrColReader, buf_as_str};
 use crate::error::{Result, VortexRdfError};
 use crate::io::VORTEX_LIGHT_SESSION;
-use crate::store::{QuadCodes, RawQuad};
-
-/// Name of the term column in serialized Dictionary-layout forms: nullable
-/// `utf8`, null on every quad row, holding the sorted terms on the dictionary
-/// rows appended after them (padded form) or on every row of a sidecar
-/// dictionary file. A term's ID is its position among the dictionary rows.
-pub(crate) const TERM_FIELD: &str = "_dict_term";
-
-/// Name of the retired list-cell dictionary column (`list<utf8>` with the
-/// whole dictionary packed into row 0). Kept only so opens can recognize a
-/// legacy array and fail with an actionable error instead of a decode error.
-pub(crate) const LEGACY_DICT_FIELD: &str = "_dict_terms";
+use crate::store::RawQuad;
+use crate::store::layouts::dictionary::QuadCodes;
+use crate::store::schema::TERM_FIELD;
 
 /// Build-only term-to-ID lookup table, keyed by owned terms. It is deliberately
 /// kept separate from [`TermDictionary`] so stores retain only the compact

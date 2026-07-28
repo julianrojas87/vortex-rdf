@@ -1,12 +1,13 @@
 use super::spill::{RunReader, RunWriter, TempRunsGuard, make_temp_dir};
 use super::{
     BuiltArray, BuiltStream, ChunkStream, DEFAULT_CHUNK_SIZE, VortexArrayBuilder, assemble_chunks,
-    build_struct_array, ingest_interning, into_vortex_error, make_empty_struct,
+    build_struct_array, into_vortex_error, make_empty_struct,
 };
 use crate::error::{Result, VortexRdfError};
 use crate::store::RawQuad;
 use crate::store::indexes::Indexes;
 use crate::store::layouts::default::DirectChunkBuilder;
+use crate::store::layouts::dictionary::ingest_interning;
 use crate::store::layouts::term_dictionary::TermDictionaryBuilder;
 use crate::store::layouts::{LayoutStrategy, dictionary};
 

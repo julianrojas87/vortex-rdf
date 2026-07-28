@@ -1,7 +1,8 @@
 //! Column-building and decoding logic for [`LayoutStrategy::Dictionary`]:
-//! s/p/o/g stored as u32 codes into a global sorted term dictionary, which
-//! itself lives in the layout's intrinsic `_dict_terms` column (see
-//! [`super::term_dictionary`]).
+//! s/p/o/g stored as u32 codes into a global sorted term dictionary (see
+//! [`super::term_dictionary`]), which travels beside the array in memory and
+//! reaches serialized forms as trailing dictionary rows (the padded form) or
+//! a sidecar file.
 //!
 //! Unlike the other layouts, chunks are not built through the generic
 //! `build_struct_array` path: encoding requires the global `TermDictionary`
@@ -27,18 +28,97 @@ use vortex_array::scalar::Scalar;
 use vortex_array::validity::Validity;
 use vortex_array::{ArrayRef, IntoArray, VortexSessionExecute};
 
+use futures::{Stream, StreamExt};
+
 use super::default::decode_spog;
-use super::term_dictionary::{DictReader, TERM_FIELD, TermDictionary, TermIdMap};
-use crate::common::utils::stamp_is_sorted;
+use super::term_dictionary::{DictReader, InterningQuadBuilder, TermDictionary, TermIdMap};
+use crate::common::array::stamp_is_sorted;
 use crate::error::{Result, VortexRdfError};
 use crate::io::VORTEX_LIGHT_SESSION;
+use crate::store::RawQuad;
+use crate::store::builders::BuiltArray;
 use crate::store::indexes::secondary_by_copy::CopyKey;
-use crate::store::indexes::{GlobalIndexes, IndexType, unique_indexes};
-use crate::store::{QuadCodes, RawQuad};
+use crate::store::indexes::{GlobalIndexes, IndexType, Indexes, unique_indexes};
+use crate::store::schema::{PRIMARY_COLUMNS, TERM_FIELD};
 
 /// Field names of the primary columns: `s`, `p`, `o`, `g` (all u32 codes).
 pub(crate) fn field_names() -> Vec<Arc<str>> {
-    vec!["s".into(), "p".into(), "o".into(), "g".into()]
+    PRIMARY_COLUMNS.iter().map(|&n| n.into()).collect()
+}
+
+/// Dictionary-encoded quad columns: [`RawQuad`] terms replaced by their u32
+/// codes in the global sorted term dictionary. Produced by the Dictionary
+/// layout's encoding pass and consumed by index builders, which can work on
+/// codes directly (sorted-dictionary codes preserve lexicographic order).
+pub(crate) struct QuadCodes {
+    pub s: Vec<u32>,
+    pub p: Vec<u32>,
+    pub o: Vec<u32>,
+    pub g: Vec<u32>,
+}
+
+/// Drain a quad stream into an [`InterningQuadBuilder`]: each quad's Strings
+/// die here, leaving one copy of every distinct term plus 16 bytes per quad.
+///
+/// The Dictionary-layout in-memory ingest for both the sorted and unsorted
+/// builders; `finish(sort)` then yields the dictionary and the coded quads.
+pub(crate) async fn ingest_interning(
+    mut quads_in: Box<dyn Stream<Item = Result<RawQuad>> + Unpin + Send + 'static>,
+) -> Result<InterningQuadBuilder> {
+    let mut interner = InterningQuadBuilder::new();
+    while let Some(res) = quads_in.next().await {
+        interner.push(res?);
+    }
+    Ok(interner)
+}
+
+/// Push-based Dictionary-layout ingest for callers that produce quads one at
+/// a time rather than as a `'static` stream — the wasm array path, whose
+/// quads are decoded chunk-by-chunk from a packed JS buffer.
+///
+/// Feeding those quads through the stream builders would require collecting
+/// them into a full `Vec<RawQuad>` first (a `'static` stream cannot borrow
+/// from the decode loop), resurrecting exactly the four-Strings-per-quad
+/// ingest high-water the interning ingest removes. Pushing into the sink
+/// instead lets each quad's Strings die on arrival; `finish` builds the same
+/// single-chunk array `SortedInMemoryBuilder`/`UnsortedStreamBuilder`
+/// produce for the Dictionary layout.
+pub struct DictionaryQuadSink {
+    interner: InterningQuadBuilder,
+    indexes: Indexes,
+    /// Sort the coded quads by (s, p, o, g) in `finish` —
+    /// [`BuilderStrategy::SortedInMemory`]'s semantics; `false` keeps arrival
+    /// order ([`BuilderStrategy::UnsortedStream`]).
+    ///
+    /// [`BuilderStrategy::SortedInMemory`]: crate::store::BuilderStrategy::SortedInMemory
+    /// [`BuilderStrategy::UnsortedStream`]: crate::store::BuilderStrategy::UnsortedStream
+    sorted: bool,
+}
+
+impl DictionaryQuadSink {
+    pub fn new(sorted: bool, indexes: Indexes) -> Self {
+        Self {
+            interner: InterningQuadBuilder::new(),
+            indexes,
+            sorted,
+        }
+    }
+
+    /// Consume one quad: intern its four terms, keep only their ids.
+    pub fn push(&mut self, quad: RawQuad) {
+        self.interner.push(quad);
+    }
+
+    /// Freeze the dictionary and build the single-chunk Dictionary-layout
+    /// array, exactly as the corresponding stream builder would.
+    pub fn finish(self) -> Result<BuiltArray> {
+        let (dict, codes) = self.interner.finish(self.sorted)?;
+        let array = build_array(&codes, &self.indexes, self.sorted)?;
+        Ok(BuiltArray {
+            array,
+            dict: Some(Arc::new(dict)),
+        })
+    }
 }
 
 /// Encode every term of every quad to its dictionary code.
@@ -300,6 +380,33 @@ pub(crate) fn pad_with_dictionary(array: &ArrayRef, dict: &TermDictionary) -> Re
     ChunkedArray::try_new(vec![quad_chunk.clone(), tail], quad_chunk.dtype().clone())
         .map_err(VortexRdfError::Vortex)
         .map(|a| a.into_array())
+}
+
+/// Adapt a Dictionary-layout chunk stream to the padded serialized form: an
+/// all-null term column on every quads chunk, and one trailing chunk holding
+/// the sorted terms — the streaming counterpart of [`pad_with_dictionary`],
+/// with the same invariants.
+#[cfg(feature = "file-io")]
+pub(crate) fn pad_chunk_stream(
+    quad_dtype: DType,
+    chunks: crate::store::builders::ChunkStream,
+    dict: &TermDictionary,
+) -> Result<(DType, crate::store::builders::ChunkStream)> {
+    use crate::store::builders::into_vortex_error;
+
+    let padded = padded_dtype(&quad_dtype)?;
+    // The tail chunk is built eagerly (the dictionary is complete before any
+    // chunk is written); an empty dictionary appends nothing.
+    let tail = if dict.len() == 0 {
+        None
+    } else {
+        Some(dict_tail_chunk(&quad_dtype, dict).map_err(into_vortex_error))
+    };
+    let chunks: crate::store::builders::ChunkStream = chunks
+        .map(|res| res.and_then(|chunk| append_null_term_column(&chunk).map_err(into_vortex_error)))
+        .chain(futures::stream::iter(tail))
+        .boxed();
+    Ok((padded, chunks))
 }
 
 /// The padded schema for a quads schema: the same fields plus the nullable

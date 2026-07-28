@@ -1,2 +1,4 @@
+pub mod array;
 pub mod formats;
-pub mod utils;
+pub mod terms;
+pub mod testing;

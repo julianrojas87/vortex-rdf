@@ -40,15 +40,23 @@ use vortex_array::dtype::DType;
 use vortex_array::{ArrayRef, IntoArray};
 
 use super::{IndexResolution, IndexedComponent, sorted_row_ids};
-use crate::common::utils::{
+use crate::common::array::{
     column_is_sorted, make_string_array, search_sorted_bounds, stamp_is_sorted,
 };
 use crate::error::{Result, VortexRdfError};
+use crate::store::RawQuad;
+use crate::store::layouts::dictionary::QuadCodes;
 use crate::store::layouts::{PatternCodes, QuadPattern, ResolvedLayout, TermRef};
-use crate::store::{QuadCodes, RawQuad};
 
 #[cfg(feature = "file-io")]
 use vortex_file::VortexFile;
+
+/// This index's four columns: a sorted copy of a component's values paired
+/// with the primary row id each value came from.
+pub(crate) const O_VAL_COL: &str = "_idx_o_val";
+pub(crate) const O_RID_COL: &str = "_idx_o_rid";
+pub(crate) const P_VAL_COL: &str = "_idx_p_val";
+pub(crate) const P_RID_COL: &str = "_idx_p_rid";
 
 /// Whether a struct dtype carries this index's four columns — how stores
 /// detect the index in an array or file schema without reading any data.
@@ -56,7 +64,7 @@ pub(crate) fn is_present(dtype: &DType) -> bool {
     match dtype {
         DType::Struct(fields, _) => {
             let has = |name: &str| fields.names().iter().any(|n| n.as_ref() == name);
-            has("_idx_o_val") && has("_idx_o_rid") && has("_idx_p_val") && has("_idx_p_rid")
+            has(O_VAL_COL) && has(O_RID_COL) && has(P_VAL_COL) && has(P_RID_COL)
         }
         _ => false,
     }
@@ -85,16 +93,16 @@ fn choose<'a>(pattern: QuadPattern<'a>) -> Option<ColumnProbe<'a>> {
     }
     if let Some(object) = pattern.object {
         return Some(ColumnProbe {
-            value_column: "_idx_o_val",
-            row_id_column: "_idx_o_rid",
+            value_column: O_VAL_COL,
+            row_id_column: O_RID_COL,
             probe_term: TermRef::Object(object),
             resolves: IndexedComponent::Object,
         });
     }
     if let Some(predicate) = pattern.predicate {
         return Some(ColumnProbe {
-            value_column: "_idx_p_val",
-            row_id_column: "_idx_p_rid",
+            value_column: P_VAL_COL,
+            row_id_column: P_RID_COL,
             probe_term: TermRef::Predicate(predicate),
             resolves: IndexedComponent::Predicate,
         });
@@ -281,10 +289,10 @@ pub(crate) fn append_sorted_string_pairs(
         stamp_is_sorted(&p_val);
     }
     field_names.extend_from_slice(&[
-        "_idx_o_val".into(),
-        "_idx_o_rid".into(),
-        "_idx_p_val".into(),
-        "_idx_p_rid".into(),
+        O_VAL_COL.into(),
+        O_RID_COL.into(),
+        P_VAL_COL.into(),
+        P_RID_COL.into(),
     ]);
     field_arrays.extend([
         o_val,
@@ -309,10 +317,10 @@ pub(crate) fn append_sorted_code_pairs(
         stamp_is_sorted(&p_val);
     }
     field_names.extend_from_slice(&[
-        "_idx_o_val".into(),
-        "_idx_o_rid".into(),
-        "_idx_p_val".into(),
-        "_idx_p_rid".into(),
+        O_VAL_COL.into(),
+        O_RID_COL.into(),
+        P_VAL_COL.into(),
+        P_RID_COL.into(),
     ]);
     field_arrays.extend([
         o_val,
@@ -395,10 +403,10 @@ impl GlobalIndexArrays {
         range: Range<usize>,
     ) -> Result<()> {
         for (name, arr, is_val) in [
-            ("_idx_o_val", &self.o_val, true),
-            ("_idx_o_rid", &self.o_rid, false),
-            ("_idx_p_val", &self.p_val, true),
-            ("_idx_p_rid", &self.p_rid, false),
+            (O_VAL_COL, &self.o_val, true),
+            (O_RID_COL, &self.o_rid, false),
+            (P_VAL_COL, &self.p_val, true),
+            (P_RID_COL, &self.p_rid, false),
         ] {
             let sliced = arr.slice(range.clone()).map_err(VortexRdfError::Vortex)?;
             if is_val {

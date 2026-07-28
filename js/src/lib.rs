@@ -5,10 +5,10 @@ use oxrdf::{GraphName, NamedNode, NamedOrBlankNode, Quad, Term};
 use oxrdfio::RdfFormat;
 use std::cell::RefCell;
 use std::io::Cursor;
+use vortex_array::VortexSessionExecute;
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::struct_::{StructArray, StructArrayExt};
-use vortex_array::VortexSessionExecute;
-use vortex_rdf_core::common::utils::parse_quads_from_reader;
+use vortex_rdf_core::common::terms::parse_quads_from_reader;
 use vortex_rdf_core::error::{Result as CoreResult, VortexRdfError};
 use vortex_rdf_core::io::{
     VORTEX_LIGHT_SESSION, array_from_ipc_bytes, deserialize, write_array_to_ipc,

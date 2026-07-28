@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use vortex_rdf_core::common::formats::{Format, detect_format};
-use vortex_rdf_core::common::utils::{
+use vortex_rdf_core::common::terms::{
     parse_graph_name, parse_named_node, parse_quads_from_reader, parse_subject, parse_term,
 };
 use vortex_rdf_core::{

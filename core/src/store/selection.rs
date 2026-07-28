@@ -14,6 +14,8 @@
 //!
 //! [`VortexRdfStore`]: crate::store::vortex_rdf_store::VortexRdfStore
 
+#[cfg(feature = "file-io")]
+use std::ops::BitAnd;
 use std::ops::Range;
 
 use vortex_array::arrays::PrimitiveArray;
@@ -299,6 +301,70 @@ fn intersect_ids(left: &[u64], right: &[u64]) -> Buffer<u64> {
         }
     }
     Buffer::from_iter(out)
+}
+
+/// Gather the rows of `base` that `selection` covers and `deleted` has not
+/// tombstoned.
+///
+/// The single place the in-memory read paths turn a view into rows, so that
+/// applying the tombstones cannot be forgotten by one of them: deletions are
+/// deliberately kept out of the selection (see [`RowSelection::live_mask`]), so
+/// a selection alone always over-reports.
+pub(crate) fn gather_live(
+    base: &ArrayRef,
+    selection: &RowSelection,
+    deleted: Option<&Mask>,
+) -> Result<ArrayRef> {
+    let rows = selection.apply(base)?;
+    let Some(deleted) = deleted else {
+        return Ok(rows);
+    };
+    let live = selection.live_mask(deleted, base.len());
+    if live.all_true() {
+        return Ok(rows);
+    }
+    rows.filter(live).map_err(VortexRdfError::Vortex)
+}
+
+/// Fold a freshly-doomed set of base rows into a store's existing tombstones,
+/// shared by both backends' delete paths.
+pub(crate) fn union_deleted(existing: Option<&Mask>, doomed: Mask) -> Mask {
+    match existing {
+        Some(existing) => existing | &doomed,
+        None => doomed,
+    }
+}
+
+/// Split a file view's [`RowSelection`] into the two knobs the per-split filter
+/// loop understands: a [`Selection`] narrowing the mask (an id list, e.g. from a
+/// secondary index) and the row-id `bounds` it iterates. A `Range` narrows the
+/// bounds; an `Ids` list narrows the mask; `All` narrows neither.
+#[cfg(feature = "file-io")]
+pub(crate) fn split_bounds(selection: &RowSelection, row_count: u64) -> (Selection, Range<u64>) {
+    match selection {
+        RowSelection::All => (Selection::All, 0..row_count),
+        RowSelection::Range(range) => (Selection::All, range.clone()),
+        RowSelection::Ids(ids) => (Selection::IncludeByIndex(ids.clone()), 0..row_count),
+    }
+}
+
+/// The starting mask for one file split: the rows `selection` covers within
+/// `range`, minus any that `deleted` has tombstoned. Returned split-relative
+/// (one bit per row of `range`), ready for [`evaluate_filter_split`].
+#[cfg(feature = "file-io")]
+pub(crate) fn split_start_mask(
+    selection: &Selection,
+    deleted: Option<&Mask>,
+    range: &Range<u64>,
+) -> Mask {
+    let mask = selection.row_mask(range).mask().clone();
+    match deleted {
+        None => mask,
+        Some(deleted) => {
+            let live = !&deleted.slice(range.start as usize..range.end as usize);
+            mask.bitand(&live)
+        }
+    }
 }
 
 #[cfg(test)]

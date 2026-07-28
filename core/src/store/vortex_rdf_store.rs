@@ -1,4 +1,4 @@
-use crate::common::utils::{bool_array_to_mask, column_is_sorted, search_sorted_bounds};
+use crate::common::array::{bool_array_to_mask, column_is_sorted, search_sorted_bounds};
 use crate::error::{Result, VortexRdfError};
 use crate::io::VORTEX_LIGHT_SESSION;
 use crate::io::de::array_from_ipc_bytes;
@@ -16,7 +16,11 @@ use crate::store::layouts::term_dictionary::{self, DictAccess, DictSnapshot, Ter
 use crate::store::layouts::{
     Constraints, LayoutStrategy, PatternCodes, QuadPattern, ResolvedLayout, TermRef, dictionary,
 };
-use crate::store::selection::RowSelection;
+use crate::store::schema;
+use crate::store::selection::{RowSelection, gather_live, union_deleted};
+#[cfg(feature = "file-io")]
+use crate::store::selection::{split_bounds, split_start_mask};
+use crate::store::typed_eq::{Needle, TypedEq, typed_positions};
 use crate::store::{QuadsSource, Tail};
 
 #[cfg(feature = "file-io")]
@@ -35,9 +39,7 @@ use web_time::Instant;
 
 use vortex_array::arrays::constant::ConstantArray;
 use vortex_array::arrays::struct_::StructArrayExt;
-use vortex_array::arrays::{
-    ChunkedArray, Primitive, PrimitiveArray, StructArray, VarBinView, VarBinViewArray,
-};
+use vortex_array::arrays::{ChunkedArray, StructArray, VarBinViewArray};
 use vortex_array::builtins::ArrayBuiltins;
 use vortex_array::dtype::{DType, FieldNames};
 use vortex_array::scalar::Scalar;
@@ -60,8 +62,6 @@ use vortex_array::expr::{Expression, and, eq, get_item, lit, root, select};
 use vortex_array::stream::ArrayStreamExt;
 #[cfg(feature = "file-io")]
 use vortex_layout::LayoutReader;
-#[cfg(feature = "file-io")]
-use vortex_scan::selection::Selection;
 
 /// Columnar RDF quad storage backed by Vortex.
 ///
@@ -119,14 +119,14 @@ impl VortexRdfStore {
                     matches!(vortex_array.dtype(), DType::Struct(fields, _)
                         if fields.names().iter().any(|n| n.as_ref() == name))
                 };
-                if has_field(term_dictionary::LEGACY_DICT_FIELD) {
+                if has_field(schema::LEGACY_DICT_FIELD) {
                     return Err(VortexRdfError::Deserialization(
                         "this array uses the retired `_dict_terms` list-cell dictionary \
                          format; re-serialize it with a current build"
                             .to_string(),
                     ));
                 }
-                if !has_field(term_dictionary::TERM_FIELD) {
+                if !has_field(schema::TERM_FIELD) {
                     return Err(VortexRdfError::Deserialization(
                         "Dictionary-layout array carries no term dictionary (bare code \
                          columns); open its file form instead, or construct the store \
@@ -190,7 +190,7 @@ impl VortexRdfStore {
         let e = VarBinViewArray::from_iter_str(iter::empty::<&str>()).into_array();
 
         let quads = StructArray::try_new(
-            FieldNames::from(["s", "p", "o", "g"]),
+            FieldNames::from(schema::PRIMARY_COLUMNS),
             vec![e.clone(), e.clone(), e.clone(), e],
             0,
             Validity::NonNullable,
@@ -231,14 +231,14 @@ impl VortexRdfStore {
         let (layout, quad_rows) = match LayoutStrategy::from_dtype(file.dtype()) {
             LayoutStrategy::Default => (ResolvedLayout::Default, file.row_count()),
             LayoutStrategy::TypedObject => (ResolvedLayout::TypedObject, file.row_count()),
-            LayoutStrategy::Dictionary if has_field(term_dictionary::LEGACY_DICT_FIELD) => {
+            LayoutStrategy::Dictionary if has_field(schema::LEGACY_DICT_FIELD) => {
                 return Err(VortexRdfError::Deserialization(
                     "this file uses the retired `_dict_terms` list-cell dictionary \
                      format; re-serialize it with a current build"
                         .to_string(),
                 ));
             }
-            LayoutStrategy::Dictionary if has_field(term_dictionary::TERM_FIELD) => {
+            LayoutStrategy::Dictionary if has_field(schema::TERM_FIELD) => {
                 // Padded file: trailing rows hold the term dictionary. Lift it
                 // resident via a single-column projection scan, and remember
                 // where the quad rows end so no scan ever surfaces the tail.
@@ -928,7 +928,7 @@ impl VortexRdfStore {
         };
         let struct_arr = base.clone().try_downcast::<Struct>().ok()?;
         let mut prims: Vec<PrimitiveArray> = Vec::with_capacity(4);
-        for name in ["s", "p", "o", "g"] {
+        for name in schema::PRIMARY_COLUMNS {
             let col = struct_arr.unmasked_field_by_name(name).ok()?;
             if !col.dtype().is_unsigned_int() || col.dtype().is_nullable() {
                 return None;
@@ -1392,7 +1392,7 @@ impl VortexRdfStore {
                 // search finds the exact [lo, hi) row range for that subject in
                 // O(log n) instead of scanning every row.
                 if let Some(subj) = pat.subject
-                    && let Ok(s_col) = struct_arr.unmasked_field_by_name("s")
+                    && let Ok(s_col) = struct_arr.unmasked_field_by_name(schema::COL_S)
                     && column_is_sorted(s_col)
                     && let Some(probe) = self
                         .layout
@@ -2211,253 +2211,6 @@ impl VortexRdfStore {
     }
 }
 
-/// Gather the rows of `base` that `selection` covers and `deleted` has not
-/// tombstoned.
-///
-/// The single place the in-memory read paths turn a view into rows, so that
-/// applying the tombstones cannot be forgotten by one of them: deletions are
-/// deliberately kept out of the selection (see [`RowSelection::live_mask`]), so
-/// a selection alone always over-reports.
-/// A residual equality constraint's probe value, extracted from its `Scalar`
-/// once per scan — not per chunk, the string extraction allocates.
-enum Needle {
-    Code(u32),
-    Str(String),
-}
-
-impl Needle {
-    fn from_scalar(scalar: &Scalar) -> Option<Self> {
-        if let Ok(code) = u32::try_from(scalar) {
-            return Some(Needle::Code(code));
-        }
-        Some(Needle::Str(scalar.as_utf8_opt()?.value()?.to_string()))
-    }
-
-    /// Extract every constraint's probe once; `None` if any is neither a u32
-    /// code nor a utf8 string.
-    fn extract(eqs: &[(&'static str, Scalar)]) -> Option<Vec<Needle>> {
-        if eqs.is_empty() {
-            return None;
-        }
-        eqs.iter().map(|(_, s)| Needle::from_scalar(s)).collect()
-    }
-}
-
-/// One equality constraint bound to a concrete typed column view, for the
-/// typed residual-filter fast paths. Two column shapes qualify: canonical
-/// non-nullable u32 primitives (the Dictionary layout's code columns, compared
-/// as integers) and canonical non-nullable Utf8 `VarBinView`s (the Default /
-/// TypedObject / tail string columns, compared at the view level). Anything
-/// else — nullable, compressed, or chunked — declines, and the caller falls
-/// back to the general mask-scan pipeline.
-enum TypedEq<'a> {
-    Code(vortex_array::arrays::PrimitiveArray, u32),
-    Str(StrEq<'a>),
-}
-
-/// A string equality probe over a canonical `VarBinView` column, comparing at
-/// the view level: length first (a u32 read from the 16-byte view struct —
-/// which alone rejects almost every row), then the inline bytes or the
-/// referenced buffer range. No per-row `ByteBuffer` is materialized —
-/// profiling showed `bytes_at`'s slice/refcount traffic dominating tail scans.
-struct StrEq<'a> {
-    arr: vortex_array::arrays::VarBinViewArray,
-    needle: &'a [u8],
-}
-
-impl StrEq<'_> {
-    #[inline]
-    fn matches(&self, i: usize) -> bool {
-        let view = &self.arr.views()[i];
-        if view.len() as usize != self.needle.len() {
-            return false;
-        }
-        if view.is_inlined() {
-            view.as_inlined().value() == self.needle
-        } else {
-            let r = view.as_view();
-            let buf: &[u8] = self.arr.buffer(r.buffer_index as usize);
-            &buf[r.as_range()] == self.needle
-        }
-    }
-}
-
-impl<'a> TypedEq<'a> {
-    fn bind_col(
-        col: &ArrayRef,
-        needle: &'a Needle,
-        ctx: &mut vortex_array::ExecutionCtx,
-    ) -> Option<TypedEq<'a>> {
-        use vortex_array::dtype::DType;
-        if col.dtype().is_nullable() {
-            return None;
-        }
-        match needle {
-            Needle::Code(code) => {
-                if !col.dtype().is_unsigned_int() {
-                    return None;
-                }
-                // A struct canonicalization does not recurse into its children,
-                // so a code column stored under a compression (BtrBlocks) is not
-                // a bare `Primitive` yet. Try the cheap downcast first — the
-                // Dictionary layout's codes are already canonical, the hot case —
-                // and only pay a one-off `execute` to decode an encoded column.
-                let prim = match col.clone().try_downcast::<Primitive>() {
-                    Ok(p) => p,
-                    Err(_) => col.clone().execute::<PrimitiveArray>(ctx).ok()?,
-                };
-                if prim.ptype() != vortex_array::dtype::PType::U32 {
-                    return None;
-                }
-                Some(TypedEq::Code(prim, *code))
-            }
-            Needle::Str(s) => {
-                if !matches!(col.dtype(), DType::Utf8(_)) {
-                    return None;
-                }
-                // Same as the code arm: the Default / TypedObject layouts hold
-                // their string columns BtrBlocks-encoded, so the direct downcast
-                // fails and they used to fall to the general mask-scan pipeline (a
-                // per-column `compare_views_constant` over the whole array, then a
-                // boolean AND — no per-row short-circuit). Decoding once to
-                // canonical views here lets `StrEq` run the length-first,
-                // conjunction-short-circuiting loop instead. Only reached with ≥2
-                // constraints (see [`Self::typed_residual_ids`]), where the
-                // short-circuit repays the decode.
-                let arr = match col.clone().try_downcast::<VarBinView>() {
-                    Ok(a) => a,
-                    Err(_) => col.clone().execute::<VarBinViewArray>(ctx).ok()?,
-                };
-                Some(TypedEq::Str(StrEq {
-                    arr,
-                    needle: s.as_bytes(),
-                }))
-            }
-        }
-    }
-
-    /// Bind every constraint to its typed column, or `None` if any declines.
-    fn bind(
-        struct_arr: &StructArray,
-        eqs: &[(&'static str, Scalar)],
-        needles: &'a [Needle],
-        ctx: &mut vortex_array::ExecutionCtx,
-    ) -> Option<Vec<TypedEq<'a>>> {
-        let mut cols = Vec::with_capacity(eqs.len());
-        for ((field, _), needle) in eqs.iter().zip(needles) {
-            let col = struct_arr.unmasked_field_by_name(field).ok()?;
-            cols.push(TypedEq::bind_col(col, needle, ctx)?);
-        }
-        Some(cols)
-    }
-
-    /// The mixed/cold row compare. The per-row `as_slice` on the Code arm is
-    /// deliberate: mixed code+string constraint sets do not occur in practice
-    /// (Dictionary bases are all-code, tails and Default bases all-string),
-    /// and the hot all-code case takes [`TypedEq::code_views`] instead.
-    #[inline]
-    fn matches(&self, i: usize) -> bool {
-        match self {
-            TypedEq::Code(prim, code) => prim.as_slice::<u32>()[i] == *code,
-            TypedEq::Str(s) => s.matches(i),
-        }
-    }
-
-    /// The all-code specialization: when every constraint is a u32 code
-    /// compare (the Dictionary layout), the row loop over plain
-    /// `(&[u32], u32)` pairs — slices hoisted once, borrowing from the bound
-    /// constraints — is branch-free per constraint and vectorizes;
-    /// benchmarking showed a mixed-enum loop costing ~2× on full-column
-    /// scans. `None` when any constraint is a string compare.
-    fn code_views<'b>(cols: &'b [TypedEq<'a>]) -> Option<Vec<(&'b [u32], u32)>> {
-        cols.iter()
-            .map(|c| match c {
-                TypedEq::Code(prim, code) => Some((prim.as_slice::<u32>(), *code)),
-                TypedEq::Str(..) => None,
-            })
-            .collect()
-    }
-}
-
-/// The positions (in `applied`'s own row order) matching every constraint,
-/// via the typed comparisons of [`TypedEq`] — the tail counterpart of
-/// [`VortexRdfStore::typed_residual_ids`]. Accepts a flat canonical struct or
-/// a chunked accretion of them (the shape [`VortexRdfStore::add_quads`]
-/// builds); `None` on any other shape, falling back to the mask pipeline.
-fn typed_positions(applied: &ArrayRef, eqs: &[(&'static str, Scalar)]) -> Option<Vec<usize>> {
-    use vortex_array::arrays::chunked::ChunkedArrayExt;
-    use vortex_array::arrays::{Chunked, Struct};
-    if eqs.is_empty() {
-        return None;
-    }
-    let needles = Needle::extract(eqs)?;
-    let mut ctx = VORTEX_LIGHT_SESSION.create_execution_ctx();
-    fn positions_of(
-        sa: &StructArray,
-        eqs: &[(&'static str, Scalar)],
-        needles: &[Needle],
-        offset: usize,
-        out: &mut Vec<usize>,
-        ctx: &mut vortex_array::ExecutionCtx,
-    ) -> Option<()> {
-        let cols = TypedEq::bind(sa, eqs, needles, ctx)?;
-        if let Some(codes) = TypedEq::code_views(&cols) {
-            out.extend(
-                (0..sa.len())
-                    .filter(|&i| codes.iter().all(|(s, c)| s[i] == *c))
-                    .map(|i| offset + i),
-            );
-        } else {
-            out.extend(
-                (0..sa.len())
-                    .filter(|&i| cols.iter().all(|c| c.matches(i)))
-                    .map(|i| offset + i),
-            );
-        }
-        Some(())
-    }
-    let mut out = Vec::new();
-    if let Ok(sa) = applied.clone().try_downcast::<Struct>() {
-        positions_of(&sa, eqs, &needles, 0, &mut out, &mut ctx)?;
-        return Some(out);
-    }
-    if let Ok(ch) = applied.clone().try_downcast::<Chunked>() {
-        let mut offset = 0usize;
-        for chunk in ch.chunks() {
-            let sa = chunk.try_downcast::<Struct>().ok()?;
-            positions_of(&sa, eqs, &needles, offset, &mut out, &mut ctx)?;
-            offset += sa.len();
-        }
-        return Some(out);
-    }
-    None
-}
-
-fn gather_live(
-    base: &ArrayRef,
-    selection: &RowSelection,
-    deleted: Option<&Mask>,
-) -> Result<ArrayRef> {
-    let rows = selection.apply(base)?;
-    let Some(deleted) = deleted else {
-        return Ok(rows);
-    };
-    let live = selection.live_mask(deleted, base.len());
-    if live.all_true() {
-        return Ok(rows);
-    }
-    rows.filter(live).map_err(VortexRdfError::Vortex)
-}
-
-/// Fold a freshly-doomed set of base rows into a store's existing tombstones,
-/// shared by both backends' delete paths.
-fn union_deleted(existing: Option<&Mask>, doomed: Mask) -> Mask {
-    match existing {
-        Some(existing) => existing | &doomed,
-        None => doomed,
-    }
-}
-
 /// Selection size below which an *already narrowed* view should skip secondary
 /// index routing and filter its remaining rows column-wise instead (see
 /// `match_base`).
@@ -2510,34 +2263,6 @@ const AUTO_COMPACT_TAIL_CAP: usize = DEFAULT_CHUNK_SIZE;
 fn tail_needs_compaction(base_rows: usize, tail_rows: usize) -> bool {
     tail_rows >= AUTO_COMPACT_TAIL_CAP
         || tail_rows >= AUTO_COMPACT_TAIL_FLOOR.max(base_rows / AUTO_COMPACT_BASE_RATIO)
-}
-
-/// Split a file view's [`RowSelection`] into the two knobs the per-split filter
-/// loop understands: a [`Selection`] narrowing the mask (an id list, e.g. from a
-/// secondary index) and the row-id `bounds` it iterates. A `Range` narrows the
-/// bounds; an `Ids` list narrows the mask; `All` narrows neither.
-#[cfg(feature = "file-io")]
-fn split_bounds(selection: &RowSelection, row_count: u64) -> (Selection, Range<u64>) {
-    match selection {
-        RowSelection::All => (Selection::All, 0..row_count),
-        RowSelection::Range(range) => (Selection::All, range.clone()),
-        RowSelection::Ids(ids) => (Selection::IncludeByIndex(ids.clone()), 0..row_count),
-    }
-}
-
-/// The starting mask for one file split: the rows `selection` covers within
-/// `range`, minus any that `deleted` has tombstoned. Returned split-relative
-/// (one bit per row of `range`), ready for [`evaluate_filter_split`].
-#[cfg(feature = "file-io")]
-fn split_start_mask(selection: &Selection, deleted: Option<&Mask>, range: &Range<u64>) -> Mask {
-    let mask = selection.row_mask(range).mask().clone();
-    match deleted {
-        None => mask,
-        Some(deleted) => {
-            let live = !&deleted.slice(range.start as usize..range.end as usize);
-            mask.bitand(&live)
-        }
-    }
 }
 
 /// Evaluate a filter over one file split, threading a narrowing mask through the

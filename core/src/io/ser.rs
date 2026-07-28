@@ -36,44 +36,6 @@ fn write_options_with_subject_stats() -> vortex_file::VortexWriteOptions {
         .with_file_statistics(stats)
 }
 
-/// Adapt a Dictionary-layout chunk stream to the padded serialized form: an
-/// all-null term column on every quads chunk, and one trailing chunk holding
-/// the sorted terms (see [`dictionary::pad_with_dictionary`] for the array
-/// counterpart and the format's invariants).
-///
-/// [`dictionary::pad_with_dictionary`]: crate::store::layouts::dictionary::pad_with_dictionary
-#[cfg(feature = "file-io")]
-fn pad_chunk_stream(
-    quad_dtype: vortex_array::dtype::DType,
-    chunks: crate::store::builders::ChunkStream,
-    dict: &crate::store::layouts::term_dictionary::TermDictionary,
-) -> Result<(
-    vortex_array::dtype::DType,
-    crate::store::builders::ChunkStream,
-)> {
-    use crate::store::builders::into_vortex_error;
-    use crate::store::layouts::dictionary as dict_layout;
-    use futures::StreamExt as _;
-
-    let padded = dict_layout::padded_dtype(&quad_dtype)?;
-    // The tail chunk is built eagerly (the dictionary is complete before any
-    // chunk is written); an empty dictionary appends nothing.
-    let tail = if dict.len() == 0 {
-        None
-    } else {
-        Some(dict_layout::dict_tail_chunk(&quad_dtype, dict).map_err(into_vortex_error))
-    };
-    let chunks: crate::store::builders::ChunkStream = chunks
-        .map(|res| {
-            res.and_then(|chunk| {
-                dict_layout::append_null_term_column(&chunk).map_err(into_vortex_error)
-            })
-        })
-        .chain(stream::iter(tail))
-        .boxed();
-    Ok((padded, chunks))
-}
-
 /// Serialize an already-materialized Vortex array to a Vortex file writer.
 ///
 /// Prefer [`quads_stream_to_vortex_writer_with_builder`] when serializing from
@@ -148,7 +110,9 @@ where
     // writing appends it as trailing dictionary rows — the padded form — so
     // the file stays a single self-describing artifact.
     let (dtype, chunks) = match built.dict {
-        Some(dict) => pad_chunk_stream(built.dtype, built.chunks, &dict)?,
+        Some(dict) => {
+            crate::store::layouts::dictionary::pad_chunk_stream(built.dtype, built.chunks, &dict)?
+        }
         None => (built.dtype, built.chunks),
     };
     let vortex_stream = ArrayStreamAdapter::new(dtype, chunks);
@@ -202,7 +166,11 @@ where
     // write when the companion is written after.
     let (dtype, chunks, sidecar) = match (built.dict, placement) {
         (Some(dict), DictionaryPlacement::Padded) => {
-            let (dtype, chunks) = pad_chunk_stream(built.dtype, built.chunks, &dict)?;
+            let (dtype, chunks) = crate::store::layouts::dictionary::pad_chunk_stream(
+                built.dtype,
+                built.chunks,
+                &dict,
+            )?;
             (dtype, chunks, None)
         }
         (Some(dict), DictionaryPlacement::Sidecar) => (built.dtype, built.chunks, Some(dict)),

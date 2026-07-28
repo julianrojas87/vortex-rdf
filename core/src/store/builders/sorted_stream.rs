@@ -5,7 +5,7 @@ use super::{
     BuiltArray, BuiltStream, ChunkStream, DEFAULT_CHUNK_SIZE, VortexArrayBuilder, assemble_chunks,
     build_struct_array, canonicalize_sorted, into_vortex_error, make_empty_struct,
 };
-use crate::common::utils::stamp_is_sorted;
+use crate::common::array::stamp_is_sorted;
 use crate::error::{Result, VortexRdfError};
 use crate::store::RawQuad;
 use crate::store::indexes::secondary_by_copy::{self, CopyKey};

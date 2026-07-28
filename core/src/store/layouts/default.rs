@@ -13,16 +13,16 @@ use vortex_array::dtype::{DType, Nullability};
 use vortex_array::validity::Validity;
 use vortex_array::{ArrayRef, IntoArray, VortexSessionExecute};
 
-use crate::common::utils::{
-    StrColReader, get_as_term, make_string_array, parse_graph_name, parse_named_node, parse_subject,
-};
+use crate::common::array::{StrColReader, make_string_array};
+use crate::common::terms::{get_as_term, parse_graph_name, parse_named_node, parse_subject};
 use crate::error::{Result, VortexRdfError};
 use crate::io::VORTEX_LIGHT_SESSION;
 use crate::store::RawQuad;
+use crate::store::schema::{COL_G, COL_O, COL_P, COL_S, PRIMARY_COLUMNS};
 
 /// Field names of the primary columns: `s`, `p`, `o`, `g`.
 pub(crate) fn field_names() -> Vec<Arc<str>> {
-    vec!["s".into(), "p".into(), "o".into(), "g".into()]
+    PRIMARY_COLUMNS.iter().map(|&n| n.into()).collect()
 }
 
 /// Build the primary column arrays from raw quads. An empty slice yields
@@ -63,10 +63,10 @@ pub(crate) fn decode_chunk(chunk: &ArrayRef) -> Vec<Result<Quad>> {
         };
     }
 
-    let s_col = get_str_col!("s");
-    let p_col = get_str_col!("p");
-    let o_col = get_str_col!("o");
-    let g_col = get_str_col!("g");
+    let s_col = get_str_col!(COL_S);
+    let p_col = get_str_col!(COL_P);
+    let o_col = get_str_col!(COL_O);
+    let g_col = get_str_col!(COL_G);
 
     let s = StrColReader::new(&s_col);
     let p = StrColReader::new(&p_col);
