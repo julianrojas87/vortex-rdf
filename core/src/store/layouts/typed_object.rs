@@ -96,20 +96,23 @@ fn compose_object(
     datatype: Option<&str>,
     lang: Option<&str>,
 ) -> Result<Term> {
+    // Trusted-input decode path — see `parse_named_node`: the sub-columns
+    // were decomposed from already-validated terms at build time, so the
+    // checked constructors' re-validation (a full `oxiri::Iri::parse` per
+    // IRI) is skipped, matching `get_as_term`.
     match kind {
-        0 => NamedNode::new(value)
-            .map(Term::NamedNode)
-            .map_err(|e| VortexRdfError::Deserialization(e.to_string())),
+        0 => Ok(Term::NamedNode(NamedNode::new_unchecked(value))),
         1 => Ok(Term::BlankNode(BlankNode::new_unchecked(value))),
         2 => Ok(Term::Literal(Literal::new_simple_literal(value))),
-        3 => Literal::new_language_tagged_literal(value, lang.unwrap_or(""))
-            .map(Term::Literal)
-            .map_err(|e| VortexRdfError::Deserialization(e.to_string())),
+        3 => Ok(Term::Literal(
+            Literal::new_language_tagged_literal_unchecked(value, lang.unwrap_or("")),
+        )),
         4 => {
             let dt_str = datatype.unwrap_or("http://www.w3.org/2001/XMLSchema#string");
-            let dt = NamedNode::new(dt_str)
-                .map_err(|e| VortexRdfError::Deserialization(e.to_string()))?;
-            Ok(Term::Literal(Literal::new_typed_literal(value, dt)))
+            Ok(Term::Literal(Literal::new_typed_literal(
+                value,
+                NamedNode::new_unchecked(dt_str),
+            )))
         }
         _ => Err(VortexRdfError::Deserialization(format!(
             "Unknown object kind: {}",
