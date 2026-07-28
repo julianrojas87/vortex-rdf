@@ -563,6 +563,34 @@ match_bench!(
     Index::ByCopy,
     Source::File
 );
+// Placement axis (Dictionary, file): the sidecar twin of
+// `match_sorted_dict_bycopy_file`. The padded tail taxes every file match —
+// extra rows/zones in the quads file, and at small scales the writer
+// co-compresses quad codes with the sentinel tail — so the two placements
+// are tracked side by side. Residency is the default (resident) for both.
+#[divan::bench(args = PATTERNS)]
+fn match_sorted_dict_bycopy_sidecar_file(bencher: divan::Bencher, pattern: &Pattern) {
+    bencher
+        .with_inputs(|| {
+            let path = cached_dict_indexed_file(DictionaryPlacement::Sidecar, bench_size());
+            rt().block_on(async {
+                VortexRdfStore::from_file(&path)
+                    .await
+                    .expect("open sidecar")
+            })
+        })
+        .bench_refs(|store| {
+            let (s, p, o, g) = terms_for(*pattern);
+            rt().block_on(async {
+                let matched = store
+                    .match_pattern(s.as_ref(), p.as_ref(), o.as_ref(), g.as_ref())
+                    .await
+                    .expect("match_pattern failed");
+                let quads = matched.quads_vec().await.expect("execute match");
+                black_box(quads)
+            })
+        });
+}
 // Index axis (file).
 match_bench!(
     match_sorted_default_noindex_file,
@@ -833,6 +861,39 @@ fn cached_dict_file(placement: DictionaryPlacement, size: usize) -> PathBuf {
         )
         .await
         .expect("write dictionary bench file");
+    });
+    cache.lock().unwrap().insert(key, path.clone());
+    path
+}
+
+static DICT_INDEXED_FILE_CACHE: OnceLock<Mutex<HashMap<(DictionaryPlacement, usize), PathBuf>>> =
+    OnceLock::new();
+
+/// Like [`cached_dict_file`], but with the by-copy index — the file behind
+/// the placement axis of the match benches.
+fn cached_dict_indexed_file(placement: DictionaryPlacement, size: usize) -> PathBuf {
+    let cache = DICT_INDEXED_FILE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let key = (placement, size);
+    if let Some(path) = cache.lock().unwrap().get(&key) {
+        return path.clone();
+    }
+    let dir = PathBuf::from("target/bench_vortex_files");
+    std::fs::create_dir_all(&dir).unwrap();
+    let placement_name = match placement {
+        DictionaryPlacement::Padded => "padded",
+        DictionaryPlacement::Sidecar => "sidecar",
+    };
+    let path = dir.join(format!("dict_{placement_name}_bycopy_{size}.vortex"));
+    rt().block_on(async {
+        io::quads_stream_to_vortex_file_with_builder::<SortedStreamBuilder, _>(
+            generate_rdf_data_stream(size),
+            &path,
+            LayoutStrategy::Dictionary,
+            Index::ByCopy.types(),
+            placement,
+        )
+        .await
+        .expect("write indexed dictionary bench file");
     });
     cache.lock().unwrap().insert(key, path.clone());
     path
