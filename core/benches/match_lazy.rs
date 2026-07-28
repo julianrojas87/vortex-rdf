@@ -1,0 +1,219 @@
+//! Match benchmarks *without* materialization: the cost of `match_pattern`
+//! alone — index resolution + row-selection composition into a narrowed view,
+//! before any quad is decoded. Same layout × source × index matrix and probe
+//! patterns as `benchmark.rs`'s match groups; the difference between the two
+//! suites is materialization's share of a match, which is what an iterative
+//! query plan defers by refining views and decoding only the final result.
+//!
+//! Deliberately a separate bench target: CodSpeed CI runs
+//! `cargo codspeed run --bench benchmark`, so these groups never upload — they
+//! exist for the local dashboard's lazy-match table only.
+
+use std::hint::black_box;
+
+use vortex_rdf_core::{DictionaryPlacement, VortexRdfStore};
+
+// The module is shared with `benchmark.rs` and compiled per-target; items
+// only the other target uses (unsorted builders, serialize helpers) are dead
+// here by design.
+#[allow(dead_code)]
+mod support;
+use support::*;
+
+fn main() {
+    divan::main();
+}
+
+/// Time `match_pattern` only: the returned view (a store sharing Arc'd
+/// internals with the base) is black-boxed and dropped per iteration, never
+/// executed.
+fn run_lazy_match(
+    bencher: divan::Bencher,
+    builder: Builder,
+    layout: Layout,
+    index: Index,
+    source: Source,
+    pattern: Pattern,
+) {
+    bencher
+        .with_inputs(|| make_store(source, builder, layout, index, bench_size()))
+        .bench_refs(|store| {
+            let (s, p, o, g) = terms_for(pattern);
+            rt().block_on(async {
+                let matched = store
+                    .match_pattern(s.as_ref(), p.as_ref(), o.as_ref(), g.as_ref())
+                    .await
+                    .expect("match_pattern failed");
+                black_box(matched)
+            })
+        });
+}
+
+macro_rules! lazy_match_bench {
+    ($name:ident, $layout:expr, $index:expr, $source:expr) => {
+        #[divan::bench(args = PATTERNS)]
+        fn $name(bencher: divan::Bencher, pattern: &Pattern) {
+            run_lazy_match(
+                bencher,
+                Builder::SortedStream,
+                $layout,
+                $index,
+                $source,
+                *pattern,
+            );
+        }
+    };
+}
+
+/// The sidecar twin, opened from the path-based writer's file (see
+/// `benchmark.rs`'s `match_sidecar_bench!`).
+macro_rules! lazy_match_sidecar_bench {
+    ($name:ident, $index:expr) => {
+        #[divan::bench(args = PATTERNS)]
+        fn $name(bencher: divan::Bencher, pattern: &Pattern) {
+            bencher
+                .with_inputs(|| {
+                    let path = cached_dict_indexed_file(
+                        DictionaryPlacement::Sidecar,
+                        $index,
+                        bench_size(),
+                    );
+                    rt().block_on(async {
+                        VortexRdfStore::from_file(&path)
+                            .await
+                            .expect("open sidecar")
+                    })
+                })
+                .bench_refs(|store| {
+                    let (s, p, o, g) = terms_for(*pattern);
+                    rt().block_on(async {
+                        let matched = store
+                            .match_pattern(s.as_ref(), p.as_ref(), o.as_ref(), g.as_ref())
+                            .await
+                            .expect("match_pattern failed");
+                        black_box(matched)
+                    })
+                });
+        }
+    };
+}
+
+// The full matrix, named `lazy_` + the materializing twin's group name so the
+// dashboard derives one set of ids from the other.
+// No secondary index.
+lazy_match_bench!(
+    lazy_match_sorted_default_noindex_mem,
+    Layout::Default,
+    Index::None,
+    Source::InMemory
+);
+lazy_match_bench!(
+    lazy_match_sorted_default_noindex_file,
+    Layout::Default,
+    Index::None,
+    Source::File
+);
+lazy_match_bench!(
+    lazy_match_sorted_typedobj_noindex_mem,
+    Layout::TypedObject,
+    Index::None,
+    Source::InMemory
+);
+lazy_match_bench!(
+    lazy_match_sorted_typedobj_noindex_file,
+    Layout::TypedObject,
+    Index::None,
+    Source::File
+);
+lazy_match_bench!(
+    lazy_match_sorted_dict_noindex_mem,
+    Layout::Dictionary,
+    Index::None,
+    Source::InMemory
+);
+lazy_match_bench!(
+    lazy_match_sorted_dict_noindex_file,
+    Layout::Dictionary,
+    Index::None,
+    Source::File
+);
+lazy_match_sidecar_bench!(lazy_match_sorted_dict_noindex_sidecar_file, Index::None);
+// Secondary by reference.
+lazy_match_bench!(
+    lazy_match_sorted_default_byref_mem,
+    Layout::Default,
+    Index::ByReference,
+    Source::InMemory
+);
+lazy_match_bench!(
+    lazy_match_sorted_default_byref_file,
+    Layout::Default,
+    Index::ByReference,
+    Source::File
+);
+lazy_match_bench!(
+    lazy_match_sorted_typedobj_byref_mem,
+    Layout::TypedObject,
+    Index::ByReference,
+    Source::InMemory
+);
+lazy_match_bench!(
+    lazy_match_sorted_typedobj_byref_file,
+    Layout::TypedObject,
+    Index::ByReference,
+    Source::File
+);
+lazy_match_bench!(
+    lazy_match_sorted_dict_byref_mem,
+    Layout::Dictionary,
+    Index::ByReference,
+    Source::InMemory
+);
+lazy_match_bench!(
+    lazy_match_sorted_dict_byref_file,
+    Layout::Dictionary,
+    Index::ByReference,
+    Source::File
+);
+lazy_match_sidecar_bench!(
+    lazy_match_sorted_dict_byref_sidecar_file,
+    Index::ByReference
+);
+// Secondary by copy.
+lazy_match_bench!(
+    lazy_match_sorted_default_bycopy_mem,
+    Layout::Default,
+    Index::ByCopy,
+    Source::InMemory
+);
+lazy_match_bench!(
+    lazy_match_sorted_default_bycopy_file,
+    Layout::Default,
+    Index::ByCopy,
+    Source::File
+);
+lazy_match_bench!(
+    lazy_match_sorted_typedobj_bycopy_mem,
+    Layout::TypedObject,
+    Index::ByCopy,
+    Source::InMemory
+);
+lazy_match_bench!(
+    lazy_match_sorted_typedobj_bycopy_file,
+    Layout::TypedObject,
+    Index::ByCopy,
+    Source::File
+);
+lazy_match_bench!(
+    lazy_match_sorted_dict_bycopy_mem,
+    Layout::Dictionary,
+    Index::ByCopy,
+    Source::InMemory
+);
+lazy_match_bench!(
+    lazy_match_sorted_dict_bycopy_file,
+    Layout::Dictionary,
+    Index::ByCopy,
+    Source::File
+);
+lazy_match_sidecar_bench!(lazy_match_sorted_dict_bycopy_sidecar_file, Index::ByCopy);

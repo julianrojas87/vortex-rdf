@@ -66,3 +66,11 @@ tokio = { workspace = true, features = ["time", "rt-multi-thread"] }
 name = "benchmark"
 harness = false
 required-features = ["file-io"]
+
+# Local-only lazy-match matrix (match_pattern without materialization).
+# CodSpeed CI runs `cargo codspeed run --bench benchmark`, so this target is
+# never uploaded; it feeds the dashboard's lazy-match table.
+[[bench]]
+name = "match_lazy"
+harness = false
+required-features = ["file-io"]
