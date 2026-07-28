@@ -225,8 +225,16 @@ impl VortexRdfStore {
     /// Dictionary-layout file whose term count exceeds `max_resident_terms`
     /// keeps its dictionary file-backed (probed and decoded by scans) instead
     /// of lifting it into memory.
+    ///
+    /// `from_file` uses the built-in default (overridable through the
+    /// `VORTEX_RDF_DICT_MAX_RESIDENT_TERMS` environment variable); this entry
+    /// pins the choice per open — `0` forces file-backed, `u64::MAX` forces
+    /// resident. On a file-backed store the synchronous dictionary surface
+    /// ([`encode_code`](Self::encode_code), [`decode_code`](Self::decode_code),
+    /// [`dictionary_snapshot`](Self::dictionary_snapshot)) answers `None`;
+    /// queries and reconstruction work unchanged.
     #[cfg(feature = "file-io")]
-    pub(crate) async fn from_file_with_dict_residency<P: AsRef<std::path::Path>>(
+    pub async fn from_file_with_dict_residency<P: AsRef<std::path::Path>>(
         path: P,
         max_resident_terms: u64,
     ) -> Result<Self> {

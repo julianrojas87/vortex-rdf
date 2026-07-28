@@ -146,7 +146,7 @@ impl LayoutStrategy {
 /// Both forms hold the same scannable sorted term column ([`TERM_FIELD`]);
 /// they differ in which file it lives in. Non-Dictionary layouts carry no
 /// dictionary, so the placement is a no-op for them.
-#[derive(Copy, Clone, PartialEq, Eq, ValueEnum, Debug, Default)]
+#[derive(Copy, Clone, PartialEq, Eq, Hash, ValueEnum, Debug, Default)]
 pub enum DictionaryPlacement {
     /// One self-contained file: the dictionary rides as trailing rows of the
     /// quads file, in a nullable term column that is null on every quad row
