@@ -54,6 +54,7 @@ static NATIVE_FILE_SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
         .with::<RuntimeSession>();
 
     vortex_file::register_default_encodings(&session);
+    crate::io::vortex_rdf_store_layout::register_vortex_rdf_store_layout(&session);
     session
 });
 use serde::{Deserialize, Serialize};
@@ -1734,6 +1735,126 @@ pub async fn match_cottas_native_file_as_compact_triples(
         execute_cottas_native_match(input_path, subject, predicate, object, graph).await?;
     projected_native_id_rows_as_compact_triples(input_path, &planned.rows, &planned.bound_terms)
         .await
+}
+
+// VORTEX_RDF_NATIVE_V10_QUAD_SOURCE_CLI_V1
+/// Experimental v10 serializer: native Vortex-RDF root plus an ID-based SPOG
+/// QuadSource. It deliberately writes no v9 manifest, sidecars, or embedded files.
+pub async fn serialize_cottas_native_quad_source_v10_file<Dict, S>(
+    quad_stream: S,
+    output_path: &Path,
+    config: CottasNativeConfig,
+) -> Result<()>
+where
+    Dict: RdfDictionary + Send + Sync + 'static,
+    S: Stream<Item = Result<Quad>> + Unpin + Send + 'static,
+{
+    if config.ordering != TripleOrdering::SPO {
+        return Err(VortexRdfError::InvalidOperation(format!(
+            "native v10 QuadSource serialization requires SPO ordering; got {:?}",
+            config.ordering
+        )));
+    }
+    let row_group_size = config.row_group_size.max(1);
+    let sort_batch_size = std::env::var("VORTEX_RDF_NATIVE_ID_SORT_BATCH_SIZE")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(row_group_size.saturating_mul(8).max(1_000_000));
+    let temp_dir = tempfile::tempdir()
+        .map_err(|error| VortexRdfError::Serialization(error.to_string()))?;
+    let string_runs = spill_sorted_native_id_string_runs(
+        quad_stream,
+        config.ordering,
+        sort_batch_size,
+        temp_dir.path(),
+    )
+    .await?;
+    let mut dictionary = Dict::new();
+    let _pair_runs =
+        build_dictionary_and_pair_runs::<Dict>(&mut dictionary, &string_runs, temp_dir.path())?;
+    let id_runs = encode_string_runs_to_id_runs::<Dict>(
+        &dictionary,
+        &string_runs,
+        config.ordering,
+        temp_dir.path(),
+    )?;
+    drop(string_runs);
+    let arrays = merge_sorted_id_runs_to_array_stream(
+        id_runs,
+        config.ordering,
+        row_group_size,
+    )?;
+    let dtype = empty_spog_array()?.dtype().clone();
+    let stream = ArrayStreamAdapter::new(dtype, arrays);
+    let inner = WriteStrategyBuilder::default().with_row_block_size(row_group_size);
+    let inner = match config.compression_profile {
+        CottasVortexCompressionProfile::Balanced => inner,
+        CottasVortexCompressionProfile::Compact => inner
+            .with_btrblocks_builder(BtrBlocksCompressorBuilder::default().with_compact()),
+    };
+    let staging_path = output_path.with_file_name(format!(
+        ".{}.v10-writing.{}.tmp",
+        output_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("vortex-rdf"),
+        std::process::id()
+    ));
+    if staging_path.exists() {
+        return Err(VortexRdfError::InvalidOperation(format!(
+            "native v10 staging path already exists: {:?}", staging_path
+        )));
+    }
+    let result: Result<()> = async {
+        let mut writer = tokio::fs::File::create(&staging_path)
+            .await
+            .map_err(|error| VortexRdfError::Serialization(error.to_string()))?;
+        let summary = crate::io::vortex_rdf_store_layout::write_vortex_rdf_quad_source_v10(
+            &NATIVE_FILE_SESSION,
+            &mut writer,
+            stream,
+            inner.build(),
+        )
+        .await
+        .map_err(VortexRdfError::from)?;
+        writer
+            .sync_all()
+            .await
+            .map_err(|error| VortexRdfError::Serialization(error.to_string()))?;
+        drop(writer);
+        if summary.footer().layout().encoding_id().as_ref()
+            != crate::io::vortex_rdf_store_layout::VORTEX_RDF_STORE_LAYOUT_ID
+        {
+            return Err(VortexRdfError::Serialization(
+                "v10 writer returned an unexpected root layout".into(),
+            ));
+        }
+        let reopened = NATIVE_FILE_SESSION
+            .open_options()
+            .open_path(&staging_path)
+            .await
+            .map_err(VortexRdfError::from)?;
+        let root = reopened.footer().layout();
+        if root.encoding_id().as_ref()
+            != crate::io::vortex_rdf_store_layout::VORTEX_RDF_STORE_LAYOUT_ID
+            || root.nchildren() != 1
+            || root.child_names().next().as_deref() != Some("quad-source")
+            || root.row_count() != summary.row_count()
+        {
+            return Err(VortexRdfError::Deserialization(
+                "native v10 QuadSource validation failed".into(),
+            ));
+        }
+        reopened.scan().map_err(VortexRdfError::from)?;
+        std::fs::rename(&staging_path, output_path)
+            .map_err(|error| VortexRdfError::Serialization(error.to_string()))?;
+        Ok(())
+    }
+    .await;
+    if result.is_err() {
+        let _ = std::fs::remove_file(&staging_path);
+    }
+    result
 }
 
 pub async fn serialize_cottas_native_file<Dict, S>(

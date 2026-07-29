@@ -3,6 +3,7 @@ pub mod cottas_native_strings;
 pub mod de;
 pub mod ser;
 pub mod utils;
+pub mod vortex_rdf_store_layout;
 
 pub use de::{array_from_ipc_reader, deserialize};
 
@@ -21,7 +22,7 @@ pub use cottas_native_ids::{
     match_cottas_native_file_as_compact_triples, match_cottas_native_file_as_triples,
     match_cottas_native_file_as_triples_optimized, match_cottas_native_file_with_diagnostics,
     rebuild_cottas_native_term_dictionary, rewrite_cottas_native_id_to_term_dictionary,
-    serialize_cottas_native_file,
+    serialize_cottas_native_file, serialize_cottas_native_quad_source_v10_file,
 };
 
 pub use cottas_native_strings::{

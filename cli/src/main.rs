@@ -35,7 +35,7 @@ use vortex_rdf_core::{
         match_cottas_native_file, match_cottas_native_file_with_diagnostics,
         match_cottas_native_string_file, match_cottas_native_string_file_with_diagnostics,
         open_vortex_file, serialize, serialize_cottas_native_file,
-        serialize_cottas_native_string_file,
+        serialize_cottas_native_quad_source_v10_file, serialize_cottas_native_string_file,
     },
     store::layout::{
         cottas::{CottasLayout, TripleOrdering},
@@ -240,7 +240,8 @@ enum StoreLayout {
 
     #[value(alias = "cottas-native")]
     CottasNativeIds,
-
+    /// Experimental native v10 root with a QuadSource child and no v9 subfiles.
+    CottasNativeIdsV10,
     CottasNativeStrings,
 }
 
@@ -361,6 +362,30 @@ async fn main() -> Result<()> {
                 return Ok(());
             }
 
+            if storage_layout == StoreLayout::CottasNativeIdsV10 {
+                if index_type != IndexType::SimpleDictionary {
+                    return Err(anyhow!(
+                        "cottas-native-ids-v10 currently supports only --index-type simple-dictionary"
+                    ));
+                }
+                let config = CottasNativeConfig {
+                    ordering,
+                    compression_profile: compression_profile.into(),
+                    ..CottasNativeConfig::default()
+                };
+                serialize_cottas_native_quad_source_v10_file::<SimpleDictionary, _>(
+                    quads_stream,
+                    &output,
+                    config,
+                )
+                .await
+                .context("Failed to serialize native v10 QuadSource artifact")?;
+                info!(
+                    "Serialized experimental native v10 QuadSource in {:?}",
+                    start.elapsed()
+                );
+                return Ok(());
+            }
             if storage_layout == StoreLayout::CottasNativeIds {
                 if index_type != IndexType::SimpleDictionary {
                     return Err(anyhow!(
@@ -422,6 +447,7 @@ async fn main() -> Result<()> {
                 },
 
                 StoreLayout::CottasNativeIds => unreachable!("handled above"),
+                StoreLayout::CottasNativeIdsV10 => unreachable!("handled above"),
                 StoreLayout::CottasNativeStrings => unreachable!("handled above"),
             };
 
@@ -534,7 +560,7 @@ async fn main() -> Result<()> {
                                 .context("Failed to deserialize from Vortex")?;
                         }
 
-                        (_, StoreLayout::CottasNativeIds) => {
+                        (_, StoreLayout::CottasNativeIds | StoreLayout::CottasNativeIdsV10) => {
                             return Err(anyhow!(
                                 "cottas-native deserialization is not handled by generic VortexRdfStore"
                             ));
@@ -603,7 +629,7 @@ async fn main() -> Result<()> {
                                 .context("Failed to deserialize from Vortex")?;
                         }
 
-                        (_, StoreLayout::CottasNativeIds) => {
+                        (_, StoreLayout::CottasNativeIds | StoreLayout::CottasNativeIdsV10) => {
                             return Err(anyhow!(
                                 "cottas-native deserialization from stdin is not supported here"
                             ));
@@ -969,6 +995,7 @@ async fn main() -> Result<()> {
                         }
                     },
                     StoreLayout::CottasNativeIds => unreachable!("handled in Serialize arm"),
+                    StoreLayout::CottasNativeIdsV10 => unreachable!("handled in Serialize arm"),
                     StoreLayout::CottasNativeStrings => unreachable!("handled above"),
                 };
                 debug!("Vortex index created in {:?}", load_start.elapsed());
@@ -1100,6 +1127,9 @@ async fn main() -> Result<()> {
                     unreachable!("handled above");
                 }
                 (IndexType::ChainedHash, StoreLayout::CottasNativeIds) => {
+                    unreachable!("handled above");
+                }
+                (_, StoreLayout::CottasNativeIdsV10) => {
                     unreachable!("handled above");
                 }
                 (_, StoreLayout::CottasNativeStrings) => {
