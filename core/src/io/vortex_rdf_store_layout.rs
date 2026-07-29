@@ -9,9 +9,11 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use futures::future::try_join;
+use futures::{StreamExt as _, TryStreamExt as _};
 use serde::{Deserialize, Serialize};
 use vortex_array::dtype::DType;
-use vortex_array::stream::{ArrayStream, ArrayStreamExt};
+use vortex_array::stream::{ArrayStream, ArrayStreamAdapter, ArrayStreamExt, SendableArrayStream};
 use vortex_array::{ArrayContext, ArrayRef, RawMetadata};
 use vortex_error::{VortexResult, vortex_bail, vortex_ensure_eq};
 use vortex_file::{OpenOptionsSessionExt, WriteOptionsSessionExt};
@@ -19,7 +21,9 @@ use vortex_flatbuffers::{FlatBuffer, WriteFlatBufferExt};
 use vortex_io::VortexWrite;
 use vortex_layout::LayoutStrategy;
 use vortex_layout::segments::{SegmentSinkRef, SegmentSource};
-use vortex_layout::sequence::{SendableSequentialStream, SequencePointer};
+use vortex_layout::sequence::{
+    SendableSequentialStream, SequencePointer, SequentialArrayStreamExt,
+};
 use vortex_layout::session::LayoutSessionExt;
 use vortex_layout::{
     Layout, LayoutChildType, LayoutDeserializeArgs, LayoutEncoding, LayoutId, LayoutParts,
@@ -356,16 +360,144 @@ impl VTable for VortexRdfStore {
 }
 
 // VORTEX_RDF_NATIVE_STORE_QUAD_SOURCE_STRATEGY_V1
-/// Writer-side strategy that preserves a configurable native quad layout
-/// beneath the transparent Vortex-RDF store root.
+// VORTEX_RDF_STREAMING_NATIVE_COMPONENTS_V1
+/// Replayable producer for one independently typed native store component.
+/// Production implementations should expose bounded streams backed by runs,
+/// temporary files, or generated batches rather than one complete ArrayRef.
+pub trait NativeComponentSource: Send + Sync + 'static {
+    fn dtype(&self) -> &DType;
+    fn open(&self) -> VortexResult<SendableArrayStream>;
+    fn buffered_bytes(&self) -> u64 {
+        0
+    }
+}
+
+/// Small replayable source for tests and genuinely small components.
+/// Large dictionaries and indexes should use run-backed sources.
+#[derive(Clone)]
+pub struct ReplayableArraySource {
+    dtype: DType,
+    chunks: Arc<[ArrayRef]>,
+    retained_bytes: u64,
+}
+
+impl ReplayableArraySource {
+    pub fn try_new(chunks: Vec<ArrayRef>) -> VortexResult<Self> {
+        let Some(first) = chunks.first() else {
+            vortex_bail!("a replayable component source requires at least one chunk");
+        };
+        let dtype = first.dtype().clone();
+        for chunk in &chunks {
+            vortex_ensure_eq!(
+                chunk.dtype(),
+                &dtype,
+                "component chunks must share one dtype"
+            );
+        }
+        let retained_bytes = chunks.iter().map(|chunk| chunk.nbytes()).sum();
+        Ok(Self {
+            dtype,
+            chunks: chunks.into(),
+            retained_bytes,
+        })
+    }
+}
+
+impl NativeComponentSource for ReplayableArraySource {
+    fn dtype(&self) -> &DType {
+        &self.dtype
+    }
+
+    fn open(&self) -> VortexResult<SendableArrayStream> {
+        let chunks = Arc::clone(&self.chunks);
+        let stream = futures::stream::unfold((chunks, 0usize), |(chunks, index)| async move {
+            let chunk = chunks.get(index)?.clone();
+            Some((Ok(chunk), (chunks, index + 1)))
+        });
+        Ok(ArrayStreamExt::boxed(ArrayStreamAdapter::new(
+            self.dtype.clone(),
+            stream,
+        )))
+    }
+
+    fn buffered_bytes(&self) -> u64 {
+        self.retained_bytes
+    }
+}
+
+#[derive(Clone)]
+pub struct NativeComponentWrite {
+    pub descriptor: StoreComponentDescriptor,
+    pub source: Arc<dyn NativeComponentSource>,
+    pub strategy: Arc<dyn LayoutStrategy>,
+}
+
+impl NativeComponentWrite {
+    pub fn new(
+        descriptor: StoreComponentDescriptor,
+        source: Arc<dyn NativeComponentSource>,
+        strategy: Arc<dyn LayoutStrategy>,
+    ) -> VortexResult<Self> {
+        descriptor.validate()?;
+        vortex_ensure_eq!(
+            &descriptor.dtype,
+            source.dtype(),
+            "component source dtype mismatch"
+        );
+        Ok(Self {
+            descriptor,
+            source,
+            strategy,
+        })
+    }
+}
+
+/// Streaming native RDF store writer over one shared Vortex SegmentSink.
+///
+/// FUTURE(Vortex multi-stream writer): replace this adapter with the upstream
+/// native multi-stream/root-layout API when publicly available. Persisted
+/// component descriptors and layout structure must remain unchanged.
+///
+/// FUTURE(performance): tune top-level concurrency together with downstream
+/// compression concurrency from measured peak RSS and throughput.
 #[derive(Clone)]
 pub struct VortexRdfStoreLayoutStrategy {
     quad_source: Arc<dyn LayoutStrategy>,
+    components: Arc<[NativeComponentWrite]>,
+    max_concurrent_components: usize,
 }
 
 impl VortexRdfStoreLayoutStrategy {
     pub fn new(quad_source: Arc<dyn LayoutStrategy>) -> Self {
-        Self { quad_source }
+        Self {
+            quad_source,
+            components: Arc::from([]),
+            max_concurrent_components: 2,
+        }
+    }
+
+    pub fn with_components(mut self, components: Vec<NativeComponentWrite>) -> VortexResult<Self> {
+        let mut names = std::collections::BTreeSet::new();
+        for component in &components {
+            component.descriptor.validate()?;
+            vortex_ensure_eq!(&component.descriptor.dtype, component.source.dtype());
+            if !names.insert(component.descriptor.name.as_ref()) {
+                vortex_bail!(
+                    "duplicate native component write name: {}",
+                    component.descriptor.name
+                );
+            }
+        }
+        self.components = components.into();
+        Ok(self)
+    }
+
+    pub fn with_max_concurrent_components(mut self, concurrency: usize) -> VortexResult<Self> {
+        if concurrency == 0 {
+            vortex_bail!("native component concurrency must be positive");
+        }
+        self.max_concurrent_components = concurrency;
+        Ok(self)
     }
 }
 
@@ -376,18 +508,61 @@ impl LayoutStrategy for VortexRdfStoreLayoutStrategy {
         ctx: ArrayContext,
         segment_sink: SegmentSinkRef,
         stream: SendableSequentialStream,
-        eof: SequencePointer,
+        mut eof: SequencePointer,
         session: &VortexSession,
     ) -> VortexResult<LayoutRef> {
-        let quad_source = self
-            .quad_source
-            .write_stream(ctx, segment_sink, stream, eof, session)
-            .await?;
-        Ok(new_vortex_rdf_store_layout(quad_source).into_layout())
+        // The input stream already occupies the first sequence subtree. Reserve
+        // a boundary for its internal writer, then ordered sibling subtrees for
+        // every independently produced component.
+        let quad_eof = eof.split_off();
+        let mut jobs = Vec::with_capacity(self.components.len());
+        for component in self.components.iter().cloned() {
+            let stream_pointer = eof.split_off();
+            let component_eof = eof.split_off();
+            let child_ctx = ctx.clone();
+            let child_sink = Arc::clone(&segment_sink);
+            let child_session = session.clone();
+            jobs.push(async move {
+                let child_stream = component.source.open()?;
+                vortex_ensure_eq!(child_stream.dtype(), &component.descriptor.dtype);
+                let layout = component
+                    .strategy
+                    .write_stream(
+                        child_ctx,
+                        child_sink,
+                        child_stream.sequenced(stream_pointer),
+                        component_eof,
+                        &child_session,
+                    )
+                    .await?;
+                StoreComponent::new(component.descriptor, layout)
+            });
+        }
+
+        let quad_future = self.quad_source.write_stream(
+            ctx,
+            Arc::clone(&segment_sink),
+            stream,
+            quad_eof,
+            session,
+        );
+        let concurrency = self.max_concurrent_components.min(jobs.len().max(1));
+        let components_future = futures::stream::iter(jobs)
+            .buffered(concurrency)
+            .try_collect::<Vec<_>>();
+        let (quad_source, components) = try_join(quad_future, components_future).await?;
+        Ok(new_vortex_rdf_store_layout_with_components(quad_source, components)?.into_layout())
     }
 
     fn buffered_bytes(&self) -> u64 {
         self.quad_source.buffered_bytes()
+            + self
+                .components
+                .iter()
+                .map(|component| {
+                    component.source.buffered_bytes() + component.strategy.buffered_bytes()
+                })
+                .sum::<u64>()
     }
 }
 
@@ -545,6 +720,132 @@ mod tests {
 
         let strategy = VortexRdfStoreLayoutStrategy::new(Arc::new(FlatLayoutStrategy::default()));
         assert_eq!(strategy.buffered_bytes(), 0);
+    }
+
+    #[tokio::test]
+    async fn streaming_native_component_uses_shared_sink_and_independent_schema() -> VortexResult<()>
+    {
+        use std::sync::Mutex;
+        use vortex_array::IntoArray;
+        use vortex_array::arrays::{StructArray, VarBinArray};
+        use vortex_array::buffer::BufferHandle;
+        use vortex_buffer::buffer;
+        use vortex_buffer::{ByteBuffer, ByteBufferMut};
+        use vortex_io::session::RuntimeSession;
+        use vortex_layout::layouts::flat::writer::FlatLayoutStrategy;
+        use vortex_layout::segments::{SegmentFuture, SegmentId, SegmentSink, SegmentSource};
+
+        #[derive(Default)]
+        struct LocalSegments {
+            buffers: Mutex<Vec<ByteBuffer>>,
+        }
+
+        impl SegmentSource for LocalSegments {
+            fn request(&self, id: SegmentId) -> SegmentFuture {
+                use futures::FutureExt as _;
+                let buffer = self
+                    .buffers
+                    .lock()
+                    .expect("segment lock")
+                    .get(*id as usize)
+                    .cloned();
+                async move {
+                    buffer
+                        .map(BufferHandle::new_host)
+                        .ok_or_else(|| vortex_error::vortex_err!("segment not found"))
+                }
+                .boxed()
+            }
+        }
+
+        #[async_trait]
+        impl SegmentSink for LocalSegments {
+            async fn write(
+                &self,
+                mut sequence_id: vortex_layout::sequence::SequenceId,
+                buffers: Vec<ByteBuffer>,
+            ) -> VortexResult<SegmentId> {
+                sequence_id.collapse().await;
+                let mut combined = ByteBufferMut::empty();
+                for buffer in buffers {
+                    combined.extend_from_slice(buffer.as_ref());
+                }
+                let mut segments = self.buffers.lock().expect("segment lock");
+                let id = SegmentId::from(u32::try_from(segments.len())?);
+                segments.push(combined.freeze());
+                Ok(id)
+            }
+        }
+        use vortex_layout::sequence::{SequenceId, SequentialArrayStreamExt};
+        use vortex_layout::session::LayoutSession;
+
+        let session = vortex_array::array_session()
+            .with::<LayoutSession>()
+            .with::<RuntimeSession>();
+        vortex_file::register_default_encodings(&session);
+        register_vortex_rdf_store_layout(&session);
+
+        let quads = StructArray::from_fields(&[
+            ("s", buffer![1u32, 2, 3].into_array()),
+            ("p", buffer![10u32, 10, 11].into_array()),
+            ("o", buffer![20u32, 21, 22].into_array()),
+            ("g", buffer![0u32, 0, 1].into_array()),
+        ])?
+        .into_array();
+        let dictionary = StructArray::from_fields(&[
+            ("id", buffer![0u32, 1, 2, 3, 4, 5, 6, 7].into_array()),
+            (
+                "term",
+                VarBinArray::from(vec!["a", "b", "c", "d", "e", "f", "g", "h"]).into_array(),
+            ),
+        ])?
+        .into_array();
+
+        let component = NativeComponentWrite::new(
+            StoreComponentDescriptor {
+                name: "dictionary.id-to-term".into(),
+                role: StoreComponentRole::Dictionary,
+                implementation: "native-id-row-v1".into(),
+                version: 1,
+                required: true,
+                dtype: dictionary.dtype().clone(),
+            },
+            Arc::new(ReplayableArraySource::try_new(vec![dictionary.clone()])?),
+            Arc::new(FlatLayoutStrategy::default()),
+        )?;
+        let strategy = VortexRdfStoreLayoutStrategy::new(Arc::new(FlatLayoutStrategy::default()))
+            .with_components(vec![component])?
+            .with_max_concurrent_components(1)?;
+        let segments = Arc::new(LocalSegments::default());
+        let (ptr, eof) = SequenceId::root().split();
+        let layout = strategy
+            .write_stream(
+                ArrayContext::empty(),
+                Arc::<LocalSegments>::clone(&segments),
+                quads.to_array_stream().sequenced(ptr),
+                eof,
+                &session,
+            )
+            .await?;
+
+        assert_eq!(layout.nchildren(), 2);
+        assert_eq!(
+            layout.child_names().collect::<Vec<_>>(),
+            vec![
+                Arc::<str>::from("quad-source"),
+                Arc::<str>::from("dictionary.id-to-term"),
+            ]
+        );
+        assert_eq!(layout.row_count(), 3);
+        let dictionary_layout = layout.child(1)?;
+        assert_eq!(dictionary_layout.row_count(), 8);
+        assert_eq!(dictionary_layout.dtype(), dictionary.dtype());
+        // Both children emitted physical segments through the same sink.
+        assert!(segments.buffers.lock().expect("segment lock").len() >= 2);
+        let typed = layout.as_::<VortexRdfStore>();
+        assert!(vortex_rdf_store_component(&typed, "dictionary.id-to-term")?.is_some());
+        assert!(vortex_rdf_store_component(&typed, "missing")?.is_none());
+        Ok(())
     }
 
     #[tokio::test]
