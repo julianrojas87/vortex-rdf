@@ -1,4 +1,5 @@
 # vortex-rdf
+[![PyPI](https://img.shields.io/pypi/v/vortex-rdf.svg)](https://pypi.org/project/vortex-rdf/)
 
 Python bindings for [Vortex-RDF](https://github.com/vortex-rdf/vortex-rdf), a
 modern, high-performance columnar RDF serialization format.

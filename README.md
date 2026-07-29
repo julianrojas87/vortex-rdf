@@ -1,6 +1,7 @@
 # Vortex-RDF
 [![Crates.io](https://img.shields.io/crates/v/vortex-rdf-core.svg)](https://crates.io/crates/vortex-rdf-core)
 [![npm](https://img.shields.io/npm/v/@vortex-rdf/vortex-rdf-store.svg)](https://www.npmjs.com/package/@vortex-rdf/vortex-rdf-store)
+[![PyPI](https://img.shields.io/pypi/v/vortex-rdf.svg)](https://pypi.org/project/vortex-rdf/)
 [![docs.rs](https://img.shields.io/docsrs/vortex-rdf-core)](https://docs.rs/vortex-rdf-core)
 [![License](https://img.shields.io/crates/l/vortex-rdf-core)](https://github.com/vortex-rdf/vortex-rdf/blob/main/LICENSE)
 [![CodSpeed](https://img.shields.io/endpoint?url=https://codspeed.io/badge.json)](https://app.codspeed.io/vortex-rdf/vortex-rdf?utm_source=badge)
