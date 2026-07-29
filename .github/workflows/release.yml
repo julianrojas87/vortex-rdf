@@ -39,8 +39,16 @@ permissions:
   contents: read
 
 jobs:
+  # The full CI suite runs against the exact ref being released; every
+  # publish job is gated on it. Dispatching from a commit whose CI was
+  # skipped (docs-only path filters) or never ran is therefore still safe.
+  ci:
+    name: CI
+    uses: ./.github/workflows/ci.yml
+
   crates:
     name: crates.io
+    needs: ci
     if: ${{ inputs.crates }}
     runs-on: ubuntu-latest
     environment: crates-io
@@ -61,6 +69,7 @@ jobs:
 
   npm:
     name: npm
+    needs: ci
     if: ${{ inputs.npm }}
     runs-on: ubuntu-latest
     environment: npm
@@ -93,6 +102,7 @@ jobs:
 
   pypi-wheels:
     name: PyPI wheel (${{ matrix.platform.name }})
+    needs: ci
     if: ${{ inputs.pypi }}
     runs-on: ${{ matrix.platform.runner }}
     strategy:
@@ -123,6 +133,7 @@ jobs:
 
   pypi-sdist:
     name: PyPI sdist
+    needs: ci
     if: ${{ inputs.pypi }}
     runs-on: ubuntu-latest
     steps:

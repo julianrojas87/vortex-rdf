@@ -16,6 +16,9 @@ on:
       - '**.md'
       - 'LICENSE'
       - '.gitignore'
+  # Lets the release workflow run the full CI suite against the exact ref
+  # being published before anything reaches a registry.
+  workflow_call:
 
 permissions:
   contents: read
