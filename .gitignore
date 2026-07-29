@@ -9,3 +9,11 @@ public
 /test
 .claude
 .venv
+
+# Python bindings and benchmark artifacts
+__pycache__/
+*.pyc
+python/.venv/
+*.so
+scripts/DBBench/data/
+scripts/DBBench/dbbench_runs/

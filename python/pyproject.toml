@@ -1,0 +1,33 @@
+[build-system]
+requires = ["maturin>=1.8,<2"]
+build-backend = "maturin"
+
+[project]
+name = "vortex-rdflib"
+version = "0.3.0"
+description = "rdflib-compatible Python bindings for Vortex-RDF, a columnar RDF store"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+keywords = ["rdf", "rdflib", "vortex", "columnar", "quad-store", "sparql"]
+classifiers = [
+  "Programming Language :: Rust",
+  "Programming Language :: Python :: Implementation :: CPython",
+  "Topic :: Database",
+]
+dependencies = ["rdflib>=7,<8"]
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+# Extras for running scripts/DBBench (pycottas provides the COTTAS
+# comparison engine; psutil powers RSS metrics and process-tree kills).
+bench = ["psutil", "pycottas"]
+
+[project.urls]
+Repository = "https://github.com/vortex-rdf/vortex-rdf"
+
+[tool.maturin]
+# Mixed Rust/Python layout: the compiled extension lands inside the pure
+# Python package as the private module `vortex_rdflib._native`.
+module-name = "vortex_rdflib._native"
+python-source = "."

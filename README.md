@@ -17,7 +17,7 @@ This library provides both serialization and deserialization capabilities for co
 - 📦 **Adaptive Compression**: Smart compression strategies can be applied based on the [BtrBlocks approach](https://www.cs.cit.tum.de/fileadmin/w00cfj/dis/papers/btrblocks.pdf), which provides a sophisticated multi-level compression system that adaptively selects optimal compression schemes based on data characteristics. These include e.g., [Fast Static Symbol Table (FSST)](https://doi.org/10.14778/3407790.3407851), [Run-Length Encoding (RLE)](https://en.wikipedia.org/wiki/Run-length_encoding), [BitPacking](https://doi.org/10.1002/spe.2326), among others.
 - ☄️ **Streaming & Out-of-Core Ingestion**: Quads can be streamed directly into and out of Vortex files with bounded memory. Larger than RAM knowledge graphs can be globally sorted via an external merge sort that spills sorted runs to disk, when serializing.
 - 🍀 **RDF Quads Support**: Full support for named Graphs `(S, P, O, G)` and in general for [RDF 1.1](https://www.w3.org/TR/rdf11-concepts/).
-- 🌍 **Cross-Platform**: Native Rust library with a CLI + WebAssembly (WASM) bindings for browsers/Node.js. Python bindings coming soon.
+- 🌍 **Cross-Platform**: Native Rust library with a CLI + WebAssembly (WASM) bindings for browsers/Node.js + Python bindings with rdflib integration.
 
 #### How it works:
 1. **Zero-copy buffer views**: When you want to access a specific column (e.g., just the `predicates`) or a specific subset of Quads, Vortex creates a [_Layout_](https://docs.vortex.dev/concepts/layouts) either from a Vortex file stored on disk or from Vortex encoded data in memory. Both representations are structured in the same way, which avoids having to convert data before reading it. Bottom line, the Layout is just metadata and pointers to the actual data, it doesn't need to duplicate it.
@@ -283,6 +283,23 @@ npm install @vortex-rdf/vortex-rdf-store
 ```
 
 See [js/README.md](js/README.md) for more details.
+
+### Python
+
+The `vortex-rdflib` package provides file-backed bindings plus an
+[rdflib](https://rdflib.readthedocs.io/) `Store` implementation, so `.vortex`
+files can be queried with SPARQL:
+
+```python
+from rdflib import Graph
+from vortex_rdflib import VortexStore
+
+graph = Graph(store=VortexStore("data.vortex"))
+graph.query("SELECT ?s WHERE { ?s ?p ?o } LIMIT 10")
+```
+
+Built with [maturin](https://www.maturin.rs/); see
+[python/README.md](python/README.md) for building and usage details.
 
 ---
 
