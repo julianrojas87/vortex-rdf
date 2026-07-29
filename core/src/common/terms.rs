@@ -40,13 +40,34 @@ pub fn parse_subject(s: &str) -> Result<NamedOrBlankNode> {
     }
 }
 
+/// Reconstructs a literal from its serialized N-Triples form: simple
+/// (`"v"`), language-tagged (`"v"@lang`), or typed (`"v"^^<dt>`). Trusted
+/// decode path — see [`parse_named_node`].
+fn literal_from_serialized(s: &str) -> Literal {
+    if s.contains("^^") {
+        let parts: Vec<&str> = s.splitn(2, "^^").collect();
+        let val = parts[0].trim_matches('"');
+        let dt = parts[1].trim_matches(|c| c == '<' || c == '>');
+        Literal::new_typed_literal(val, NamedNode::new_unchecked(dt))
+    } else if let Some(at_pos) = s.rfind('@') {
+        if at_pos > 0 && s.as_bytes()[at_pos - 1] == b'"' {
+            let val = s[..at_pos].trim_matches('"');
+            let lang = &s[at_pos + 1..];
+            Literal::new_language_tagged_literal_unchecked(val, lang)
+        } else {
+            Literal::new_simple_literal(s.trim_matches('"'))
+        }
+    } else {
+        Literal::new_simple_literal(s.trim_matches('"'))
+    }
+}
+
 /// Parses an arbitrary RDF term (blank node, literal, or named node) from its string form.
 pub fn parse_term(s: &str) -> Result<Term> {
     if s.starts_with('_') {
         Ok(Term::BlankNode(parse_blank_node(s)?))
     } else if s.starts_with('"') {
-        let val = s.trim_matches('"');
-        Ok(Term::Literal(Literal::new_simple_literal(val)))
+        Ok(Term::Literal(literal_from_serialized(s)))
     } else {
         Ok(Term::NamedNode(parse_named_node(s)?))
     }
@@ -78,31 +99,7 @@ pub fn get_as_term(s: &str) -> Option<Term> {
             s.trim_start_matches("_:"),
         )))
     } else if s.starts_with('"') {
-        if s.contains("^^") {
-            let parts: Vec<&str> = s.splitn(2, "^^").collect();
-            let val = parts[0].trim_matches('"');
-            let dt = parts[1].trim_matches(|c| c == '<' || c == '>');
-            Some(Term::Literal(Literal::new_typed_literal(
-                val,
-                NamedNode::new_unchecked(dt),
-            )))
-        } else if let Some(at_pos) = s.rfind('@') {
-            if at_pos > 0 && s.as_bytes()[at_pos - 1] == b'"' {
-                let val = s[..at_pos].trim_matches('"');
-                let lang = &s[at_pos + 1..];
-                Some(Term::Literal(
-                    Literal::new_language_tagged_literal_unchecked(val, lang),
-                ))
-            } else {
-                Some(Term::Literal(Literal::new_simple_literal(
-                    s.trim_matches('"'),
-                )))
-            }
-        } else {
-            Some(Term::Literal(Literal::new_simple_literal(
-                s.trim_matches('"'),
-            )))
-        }
+        Some(Term::Literal(literal_from_serialized(s)))
     } else {
         None
     }

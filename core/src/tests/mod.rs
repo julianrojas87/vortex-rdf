@@ -13,6 +13,7 @@ mod matching;
 mod mutation;
 mod roundtrip;
 mod streaming;
+mod terms;
 
 fn make_quad(s: &str, p: &str, o_lit: &str, g: GraphName) -> Quad {
     Quad::new(
