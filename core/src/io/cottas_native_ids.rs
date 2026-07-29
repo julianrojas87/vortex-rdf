@@ -1964,17 +1964,13 @@ where
                     );
                 }
                 NativeIndexSpec::PredicateExactRangesV2 => {
-                    let _shared_paths = index_build_context
-                        .selected_run_paths(spec)
-                        .ok_or_else(|| {
-                            VortexRdfError::Serialization(
-                                "predicate exact-range replay paths were not retained".into(),
-                            )
-                        })?;
-                    return Err(VortexRdfError::InvalidOperation(
-                        "predicate:exact-ranges-v2 is configuration-valid, but its directory and payload producers must be installed by the native predicate exact-range producer patch"
-                            .into(),
-                    ));
+                    let run_paths = index_build_context.selected_run_paths(spec).ok_or_else(|| VortexRdfError::Serialization("predicate exact-range replay paths were not retained".into()))?;
+                    let prepared = Arc::new(prepare_native_predicate_exact_v2(run_paths, temp_dir.path())?);
+                    let directory = Arc::new(NativePredicateExactDirectorySource::new(Arc::clone(&prepared))?);
+                    let payload = Arc::new(NativePredicateExactPayloadSource::new(prepared.payload_path.clone(), index_build_context.index_row_group_size)?);
+                    let strategy: Arc<dyn LayoutStrategy> = WriteStrategyBuilder::default().with_row_block_size(index_build_context.index_row_group_size).with_btrblocks_builder(BtrBlocksCompressorBuilder::default().with_compact()).build();
+                    components.push(NativeComponentWrite::new(StoreComponentDescriptor { name: "index.predicate.exact-ranges.directory".into(), role: StoreComponentRole::Index, implementation: "native-predicate-exact-directory-v2-compact".into(), version: 2, required: false, dtype: directory.dtype().clone() }, directory, Arc::clone(&strategy)).map_err(VortexRdfError::from)?);
+                    components.push(NativeComponentWrite::new(StoreComponentDescriptor { name: "index.predicate.exact-ranges.payload".into(), role: StoreComponentRole::Index, implementation: "native-predicate-exact-payload-v2-compact".into(), version: 2, required: false, dtype: payload.dtype().clone() }, payload, strategy).map_err(VortexRdfError::from)?);
                 }
                 unsupported => {
                     return Err(VortexRdfError::InvalidOperation(format!(
@@ -3397,6 +3393,84 @@ impl NativeRdfStoreFile {
         Ok(resolved)
     }
 
+    async fn lookup_native_predicate_exact_ranges(
+        &self,
+        predicate_id: u32,
+    ) -> Result<Option<Vec<Range<u64>>>> {
+        let Some(directory) = self.component_scan("index.predicate.exact-ranges.directory")? else {
+            return Ok(None);
+        };
+        let result = directory
+            .with_filter(eq(col("predicate_id"), lit(predicate_id)))
+            .with_projection(vortex_array::expr::select(
+                ["range_offset", "range_count", "candidate_rows"],
+                vortex_array::expr::root(),
+            ))
+            .into_array_stream()
+            .map_err(VortexRdfError::from)?
+            .read_all()
+            .await
+            .map_err(VortexRdfError::from)?;
+        if result.len() == 0 {
+            return Ok(Some(Vec::new()));
+        }
+        if result.len() != 1 {
+            return Err(VortexRdfError::Deserialization(format!(
+                "predicate exact v2 directory returned {} rows for predicate {predicate_id}",
+                result.len()
+            )));
+        }
+        let offsets = extract_projected_u64_column(&result, "range_offset")?;
+        let counts = extract_projected_u32_column(&result, "range_count")?;
+        let candidates = extract_projected_u64_column(&result, "candidate_rows")?;
+        let offset = offsets[0];
+        let count = counts[0];
+        let Some(payload) = self.component_scan("index.predicate.exact-ranges.payload")? else {
+            return Err(VortexRdfError::Deserialization(
+                "predicate exact v2 directory exists without payload".into(),
+            ));
+        };
+        let end = offset.checked_add(u64::from(count)).ok_or_else(|| {
+            VortexRdfError::Deserialization("predicate exact v2 payload range overflow".into())
+        })?;
+        let payload_result = payload
+            .with_row_range(offset..end)
+            .with_projection(vortex_array::expr::select(
+                ["row_start", "row_end"],
+                vortex_array::expr::root(),
+            ))
+            .into_array_stream()
+            .map_err(VortexRdfError::from)?
+            .read_all()
+            .await
+            .map_err(VortexRdfError::from)?;
+        let starts = extract_projected_u64_column(&payload_result, "row_start")?;
+        let ends = extract_projected_u64_column(&payload_result, "row_end")?;
+        if starts.len() != usize::try_from(count).unwrap_or(usize::MAX)
+            || starts.len() != ends.len()
+        {
+            return Err(VortexRdfError::Deserialization(
+                "predicate exact v2 payload length mismatch".into(),
+            ));
+        }
+        let ranges: Vec<_> = starts
+            .into_iter()
+            .zip(ends)
+            .map(|(start, end)| start..end)
+            .collect();
+        if ranges
+            .iter()
+            .map(|range| range.end - range.start)
+            .sum::<u64>()
+            != candidates[0]
+        {
+            return Err(VortexRdfError::Deserialization(
+                "predicate exact v2 candidate-row mismatch".into(),
+            ));
+        }
+        Ok(Some(ranges))
+    }
+
     async fn lookup_native_predicate_ranges(
         &self,
         predicate_id: u32,
@@ -3528,7 +3602,14 @@ impl NativeRdfStoreFile {
         }
 
         let subject_index_available = self.component_layout("index.subject-ranges")?.is_some();
-        let predicate_index_available = self.component_layout("index.predicate-runs")?.is_some();
+        let predicate_exact_available = self
+            .component_layout("index.predicate.exact-ranges.directory")?
+            .is_some()
+            && self
+                .component_layout("index.predicate.exact-ranges.payload")?
+                .is_some();
+        let predicate_run_available = self.component_layout("index.predicate-runs")?.is_some();
+        let predicate_index_available = predicate_exact_available || predicate_run_available;
         let quad_source_rows = self.file.footer().layout().row_count();
         let mut available_index = "none";
         let mut fallback_reason = "none";
@@ -3558,16 +3639,23 @@ impl NativeRdfStoreFile {
                 (None, "full-scan")
             }
         } else if let Some(predicate_id) = resolved.p {
-            available_index = if predicate_index_available {
+            available_index = if predicate_exact_available {
+                "index.predicate.exact-ranges"
+            } else if predicate_run_available {
                 "index.predicate-runs"
             } else {
                 "none"
             };
             if predicate_index_available {
-                let ranges = self
-                    .lookup_native_predicate_ranges(predicate_id)
-                    .await?
-                    .unwrap_or_default();
+                let ranges = if predicate_exact_available {
+                    self.lookup_native_predicate_exact_ranges(predicate_id)
+                        .await?
+                        .unwrap_or_default()
+                } else {
+                    self.lookup_native_predicate_ranges(predicate_id)
+                        .await?
+                        .unwrap_or_default()
+                };
                 let candidate_rows = ranges
                     .iter()
                     .map(|range| range.end - range.start)
@@ -3578,7 +3666,7 @@ impl NativeRdfStoreFile {
                     <= quad_source_rows
                         .saturating_mul(NATIVE_AUTO_MAX_PREDICATE_SELECTIVITY_NUMERATOR);
                 if policy == NativeIndexPolicy::Required || (range_cost_ok && row_cost_ok) {
-                    (Some(ranges), "index.predicate-runs")
+                    (Some(ranges), available_index)
                 } else {
                     fallback_reason = if !range_cost_ok && !row_cost_ok {
                         "predicate-index-too-fragmented-and-unselective"
@@ -6442,6 +6530,241 @@ fn build_predicate_directory_array(
     ])
     .map_err(VortexRdfError::Vortex)
     .map(|a| a.into_array())
+}
+
+// VORTEX_RDF_INTEGRATED_NATIVE_PREDICATE_EXACT_RANGES_V2
+#[derive(Clone)]
+struct PreparedNativePredicateExactV2 {
+    payload_path: PathBuf,
+    predicate_ids: Arc<[u32]>,
+    range_offsets: Arc<[u64]>,
+    range_counts: Arc<[u32]>,
+    candidate_rows: Arc<[u64]>,
+}
+
+fn prepare_native_predicate_exact_v2(
+    run_paths: &[PathBuf],
+    temp_dir: &Path,
+) -> Result<PreparedNativePredicateExactV2> {
+    let sort_batch = std::env::var("VORTEX_RDF_P_V2_SORT_BATCH_RANGES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(1_000_000)
+        .max(1);
+    let mut readers = run_paths
+        .iter()
+        .map(|path| NativeIdRunReader::new(path))
+        .collect::<Result<Vec<_>>>()?;
+    let mut heap = BinaryHeap::new();
+    for run_idx in 0..readers.len() {
+        if let Some(triple) = readers[run_idx].read_one()? {
+            heap.push(IdRunHeapItem {
+                triple,
+                run_idx,
+                ordering: TripleOrdering::SPO,
+            });
+        }
+    }
+    let mut records = Vec::with_capacity(sort_batch);
+    let mut sorted_runs = Vec::new();
+    let mut row = 0u64;
+    let mut active_predicate = None;
+    let mut active_start = 0u64;
+    while let Some(item) = heap.pop() {
+        let predicate = item.triple.p;
+        match active_predicate {
+            None => {
+                active_predicate = Some(predicate);
+                active_start = row;
+            }
+            Some(previous) if previous != predicate => {
+                records.push(NativePredicateRangeRecord {
+                    predicate_id: previous,
+                    row_start: active_start,
+                    row_end: row,
+                });
+                active_predicate = Some(predicate);
+                active_start = row;
+                if records.len() >= sort_batch {
+                    let index = sorted_runs.len();
+                    flush_predicate_range_run(&mut records, temp_dir, index, &mut sorted_runs)?;
+                }
+            }
+            Some(_) => {}
+        }
+        row = row.checked_add(1).ok_or_else(|| {
+            VortexRdfError::Serialization("predicate exact v2 row overflow".into())
+        })?;
+        if let Some(next) = readers[item.run_idx].read_one()? {
+            heap.push(IdRunHeapItem {
+                triple: next,
+                run_idx: item.run_idx,
+                ordering: TripleOrdering::SPO,
+            });
+        }
+    }
+    if let Some(predicate_id) = active_predicate {
+        records.push(NativePredicateRangeRecord {
+            predicate_id,
+            row_start: active_start,
+            row_end: row,
+        });
+    }
+    if !records.is_empty() {
+        let index = sorted_runs.len();
+        flush_predicate_range_run(&mut records, temp_dir, index, &mut sorted_runs)?;
+    }
+    let payload_path = temp_dir.join("native_predicate_exact_v2_payload.bin");
+    let mut payload = BufWriter::new(
+        std::fs::File::create(&payload_path)
+            .map_err(|e| VortexRdfError::Serialization(e.to_string()))?,
+    );
+    let mut range_readers = sorted_runs
+        .iter()
+        .map(|path| NativePredicateRangeRunReader::new(path))
+        .collect::<Result<Vec<_>>>()?;
+    let mut range_heap = BinaryHeap::new();
+    for run_idx in 0..range_readers.len() {
+        if let Some(value) = range_readers[run_idx].read_one()? {
+            range_heap.push(NativePredicateRangeHeapItem { value, run_idx });
+        }
+    }
+    let (mut ids, mut offsets, mut counts, mut rows) =
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let mut payload_offset = 0u64;
+    let mut current = None;
+    let mut current_offset = 0u64;
+    let mut current_count = 0u32;
+    let mut current_rows = 0u64;
+    while let Some(item) = range_heap.pop() {
+        let value = item.value;
+        if current != Some(value.predicate_id) {
+            if let Some(predicate_id) = current {
+                ids.push(predicate_id);
+                offsets.push(current_offset);
+                counts.push(current_count);
+                rows.push(current_rows);
+            }
+            current = Some(value.predicate_id);
+            current_offset = payload_offset;
+            current_count = 0;
+            current_rows = 0;
+        }
+        if value.row_start >= value.row_end {
+            return Err(VortexRdfError::Serialization(
+                "predicate exact v2 contains an empty range".into(),
+            ));
+        }
+        write_predicate_range_record(&mut payload, value)?;
+        current_count = current_count.checked_add(1).ok_or_else(|| {
+            VortexRdfError::Serialization("predicate exact v2 range-count overflow".into())
+        })?;
+        current_rows = current_rows
+            .checked_add(value.row_end - value.row_start)
+            .ok_or_else(|| {
+                VortexRdfError::Serialization("predicate exact v2 candidate-row overflow".into())
+            })?;
+        payload_offset += 1;
+        if let Some(next) = range_readers[item.run_idx].read_one()? {
+            range_heap.push(NativePredicateRangeHeapItem {
+                value: next,
+                run_idx: item.run_idx,
+            });
+        }
+    }
+    if let Some(predicate_id) = current {
+        ids.push(predicate_id);
+        offsets.push(current_offset);
+        counts.push(current_count);
+        rows.push(current_rows);
+    }
+    payload
+        .flush()
+        .map_err(|e| VortexRdfError::Serialization(e.to_string()))?;
+    Ok(PreparedNativePredicateExactV2 {
+        payload_path,
+        predicate_ids: ids.into(),
+        range_offsets: offsets.into(),
+        range_counts: counts.into(),
+        candidate_rows: rows.into(),
+    })
+}
+
+#[derive(Clone)]
+struct NativePredicateExactDirectorySource {
+    prepared: Arc<PreparedNativePredicateExactV2>,
+    dtype: vortex_array::dtype::DType,
+}
+impl NativePredicateExactDirectorySource {
+    fn new(prepared: Arc<PreparedNativePredicateExactV2>) -> Result<Self> {
+        let dtype =
+            build_predicate_directory_array(Vec::new(), Vec::new(), Vec::new(), Vec::new())?
+                .dtype()
+                .clone();
+        Ok(Self { prepared, dtype })
+    }
+}
+impl NativeComponentSource for NativePredicateExactDirectorySource {
+    fn dtype(&self) -> &vortex_array::dtype::DType {
+        &self.dtype
+    }
+    fn open(&self) -> VortexResult<vortex_array::stream::SendableArrayStream> {
+        let array = build_predicate_directory_array(
+            self.prepared.predicate_ids.to_vec(),
+            self.prepared.range_offsets.to_vec(),
+            self.prepared.range_counts.to_vec(),
+            self.prepared.candidate_rows.to_vec(),
+        )
+        .map_err(rdf_err_to_vortex_err)?;
+        Ok(ArrayStreamExt::boxed(ArrayStreamAdapter::new(
+            self.dtype.clone(),
+            futures::stream::iter(vec![Ok(array)]),
+        )))
+    }
+}
+
+#[derive(Clone)]
+struct NativePredicateExactPayloadSource {
+    path: PathBuf,
+    batch_size: usize,
+    dtype: vortex_array::dtype::DType,
+}
+impl NativePredicateExactPayloadSource {
+    fn new(path: PathBuf, batch_size: usize) -> Result<Self> {
+        let dtype = build_predicate_payload_array(Vec::new(), Vec::new())?
+            .dtype()
+            .clone();
+        Ok(Self {
+            path,
+            batch_size: batch_size.max(1),
+            dtype,
+        })
+    }
+}
+impl NativeComponentSource for NativePredicateExactPayloadSource {
+    fn dtype(&self) -> &vortex_array::dtype::DType {
+        &self.dtype
+    }
+    fn open(&self) -> VortexResult<vortex_array::stream::SendableArrayStream> {
+        let path = self.path.clone();
+        let batch_size = self.batch_size;
+        let stream = async_stream::try_stream! {
+            let mut reader = NativePredicateRangeRunReader::new(&path).map_err(rdf_err_to_vortex_err)?;
+            loop {
+                let (mut starts, mut ends) = (Vec::with_capacity(batch_size), Vec::with_capacity(batch_size));
+                while starts.len() < batch_size {
+                    let Some(value) = reader.read_one().map_err(rdf_err_to_vortex_err)? else { break; };
+                    starts.push(value.row_start); ends.push(value.row_end);
+                }
+                if starts.is_empty() { break; }
+                yield build_predicate_payload_array(starts, ends).map_err(rdf_err_to_vortex_err)?;
+            }
+        };
+        Ok(ArrayStreamExt::boxed(ArrayStreamAdapter::new(
+            self.dtype.clone(),
+            stream,
+        )))
+    }
 }
 
 pub async fn build_cottas_native_p_exact_ranges_index(
