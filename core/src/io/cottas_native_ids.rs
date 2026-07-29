@@ -3403,6 +3403,42 @@ impl NativeRdfStoreFile {
 pub async fn inspect_native_rdf_store_file(path: impl AsRef<Path>) -> Result<String> {
     NativeRdfStoreFile::open(path).await?.named_layout_tree()
 }
+// VORTEX_RDF_NATIVE_MATCH_CLI_V1
+/// Open and match a native RDF store, then serialize lexical triples.
+pub async fn match_native_rdf_store_file<W>(
+    input_path: &Path,
+    subject: Option<&NamedOrBlankNode>,
+    predicate: Option<&NamedNode>,
+    object: Option<&Term>,
+    graph: Option<&GraphName>,
+    policy: NativeIndexPolicy,
+    writer: W,
+    format: RdfFormat,
+) -> Result<usize>
+where
+    W: Write,
+{
+    let store = NativeRdfStoreFile::open(input_path).await?;
+    let triples = store
+        .match_pattern_with_policy(subject, predicate, object, graph, policy)
+        .await?;
+    let count = triples.len();
+    let mut serializer = RdfSerializer::from_format(format).for_writer(writer);
+    for (subject, predicate, object) in triples {
+        let triple = oxrdf::Triple::new(
+            crate::common::utils::parse_subject(&subject)?,
+            crate::common::utils::parse_named_node(&predicate)?,
+            crate::common::utils::parse_term(&object)?,
+        );
+        serializer
+            .serialize_triple(&triple)
+            .map_err(|error| VortexRdfError::Deserialization(error.to_string()))?;
+    }
+    serializer
+        .finish()
+        .map_err(|error| VortexRdfError::Deserialization(error.to_string()))?;
+    Ok(count)
+}
 
 /// Controls whether matching may use optional native index components.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]

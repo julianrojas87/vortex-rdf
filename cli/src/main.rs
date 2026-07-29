@@ -29,12 +29,12 @@ use vortex_rdf_core::{
     index::{ChainedHash, SimpleDictionary},
     io::{
         CottasNativeConfig, CottasNativeStringConfig, CottasVortexCompressionProfile,
-        NativeIdsCountMode, NativeStringCountMode,
+        NativeIdsCountMode, NativeIndexPolicy, NativeStringCountMode,
         count_cottas_native_ids_file_with_diagnostics_mode,
         count_cottas_native_string_file_with_diagnostics_mode, load_vortex_file_ref,
         match_cottas_native_file, match_cottas_native_file_with_diagnostics,
         match_cottas_native_string_file, match_cottas_native_string_file_with_diagnostics,
-        open_vortex_file, serialize, serialize_cottas_native_file,
+        match_native_rdf_store_file, open_vortex_file, serialize, serialize_cottas_native_file,
         serialize_cottas_native_quad_source_v10_file, serialize_cottas_native_string_file,
     },
     store::layout::{
@@ -140,6 +140,10 @@ enum Action {
         #[arg(long, value_enum)]
         storage_layout: Option<StoreLayout>,
 
+        /// Native index use policy for --storage-layout native-rdf-store.
+        #[arg(long, value_enum, default_value_t = NativeIndexPolicyArg::Auto)]
+        native_index_policy: NativeIndexPolicyArg,
+
         /// Write match diagnostics JSON to this file
         #[arg(long)]
         diagnostics_out: Option<PathBuf>,
@@ -229,6 +233,24 @@ fn to_native_ids_count_mode(mode: CountMode) -> NativeIdsCountMode {
         // For primitive u32 IDs, decode-only is equivalent to manual equality
         // when a bound term exists.
         CountMode::DecodeOnly => NativeIdsCountMode::ManualEq,
+    }
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, ValueEnum, Debug)]
+#[clap(rename_all = "kebab_case")]
+enum NativeIndexPolicyArg {
+    Auto,
+    Disabled,
+    Required,
+}
+
+impl From<NativeIndexPolicyArg> for NativeIndexPolicy {
+    fn from(value: NativeIndexPolicyArg) -> Self {
+        match value {
+            NativeIndexPolicyArg::Auto => NativeIndexPolicy::Auto,
+            NativeIndexPolicyArg::Disabled => NativeIndexPolicy::Disabled,
+            NativeIndexPolicyArg::Required => NativeIndexPolicy::Required,
+        }
     }
 }
 
@@ -773,6 +795,7 @@ async fn main() -> Result<()> {
             object,
             graph,
             storage_layout,
+            native_index_policy,
             diagnostics_out,
         } => {
             let start = Instant::now();
@@ -801,6 +824,43 @@ async fn main() -> Result<()> {
 
             // 2. Prepare/Load Vortex Array and Text IndexType
             let is_vortex_file = input.extension().map(|e| e == "vortex").unwrap_or(false);
+
+            // VORTEX_RDF_NATIVE_MATCH_CLI_V1
+            if is_vortex_file && storage_layout == Some(StoreLayout::NativeRdfStore) {
+                if diagnostics_out.is_some() {
+                    return Err(anyhow!(
+                        "native-rdf-store diagnostics are not exposed yet; omit --diagnostics-out"
+                    ));
+                }
+                let output_format = format
+                    .map(RdfFormat::from)
+                    .or_else(|| detect_format(&output))
+                    .unwrap_or(RdfFormat::NTriples);
+                let writer: Box<dyn Write> = match &output {
+                    Some(path) => {
+                        Box::new(File::create(path).context("Failed to create output file")?)
+                    }
+                    None => Box::new(stdout()),
+                };
+                let rows = match_native_rdf_store_file(
+                    &input,
+                    subject_node.as_ref(),
+                    predicate_node.as_ref(),
+                    object_node.as_ref(),
+                    graph_node.as_ref(),
+                    native_index_policy.into(),
+                    writer,
+                    output_format,
+                )
+                .await
+                .context("Failed to match native RDF store")?;
+                info!(
+                    "Native RDF store matching returned {} triples in {:?}",
+                    rows,
+                    start.elapsed()
+                );
+                return Ok(());
+            }
 
             if is_vortex_file && storage_layout == Some(StoreLayout::CottasNativeStrings) {
                 let output_format = format
