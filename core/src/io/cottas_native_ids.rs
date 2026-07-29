@@ -3299,6 +3299,47 @@ impl NativeRdfStoreFile {
         Ok(resolved)
     }
 
+    // VORTEX_RDF_NATIVE_SUBJECT_RANGE_MATCHING_V1
+    async fn lookup_native_subject_range(&self, subject_id: u32) -> Result<Option<Range<u64>>> {
+        let Some(scan) = self.component_scan("index.subject-ranges")? else {
+            return Ok(None);
+        };
+        let started = Instant::now();
+        let result = scan
+            .with_filter(eq(col("subject_id"), lit(subject_id)))
+            .with_projection(vortex_array::expr::select(
+                ["row_start", "row_end"],
+                vortex_array::expr::root(),
+            ))
+            .into_array_stream()
+            .map_err(VortexRdfError::from)?
+            .read_all()
+            .await
+            .map_err(VortexRdfError::from)?;
+        log::debug!(
+            "[native-rdf-store] subject range lookup subject_id={} rows={} elapsed={:?}",
+            subject_id,
+            result.len(),
+            started.elapsed()
+        );
+        match result.len() {
+            0 => Ok(Some(0..0)),
+            1 => {
+                let starts = extract_projected_u64_column(&result, "row_start")?;
+                let ends = extract_projected_u64_column(&result, "row_end")?;
+                if starts.len() != 1 || ends.len() != 1 || starts[0] >= ends[0] {
+                    return Err(VortexRdfError::Deserialization(format!(
+                        "index.subject-ranges returned invalid range columns for subject ID {subject_id}: starts={starts:?}, ends={ends:?}"
+                    )));
+                }
+                Ok(Some(starts[0]..ends[0]))
+            }
+            rows => Err(VortexRdfError::Deserialization(format!(
+                "index.subject-ranges returned {rows} rows for subject ID {subject_id}; expected at most one"
+            ))),
+        }
+    }
+
     // VORTEX_RDF_NATIVE_INDEX_INDEPENDENT_MATCHING_V1
     /// Match one RDF quad pattern against the native QuadSource.
     ///
@@ -3316,13 +3357,6 @@ impl NativeRdfStoreFile {
         graph: Option<&GraphName>,
         policy: NativeIndexPolicy,
     ) -> Result<Vec<(String, String, String)>> {
-        if policy == NativeIndexPolicy::Required {
-            return Err(VortexRdfError::InvalidOperation(
-                "NativeIndexPolicy::Required requested, but this native RDF store has no compatible query index component"
-                    .into(),
-            ));
-        }
-
         let bound = BoundNativeRdfTerms::from_pattern(subject, predicate, object, graph);
         let requested = [
             (bound.s.as_deref(), "s"),
@@ -3345,13 +3379,56 @@ impl NativeRdfStoreFile {
             }
         }
 
+        let component_available = self.component_layout("index.subject-ranges")?.is_some();
+        let subject_range = if policy != NativeIndexPolicy::Disabled {
+            match resolved.s {
+                Some(subject_id) if component_available => {
+                    self.lookup_native_subject_range(subject_id).await?
+                }
+                Some(_) if policy == NativeIndexPolicy::Required => {
+                    return Err(VortexRdfError::InvalidOperation(
+                        "NativeIndexPolicy::Required requested for a subject-bound pattern, but index.subject-ranges is absent"
+                            .into(),
+                    ));
+                }
+                None if policy == NativeIndexPolicy::Required => {
+                    return Err(VortexRdfError::InvalidOperation(
+                        "NativeIndexPolicy::Required requested, but the query has no bound subject and no compatible native index exists for this shape"
+                            .into(),
+                    ));
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        if subject_range.as_ref().is_some_and(|range| range.is_empty()) {
+            return Ok(Vec::new());
+        }
+
         let projection = native_projection_columns_for_bound_terms(&bound);
+        let scan_started = Instant::now();
         let scan = self.file.scan().map_err(VortexRdfError::from)?;
+        let scan = match &subject_range {
+            Some(range) => scan.with_row_range(range.clone()),
+            None => scan,
+        };
         let scan = match resolved.filter() {
             NativePatternFilter::All => scan,
             NativePatternFilter::Empty => return Ok(Vec::new()),
             NativePatternFilter::Expr(expr) => scan.with_filter(expr),
         };
+        log::debug!(
+            "[native-rdf-store] match policy={:?} access={} candidate_range={:?} setup={:?}",
+            policy,
+            if subject_range.is_some() {
+                "index.subject-ranges"
+            } else {
+                "full-scan"
+            },
+            subject_range,
+            scan_started.elapsed()
+        );
         let stream = scan
             .with_projection(vortex_array::expr::select(
                 projection.as_slice(),
@@ -3359,7 +3436,16 @@ impl NativeRdfStoreFile {
             ))
             .into_array_stream()
             .map_err(VortexRdfError::from)?;
-        let (rows, _, _) = read_native_projected_stream_all_with_scan_stats(stream).await?;
+        let read_started = Instant::now();
+        let (rows, batches, max_batch_rows) =
+            read_native_projected_stream_all_with_scan_stats(stream).await?;
+        log::debug!(
+            "[native-rdf-store] match scan rows={} batches={} max_batch_rows={} elapsed={:?}",
+            rows.rows,
+            batches,
+            max_batch_rows,
+            read_started.elapsed()
+        );
         if rows.rows == 0 {
             return Ok(Vec::new());
         }
