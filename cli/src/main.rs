@@ -88,8 +88,8 @@ enum Action {
         #[arg(long, default_value = "SPO")]
         ordering: TripleOrdering,
 
-        /// Native index profile for native-rdf-store serialization.
-        #[arg(long, value_enum, default_value_t = NativeIndexProfileArg::Bootstrap)]
+        /// Native index profile for native-rdf-store serialization (defaults to the complete standard family).
+        #[arg(long, value_enum, default_value_t = NativeIndexProfileArg::Standard)]
         native_index_profile: NativeIndexProfileArg,
 
         /// Explicit native index specification; repeat to override the profile.
@@ -1243,4 +1243,59 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn native_rdf_store_cli_defaults_to_standard_index_profile() {
+        let cli = Cli::try_parse_from([
+            "vortex-rdf-cli",
+            "serialize",
+            "--index-type",
+            "simple-dictionary",
+            "--storage-layout",
+            "native-rdf-store",
+            "--output",
+            "out.vortex",
+        ])
+        .expect("native RDF store defaults must parse");
+        let Action::Serialize {
+            native_index_profile,
+            native_indexes,
+            ..
+        } = cli.action
+        else {
+            panic!("expected serialize action");
+        };
+        assert_eq!(native_index_profile, NativeIndexProfileArg::Standard);
+        assert!(native_indexes.is_empty());
+    }
+
+    #[test]
+    fn bootstrap_profile_remains_explicitly_selectable() {
+        let cli = Cli::try_parse_from([
+            "vortex-rdf-cli",
+            "serialize",
+            "--index-type",
+            "simple-dictionary",
+            "--storage-layout",
+            "native-rdf-store",
+            "--native-index-profile",
+            "bootstrap",
+            "--output",
+            "out.vortex",
+        ])
+        .expect("bootstrap profile must remain selectable");
+        let Action::Serialize {
+            native_index_profile,
+            ..
+        } = cli.action
+        else {
+            panic!("expected serialize action");
+        };
+        assert_eq!(native_index_profile, NativeIndexProfileArg::Bootstrap);
+    }
 }

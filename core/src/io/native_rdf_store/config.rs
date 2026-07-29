@@ -163,6 +163,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn default_selection_is_materializable_standard_profile() {
+        let selection = NativeIndexSelection::default();
+        assert_eq!(selection.profile, NativeIndexProfile::Standard);
+        assert!(selection.explicit.is_empty());
+        assert_eq!(selection.resolved(), NativeIndexProfile::Standard.specs());
+        assert!(selection.ensure_materializable_now().is_ok());
+    }
+
+    #[test]
     fn explicit_specs_override_profile_and_deduplicate() {
         let selection = NativeIndexSelection {
             profile: NativeIndexProfile::Standard,

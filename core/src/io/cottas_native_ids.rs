@@ -85,10 +85,8 @@ impl Default for CottasNativeConfig {
             row_group_size: 122_880,
             dict_row_group_size: 1_024,
             compression_profile: CottasVortexCompressionProfile::Balanced,
-            native_indexes: NativeIndexSelection {
-                profile: crate::io::native_rdf_store::NativeIndexProfile::Bootstrap,
-                explicit: Vec::new(),
-            },
+            // VORTEX_RDF_NATIVE_STANDARD_PROFILE_DEFAULT_V1
+            native_indexes: NativeIndexSelection::default(),
         }
     }
 }
