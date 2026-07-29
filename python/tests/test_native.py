@@ -2,7 +2,7 @@ import pytest
 
 from conftest import LAYOUTS
 
-from vortex_rdflib._native import VortexRdfStore, serialize_rdf
+from vortex_rdf import VortexRdfStore, serialize_rdf
 
 NAME = "<http://xmlns.com/foaf/0.1/name>"
 

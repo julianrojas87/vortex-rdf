@@ -11,11 +11,12 @@ diagnostics and the provisional vortex-duckdb engine were dropped.
 ## Setup
 
 ```bash
-# Build + install the vortex-rdflib bindings and benchmark deps
-cd python
 python3 -m venv .venv && . .venv/bin/activate
-pip install maturin && maturin develop --release
-pip install psutil pycottas       # or: pip install -e .[bench]
+pip install vortex-rdflib pycottas psutil
+
+# To benchmark unreleased binding changes from this repo instead of the
+# published vortex-rdf wheel:
+#   pip install maturin && maturin develop --release -m python/Cargo.toml
 ```
 
 ## Data and queries (not in this repo)
@@ -54,8 +55,7 @@ cargo run --release -p vortex-rdf-cli -- serialize \
 python3 -c "import pycottas; pycottas.rdf2cottas('dbpedia_5M.nt', 'dbpedia_5M.cottas')"
 ```
 
-(`vortex_rdflib._native.serialize_rdf` does the same as the CLI serialize,
-from Python.)
+(`vortex_rdf.serialize_rdf` does the same as the CLI serialize, from Python.)
 
 ## Running
 

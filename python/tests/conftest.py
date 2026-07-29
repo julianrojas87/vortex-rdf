@@ -1,6 +1,6 @@
 import pytest
 
-from vortex_rdflib._native import serialize_rdf
+from vortex_rdf import serialize_rdf
 
 FIXTURE_NT = """\
 <http://ex.org/alice> <http://xmlns.com/foaf/0.1/name> "Alice" .

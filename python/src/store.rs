@@ -34,7 +34,7 @@ type CodeColumns = (U32Column, U32Column, U32Column, U32Column);
 /// fits the residency budget). Keeping one instance warm across queries is
 /// what makes rdflib `triples()` traffic cheap — reopening per call would
 /// re-lift the dictionary every time.
-#[pyclass(frozen, module = "vortex_rdflib._native")]
+#[pyclass(frozen, module = "vortex_rdf._native")]
 pub struct VortexRdfStore {
     store: CoreStore,
     path: String,

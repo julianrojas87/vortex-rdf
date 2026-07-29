@@ -14,7 +14,7 @@ use vortex_rdf_core::DictSnapshot;
 /// An immutable handle on a store's term dictionary. Decodes term codes to
 /// their N-Triples strings; safe to keep across store mutations (the snapshot
 /// is frozen at creation).
-#[pyclass(frozen, module = "vortex_rdflib._native")]
+#[pyclass(frozen, module = "vortex_rdf._native")]
 pub struct TermDict {
     pub(crate) snapshot: DictSnapshot,
 }
@@ -39,7 +39,7 @@ impl TermDict {
 /// One matched term-code column, exposed to Python zero-copy through the
 /// buffer protocol: `memoryview(col).cast("I")` views the Rust memory
 /// directly. The column is read-only and owns (refcounts) its backing array.
-#[pyclass(frozen, module = "vortex_rdflib._native")]
+#[pyclass(frozen, module = "vortex_rdf._native")]
 pub struct U32Column {
     pub(crate) prim: PrimitiveArray,
 }

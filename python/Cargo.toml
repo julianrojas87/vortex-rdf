@@ -6,10 +6,10 @@ rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Python bindings for Vortex-RDF (published as vortex-rdflib)"
+description = "Python bindings for Vortex-RDF (published to PyPI as vortex-rdf)"
 publish = false
 
-# The compiled module is imported as `vortex_rdflib._native` (see
+# The compiled module is imported as `vortex_rdf._native` (see
 # `[tool.maturin] module-name` in pyproject.toml). `test = false` keeps
 # `cargo test --workspace` from producing a test binary that would need to
 # link libpython — the crate's behavior is covered by the pytest suite.

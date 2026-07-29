@@ -9,8 +9,9 @@ is the only variable.
 Ported from the feat/cottas-bench branch; the branch-only native diagnostics
 and the provisional vortex-duckdb engine were dropped.
 
-Requires: rdflib, psutil, vortex-rdflib (this repo's python/ package built
-with maturin), and pycottas when the cottas engine is selected.
+Requires: rdflib, psutil, vortex-rdflib (the rdflib Store package built on
+this repo's vortex-rdf bindings), and pycottas when the cottas engine is
+selected.
 """
 
 from rdflib import Graph

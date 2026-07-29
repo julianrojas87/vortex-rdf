@@ -286,20 +286,23 @@ See [js/README.md](js/README.md) for more details.
 
 ### Python
 
-The `vortex-rdflib` package provides file-backed bindings plus an
-[rdflib](https://rdflib.readthedocs.io/) `Store` implementation, so `.vortex`
-files can be queried with SPARQL:
+The `vortex-rdf` package provides file-backed native bindings:
 
-```python
-from rdflib import Graph
-from vortex_rdflib import VortexStore
-
-graph = Graph(store=VortexStore("data.vortex"))
-graph.query("SELECT ?s WHERE { ?s ?p ?o } LIMIT 10")
+```bash
+pip install vortex-rdf
 ```
 
-Built with [maturin](https://www.maturin.rs/); see
-[python/README.md](python/README.md) for building and usage details.
+```python
+from vortex_rdf import VortexRdfStore
+
+store = VortexRdfStore("data.vortex")
+store.match_triples(p="<http://xmlns.com/foaf/0.1/name>")
+```
+
+For SPARQL over [rdflib](https://rdflib.readthedocs.io/), use the separate
+[`vortex-rdflib`](https://pypi.org/project/vortex-rdflib/) package, which
+implements an rdflib `Store` (with SPARQL BGP pushdown) on top of these
+bindings. See [python/README.md](python/README.md) for details.
 
 ---
 

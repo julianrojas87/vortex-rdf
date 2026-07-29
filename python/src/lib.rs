@@ -1,6 +1,7 @@
 //! Python bindings for Vortex-RDF, exposed as the private extension module
-//! `vortex_rdflib._native`. The public Python API is the pure-Python
-//! `vortex_rdflib` package (an rdflib `Store` implementation) built on top.
+//! `vortex_rdf._native`, re-exported by the pure-Python `vortex_rdf`
+//! package. The rdflib `Store` integration lives in the separate
+//! `vortex-rdflib` package/repository, built on top of these bindings.
 //!
 //! Unlike the wasm bindings, this crate keeps core's `file-io` feature on:
 //! stores are opened lazily from `.vortex` files and queried in place.
@@ -29,7 +30,7 @@ pub(crate) static RUNTIME: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| 
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
-        .expect("failed to create tokio runtime for vortex_rdflib._native")
+        .expect("failed to create tokio runtime for vortex_rdf._native")
 });
 
 /// Store/IO failures: IO errors surface as `OSError` subclasses so Python
