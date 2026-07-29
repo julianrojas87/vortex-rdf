@@ -9,11 +9,13 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use vortex_array::dtype::DType;
 use vortex_array::stream::{ArrayStream, ArrayStreamExt};
-use vortex_array::{ArrayContext, ArrayRef, EmptyMetadata};
+use vortex_array::{ArrayContext, ArrayRef, RawMetadata};
 use vortex_error::{VortexResult, vortex_bail, vortex_ensure_eq};
 use vortex_file::{OpenOptionsSessionExt, WriteOptionsSessionExt};
+use vortex_flatbuffers::{FlatBuffer, WriteFlatBufferExt};
 use vortex_io::VortexWrite;
 use vortex_layout::LayoutStrategy;
 use vortex_layout::segments::{SegmentSinkRef, SegmentSource};
@@ -101,6 +103,164 @@ impl StoreBuildStrategy {
     }
 }
 
+// VORTEX_RDF_EXTENSIBLE_STORE_COMPONENTS_V1
+const STORE_METADATA_VERSION: u32 = 1;
+
+/// Persisted role of a native child layout.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum StoreComponentRole {
+    Dictionary,
+    Index,
+    ChangeSet,
+    Other,
+}
+
+/// Stable descriptor for one auxiliary native layout child.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StoreComponentDescriptor {
+    pub name: Arc<str>,
+    pub role: StoreComponentRole,
+    pub implementation: Arc<str>,
+    pub version: u32,
+    pub required: bool,
+    pub dtype: DType,
+}
+
+impl StoreComponentDescriptor {
+    pub fn validate(&self) -> VortexResult<()> {
+        if self.name.is_empty() {
+            vortex_bail!("store component name must not be empty");
+        }
+        if self.name.as_ref() == "quad-source" {
+            vortex_bail!("quad-source is reserved for the transparent root child");
+        }
+        if self.implementation.is_empty() {
+            vortex_bail!("store component implementation must not be empty");
+        }
+        if self.version == 0 {
+            vortex_bail!("store component version must be positive");
+        }
+        Ok(())
+    }
+}
+
+/// One descriptor paired with its physical native layout.
+#[derive(Clone)]
+pub struct StoreComponent {
+    pub descriptor: StoreComponentDescriptor,
+    pub layout: LayoutRef,
+}
+
+impl StoreComponent {
+    pub fn new(descriptor: StoreComponentDescriptor, layout: LayoutRef) -> VortexResult<Self> {
+        descriptor.validate()?;
+        vortex_ensure_eq!(
+            &descriptor.dtype,
+            layout.dtype(),
+            "store component descriptor dtype does not match child layout"
+        );
+        Ok(Self { descriptor, layout })
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct VortexRdfStoreData {
+    components: Arc<[StoreComponentDescriptor]>,
+}
+
+#[derive(Serialize)]
+struct StoreMetadataWireRef<'a> {
+    version: u32,
+    components: Vec<StoreComponentWireRef<'a>>,
+}
+
+#[derive(Serialize)]
+struct StoreComponentWireRef<'a> {
+    name: &'a str,
+    role: StoreComponentRole,
+    implementation: &'a str,
+    version: u32,
+    required: bool,
+    dtype: Vec<u8>,
+}
+
+#[derive(Deserialize)]
+struct StoreMetadataWire {
+    version: u32,
+    components: Vec<StoreComponentWire>,
+}
+
+#[derive(Deserialize)]
+struct StoreComponentWire {
+    name: String,
+    role: StoreComponentRole,
+    implementation: String,
+    version: u32,
+    required: bool,
+    dtype: Vec<u8>,
+}
+
+fn encode_store_metadata(components: &[StoreComponentDescriptor]) -> VortexResult<Vec<u8>> {
+    let wire = StoreMetadataWireRef {
+        version: STORE_METADATA_VERSION,
+        components: components
+            .iter()
+            .map(|component| {
+                Ok(StoreComponentWireRef {
+                    name: component.name.as_ref(),
+                    role: component.role,
+                    implementation: component.implementation.as_ref(),
+                    version: component.version,
+                    required: component.required,
+                    dtype: component.dtype.write_flatbuffer_bytes()?.as_ref().to_vec(),
+                })
+            })
+            .collect::<VortexResult<Vec<_>>>()?,
+    };
+    serde_json::to_vec(&wire).map_err(|error| vortex_error::vortex_err!("{}", error))
+}
+
+fn decode_store_metadata(
+    bytes: &[u8],
+    session: &VortexSession,
+) -> VortexResult<Vec<StoreComponentDescriptor>> {
+    // Compatibility with the initial QuadSource-only v10 proof artifacts.
+    if bytes.is_empty() {
+        return Ok(Vec::new());
+    }
+    let wire: StoreMetadataWire =
+        serde_json::from_slice(bytes).map_err(|error| vortex_error::vortex_err!("{}", error))?;
+    vortex_ensure_eq!(
+        wire.version,
+        STORE_METADATA_VERSION,
+        "unsupported Vortex-RDF store metadata version"
+    );
+    let mut names = std::collections::BTreeSet::new();
+    wire.components
+        .into_iter()
+        .map(|component| {
+            let dtype = DType::from_flatbuffer(
+                FlatBuffer::align_from(vortex_buffer::ByteBuffer::from(component.dtype)),
+                session,
+            )?;
+            let descriptor = StoreComponentDescriptor {
+                name: component.name.into(),
+                role: component.role,
+                implementation: component.implementation.into(),
+                version: component.version,
+                required: component.required,
+                dtype,
+            };
+            descriptor.validate()?;
+            if !names.insert(descriptor.name.to_string()) {
+                vortex_bail!("duplicate store component name: {}", descriptor.name);
+            }
+            Ok(descriptor)
+        })
+        .collect()
+}
+
 /// VTable for the native RDF store root.
 #[derive(Clone, Debug)]
 pub struct VortexRdfStore;
@@ -109,27 +269,31 @@ pub struct VortexRdfStore;
 pub type VortexRdfStoreLayout = Layout<VortexRdfStore>;
 
 impl VTable for VortexRdfStore {
-    type LayoutData = ();
-    type Metadata = EmptyMetadata;
+    type LayoutData = VortexRdfStoreData;
+    type Metadata = RawMetadata;
 
     fn id(&self) -> LayoutId {
         static ID: CachedId = CachedId::new(VORTEX_RDF_STORE_LAYOUT_ID);
         *ID
     }
 
-    fn metadata(_layout: &Layout<Self>) -> Self::Metadata {
-        EmptyMetadata
+    fn metadata(layout: &Layout<Self>) -> Self::Metadata {
+        RawMetadata(
+            encode_store_metadata(&layout.data().components)
+                .expect("validated Vortex-RDF store metadata must serialize"),
+        )
     }
 
     fn deserialize(
         &self,
         args: &LayoutDeserializeArgs<'_>,
-        _metadata: &EmptyMetadata,
+        metadata: &Vec<u8>,
     ) -> VortexResult<Self::LayoutData> {
+        let components = decode_store_metadata(metadata, args.session)?;
         vortex_ensure_eq!(
             args.children.nchildren(),
-            1,
-            "VortexRdfStoreLayout v1 expects exactly one quad-source child"
+            1 + components.len(),
+            "VortexRdfStoreLayout child count does not match metadata"
         );
         let quads = args.children.child(QUAD_SOURCE_CHILD, args.dtype)?;
         vortex_ensure_eq!(
@@ -137,20 +301,42 @@ impl VTable for VortexRdfStore {
             args.row_count,
             "quad-source row count must match the RDF store root"
         );
-        Ok(())
+        for (component_index, component) in components.iter().enumerate() {
+            let child = args.children.child(component_index + 1, &component.dtype)?;
+            vortex_ensure_eq!(
+                child.dtype(),
+                &component.dtype,
+                "auxiliary component dtype does not match metadata"
+            );
+        }
+        Ok(VortexRdfStoreData {
+            components: components.into(),
+        })
     }
 
     fn child_dtype(layout: &Layout<Self>, idx: usize) -> VortexResult<DType> {
         match idx {
             QUAD_SOURCE_CHILD => Ok(layout.dtype().clone()),
-            _ => vortex_bail!("invalid VortexRdfStoreLayout child index: {idx}"),
+            _ => layout
+                .data()
+                .components
+                .get(idx - 1)
+                .map(|component| component.dtype.clone())
+                .ok_or_else(|| {
+                    vortex_error::vortex_err!("invalid VortexRdfStoreLayout child index: {idx}")
+                }),
         }
     }
 
-    fn child_type(_layout: &Layout<Self>, idx: usize) -> LayoutChildType {
+    fn child_type(layout: &Layout<Self>, idx: usize) -> LayoutChildType {
         match idx {
             QUAD_SOURCE_CHILD => LayoutChildType::Transparent("quad-source".into()),
-            _ => panic!("invalid VortexRdfStoreLayout child index: {idx}"),
+            _ => layout
+                .data()
+                .components
+                .get(idx - 1)
+                .map(|component| LayoutChildType::Auxiliary(component.name.clone()))
+                .unwrap_or_else(|| panic!("invalid VortexRdfStoreLayout child index: {idx}")),
         }
     }
 
@@ -207,17 +393,66 @@ impl LayoutStrategy for VortexRdfStoreLayoutStrategy {
 
 /// Construct a native RDF store root around a quad-source layout.
 pub fn new_vortex_rdf_store_layout(quad_source: LayoutRef) -> VortexRdfStoreLayout {
+    new_vortex_rdf_store_layout_with_components(quad_source, Vec::new())
+        .expect("empty component inventory is valid")
+}
+
+pub fn new_vortex_rdf_store_layout_with_components(
+    quad_source: LayoutRef,
+    components: Vec<StoreComponent>,
+) -> VortexResult<VortexRdfStoreLayout> {
     let dtype = quad_source.dtype().clone();
     let row_count = quad_source.row_count();
-    LayoutParts::new(
+    let mut names = std::collections::BTreeSet::new();
+    let mut descriptors = Vec::with_capacity(components.len());
+    let mut children = Vec::with_capacity(1 + components.len());
+    children.push(quad_source);
+    for component in components {
+        component.descriptor.validate()?;
+        vortex_ensure_eq!(
+            &component.descriptor.dtype,
+            component.layout.dtype(),
+            "store component dtype does not match child layout"
+        );
+        if !names.insert(component.descriptor.name.to_string()) {
+            vortex_bail!(
+                "duplicate store component name: {}",
+                component.descriptor.name
+            );
+        }
+        descriptors.push(component.descriptor);
+        children.push(component.layout);
+    }
+    Ok(LayoutParts::new(
         VortexRdfStore,
         dtype,
         row_count,
         Vec::new(),
-        layout_children(vec![quad_source]),
-        (),
+        layout_children(children),
+        VortexRdfStoreData {
+            components: descriptors.into(),
+        },
     )
-    .into_typed()
+    .into_typed())
+}
+
+pub fn vortex_rdf_store_component(
+    layout: &VortexRdfStoreLayout,
+    name: &str,
+) -> VortexResult<Option<LayoutRef>> {
+    let Some(index) = layout
+        .data()
+        .components
+        .iter()
+        .position(|component| component.name.as_ref() == name)
+    else {
+        return Ok(None);
+    };
+    layout.child(index + 1).map(Some)
+}
+
+pub fn vortex_rdf_store_components(layout: &VortexRdfStoreLayout) -> &[StoreComponentDescriptor] {
+    &layout.data().components
 }
 
 /// Return the transparent quad-source child of a native RDF store root.
@@ -358,6 +593,41 @@ mod tests {
         assert_eq!(rows.len(), 3);
         assert_eq!(rows.dtype(), &expected_dtype);
         Ok(())
+    }
+
+    #[test]
+    fn store_component_metadata_round_trips_independent_dtypes() -> VortexResult<()> {
+        use vortex_array::dtype::{Nullability, PType, StructFields};
+
+        let session = vortex_array::array_session();
+        let components = vec![StoreComponentDescriptor {
+            name: "dictionary.id-to-term".into(),
+            role: StoreComponentRole::Dictionary,
+            implementation: "id-row-v1".into(),
+            version: 1,
+            required: true,
+            dtype: DType::Struct(
+                StructFields::new(
+                    ["id", "term"].into(),
+                    vec![
+                        DType::Primitive(PType::U32, Nullability::NonNullable),
+                        DType::Utf8(Nullability::NonNullable),
+                    ],
+                ),
+                Nullability::NonNullable,
+            ),
+        }];
+        let bytes = encode_store_metadata(&components)?;
+        let decoded = decode_store_metadata(&bytes, &session)?;
+        assert_eq!(decoded, components);
+        Ok(())
+    }
+
+    #[test]
+    fn store_component_metadata_rejects_duplicate_names() {
+        let session = vortex_array::array_session();
+        let json = br#"{"version":1,"components":[{"name":"x","role":"index","implementation":"a","version":1,"required":false,"dtype":{"Primitive":["u32",false]}},{"name":"x","role":"index","implementation":"b","version":1,"required":false,"dtype":{"Primitive":["u32",false]}}]}"#;
+        assert!(decode_store_metadata(json, &session).is_err());
     }
 
     #[test]

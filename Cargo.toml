@@ -27,6 +27,7 @@ vortex-layout = "0.83.0"
 async-trait = "0.1.91"
 vortex-btrblocks = "0.83.0"
 vortex-buffer = "0.83.0"
+vortex-flatbuffers = "0.83.0"
 
 tokio = { version = "1.53.1", features = ["sync", "macros", "rt"] }
 futures = "0.3.33"
