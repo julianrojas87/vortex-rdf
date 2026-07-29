@@ -1784,6 +1784,7 @@ where
     )?;
     drop(string_runs);
     let subject_range_runs = id_runs.clone();
+    let predicate_run_paths = id_runs.clone();
     let arrays = merge_sorted_id_runs_to_array_stream(id_runs, config.ordering, row_group_size)?;
     let dtype = empty_spog_array()?.dtype().clone();
     let stream = ArrayStreamAdapter::new(dtype, arrays);
@@ -1882,6 +1883,28 @@ where
             subject_ranges_strategy,
         )
         .map_err(VortexRdfError::from)?;
+
+        let predicate_runs_source = Arc::new(NativePredicateRunsSource::new(
+            &predicate_run_paths,
+            config.dict_row_group_size,
+        )?);
+        let predicate_runs_strategy: Arc<dyn LayoutStrategy> = WriteStrategyBuilder::default()
+            .with_row_block_size(config.dict_row_group_size.max(1))
+            .with_btrblocks_builder(BtrBlocksCompressorBuilder::default().with_compact())
+            .build();
+        let predicate_runs_component = NativeComponentWrite::new(
+            StoreComponentDescriptor {
+                name: "index.predicate-runs".into(),
+                role: StoreComponentRole::Index,
+                implementation: "native-predicate-runs-v1-compact".into(),
+                version: 1,
+                required: false,
+                dtype: predicate_runs_source.dtype().clone(),
+            },
+            predicate_runs_source,
+            predicate_runs_strategy,
+        )
+        .map_err(VortexRdfError::from)?;
         let summary = crate::io::vortex_rdf_store_layout::write_native_rdf_store(
             &NATIVE_FILE_SESSION,
             &mut writer,
@@ -1891,6 +1914,7 @@ where
                 id_to_term_component,
                 term_to_id_component,
                 subject_ranges_component,
+                predicate_runs_component,
             ],
         )
         .await
@@ -1915,18 +1939,19 @@ where
         let root = reopened.footer().layout();
         if root.encoding_id().as_ref()
             != crate::io::vortex_rdf_store_layout::VORTEX_RDF_STORE_LAYOUT_ID
-            || root.nchildren() != 4
+            || root.nchildren() != 5
             || root.child_names().collect::<Vec<_>>()
                 != vec![
                     Arc::<str>::from("quad-source"),
                     Arc::<str>::from("dictionary.id-to-term"),
                     Arc::<str>::from("dictionary.term-to-id"),
                     Arc::<str>::from("index.subject-ranges"),
+                    Arc::<str>::from("index.predicate-runs"),
                 ]
             || root.row_count() != summary.row_count()
         {
             return Err(VortexRdfError::Deserialization(
-                "native RDF store QuadSource/dictionaries/subject-index validation failed".into(),
+                "native RDF store QuadSource/dictionaries/subject/predicate-index validation failed".into(),
             ));
         }
         reopened.scan().map_err(VortexRdfError::from)?;
@@ -3299,6 +3324,56 @@ impl NativeRdfStoreFile {
         Ok(resolved)
     }
 
+    async fn lookup_native_predicate_ranges(
+        &self,
+        predicate_id: u32,
+    ) -> Result<Option<Vec<Range<u64>>>> {
+        let Some(scan) = self.component_scan("index.predicate-runs")? else {
+            return Ok(None);
+        };
+        let started = Instant::now();
+        let result = scan
+            .with_filter(eq(col("predicate_id"), lit(predicate_id)))
+            .with_projection(vortex_array::expr::select(
+                ["row_start", "row_end"],
+                vortex_array::expr::root(),
+            ))
+            .into_array_stream()
+            .map_err(VortexRdfError::from)?
+            .read_all()
+            .await
+            .map_err(VortexRdfError::from)?;
+        let starts = extract_projected_u64_column(&result, "row_start")?;
+        let ends = extract_projected_u64_column(&result, "row_end")?;
+        if starts.len() != ends.len() || starts.len() != result.len() {
+            return Err(VortexRdfError::Deserialization(format!(
+                "index.predicate-runs returned inconsistent columns for predicate ID {predicate_id}"
+            )));
+        }
+        let mut ranges = Vec::with_capacity(starts.len());
+        let mut previous_end = None;
+        for (start, end) in starts.into_iter().zip(ends) {
+            if start >= end || previous_end.is_some_and(|previous| start < previous) {
+                return Err(VortexRdfError::Deserialization(format!(
+                    "index.predicate-runs returned invalid or unsorted range {start}..{end} for predicate ID {predicate_id}"
+                )));
+            }
+            previous_end = Some(end);
+            ranges.push(start..end);
+        }
+        log::debug!(
+            "[native-rdf-store] predicate run lookup predicate_id={} ranges={} candidate_rows={} elapsed={:?}",
+            predicate_id,
+            ranges.len(),
+            ranges
+                .iter()
+                .map(|range| range.end - range.start)
+                .sum::<u64>(),
+            started.elapsed()
+        );
+        Ok(Some(ranges))
+    }
+
     // VORTEX_RDF_NATIVE_SUBJECT_RANGE_MATCHING_V1
     async fn lookup_native_subject_range(&self, subject_id: u32) -> Result<Option<Range<u64>>> {
         let Some(scan) = self.component_scan("index.subject-ranges")? else {
@@ -3379,38 +3454,65 @@ impl NativeRdfStoreFile {
             }
         }
 
-        let component_available = self.component_layout("index.subject-ranges")?.is_some();
-        let subject_range = if policy != NativeIndexPolicy::Disabled {
-            match resolved.s {
-                Some(subject_id) if component_available => {
-                    self.lookup_native_subject_range(subject_id).await?
-                }
-                Some(_) if policy == NativeIndexPolicy::Required => {
-                    return Err(VortexRdfError::InvalidOperation(
-                        "NativeIndexPolicy::Required requested for a subject-bound pattern, but index.subject-ranges is absent"
-                            .into(),
-                    ));
-                }
-                None if policy == NativeIndexPolicy::Required => {
-                    return Err(VortexRdfError::InvalidOperation(
-                        "NativeIndexPolicy::Required requested, but the query has no bound subject and no compatible native index exists for this shape"
-                            .into(),
-                    ));
-                }
-                _ => None,
+        let subject_index_available = self.component_layout("index.subject-ranges")?.is_some();
+        let predicate_index_available = self.component_layout("index.predicate-runs")?.is_some();
+        let (candidate_ranges, access) = if policy == NativeIndexPolicy::Disabled {
+            (None, "full-scan")
+        } else if let Some(subject_id) = resolved.s {
+            if subject_index_available {
+                (
+                    self.lookup_native_subject_range(subject_id)
+                        .await?
+                        .map(|range| vec![range]),
+                    "index.subject-ranges",
+                )
+            } else if policy == NativeIndexPolicy::Required {
+                return Err(VortexRdfError::InvalidOperation(
+                    "NativeIndexPolicy::Required requested for a subject-bound pattern, but index.subject-ranges is absent"
+                        .into(),
+                ));
+            } else {
+                (None, "full-scan")
             }
+        } else if let Some(predicate_id) = resolved.p {
+            if predicate_index_available {
+                (
+                    self.lookup_native_predicate_ranges(predicate_id).await?,
+                    "index.predicate-runs",
+                )
+            } else if policy == NativeIndexPolicy::Required {
+                return Err(VortexRdfError::InvalidOperation(
+                    "NativeIndexPolicy::Required requested for a predicate-bound pattern, but index.predicate-runs is absent"
+                        .into(),
+                ));
+            } else {
+                (None, "full-scan")
+            }
+        } else if policy == NativeIndexPolicy::Required {
+            return Err(VortexRdfError::InvalidOperation(
+                "NativeIndexPolicy::Required requested, but the query has neither a bound subject nor a bound predicate"
+                    .into(),
+            ));
         } else {
-            None
+            (None, "full-scan")
         };
-        if subject_range.as_ref().is_some_and(|range| range.is_empty()) {
+        if candidate_ranges.as_ref().is_some_and(Vec::is_empty)
+            || candidate_ranges
+                .as_ref()
+                .is_some_and(|ranges| ranges.len() == 1 && ranges[0].is_empty())
+        {
             return Ok(Vec::new());
         }
 
         let projection = native_projection_columns_for_bound_terms(&bound);
         let scan_started = Instant::now();
         let scan = self.file.scan().map_err(VortexRdfError::from)?;
-        let scan = match &subject_range {
-            Some(range) => scan.with_row_range(range.clone()),
+        let scan = match &candidate_ranges {
+            Some(ranges) if ranges.len() == 1 => scan.with_row_range(ranges[0].clone()),
+            Some(ranges) => {
+                let rows = ranges.iter().map(|range| range.end - range.start).sum();
+                scan.with_row_indices(exact_ranges_to_row_indices(ranges, rows)?)
+            }
             None => scan,
         };
         let scan = match resolved.filter() {
@@ -3419,14 +3521,14 @@ impl NativeRdfStoreFile {
             NativePatternFilter::Expr(expr) => scan.with_filter(expr),
         };
         log::debug!(
-            "[native-rdf-store] match policy={:?} access={} candidate_range={:?} setup={:?}",
+            "[native-rdf-store] match policy={:?} access={} candidate_ranges={} candidate_rows={} setup={:?}",
             policy,
-            if subject_range.is_some() {
-                "index.subject-ranges"
-            } else {
-                "full-scan"
-            },
-            subject_range,
+            access,
+            candidate_ranges.as_ref().map_or(0, Vec::len),
+            candidate_ranges.as_ref().map_or(0, |ranges| ranges
+                .iter()
+                .map(|range| range.end - range.start)
+                .sum()),
             scan_started.elapsed()
         );
         let stream = scan
@@ -7401,6 +7503,140 @@ fn native_subject_range_stream(
             yield empty_native_subject_range_array().map_err(rdf_err_to_vortex_err)?;
         }
     })
+}
+
+// VORTEX_RDF_NATIVE_PREDICATE_RUN_INDEX_V1
+fn build_native_predicate_run_array(
+    predicate_ids: Vec<u32>,
+    row_starts: Vec<u64>,
+    row_ends: Vec<u64>,
+) -> Result<ArrayRef> {
+    StructArray::from_fields(&[
+        (
+            "predicate_id",
+            PrimitiveArray::from_iter(predicate_ids).into_array(),
+        ),
+        (
+            "row_start",
+            PrimitiveArray::from_iter(row_starts).into_array(),
+        ),
+        ("row_end", PrimitiveArray::from_iter(row_ends).into_array()),
+    ])
+    .map_err(VortexRdfError::Vortex)
+    .map(|array| array.into_array())
+}
+
+fn empty_native_predicate_run_array() -> Result<ArrayRef> {
+    build_native_predicate_run_array(Vec::new(), Vec::new(), Vec::new())
+}
+
+/// Stream maximal contiguous predicate runs in physical SPO row order.
+///
+/// This is deliberately a run posting index, not one posting per triple. It is
+/// exact and bounded-memory; a future predicate-ordered QuadSource can replace
+/// it if measurements show excessive fragmentation for high-cardinality data.
+fn native_predicate_run_stream(
+    run_paths: Vec<PathBuf>,
+    batch_size: usize,
+) -> Result<impl Stream<Item = VortexResult<ArrayRef>> + Send> {
+    let batch_size = batch_size.max(1);
+    Ok(async_stream::try_stream! {
+        let mut readers = Vec::with_capacity(run_paths.len());
+        for path in &run_paths {
+            readers.push(NativeIdRunReader::new(path).map_err(rdf_err_to_vortex_err)?);
+        }
+        let mut heap = BinaryHeap::new();
+        for run_idx in 0..readers.len() {
+            if let Some(triple) = readers[run_idx].read_one().map_err(rdf_err_to_vortex_err)? {
+                heap.push(IdRunHeapItem { triple, run_idx, ordering: TripleOrdering::SPO });
+            }
+        }
+        let mut current_predicate = None;
+        let mut current_start = 0u64;
+        let mut row = 0u64;
+        let mut predicate_ids = Vec::with_capacity(batch_size);
+        let mut row_starts = Vec::with_capacity(batch_size);
+        let mut row_ends = Vec::with_capacity(batch_size);
+        while let Some(item) = heap.pop() {
+            let run_idx = item.run_idx;
+            let predicate = item.triple.p;
+            match current_predicate {
+                None => {
+                    current_predicate = Some(predicate);
+                    current_start = row;
+                }
+                Some(previous) if previous != predicate => {
+                    predicate_ids.push(previous);
+                    row_starts.push(current_start);
+                    row_ends.push(row);
+                    current_predicate = Some(predicate);
+                    current_start = row;
+                }
+                Some(_) => {}
+            }
+            row += 1;
+            if let Some(next) = readers[run_idx].read_one().map_err(rdf_err_to_vortex_err)? {
+                heap.push(IdRunHeapItem {
+                    triple: next,
+                    run_idx,
+                    ordering: TripleOrdering::SPO,
+                });
+            }
+            if predicate_ids.len() >= batch_size {
+                yield build_native_predicate_run_array(
+                    std::mem::take(&mut predicate_ids),
+                    std::mem::take(&mut row_starts),
+                    std::mem::take(&mut row_ends),
+                ).map_err(rdf_err_to_vortex_err)?;
+                predicate_ids = Vec::with_capacity(batch_size);
+                row_starts = Vec::with_capacity(batch_size);
+                row_ends = Vec::with_capacity(batch_size);
+            }
+        }
+        if let Some(predicate) = current_predicate {
+            predicate_ids.push(predicate);
+            row_starts.push(current_start);
+            row_ends.push(row);
+        }
+        if !predicate_ids.is_empty() {
+            yield build_native_predicate_run_array(predicate_ids, row_starts, row_ends)
+                .map_err(rdf_err_to_vortex_err)?;
+        } else if readers.is_empty() {
+            yield empty_native_predicate_run_array().map_err(rdf_err_to_vortex_err)?;
+        }
+    })
+}
+
+#[derive(Clone)]
+struct NativePredicateRunsSource {
+    run_paths: Arc<[PathBuf]>,
+    batch_size: usize,
+    dtype: vortex_array::dtype::DType,
+}
+
+impl NativePredicateRunsSource {
+    fn new(run_paths: &[PathBuf], batch_size: usize) -> Result<Self> {
+        Ok(Self {
+            run_paths: run_paths.to_vec().into(),
+            batch_size: batch_size.max(1),
+            dtype: empty_native_predicate_run_array()?.dtype().clone(),
+        })
+    }
+}
+
+impl NativeComponentSource for NativePredicateRunsSource {
+    fn dtype(&self) -> &vortex_array::dtype::DType {
+        &self.dtype
+    }
+
+    fn open(&self) -> VortexResult<vortex_array::stream::SendableArrayStream> {
+        let stream = native_predicate_run_stream(self.run_paths.to_vec(), self.batch_size)
+            .map_err(rdf_err_to_vortex_err)?;
+        Ok(ArrayStreamExt::boxed(ArrayStreamAdapter::new(
+            self.dtype.clone(),
+            stream,
+        )))
+    }
 }
 
 #[derive(Clone)]
