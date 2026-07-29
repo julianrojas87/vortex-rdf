@@ -3272,6 +3272,105 @@ impl NativeRdfStoreFile {
         Ok(resolved)
     }
 
+    // VORTEX_RDF_NATIVE_INDEX_INDEPENDENT_MATCHING_V1
+    /// Match one RDF quad pattern against the native QuadSource.
+    ///
+    /// `Disabled` is the correctness baseline. `Auto` currently takes the same
+    /// path until compatible native index components are added. `Required`
+    /// fails explicitly rather than silently scanning.
+    ///
+    /// FUTURE(performance): `Auto` will select candidate row ranges from native
+    /// indexes, but the exact QuadSource filter below must remain mandatory.
+    pub async fn match_pattern_with_policy(
+        &self,
+        subject: Option<&NamedOrBlankNode>,
+        predicate: Option<&NamedNode>,
+        object: Option<&Term>,
+        graph: Option<&GraphName>,
+        policy: NativeIndexPolicy,
+    ) -> Result<Vec<(String, String, String)>> {
+        if policy == NativeIndexPolicy::Required {
+            return Err(VortexRdfError::InvalidOperation(
+                "NativeIndexPolicy::Required requested, but this native RDF store has no compatible query index component"
+                    .into(),
+            ));
+        }
+
+        let bound = BoundNativeRdfTerms::from_pattern(subject, predicate, object, graph);
+        let requested = [
+            (bound.s.as_deref(), "s"),
+            (bound.p.as_deref(), "p"),
+            (bound.o.as_deref(), "o"),
+            (bound.g.as_deref(), "g"),
+        ];
+        let mut resolved = ResolvedNativePattern::default();
+        for (term, column) in requested {
+            let Some(term) = term else { continue };
+            let Some(id) = self.lookup_term_id(term).await? else {
+                return Ok(Vec::new());
+            };
+            match column {
+                "s" => resolved.s = Some(id),
+                "p" => resolved.p = Some(id),
+                "o" => resolved.o = Some(id),
+                "g" => resolved.g = Some(id),
+                _ => unreachable!("only native SPOG columns are resolved"),
+            }
+        }
+
+        let projection = native_projection_columns_for_bound_terms(&bound);
+        let scan = self.file.scan().map_err(VortexRdfError::from)?;
+        let scan = match resolved.filter() {
+            NativePatternFilter::All => scan,
+            NativePatternFilter::Empty => return Ok(Vec::new()),
+            NativePatternFilter::Expr(expr) => scan.with_filter(expr),
+        };
+        let stream = scan
+            .with_projection(vortex_array::expr::select(
+                projection.as_slice(),
+                vortex_array::expr::root(),
+            ))
+            .into_array_stream()
+            .map_err(VortexRdfError::from)?;
+        let (rows, _, _) = read_native_projected_stream_all_with_scan_stats(stream).await?;
+        if rows.rows == 0 {
+            return Ok(Vec::new());
+        }
+
+        let requested_ids = rows.unique_unbound_ids(&bound);
+        let id_to_term = self.lookup_terms_by_ids(&requested_ids).await?;
+        let mut triples = Vec::with_capacity(rows.rows);
+        for row in 0..rows.rows {
+            let subject_id = rows.id_at(NativeIdColumn::Subject, &bound, row)?;
+            let predicate_id = rows.id_at(NativeIdColumn::Predicate, &bound, row)?;
+            let object_id = rows.id_at(NativeIdColumn::Object, &bound, row)?;
+            let subject = lookup_projected_or_use_bound(&id_to_term, &bound.s, subject_id, "S")?;
+            let predicate =
+                lookup_projected_or_use_bound(&id_to_term, &bound.p, predicate_id, "P")?;
+            let object = lookup_projected_or_use_bound(&id_to_term, &bound.o, object_id, "O")?;
+            triples.push((subject.to_owned(), predicate.to_owned(), object.to_owned()));
+        }
+        Ok(triples)
+    }
+
+    /// Convenience correctness-baseline matcher that never uses indexes.
+    pub async fn match_pattern_without_indexes(
+        &self,
+        subject: Option<&NamedOrBlankNode>,
+        predicate: Option<&NamedNode>,
+        object: Option<&Term>,
+        graph: Option<&GraphName>,
+    ) -> Result<Vec<(String, String, String)>> {
+        self.match_pattern_with_policy(
+            subject,
+            predicate,
+            object,
+            graph,
+            NativeIndexPolicy::Disabled,
+        )
+        .await
+    }
+
     /// Render stable logical names even when a generic explorer displays
     /// unregistered custom-layout children positionally as 0, 1, 2, ...
     pub fn named_layout_tree(&self) -> Result<String> {
