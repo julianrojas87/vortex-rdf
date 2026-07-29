@@ -3,8 +3,18 @@ name: CodSpeed Benchmarks
 on:
   push:
     branches:
-      - "main" 
+      - "main"
+    # Doc-only changes move no instruction counts; workflow_dispatch stays as
+    # the escape hatch since path filters never apply to it.
+    paths-ignore:
+      - '**.md'
+      - 'LICENSE'
+      - '.gitignore'
   pull_request:
+    paths-ignore:
+      - '**.md'
+      - 'LICENSE'
+      - '.gitignore'
   workflow_dispatch:
 
 permissions: # optional for public repositories

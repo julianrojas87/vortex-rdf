@@ -4,7 +4,18 @@ on:
   push:
     branches:
       - main
+    # Doc-only changes can't break the build. Repeated per event because path
+    # filters are not inherited across triggers (and Actions does not support
+    # YAML anchors).
+    paths-ignore:
+      - '**.md'
+      - 'LICENSE'
+      - '.gitignore'
   pull_request:
+    paths-ignore:
+      - '**.md'
+      - 'LICENSE'
+      - '.gitignore'
 
 permissions:
   contents: read

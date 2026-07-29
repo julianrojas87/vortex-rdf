@@ -4,6 +4,12 @@ on:
   push:
     branches:
       - main
+    # Skip the two cargo bench runs + full JS comparative bench on doc-only
+    # pushes. Deliberately narrow: scripts/ and public/ are dashboard inputs.
+    paths-ignore:
+      - '**.md'
+      - 'LICENSE'
+      - '.gitignore'
   workflow_dispatch:
 
 permissions:
