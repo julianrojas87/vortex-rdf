@@ -30,7 +30,7 @@ body = """
 {% for group, commits in commits | group_by(attribute="group") %}
     ### {{ group | striptags | trim | upper_first }}
     {% for commit in commits %}
-        - {{ commit.message | split(pat="\n") | first | upper_first | trim }}{% if commit.scope %} ({{ commit.scope }}){% endif %} ([`{{ commit.id | truncate(length=7, end="") }}`](https://github.com/{{ remote.github.owner }}/{{ remote.github.repo }}/commit/{{ commit.id }}) by {% if commit.remote.username %}[@{{ commit.remote.username }}](https://github.com/{{ commit.remote.username }}){% else %}{{ commit.author.name }}{% endif %})\
+        - {{ commit.message | split(pat="\n") | first | upper_first | trim }}{% if commit.scope %} ({{ commit.scope }}){% endif %} ([`{{ commit.id | truncate(length=7, end="") }}`](https://github.com/{{ remote.github.owner }}/{{ remote.github.repo }}/commit/{{ commit.id }}) by {% if commit.remote.username %}@{{ commit.remote.username }}{% else %}{{ commit.author.name }}{% endif %})\
     {% endfor %}
 {% endfor %}
 """
@@ -77,5 +77,7 @@ repo = "vortex-rdf"
 # Author handles: when a GitHub token is available (GITHUB_TOKEN env, or
 # scripts/update-changelog.sh derives one from `gh auth token`), git-cliff resolves
 # each commit's author to their GitHub @handle (commit.remote.username) and the body
-# links it. Without a token it falls back to the plain git author name. Never commit
-# a token here — it is passed at runtime via the environment.
+# emits it bare — GitHub auto-links a leading @, so an explicit markdown link would
+# be redundant. Without a token it falls back to the plain git author name (which is
+# NOT necessarily a handle, hence no @). Never commit a token here — it is passed at
+# runtime via the environment.

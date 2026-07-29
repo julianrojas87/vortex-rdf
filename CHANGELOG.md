@@ -5,15 +5,37 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased](https://github.com/vortex-rdf/vortex-rdf/compare/v0.3.0...HEAD)
+## [0.4.0](https://github.com/vortex-rdf/vortex-rdf/compare/v0.3.0...v0.4.0) - 2026-07-29
+
+### Added
+
+- Store the term dictionary as a scannable column, not a list cell ([`30c0fa0`](https://github.com/vortex-rdf/vortex-rdf/commit/30c0fa042c5756d22a36148cc01ef146a467faff) by @julianrojas87)
+- Choose the dictionary placement when writing files (core) ([`210db2e`](https://github.com/vortex-rdf/vortex-rdf/commit/210db2e06b807d2df90e937bbdd1d11a3caf73e6) by @julianrojas87)
+- File-backed term dictionary with auto residency (core) ([`fb469c5`](https://github.com/vortex-rdf/vortex-rdf/commit/fb469c57fd618a9d223bff0020b38b2ae6de12d2) by @julianrojas87)
+- Avoid action runs on docs-only commits ([`d620bb3`](https://github.com/vortex-rdf/vortex-rdf/commit/d620bb3af328e22541d088b1e0c45e1338fa0427) by @julianrojas87)
 
 ### Changed
 
-- Cut wasm dictionary and ingest memory ([`2573626`](https://github.com/vortex-rdf/vortex-rdf/commit/25736260ef0bff113d34030cbe1efb16357ddb7a) by julianrojas87)
+- Cut wasm dictionary and ingest memory ([`2573626`](https://github.com/vortex-rdf/vortex-rdf/commit/25736260ef0bff113d34030cbe1efb16357ddb7a) by @julianrojas87)
 - Hold and serialize the term dictionary FSST-compressed ([`75a9389`](https://github.com/vortex-rdf/vortex-rdf/commit/75a9389dbab2836d55b4a384e138c08917e927d3) by @julianrojas87)
 - Share one term resolution across a match's index probes (core) ([`d442fff`](https://github.com/vortex-rdf/vortex-rdf/commit/d442ffffcc124c25ef17acdf30c60eac3432e663) by @julianrojas87)
 - Stop pessimizing views a fast path already narrowed (core) ([`9d2ea13`](https://github.com/vortex-rdf/vortex-rdf/commit/9d2ea13ab24d7ee6217891965ba5716872d7fa76) by @julianrojas87)
 - Memoize term to code lookups per dictionary (core) ([`8da6c31`](https://github.com/vortex-rdf/vortex-rdf/commit/8da6c312243e03522fc471c89335ab4504d463da) by @julianrojas87)
+- Intern terms at ingest instead of buffering owned quads ([`276089d`](https://github.com/vortex-rdf/vortex-rdf/commit/276089de0675b9f02a9b340898177d43db514c28) by @julianrojas87)
+- Seam the dictionary behind DictAccess with an async match prelude ([`7f06209`](https://github.com/vortex-rdf/vortex-rdf/commit/7f06209077bd75e03f73eed7d8ea43a17e554cb5) by @julianrojas87)
+- Give shared types dedicated source modules (core) ([`5b6b867`](https://github.com/vortex-rdf/vortex-rdf/commit/5b6b867f9003664ee06d29ff1b86787b67471652) by @julianrojas87)
+- Split the crate test suite by area (core) ([`7fae164`](https://github.com/vortex-rdf/vortex-rdf/commit/7fae164e1854b0826d5066a01f2ba69cdab6d813) by @julianrojas87)
+- Split the wasm binding crate into modules (js) ([`c4dea32`](https://github.com/vortex-rdf/vortex-rdf/commit/c4dea32405405453062c38b3a6cb044a5f294477) by @julianrojas87)
+- Share the RDF format-name table with core (js) ([`46a7668`](https://github.com/vortex-rdf/vortex-rdf/commit/46a76680078129b22e30c06853f2a82f3d2e30d6) by @julianrojas87)
+- Derive the padded dictionary extent from footer statistics (core) ([`7f9eceb`](https://github.com/vortex-rdf/vortex-rdf/commit/7f9eceb9aadec3d0cb0c4cf74bc6e8591d5b3287) by @julianrojas87)
+- Erase the retired _dict_terms format (core) ([`c947d1a`](https://github.com/vortex-rdf/vortex-rdf/commit/c947d1a8fc77d6b95fe6ab23d209b7d1c38d4ad9) by @julianrojas87)
+- Fence-guided probes for the file-backed dictionary (core) ([`1720a44`](https://github.com/vortex-rdf/vortex-rdf/commit/1720a440d535b1b1fd216cb79640a2753d516171) by @julianrojas87)
+- Compose typed objects without re-validating stored terms (core) ([`eb78570`](https://github.com/vortex-rdf/vortex-rdf/commit/eb78570b2af8fd0c23930da6f13d08b49ed663a5) by @julianrojas87)
+- Materialize quads chunk-wise into an exactly-sized vec (core) ([`b1c01f3`](https://github.com/vortex-rdf/vortex-rdf/commit/b1c01f3cd78bf671721ab8b6ca01be6a1b0d8720) by @julianrojas87)
+
+### Fixed
+
+- Polluted CHANGELOG ([`b5951c0`](https://github.com/vortex-rdf/vortex-rdf/commit/b5951c04fe6527630e73cd2178f899fba1422f89) by @julianrojas87)
 
 ## [0.3.0](https://github.com/vortex-rdf/vortex-rdf/compare/v0.2.1...v0.3.0) - 2026-07-25
 
