@@ -7,6 +7,7 @@ pub mod build_context;
 pub mod component_names;
 pub mod config;
 pub(crate) mod exact_ranges;
+pub(crate) mod object_index;
 
 pub use config::{NativeIndexProfile, NativeIndexSelection, NativeIndexSpec};
 

@@ -867,7 +867,6 @@ mod tests {
     async fn quad_source_v10_round_trips_native_root_and_scan() -> VortexResult<()> {
         use vortex_array::IntoArray;
         use vortex_array::arrays::StructArray;
-        use vortex_array::stream::ArrayStreamExt;
         use vortex_buffer::{ByteBuffer, ByteBufferMut, buffer};
         use vortex_io::session::RuntimeSession;
         use vortex_layout::layouts::flat::writer::FlatLayoutStrategy;
