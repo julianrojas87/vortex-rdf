@@ -34,22 +34,29 @@
 use std::ops::Range;
 use std::sync::Arc;
 
-use oxrdf::{GraphName, NamedNode, NamedOrBlankNode, Term};
 use vortex_array::arrays::struct_::StructArrayExt;
 use vortex_array::arrays::{PrimitiveArray, StructArray};
 use vortex_array::dtype::DType;
 use vortex_array::{ArrayRef, IntoArray};
 
 use super::{IndexResolution, IndexedComponent, sorted_row_ids};
-use crate::common::utils::{
+use crate::common::array::{
     column_is_sorted, make_string_array, search_sorted_bounds, stamp_is_sorted,
 };
 use crate::error::{Result, VortexRdfError};
-use crate::store::layouts::ResolvedLayout;
-use crate::store::{QuadCodes, RawQuad};
+use crate::store::RawQuad;
+use crate::store::layouts::dictionary::QuadCodes;
+use crate::store::layouts::{PatternCodes, QuadPattern, ResolvedLayout, TermRef};
 
 #[cfg(feature = "file-io")]
 use vortex_file::VortexFile;
+
+/// This index's four columns: a sorted copy of a component's values paired
+/// with the primary row id each value came from.
+pub(crate) const O_VAL_COL: &str = "_idx_o_val";
+pub(crate) const O_RID_COL: &str = "_idx_o_rid";
+pub(crate) const P_VAL_COL: &str = "_idx_p_val";
+pub(crate) const P_RID_COL: &str = "_idx_p_rid";
 
 /// Whether a struct dtype carries this index's four columns — how stores
 /// detect the index in an array or file schema without reading any data.
@@ -57,7 +64,7 @@ pub(crate) fn is_present(dtype: &DType) -> bool {
     match dtype {
         DType::Struct(fields, _) => {
             let has = |name: &str| fields.names().iter().any(|n| n.as_ref() == name);
-            has("_idx_o_val") && has("_idx_o_rid") && has("_idx_p_val") && has("_idx_p_rid")
+            has(O_VAL_COL) && has(O_RID_COL) && has(P_VAL_COL) && has(P_RID_COL)
         }
         _ => false,
     }
@@ -65,10 +72,10 @@ pub(crate) fn is_present(dtype: &DType) -> bool {
 
 /// The sorted value column to probe, its paired row-id column, the term to
 /// probe for, and which pattern component a hit resolves.
-struct ColumnProbe {
+struct ColumnProbe<'a> {
     value_column: &'static str,
     row_id_column: &'static str,
-    probe_term: String,
+    probe_term: TermRef<'a>,
     resolves: IndexedComponent,
 }
 
@@ -80,27 +87,23 @@ struct ColumnProbe {
 /// predicate are bound, the object side is chosen — object equality is usually
 /// the more selective constraint. `None` when nothing this index covers is
 /// bound.
-fn choose(
-    subject: Option<&NamedOrBlankNode>,
-    predicate: Option<&NamedNode>,
-    object: Option<&Term>,
-) -> Option<ColumnProbe> {
-    if subject.is_some() {
+fn choose<'a>(pattern: QuadPattern<'a>) -> Option<ColumnProbe<'a>> {
+    if pattern.subject.is_some() {
         return None;
     }
-    if let Some(object) = object {
+    if let Some(object) = pattern.object {
         return Some(ColumnProbe {
-            value_column: "_idx_o_val",
-            row_id_column: "_idx_o_rid",
-            probe_term: object.to_string(),
+            value_column: O_VAL_COL,
+            row_id_column: O_RID_COL,
+            probe_term: TermRef::Object(object),
             resolves: IndexedComponent::Object,
         });
     }
-    if let Some(predicate) = predicate {
+    if let Some(predicate) = pattern.predicate {
         return Some(ColumnProbe {
-            value_column: "_idx_p_val",
-            row_id_column: "_idx_p_rid",
-            probe_term: predicate.to_string(),
+            value_column: P_VAL_COL,
+            row_id_column: P_RID_COL,
+            probe_term: TermRef::Predicate(predicate),
             resolves: IndexedComponent::Predicate,
         });
     }
@@ -117,18 +120,18 @@ fn choose(
 pub(crate) fn resolve_in_memory(
     struct_arr: &StructArray,
     layout: &ResolvedLayout,
-    subject: Option<&NamedOrBlankNode>,
-    predicate: Option<&NamedNode>,
-    object: Option<&Term>,
-    _graph: Option<&GraphName>,
+    pattern: QuadPattern<'_>,
+    codes: &mut PatternCodes,
 ) -> Result<IndexResolution> {
     // Pick the column pair for this pattern shape, or decline it entirely.
-    let Some(probe) = choose(subject, predicate, object) else {
+    let Some(probe) = choose(pattern) else {
         return Ok(IndexResolution::Declined);
     };
     // Translate the term to the value column's native probe value (a string, or
-    // a dictionary code). Absent from the dictionary ⇒ nothing can match.
-    let Some(native) = layout.probe_scalar(&probe.probe_term) else {
+    // a dictionary code). Absent from the dictionary ⇒ nothing can match. The
+    // probe term is the pattern's own predicate or object, so this shares the
+    // match's resolution cache rather than searching the dictionary again.
+    let Some(native) = layout.probe_scalar_cached(probe.probe_term, codes) else {
         return Ok(IndexResolution::Empty);
     };
     // Route through the index only when its value column is actually usable:
@@ -173,22 +176,25 @@ pub(crate) fn resolve_in_memory(
 #[cfg(feature = "file-io")]
 pub(crate) async fn resolve_file(
     file: &VortexFile,
+    quad_rows: u64,
     layout: &ResolvedLayout,
-    subject: Option<&NamedOrBlankNode>,
-    predicate: Option<&NamedNode>,
-    object: Option<&Term>,
-    _graph: Option<&GraphName>,
+    pattern: QuadPattern<'_>,
+    codes: &mut PatternCodes,
 ) -> Result<IndexResolution> {
-    let Some(probe) = choose(subject, predicate, object) else {
+    let Some(probe) = choose(pattern) else {
         return Ok(IndexResolution::Declined);
     };
     // Term absent from the dictionary ⇒ the pattern provably matches nothing.
-    let Some(native) = layout.probe_scalar(&probe.probe_term) else {
+    let Some(native) = layout.probe_scalar_cached(probe.probe_term, codes) else {
         return Ok(IndexResolution::Empty);
     };
-    let row_ids =
-        super::scan_index_row_ids(file, &[(probe.value_column, native)], probe.row_id_column)
-            .await?;
+    let row_ids = super::scan_index_row_ids(
+        file,
+        quad_rows,
+        &[(probe.value_column, native)],
+        probe.row_id_column,
+    )
+    .await?;
     if row_ids.is_empty() {
         return Ok(IndexResolution::Empty);
     }
@@ -283,10 +289,10 @@ pub(crate) fn append_sorted_string_pairs(
         stamp_is_sorted(&p_val);
     }
     field_names.extend_from_slice(&[
-        "_idx_o_val".into(),
-        "_idx_o_rid".into(),
-        "_idx_p_val".into(),
-        "_idx_p_rid".into(),
+        O_VAL_COL.into(),
+        O_RID_COL.into(),
+        P_VAL_COL.into(),
+        P_RID_COL.into(),
     ]);
     field_arrays.extend([
         o_val,
@@ -311,10 +317,10 @@ pub(crate) fn append_sorted_code_pairs(
         stamp_is_sorted(&p_val);
     }
     field_names.extend_from_slice(&[
-        "_idx_o_val".into(),
-        "_idx_o_rid".into(),
-        "_idx_p_val".into(),
-        "_idx_p_rid".into(),
+        O_VAL_COL.into(),
+        O_RID_COL.into(),
+        P_VAL_COL.into(),
+        P_RID_COL.into(),
     ]);
     field_arrays.extend([
         o_val,
@@ -397,10 +403,10 @@ impl GlobalIndexArrays {
         range: Range<usize>,
     ) -> Result<()> {
         for (name, arr, is_val) in [
-            ("_idx_o_val", &self.o_val, true),
-            ("_idx_o_rid", &self.o_rid, false),
-            ("_idx_p_val", &self.p_val, true),
-            ("_idx_p_rid", &self.p_rid, false),
+            (O_VAL_COL, &self.o_val, true),
+            (O_RID_COL, &self.o_rid, false),
+            (P_VAL_COL, &self.p_val, true),
+            (P_RID_COL, &self.p_rid, false),
         ] {
             let sliced = arr.slice(range.clone()).map_err(VortexRdfError::Vortex)?;
             if is_val {
@@ -416,7 +422,7 @@ impl GlobalIndexArrays {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use oxrdf::Literal;
+    use oxrdf::{Literal, NamedNode, NamedOrBlankNode, Term};
 
     #[test]
     fn choose_component_selection() {
@@ -426,23 +432,23 @@ mod tests {
 
         // A bound subject declines: the primary sorted `s` column is the
         // better access path than this index.
-        assert!(choose(Some(&s), Some(&p), Some(&o)).is_none());
+        assert!(choose(QuadPattern::new(Some(&s), Some(&p), Some(&o), None)).is_none());
 
         // Object preferred over predicate when both are bound.
-        let probe = choose(None, Some(&p), Some(&o)).unwrap();
+        let probe = choose(QuadPattern::new(None, Some(&p), Some(&o), None)).unwrap();
         assert_eq!(probe.resolves, IndexedComponent::Object);
         assert_eq!(probe.value_column, "_idx_o_val");
         assert_eq!(probe.row_id_column, "_idx_o_rid");
-        assert_eq!(probe.probe_term, o.to_string());
+        assert_eq!(probe.probe_term.to_string(), o.to_string());
 
         // Predicate-only patterns use the predicate side.
-        let probe = choose(None, Some(&p), None).unwrap();
+        let probe = choose(QuadPattern::new(None, Some(&p), None, None)).unwrap();
         assert_eq!(probe.resolves, IndexedComponent::Predicate);
         assert_eq!(probe.value_column, "_idx_p_val");
         assert_eq!(probe.row_id_column, "_idx_p_rid");
-        assert_eq!(probe.probe_term, p.to_string());
+        assert_eq!(probe.probe_term.to_string(), p.to_string());
 
         // Nothing this index covers is bound: declines.
-        assert!(choose(None, None, None).is_none());
+        assert!(choose(QuadPattern::new(None, None, None, None)).is_none());
     }
 }

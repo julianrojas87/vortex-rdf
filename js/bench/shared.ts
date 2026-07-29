@@ -21,55 +21,176 @@ import { Store as OxiStore } from 'oxigraph';
 export const df = new DataFactory();
 
 // ─── Config (env-tunable) ────────────────────────────────────────────────────
-export const D = Number(process.env.BENCH_DIM ?? 128); // triples dataset: D³ triples (rdf-stores `-d 128`)
-export const DQ = Number(process.env.BENCH_DIM_QUADS ?? 32); // quads dataset: DQ⁴ quads (graph patterns)
+export const D = Number(process.env.BENCH_DIM ?? 128); // triples dataset: D³ triples
+export const DQ = Number(process.env.BENCH_DIM_QUADS ?? 32); // quads dataset: DQ⁴ quads
 export const MUT_BATCH = Number(process.env.MUT_BATCH ?? 10_000); // add/delete batch, independent of D
-const EX = 'http://example.org/#';
+/** Row counts, kept as D³/DQ⁴ so the existing scale knobs mean what they always did. */
+export const N_TRIPLES = D ** 3;
+export const N_QUADS = DQ ** 4;
 
-// ─── Dataset generators (rdf-stores.js style) ────────────────────────────────
-const nn = (n: number | string) => df.namedNode(EX + n);
+// ─── Dataset generator ───────────────────────────────────────────────────────
+//
+// Term cardinality is an explicit knob, independent of row count. The previous
+// generator drew D³ rows from a namespace of only D IRIs (128 distinct terms for
+// 2,097,152 triples), which made every store's term handling — dictionaries,
+// interning, string storage — invisible to the benchmark, and is nothing like
+// real RDF, where distinct terms scale with the data.
+//
+// Uniqueness: term indices are `i % k` per role, so quad i maps to the residue
+// tuple (i mod nSubj, i mod nPred, i mod nObj, i mod nGraph). By the Chinese
+// Remainder Theorem that map is injective over `i < lcm(...)`, so making the
+// four moduli pairwise coprime (their lcm is then their product) and checking
+// the product covers `n` guarantees every generated quad is distinct — with no
+// dedupe set, which at these row counts would itself dominate memory.
+//
+// Deliberate consequence: index 0 exists for every role, so row 0 satisfies all
+// four single-term probes and every pattern in `datasetProbes` matches at least
+// one row.
 
-/** D³ triples in the default graph: quad(ex#s, ex#p, ex#o). */
-export function genTriples(d: number): Quad[] {
-    const out: Quad[] = [];
-    for (let s = 0; s < d; s++)
-        for (let p = 0; p < d; p++)
-            for (let o = 0; o < d; o++) out.push(df.quad(nn(s), nn(p), nn(o)));
+const BASE = 'http://data.example.org';
+
+export interface DatasetOpts {
+    /** distinct subjects / n (default 0.1 — see `SUBJECT_RATIO_DEFAULT`). */
+    subjectRatio?: number;
+    /** distinct predicates: a small closed vocabulary, as in real data (default 32). */
+    predicates?: number;
+    /** distinct objects / n (default 0.5). */
+    objectRatio?: number;
+    /** fraction of distinct objects that are literals rather than IRIs (default 0.4). */
+    literalFrac?: number;
+    /** distinct named graphs; 1 means the default graph only (default 1). */
+    graphs?: number;
+}
+
+/** Distinct subjects per row, i.e. the reciprocal of how many triples describe
+ *  each resource. 0.1 is ten triples per subject.
+ *
+ *  This is the knob that decides how much of the dataset is *terms*: the
+ *  dictionary holds `subjectRatio + objectRatio` terms per quad, so the two
+ *  ratios alone say whether there are more distinct terms than rows.
+ *
+ *  It was 1.0 — a distinct subject for every row. That is not how RDF looks: a
+ *  resource is normally described by several properties, so its subject recurs
+ *  across that many triples. 1.0 also made `S` match exactly one row, and with
+ *  `PO`/`SPO`/`SPOG` matching one apiece, five of the seven probes returned two
+ *  rows or fewer — so the comparison measured query *setup* almost to the
+ *  exclusion of decoding, on a dictionary half again the size of the dataset.
+ *
+ *  Set `BENCH_SUBJ_RATIO=1.0` to get that back deliberately: it is a reasonable
+ *  dictionary-stress configuration, and `bench:dict-memory` asks for it
+ *  explicitly for exactly that reason. It is a poor default. */
+export const SUBJECT_RATIO_DEFAULT = 0.1;
+
+/** Env-overridable defaults, so a sweep can vary cardinality without new code. */
+export function datasetOpts(o: DatasetOpts = {}): Required<DatasetOpts> {
+    return {
+        subjectRatio:
+            o.subjectRatio ?? Number(process.env.BENCH_SUBJ_RATIO ?? SUBJECT_RATIO_DEFAULT),
+        predicates: o.predicates ?? Number(process.env.BENCH_PREDICATES ?? 32),
+        objectRatio: o.objectRatio ?? Number(process.env.BENCH_OBJ_RATIO ?? 0.5),
+        literalFrac: o.literalFrac ?? Number(process.env.BENCH_LITERAL_FRAC ?? 0.4),
+        graphs: o.graphs ?? Number(process.env.BENCH_GRAPHS ?? 1),
+    };
+}
+
+function gcd(a: number, b: number): number {
+    while (b) [a, b] = [b, a % b];
+    return a;
+}
+
+/** Per-role term counts: the requested values nudged up until pairwise coprime. */
+export function moduli(n: number, opts: DatasetOpts = {}): {
+    nSubj: number; nPred: number; nObj: number; nGraph: number; terms: number;
+} {
+    const o = datasetOpts(opts);
+    const want = [
+        Math.max(1, Math.round(n * o.subjectRatio)),
+        Math.max(1, Math.round(o.predicates)),
+        Math.max(1, Math.round(n * o.objectRatio)),
+        Math.max(1, Math.round(o.graphs)),
+    ];
+    const got: number[] = [];
+    for (const w of want) {
+        let k = w;
+        while (got.some((g) => gcd(g, k) !== 1)) k++;
+        got.push(k);
+    }
+    const [nSubj, nPred, nObj, nGraph] = got;
+    // Product == lcm because they are pairwise coprime; see the CRT note above.
+    // Use logs: the product overflows the float mantissa long before it matters.
+    const logProduct = got.reduce((acc, k) => acc + Math.log(k), 0);
+    if (logProduct < Math.log(n)) {
+        throw new Error(
+            `dataset cardinality too low for ${n} distinct quads: ` +
+            `${nSubj}x${nPred}x${nObj}x${nGraph} cannot cover it — raise a ratio`,
+        );
+    }
+    // The default graph is a term too, and it is not one of the named graphs.
+    const terms = nSubj + nPred + nObj + (nGraph === 1 ? 1 : nGraph);
+    return { nSubj, nPred, nObj, nGraph, terms };
+}
+
+const subjectTerm = (i: number) =>
+    df.namedNode(`${BASE}/resource/2026/subject/${String(i).padStart(9, '0')}`);
+const predicateTerm = (i: number) =>
+    df.namedNode(`${BASE}/ontology/2026/property/${String(i).padStart(4, '0')}`);
+const graphTerm = (i: number) =>
+    df.namedNode(`${BASE}/graph/2026/named/${String(i).padStart(6, '0')}`);
+
+/** Objects alternate IRI/literal deterministically, in `literalFrac` proportion. */
+function objectTerm(i: number, literalFrac: number): Term {
+    return i % 10 < Math.round(literalFrac * 10)
+        ? df.literal(`descriptive object value number ${String(i).padStart(9, '0')}`)
+        : df.namedNode(`${BASE}/resource/2026/object/${String(i).padStart(9, '0')}`);
+}
+
+/** Quad `i` of the `n`-row dataset. Pure in `i`, so probes and prefixes can be
+ *  derived without materializing the array. */
+function quadAt(i: number, m: ReturnType<typeof moduli>, literalFrac: number): Quad {
+    return df.quad(
+        subjectTerm(i % m.nSubj),
+        predicateTerm(i % m.nPred),
+        objectTerm(i % m.nObj, literalFrac) as never,
+        m.nGraph === 1 ? df.defaultGraph() : graphTerm(i % m.nGraph),
+    );
+}
+
+/** `n` distinct quads whose term cardinality follows `opts`. */
+export function genDataset(n: number, opts: DatasetOpts = {}): Quad[] {
+    const o = datasetOpts(opts);
+    const m = moduli(n, opts);
+    const out: Quad[] = new Array(n);
+    for (let i = 0; i < n; i++) out[i] = quadAt(i, m, o.literalFrac);
     return out;
 }
 
-/** DQ⁴ quads across named graphs: quad(ex#s, ex#p, ex#o, ex#g). */
-export function genQuads(d: number): Quad[] {
-    const out: Quad[] = [];
-    for (let s = 0; s < d; s++)
-        for (let p = 0; p < d; p++)
-            for (let o = 0; o < d; o++)
-                for (let g = 0; g < d; g++) out.push(df.quad(nn(s), nn(p), nn(o), nn(g)));
+/** The first `take` quads `genDataset(n, opts)` would produce, without building
+ *  the full array — the mutation worker needs only a MUT_BATCH-sized slice for
+ *  the delete phase, and `n` can be a couple of million. */
+export function genDatasetPrefix(n: number, take: number, opts: DatasetOpts = {}): Quad[] {
+    const o = datasetOpts(opts);
+    const m = moduli(n, opts);
+    const k = Math.min(take, n);
+    const out: Quad[] = new Array(k);
+    for (let i = 0; i < k; i++) out[i] = quadAt(i, m, o.literalFrac);
     return out;
 }
 
-/** A batch of fresh quads (disjoint namespace) for the add phase. */
+/** A batch of fresh quads in a disjoint namespace, for the add phase. */
 export function genFresh(n: number): Quad[] {
-    const out: Quad[] = [];
-    for (let i = 0; i < n; i++) out.push(df.quad(nn('add-s' + i), nn('add-p'), nn('add-o' + i)));
-    return out;
-}
-
-/** The first `n` triples `genTriples(d)` would produce, without materializing the
- * full D³ array — the mutation worker only needs a MUT_BATCH-sized slice for the
- * delete phase, and D³ can be a couple million quads. */
-export function genTriplesPrefix(d: number, n: number): Quad[] {
-    const out: Quad[] = [];
-    for (let s = 0; s < d && out.length < n; s++)
-        for (let p = 0; p < d && out.length < n; p++)
-            for (let o = 0; o < d && out.length < n; o++) out.push(df.quad(nn(s), nn(p), nn(o)));
+    const out: Quad[] = new Array(n);
+    for (let i = 0; i < n; i++) {
+        out[i] = df.quad(
+            df.namedNode(`${BASE}/fresh/2026/subject/${String(i).padStart(9, '0')}`),
+            df.namedNode(`${BASE}/fresh/2026/property/0000`),
+            df.namedNode(`${BASE}/fresh/2026/object/${String(i).padStart(9, '0')}`),
+        );
+    }
     return out;
 }
 
 // ─── Query patterns (probe terms fixed at index 0, so they always hit rows) ──
 export type Pat = { name: string; s: Term | null; p: Term | null; o: Term | null; g: Term | null };
-const t0 = nn(0); // simultaneously subject/predicate/object 0 in the rdf-stores namespace
-const g0 = nn(0);
 // 'full' (every variable unbound) is measured separately from the selective patterns,
 // under FULL_SCAN_OPTS's much lower repetition count: repeating a full-table
 // materialization (all D³ rows, ~2M at the default D=128) ~15x (QUERY_OPTS's 5 warmup
@@ -80,18 +201,44 @@ const g0 = nn(0);
 // dump repeated many times is a heavy op for any store (closer in spirit to `ingest`
 // than to a selective query), so the lower budget applies to every adapter uniformly
 // rather than singling out the one library that happens to crash on it.
-export const TRIPLE_PATTERNS: Pat[] = [
-    { name: 'S', s: t0, p: null, o: null, g: null },
-    { name: 'P', s: null, p: t0, o: null, g: null },
-    { name: 'O', s: null, p: null, o: t0, g: null },
-    { name: 'PO', s: null, p: t0, o: t0, g: null },
-    { name: 'SPO', s: t0, p: t0, o: t0, g: null },
-];
 export const FULL_SCAN_PATTERN: Pat = { name: 'full', s: null, p: null, o: null, g: null };
-export const QUAD_PATTERNS: Pat[] = [
-    { name: 'G', s: null, p: null, o: null, g: g0 },
-    { name: 'SPOG', s: t0, p: t0, o: t0, g: g0 },
-];
+
+/**
+ * Probes for an `n`-row dataset built with `opts`, all bound to term index 0 so
+ * every one matches row 0 at minimum — no pattern can silently measure a
+ * zero-row query.
+ *
+ * Selectivity now follows the data rather than the old shared namespace: at the
+ * defaults `S` matches ~1 row (subjects are near-unique), `P` ~n/32, `O` ~2, and
+ * the conjunctions narrow to a handful. That spread is what real queries look
+ * like, but it is *not* comparable to the pre-cardinality numbers — the workers
+ * record each pattern's matched-row count alongside its timing so the figures
+ * stay interpretable.
+ */
+export function datasetProbes(n: number, opts: DatasetOpts = {}): {
+    triples: Pat[]; quads: Pat[]; full: Pat;
+} {
+    const o = datasetOpts(opts);
+    const m = moduli(n, opts);
+    const s0 = subjectTerm(0);
+    const p0 = predicateTerm(0);
+    const o0 = objectTerm(0, o.literalFrac);
+    const g0 = m.nGraph === 1 ? df.defaultGraph() : graphTerm(0);
+    return {
+        triples: [
+            { name: 'S', s: s0, p: null, o: null, g: null },
+            { name: 'P', s: null, p: p0, o: null, g: null },
+            { name: 'O', s: null, p: null, o: o0, g: null },
+            { name: 'PO', s: null, p: p0, o: o0, g: null },
+            { name: 'SPO', s: s0, p: p0, o: o0, g: null },
+        ],
+        quads: [
+            { name: 'G', s: null, p: null, o: null, g: g0 },
+            { name: 'SPOG', s: s0, p: p0, o: o0, g: g0 },
+        ],
+        full: FULL_SCAN_PATTERN,
+    };
+}
 
 // ─── Adapter interface ───────────────────────────────────────────────────────
 export interface StoreAdapter<H = unknown> {
@@ -127,8 +274,18 @@ function freeWasm(h: unknown): void {
 // actually reclaim it before the next multi-hundred-MB allocation piles on top. Run
 // with `--expose-gc` (wired into every worker spawn) and force a collection at every
 // isolation point, for every adapter, wasm-backed or not.
+// Disposal is best-effort: a store that trapped mid-query can leave its wasm
+// value borrowed, so `free()` itself throws ("attempted to take ownership of a
+// Rust value while it was borrowed"). That is cleanup of an already-failed
+// measurement — letting it propagate would discard every row the adapter had
+// successfully produced, which is exactly backwards. The collection below still
+// runs, and the process exits shortly after regardless.
 export function reclaim(a: StoreAdapter, h: unknown): void {
-    a.dispose?.(h);
+    try {
+        a.dispose?.(h);
+    } catch (e) {
+        console.error(`  !! ${a.label}: dispose failed (${e instanceof Error ? e.message : e})`);
+    }
     global.gc?.();
 }
 
@@ -259,6 +416,14 @@ export const HEAVY_OPTS: BenchOptions = { time: 0, iterations: 3, warmup: false,
 // See the comment on FULL_SCAN_PATTERN: far fewer repetitions of a full-table dump.
 export const FULL_SCAN_OPTS: BenchOptions = { time: 0, iterations: 3, warmup: false, warmupIterations: 0, throws: true };
 
+// ─── Memory instrumentation ──────────────────────────────────────────────────
+//
+// `peakRssMb` is the cross-library metric: it is the only figure that means the
+// same thing for a wasm-backed store (Vortex, oxigraph) and a pure-JS one
+// (rdf-stores). `wasmHeapMb` is for attribution *within* Vortex only — it is
+// meaningless for rdf-stores and would understate oxigraph, which has its own
+// module. Never rank adapters by it.
+
 /** Linux-only: the kernel-tracked high-water mark, the true peak RSS for this
  * process's whole lifetime — unlike `process.memoryUsage().rss`, which is only a
  * point-in-time reading and can miss a spike between samples. */
@@ -267,6 +432,44 @@ export function peakRssMb(): number | null {
         const status = readFileSync('/proc/self/status', 'utf8');
         const m = status.match(/^VmHWM:\s+(\d+)\s+kB/m);
         return m ? Math.round(Number(m[1]) / 1024) : null;
+    } catch {
+        return null;
+    }
+}
+
+/** Current (not peak) RSS. Paired with dropping the input quads and forcing a
+ * collection, this isolates what a store actually holds: the generated `Quad[]`
+ * is well over a gigabyte of JS objects at the default scale, is identical for
+ * every adapter, and otherwise swamps the differences between them in the peak. */
+export function rssMb(): number | null {
+    try {
+        const status = readFileSync('/proc/self/status', 'utf8');
+        const m = status.match(/^VmRSS:\s+(\d+)\s+kB/m);
+        return m ? Math.round(Number(m[1]) / 1024) : null;
+    } catch {
+        return null;
+    }
+}
+
+/** JS heap in use, after forcing a collection. Requires `--expose-gc` (every
+ * worker spawn wires it in); without it this is a point-in-time reading that may
+ * include garbage. */
+export function jsHeapMb(): number {
+    global.gc?.();
+    return Math.round(process.memoryUsage().heapUsed / 1048576);
+}
+
+/** Vortex's wasm linear memory, in MB.
+ *
+ * `__wbg_init` short-circuits and returns the exports when the module is already
+ * initialized (`entry/node.js` does that at import time), so re-invoking it is
+ * just how one gets at the namespace. Linear memory only ever grows, so this is
+ * simultaneously the current and the peak figure. */
+export async function wasmHeapMb(): Promise<number | null> {
+    try {
+        const mod = await import('../pkg/web/vortex_rdf.js');
+        const wasm = await mod.default();
+        return Math.round((wasm as { memory: WebAssembly.Memory }).memory.buffer.byteLength / 1048576);
     } catch {
         return null;
     }

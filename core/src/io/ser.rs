@@ -8,11 +8,10 @@ use crate::error;
 #[cfg(feature = "file-io")]
 use crate::store::builders::{UnsortedStreamBuilder, VortexArrayBuilder};
 #[cfg(feature = "file-io")]
-use crate::store::{Indexes, LayoutStrategy};
+use crate::store::{Indexes, LayoutStrategy, RawQuad};
 #[cfg(feature = "file-io")]
 use futures::{Stream, stream};
 #[cfg(feature = "file-io")]
-use oxrdf::Quad;
 #[cfg(feature = "file-io")]
 use vortex_array::expr::stats::Stat;
 #[cfg(feature = "file-io")]
@@ -101,12 +100,21 @@ pub async fn quads_stream_to_vortex_writer_with_builder<B, S, W>(
 ) -> Result<()>
 where
     B: VortexArrayBuilder,
-    S: Stream<Item = error::Result<Quad>> + Unpin + Send + 'static,
+    S: Stream<Item = error::Result<RawQuad>> + Unpin + Send + 'static,
     W: VortexWrite + Unpin + Send,
 {
     let start = Instant::now();
 
-    let (dtype, chunks) = B::build_vortex_stream(Box::new(quads), layout, indexes).await?;
+    let built = B::build_vortex_stream(Box::new(quads), layout, indexes).await?;
+    // A Dictionary-layout stream carries its dictionary beside the chunks;
+    // writing appends it as trailing dictionary rows — the padded form — so
+    // the file stays a single self-describing artifact.
+    let (dtype, chunks) = match built.dict {
+        Some(dict) => {
+            crate::store::layouts::dictionary::pad_chunk_stream(built.dtype, built.chunks, &dict)?
+        }
+        None => (built.dtype, built.chunks),
+    };
     let vortex_stream = ArrayStreamAdapter::new(dtype, chunks);
 
     let _summary = write_options_with_subject_stats()
@@ -126,12 +134,105 @@ where
     Ok(())
 }
 
+/// Serialize a quad stream to a Vortex file at `path`, with the Dictionary
+/// layout's term dictionary placed per `placement` — the path-based entry
+/// that can write the two-file sidecar form.
+///
+/// [`quads_stream_to_vortex_writer_with_builder`] (writer-generic) always
+/// pads: a bare writer has no path for a companion to live beside.
+#[cfg(feature = "file-io")]
+pub async fn quads_stream_to_vortex_file_with_builder<B, S>(
+    quads: S,
+    path: &std::path::Path,
+    layout: LayoutStrategy,
+    indexes: Indexes,
+    placement: crate::store::DictionaryPlacement,
+) -> Result<()>
+where
+    B: VortexArrayBuilder,
+    S: Stream<Item = error::Result<RawQuad>> + Unpin + Send + 'static,
+{
+    use crate::store::DictionaryPlacement;
+    use crate::store::layouts::term_dictionary;
+
+    let start = Instant::now();
+    let built = B::build_vortex_stream(Box::new(quads), layout, indexes).await?;
+
+    let mut writer = tokio::fs::File::create(path)
+        .await
+        .map_err(|e| VortexRdfError::Serialization(format!("create {:?}: {}", path, e)))?;
+
+    // Which file the dictionary goes to. `sidecar` holds it across the quads
+    // write when the companion is written after.
+    let (dtype, chunks, sidecar) = match (built.dict, placement) {
+        (Some(dict), DictionaryPlacement::Padded) => {
+            let (dtype, chunks) = crate::store::layouts::dictionary::pad_chunk_stream(
+                built.dtype,
+                built.chunks,
+                &dict,
+            )?;
+            (dtype, chunks, None)
+        }
+        (Some(dict), DictionaryPlacement::Sidecar) => (built.dtype, built.chunks, Some(dict)),
+        (None, _) => (built.dtype, built.chunks, None),
+    };
+
+    let vortex_stream = ArrayStreamAdapter::new(dtype, chunks);
+    let _summary = write_options_with_subject_stats()
+        .write(&mut writer, vortex_stream)
+        .await
+        .map_err(VortexRdfError::Vortex)?;
+    writer
+        .shutdown()
+        .await
+        .map_err(|e| VortexRdfError::Serialization(format!("Failed to shutdown writer: {}", e)))?;
+
+    if let Some(dict) = sidecar {
+        let array = term_dictionary::sidecar_dict_array(&dict)?;
+        let sidecar_path = term_dictionary::sidecar_dict_path(path);
+        let file = tokio::fs::File::create(&sidecar_path).await.map_err(|e| {
+            VortexRdfError::Serialization(format!("create {:?}: {}", sidecar_path, e))
+        })?;
+        serialize(array, file).await?;
+    }
+
+    log::debug!(
+        "[ser::quads_stream_to_vortex_file_with_builder] Streaming write ({:?}) took {:?}",
+        placement,
+        start.elapsed()
+    );
+    Ok(())
+}
+
+/// Write a store's term dictionary as the sidecar file beside `quads_path`
+/// (`data.vortex` → `data.dict.vortex`): a one-column `{_dict_term: utf8}`
+/// file whose row `i` is the term with ID `i`, kept in the encoding the
+/// dictionary is held in (FSST when compressed at the source).
+///
+/// The sidecar placement's write half: a quads file with bare code columns
+/// decodes only through this companion (see
+/// `VortexRdfStore::from_file`), so the two files must travel together.
+#[cfg(feature = "file-io")]
+pub async fn write_sidecar_dictionary(
+    snapshot: &crate::store::DictSnapshot,
+    quads_path: &std::path::Path,
+) -> Result<std::path::PathBuf> {
+    use crate::store::layouts::term_dictionary;
+    let array = term_dictionary::sidecar_dict_array(&snapshot.0)?;
+    let path = term_dictionary::sidecar_dict_path(quads_path);
+    let file = tokio::fs::File::create(&path)
+        .await
+        .map_err(|e| VortexRdfError::Serialization(format!("create {:?}: {}", path, e)))?;
+    serialize(array, file).await?;
+    Ok(path)
+}
+
 /// Serialize a stream of quads directly to a Vortex file writer using the
 /// default configuration (UnsortedStream builder, Default layout, no indexes).
 #[cfg(feature = "file-io")]
 pub async fn quads_stream_to_vortex_writer<S, W>(quads: S, writer: W) -> error::Result<()>
 where
-    S: Stream<Item = error::Result<Quad>> + Unpin + Send + 'static,
+    S: Stream<Item = error::Result<RawQuad>> + Unpin + Send + 'static,
     W: VortexWrite + Unpin + Send,
 {
     quads_stream_to_vortex_writer_with_builder::<UnsortedStreamBuilder, _, _>(
@@ -147,7 +248,7 @@ where
 #[cfg(feature = "file-io")]
 pub async fn quads_stream_to_vortex<S>(quads: S) -> error::Result<Vec<u8>>
 where
-    S: Stream<Item = error::Result<Quad>> + Unpin + Send + 'static,
+    S: Stream<Item = error::Result<RawQuad>> + Unpin + Send + 'static,
 {
     let mut buffer = Vec::new();
     quads_stream_to_vortex_writer(quads, &mut buffer).await?;

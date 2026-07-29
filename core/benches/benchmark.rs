@@ -40,230 +40,23 @@ use std::hint::black_box;
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
-use futures::{StreamExt, TryStreamExt, stream};
-use oxrdf::{GraphName, NamedNode, NamedOrBlankNode, Quad, Term};
-use tokio::runtime::Runtime;
-use vortex_array::ArrayRef;
+use futures::stream;
+use oxrdf::{GraphName, NamedNode, NamedOrBlankNode, Term};
 
-use vortex_rdf_core::common::utils::generate_rdf_data_stream;
+use vortex_rdf_core::common::testing::generate_rdf_data_stream;
 use vortex_rdf_core::{
-    IndexType, LayoutStrategy, SortedInMemoryBuilder, SortedStreamBuilder, UnsortedStreamBuilder,
-    VortexRdfError, VortexRdfStore, io,
+    DictionaryPlacement, LayoutStrategy, SortedInMemoryBuilder, SortedStreamBuilder,
+    UnsortedStreamBuilder, VortexRdfError, VortexRdfStore, io,
 };
+
+mod support;
+use support::*;
 
 fn main() {
     divan::main();
 }
 
-/// Single dataset size for the whole suite. In simulation mode CodSpeed counts
-/// instructions deterministically, so one representative size catches
-/// regressions in every path; larger sizes only multiply valgrind cost without
-/// adding signal (CodSpeed does not analyse scaling curves). Default matches
-/// CodSpeed CI; override locally (e.g. `BENCH_SIZE=2097152 cargo bench`, to
-/// match the JS comparative benchmark's default D=128 scale) to see how
-/// results shift at a larger size.
-fn bench_size() -> usize {
-    static SIZE: OnceLock<usize> = OnceLock::new();
-    *SIZE.get_or_init(|| {
-        std::env::var("BENCH_SIZE")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(100_000)
-    })
-}
-
-// ── shared tokio runtime ────────────────────────────────────────────────────
-
-static TOKIO_RUNTIME: OnceLock<Runtime> = OnceLock::new();
-
-fn rt() -> &'static Runtime {
-    TOKIO_RUNTIME.get_or_init(|| Runtime::new().unwrap())
-}
-
-// ── configuration axes ──────────────────────────────────────────────────────
-
-#[derive(Copy, Clone, PartialEq, Eq, Hash)]
-enum Builder {
-    Unsorted,
-    SortedInMemory,
-    SortedStream,
-}
-
-impl Builder {
-    fn short(self) -> &'static str {
-        match self {
-            Self::Unsorted => "unsorted",
-            Self::SortedInMemory => "sorted_in_memory",
-            Self::SortedStream => "sorted_stream",
-        }
-    }
-}
-
-#[derive(Copy, Clone, PartialEq, Eq, Hash)]
-enum Layout {
-    Default,
-    TypedObject,
-    Dictionary,
-}
-
-impl Layout {
-    fn strategy(self) -> LayoutStrategy {
-        match self {
-            Self::Default => LayoutStrategy::Default,
-            Self::TypedObject => LayoutStrategy::TypedObject,
-            Self::Dictionary => LayoutStrategy::Dictionary,
-        }
-    }
-    fn short(self) -> &'static str {
-        match self {
-            Self::Default => "default",
-            Self::TypedObject => "typed_object",
-            Self::Dictionary => "dictionary",
-        }
-    }
-}
-
-impl fmt::Debug for Layout {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.short())
-    }
-}
-
-#[derive(Copy, Clone, PartialEq, Eq, Hash)]
-enum Index {
-    None,
-    ByReference,
-    ByCopy,
-}
-
-impl Index {
-    fn types(self) -> Vec<IndexType> {
-        match self {
-            Self::None => vec![],
-            Self::ByReference => vec![IndexType::SecondaryByReference],
-            Self::ByCopy => vec![IndexType::SecondaryByCopy],
-        }
-    }
-    fn short(self) -> &'static str {
-        match self {
-            Self::None => "no_index",
-            Self::ByReference => "by_reference",
-            Self::ByCopy => "by_copy",
-        }
-    }
-}
-
-#[derive(Copy, Clone, PartialEq, Eq, Hash)]
-enum Source {
-    File,
-    InMemory,
-}
-
-impl Source {
-    fn short(self) -> &'static str {
-        match self {
-            Self::File => "file",
-            Self::InMemory => "in_memory",
-        }
-    }
-}
-
-impl fmt::Debug for Source {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.short())
-    }
-}
-
-// ── dataset + artifact construction (all untimed helpers) ────────────────────
-
-/// Materialize the generated quads into an owned `Vec`, eagerly. The generator
-/// is a *lazy* stream whose per-quad `format!` allocations would otherwise be
-/// polled — and charged — inside the timed serialization region; draining it
-/// here keeps those allocations out of the measurement.
-fn materialize_quads(size: usize) -> Vec<Quad> {
-    rt().block_on(async move {
-        generate_rdf_data_stream(size)
-            .map(|q| q.expect("quad generation is infallible"))
-            .collect()
-            .await
-    })
-}
-
-/// Build the in-memory Vortex array for a config, dispatching the generic
-/// builder on the runtime `Builder` enum.
-fn build_array(builder: Builder, layout: Layout, index: Index, size: usize) -> ArrayRef {
-    rt().block_on(async move {
-        let stream = generate_rdf_data_stream(size);
-        let strategy = layout.strategy();
-        let indexes = index.types();
-        match builder {
-            Builder::Unsorted => {
-                VortexRdfStore::build_vortex_array_with_builder::<UnsortedStreamBuilder>(
-                    stream, strategy, indexes,
-                )
-                .await
-            }
-            Builder::SortedInMemory => {
-                VortexRdfStore::build_vortex_array_with_builder::<SortedInMemoryBuilder>(
-                    stream, strategy, indexes,
-                )
-                .await
-            }
-            Builder::SortedStream => {
-                VortexRdfStore::build_vortex_array_with_builder::<SortedStreamBuilder>(
-                    stream, strategy, indexes,
-                )
-                .await
-            }
-        }
-        .expect("failed to build vortex array")
-    })
-}
-
-type CacheKey = (Builder, Layout, Index, usize);
-
-/// Cache of built in-memory arrays. Under the star design only a handful of
-/// distinct configs are ever requested, so this stays naturally bounded (unlike
-/// the old full-factorial cache, which held every combination for the process
-/// lifetime).
-static ARRAY_CACHE: OnceLock<Mutex<HashMap<CacheKey, ArrayRef>>> = OnceLock::new();
-static FILE_CACHE: OnceLock<Mutex<HashMap<CacheKey, PathBuf>>> = OnceLock::new();
 static IPC_CACHE: OnceLock<Mutex<HashMap<CacheKey, Vec<u8>>>> = OnceLock::new();
-
-fn cached_array(builder: Builder, layout: Layout, index: Index, size: usize) -> ArrayRef {
-    let cache = ARRAY_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    let key = (builder, layout, index, size);
-    if let Some(arr) = cache.lock().unwrap().get(&key) {
-        return arr.clone();
-    }
-    let arr = build_array(builder, layout, index, size);
-    cache.lock().unwrap().insert(key, arr.clone());
-    arr
-}
-
-fn cached_file(builder: Builder, layout: Layout, index: Index, size: usize) -> PathBuf {
-    let cache = FILE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    let key = (builder, layout, index, size);
-    if let Some(path) = cache.lock().unwrap().get(&key) {
-        return path.clone();
-    }
-    let arr = cached_array(builder, layout, index, size);
-    let dir = PathBuf::from("target/bench_vortex_files");
-    std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join(format!(
-        "{}_{}_{}_{}.vortex",
-        builder.short(),
-        layout.short(),
-        index.short(),
-        size
-    ));
-    rt().block_on(async {
-        let writer = tokio::fs::File::create(&path).await.expect("create file");
-        io::serialize(arr, writer).await.expect("serialize file");
-    });
-    cache.lock().unwrap().insert(key, path.clone());
-    path
-}
 
 fn cached_ipc_bytes(builder: Builder, layout: Layout, index: Index, size: usize) -> Vec<u8> {
     let cache = IPC_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
@@ -271,35 +64,12 @@ fn cached_ipc_bytes(builder: Builder, layout: Layout, index: Index, size: usize)
     if let Some(bytes) = cache.lock().unwrap().get(&key) {
         return bytes.clone();
     }
-    let arr = cached_array(builder, layout, index, size);
+    let store = cached_store(builder, layout, index, size);
+    let arr = rt().block_on(store.to_ipc_array()).expect("ipc array");
     let mut buf = Vec::new();
     io::write_array_to_ipc(arr, &mut buf).expect("write ipc");
     cache.lock().unwrap().insert(key, buf.clone());
     buf
-}
-
-/// Construct a store over a config's data, from the requested source. Both are
-/// untimed: `from_file` reads the footer only, and `new` wraps a cached
-/// (Arc-shared) array.
-fn make_store(
-    source: Source,
-    builder: Builder,
-    layout: Layout,
-    index: Index,
-    size: usize,
-) -> VortexRdfStore {
-    match source {
-        Source::File => {
-            let path = cached_file(builder, layout, index, size);
-            rt().block_on(async {
-                VortexRdfStore::from_file(path)
-                    .await
-                    .expect("open file store")
-            })
-        }
-        Source::InMemory => VortexRdfStore::new(cached_array(builder, layout, index, size))
-            .expect("build in-memory store"),
-    }
 }
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -440,56 +210,6 @@ fn serialize(bencher: divan::Bencher, cfg: &SerCfg) {
 // query-indistinguishable from SortedStream (identical stamped columns).
 // ══════════════════════════════════════════════════════════════════════════
 
-// Each variant names the bound components by letter (Subject/Predicate/
-// Object/Graph), so `SPOG` is consistent with its siblings, not a word to
-// re-case.
-#[allow(clippy::upper_case_acronyms)]
-#[derive(Copy, Clone, Debug)]
-enum Pattern {
-    S,
-    P,
-    O,
-    PO,
-    G,
-    SPOG,
-}
-
-const PATTERNS: &[Pattern] = &[
-    Pattern::S,
-    Pattern::P,
-    Pattern::O,
-    Pattern::PO,
-    Pattern::G,
-    Pattern::SPOG,
-];
-
-/// Probe terms, all chosen to hit rows the generator actually emits (see the
-/// module docs on selectivity).
-#[allow(clippy::type_complexity)]
-fn terms_for(
-    pattern: Pattern,
-) -> (
-    Option<NamedOrBlankNode>,
-    Option<NamedNode>,
-    Option<Term>,
-    Option<GraphName>,
-) {
-    let s =
-        || NamedOrBlankNode::NamedNode(NamedNode::new_unchecked("http://example.org/subject/0"));
-    let p = || NamedNode::new_unchecked("http://example.org/predicate/0");
-    let o = || Term::NamedNode(NamedNode::new_unchecked("http://example.org/object/0"));
-    let g = || GraphName::NamedNode(NamedNode::new_unchecked("http://example.org/graph/0"));
-
-    match pattern {
-        Pattern::S => (Some(s()), None, None, None),
-        Pattern::P => (None, Some(p()), None, None),
-        Pattern::O => (None, None, Some(o()), None),
-        Pattern::PO => (None, Some(p()), Some(o()), None),
-        Pattern::G => (None, None, None, Some(g())),
-        Pattern::SPOG => (Some(s()), Some(p()), Some(o()), Some(g())),
-    }
-}
-
 /// Run one match config across a pattern: build the store once (untimed), then
 /// time `match_pattern` plus materialization of the matched quads (so the lazy
 /// derived view is actually executed).
@@ -510,12 +230,7 @@ fn run_match(
                     .match_pattern(s.as_ref(), p.as_ref(), o.as_ref(), g.as_ref())
                     .await
                     .expect("match_pattern failed");
-                let quads: Vec<_> = matched
-                    .quads()
-                    .expect("quad stream")
-                    .try_collect()
-                    .await
-                    .expect("execute match");
+                let quads = matched.quads_vec().await.expect("execute match");
                 black_box(quads)
             })
         });
@@ -530,51 +245,81 @@ macro_rules! match_bench {
     };
 }
 
-// Baseline + source axis.
-match_bench!(
-    match_sorted_default_bycopy_file,
-    Builder::SortedStream,
-    Layout::Default,
-    Index::ByCopy,
-    Source::File
+/// The sidecar twin of a padded `match_bench!` row: the dictionary lives in
+/// a companion file, so the store is opened from a path written by the
+/// path-based writer (`make_store`'s writer-generic path always pads). The
+/// padded tail taxes every file match — extra rows/zones in the quads file,
+/// and at small scales the writer co-compresses quad codes with the sentinel
+/// tail — so the two placements are tracked side by side. Residency is the
+/// default (resident) for both.
+macro_rules! match_sidecar_bench {
+    ($name:ident, $index:expr) => {
+        #[divan::bench(args = PATTERNS)]
+        fn $name(bencher: divan::Bencher, pattern: &Pattern) {
+            bencher
+                .with_inputs(|| {
+                    let path = cached_dict_indexed_file(
+                        DictionaryPlacement::Sidecar,
+                        $index,
+                        bench_size(),
+                    );
+                    rt().block_on(async {
+                        VortexRdfStore::from_file(&path)
+                            .await
+                            .expect("open sidecar")
+                    })
+                })
+                .bench_refs(|store| {
+                    let (s, p, o, g) = terms_for(*pattern);
+                    rt().block_on(async {
+                        let matched = store
+                            .match_pattern(s.as_ref(), p.as_ref(), o.as_ref(), g.as_ref())
+                            .await
+                            .expect("match_pattern failed");
+                        let quads = matched.quads_vec().await.expect("execute match");
+                        black_box(quads)
+                    })
+                });
+        }
+    };
+}
+
+/// The full layout × source × index match matrix (sorted-stream builder
+/// throughout; the unsorted builder is its own axis below). One group per
+/// cell, named `match_sorted_{layout}_{index}_{source}`; the Dictionary
+/// layout contributes a padded and a sidecar file row per index because
+/// placement is a file-storage concept.
+macro_rules! match_matrix {
+    ($(($layout:expr, $index:expr, $source:expr) => $name:ident,)*) => {
+        $(match_bench!($name, Builder::SortedStream, $layout, $index, $source);)*
+    };
+}
+match_matrix!(
+    // No secondary index.
+    (Layout::Default, Index::None, Source::InMemory) => match_sorted_default_noindex_mem,
+    (Layout::Default, Index::None, Source::File) => match_sorted_default_noindex_file,
+    (Layout::TypedObject, Index::None, Source::InMemory) => match_sorted_typedobj_noindex_mem,
+    (Layout::TypedObject, Index::None, Source::File) => match_sorted_typedobj_noindex_file,
+    (Layout::Dictionary, Index::None, Source::InMemory) => match_sorted_dict_noindex_mem,
+    (Layout::Dictionary, Index::None, Source::File) => match_sorted_dict_noindex_file,
+    // Secondary by reference.
+    (Layout::Default, Index::ByReference, Source::InMemory) => match_sorted_default_byref_mem,
+    (Layout::Default, Index::ByReference, Source::File) => match_sorted_default_byref_file,
+    (Layout::TypedObject, Index::ByReference, Source::InMemory) => match_sorted_typedobj_byref_mem,
+    (Layout::TypedObject, Index::ByReference, Source::File) => match_sorted_typedobj_byref_file,
+    (Layout::Dictionary, Index::ByReference, Source::InMemory) => match_sorted_dict_byref_mem,
+    (Layout::Dictionary, Index::ByReference, Source::File) => match_sorted_dict_byref_file,
+    // Secondary by copy.
+    (Layout::Default, Index::ByCopy, Source::InMemory) => match_sorted_default_bycopy_mem,
+    (Layout::Default, Index::ByCopy, Source::File) => match_sorted_default_bycopy_file,
+    (Layout::TypedObject, Index::ByCopy, Source::InMemory) => match_sorted_typedobj_bycopy_mem,
+    (Layout::TypedObject, Index::ByCopy, Source::File) => match_sorted_typedobj_bycopy_file,
+    (Layout::Dictionary, Index::ByCopy, Source::InMemory) => match_sorted_dict_bycopy_mem,
+    (Layout::Dictionary, Index::ByCopy, Source::File) => match_sorted_dict_bycopy_file,
 );
-match_bench!(
-    match_sorted_default_bycopy_mem,
-    Builder::SortedStream,
-    Layout::Default,
-    Index::ByCopy,
-    Source::InMemory
-);
-// Layout axis (file).
-match_bench!(
-    match_sorted_typedobj_bycopy_file,
-    Builder::SortedStream,
-    Layout::TypedObject,
-    Index::ByCopy,
-    Source::File
-);
-match_bench!(
-    match_sorted_dict_bycopy_file,
-    Builder::SortedStream,
-    Layout::Dictionary,
-    Index::ByCopy,
-    Source::File
-);
-// Index axis (file).
-match_bench!(
-    match_sorted_default_noindex_file,
-    Builder::SortedStream,
-    Layout::Default,
-    Index::None,
-    Source::File
-);
-match_bench!(
-    match_sorted_default_byref_file,
-    Builder::SortedStream,
-    Layout::Default,
-    Index::ByReference,
-    Source::File
-);
+match_sidecar_bench!(match_sorted_dict_noindex_sidecar_file, Index::None);
+match_sidecar_bench!(match_sorted_dict_byref_sidecar_file, Index::ByReference);
+match_sidecar_bench!(match_sorted_dict_bycopy_sidecar_file, Index::ByCopy);
 // Sortedness axis: unsorted builder leaves nothing stamped, so indexes decline
 // and everything falls to the mask scan — the worst case, and the typical
 // in-memory (JS bindings) case.
@@ -621,12 +366,7 @@ fn match_chained(bencher: divan::Bencher, source: &Source) {
                     .match_pattern(None, None, Some(&o), None)
                     .await
                     .expect("match O on view");
-                let quads: Vec<_> = after_po
-                    .quads()
-                    .expect("quad stream")
-                    .try_collect()
-                    .await
-                    .expect("execute chained match");
+                let quads = after_po.quads_vec().await.expect("execute chained match");
                 black_box(quads)
             })
         });
@@ -670,6 +410,14 @@ const DECODE_CONFIGS: &[DecodeCfg] = &[
         layout: Layout::Default,
         source: Source::InMemory,
     }, // in-memory decode path
+    DecodeCfg {
+        layout: Layout::TypedObject,
+        source: Source::InMemory,
+    }, // in-memory object reassembly
+    DecodeCfg {
+        layout: Layout::Dictionary,
+        source: Source::InMemory,
+    }, // in-memory code → term
 ];
 
 /// Decode every quad in the store (`quads()` → `Vec`). Index is irrelevant to a
@@ -689,21 +437,16 @@ fn decode_all(bencher: divan::Bencher, cfg: &DecodeCfg) {
         })
         .bench_refs(|store| {
             rt().block_on(async {
-                let quads: Vec<_> = store
-                    .quads()
-                    .expect("quad stream")
-                    .try_collect()
-                    .await
-                    .expect("decode all");
+                let quads = store.quads_vec().await.expect("decode all");
                 black_box(quads.len())
             })
         });
 }
 
-/// Open a file-backed store. Default reads the footer only; Dictionary also
-/// reads its term dictionary up front (an extra single-column scan), so the two
-/// are worth distinguishing.
-#[divan::bench(args = [Layout::Default, Layout::Dictionary])]
+/// Open a file-backed store. Default and TypedObject read the footer only;
+/// Dictionary also reads its term dictionary up front (an extra single-column
+/// scan), so the layouts are worth distinguishing.
+#[divan::bench(args = [Layout::Default, Layout::TypedObject, Layout::Dictionary])]
 fn open_file(bencher: divan::Bencher, layout: &Layout) {
     let layout = *layout;
     bencher
@@ -735,4 +478,211 @@ fn from_bytes(bencher: divan::Bencher) {
                 black_box(store)
             })
         });
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// Group 4 — DICTIONARY RESIDENCY (file-backed vs resident term dictionary)
+//
+// A Dictionary file's term dictionary can be lifted resident at open or left
+// in the file and reached by scans (`from_file_with_dict_residency`). The
+// residency axis moves cost between phases: resident pays a full term-column
+// scan at open and then probes/decodes from memory; file-backed opens on
+// footer metadata alone but pays a pruned column scan per cold term probe and
+// a row-index scan per decoded chunk. Placement (padded vs sidecar) decides
+// *which* file those scans hit. Sweeping residency × placement here is what
+// keeps both sides of the trade measured.
+// ══════════════════════════════════════════════════════════════════════════
+
+#[derive(Copy, Clone, PartialEq, Eq, Hash)]
+enum DictResidency {
+    Resident,
+    FileBacked,
+}
+
+impl DictResidency {
+    /// The `max_resident_terms` value that forces this residency.
+    fn threshold(self) -> u64 {
+        match self {
+            Self::Resident => u64::MAX,
+            Self::FileBacked => 0,
+        }
+    }
+
+    fn short(self) -> &'static str {
+        match self {
+            Self::Resident => "resident",
+            Self::FileBacked => "file_backed",
+        }
+    }
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, Hash)]
+struct DictCfg {
+    placement: DictionaryPlacement,
+    residency: DictResidency,
+}
+
+impl fmt::Debug for DictCfg {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let placement = match self.placement {
+            DictionaryPlacement::Padded => "padded",
+            DictionaryPlacement::Sidecar => "sidecar",
+        };
+        write!(f, "{placement}_{}", self.residency.short())
+    }
+}
+
+const DICT_CONFIGS: &[DictCfg] = &[
+    DictCfg {
+        placement: DictionaryPlacement::Padded,
+        residency: DictResidency::Resident,
+    },
+    DictCfg {
+        placement: DictionaryPlacement::Padded,
+        residency: DictResidency::FileBacked,
+    },
+    DictCfg {
+        placement: DictionaryPlacement::Sidecar,
+        residency: DictResidency::Resident,
+    },
+    DictCfg {
+        placement: DictionaryPlacement::Sidecar,
+        residency: DictResidency::FileBacked,
+    },
+];
+
+/// The residency axis alone (placement fixed to the padded default) for the
+/// benches where placement does not change the code path being measured.
+const DICT_PADDED_CONFIGS: &[DictCfg] = &[DICT_CONFIGS[0], DICT_CONFIGS[1]];
+
+static DICT_FILE_CACHE: OnceLock<Mutex<HashMap<(DictionaryPlacement, usize), PathBuf>>> =
+    OnceLock::new();
+
+/// A Dictionary-layout file written with the given placement (sorted-stream
+/// builder, no indexes), built once per placement and size.
+fn cached_dict_file(placement: DictionaryPlacement, size: usize) -> PathBuf {
+    let cache = DICT_FILE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let key = (placement, size);
+    if let Some(path) = cache.lock().unwrap().get(&key) {
+        return path.clone();
+    }
+    let dir = PathBuf::from("target/bench_vortex_files");
+    std::fs::create_dir_all(&dir).unwrap();
+    let placement_name = match placement {
+        DictionaryPlacement::Padded => "padded",
+        DictionaryPlacement::Sidecar => "sidecar",
+    };
+    let path = dir.join(format!("dict_{placement_name}_{size}.vortex"));
+    rt().block_on(async {
+        io::quads_stream_to_vortex_file_with_builder::<SortedStreamBuilder, _>(
+            generate_rdf_data_stream(size),
+            &path,
+            LayoutStrategy::Dictionary,
+            Vec::new(),
+            placement,
+        )
+        .await
+        .expect("write dictionary bench file");
+    });
+    cache.lock().unwrap().insert(key, path.clone());
+    path
+}
+
+fn open_dict_store(cfg: DictCfg, size: usize) -> VortexRdfStore {
+    let path = cached_dict_file(cfg.placement, size);
+    rt().block_on(async {
+        VortexRdfStore::from_file_with_dict_residency(&path, cfg.residency.threshold())
+            .await
+            .expect("open dictionary store")
+    })
+}
+
+/// Open cost across the matrix: resident pays the dictionary lift (a term-
+/// column scan), file-backed only the extent discovery (padded) or the
+/// companion's footer (sidecar).
+#[divan::bench(args = DICT_CONFIGS)]
+fn dict_open(bencher: divan::Bencher, cfg: &DictCfg) {
+    let cfg = *cfg;
+    bencher
+        .with_inputs(|| {
+            (
+                cached_dict_file(cfg.placement, bench_size()),
+                cfg.residency.threshold(),
+            )
+        })
+        .bench_refs(|(path, threshold)| {
+            rt().block_on(async {
+                let store = VortexRdfStore::from_file_with_dict_residency(&*path, *threshold)
+                    .await
+                    .expect("open");
+                black_box(store.layout())
+            })
+        });
+}
+
+/// Cold term→ID probes: a fully bound pattern (four dictionary probes) on a
+/// store opened fresh each iteration, so the file-backed probe cache never
+/// warms. Resident probes are in-memory binary searches; file-backed ones are
+/// zone-pruned column scans.
+#[divan::bench(args = DICT_CONFIGS)]
+fn dict_probe_cold(bencher: divan::Bencher, cfg: &DictCfg) {
+    let cfg = *cfg;
+    bencher
+        .with_inputs(|| open_dict_store(cfg, bench_size()))
+        .bench_refs(|store| {
+            let s = NamedOrBlankNode::NamedNode(NamedNode::new_unchecked(
+                "http://example.org/subject/0",
+            ));
+            let p = NamedNode::new_unchecked("http://example.org/predicate/0");
+            let o = Term::NamedNode(NamedNode::new_unchecked("http://example.org/object/0"));
+            let g = GraphName::NamedNode(NamedNode::new_unchecked("http://example.org/graph/0"));
+            rt().block_on(async {
+                let matched = store
+                    .match_pattern(Some(&s), Some(&p), Some(&o), Some(&g))
+                    .await
+                    .expect("match SPOG");
+                black_box(matched)
+            })
+        });
+}
+
+/// The same fully bound pattern on one shared store: after the first
+/// iteration every file-backed probe hits the memoized probe cache — the
+/// steady state of repeated lookups for the same terms.
+#[divan::bench(args = DICT_PADDED_CONFIGS)]
+fn dict_probe_warm(bencher: divan::Bencher, cfg: &DictCfg) {
+    let store = open_dict_store(*cfg, bench_size());
+    let s = NamedOrBlankNode::NamedNode(NamedNode::new_unchecked("http://example.org/subject/0"));
+    let p = NamedNode::new_unchecked("http://example.org/predicate/0");
+    let o = Term::NamedNode(NamedNode::new_unchecked("http://example.org/object/0"));
+    let g = GraphName::NamedNode(NamedNode::new_unchecked("http://example.org/graph/0"));
+    bencher.bench(|| {
+        rt().block_on(async {
+            let matched = store
+                .match_pattern(Some(&s), Some(&p), Some(&o), Some(&g))
+                .await
+                .expect("match SPOG");
+            black_box(matched)
+        })
+    });
+}
+
+/// Reconstruction of a matched subset (predicate-bound, 1% of rows at the
+/// default size): resident decodes codes against the in-memory dictionary;
+/// file-backed resolves each chunk's distinct codes with a row-index scan
+/// first.
+#[divan::bench(args = DICT_CONFIGS)]
+fn dict_decode_matched(bencher: divan::Bencher, cfg: &DictCfg) {
+    let store = open_dict_store(*cfg, bench_size());
+    let p = NamedNode::new_unchecked("http://example.org/predicate/0");
+    bencher.bench(|| {
+        rt().block_on(async {
+            let matched = store
+                .match_pattern(None, Some(&p), None, None)
+                .await
+                .expect("match P");
+            let quads = matched.quads_vec().await.expect("decode matched");
+            black_box(quads.len())
+        })
+    });
 }

@@ -269,6 +269,77 @@ describe('free functions', () => {
     });
 });
 
+describe('lazy terms outliving a dictionary rebuild', () => {
+    // A Dictionary-layout read hands back `u32` term codes plus a handle on the
+    // dictionary they index into. Auto-compaction re-encodes the store against a
+    // *fresh* dictionary, renumbering every term, so lazy quads that decoded
+    // against the live store would silently resolve old codes to other terms.
+    // They must decode against the snapshot taken when they were produced.
+    const dictOpts: BuildOptions = { builder: 'Sorted', layout: 'Dictionary' };
+    const PROBE = '<http://example.org/s3>';
+
+    /** Enough quads to cross the auto-compaction floor, all sorting *before*
+     *  the probe term so its code is guaranteed to move. */
+    function compactionTrigger(): Quad[] {
+        const out: Quad[] = [];
+        for (let i = 0; i < 4200; i++) {
+            out.push(df.quad(
+                df.namedNode('http://example.org/aaa' + i),
+                df.namedNode('http://example.org/aap'),
+                df.namedNode('http://example.org/aao' + i),
+            ));
+        }
+        return out;
+    }
+
+    test('getQuads results survive the rebuild', async () => {
+        const store = await VortexRdfStore.fromString(NQUADS, 'nquads', dictOpts);
+        // Deliberately do not read `.value` yet — the terms stay undecoded, so a
+        // stale-dictionary bug cannot be masked by the intern cache.
+        const held = await store.getQuads(null, df.namedNode('http://example.org/p3'), null, null);
+        expect(held.length).toBe(1);
+
+        const codeBefore = store.encodeTerm(PROBE);
+        await store.addQuads(compactionTrigger());
+        // Preconditions, so this cannot pass vacuously if compaction stops
+        // firing: the term was renumbered, and its old code now names a
+        // *different* term — which is precisely what a lazy quad decoding
+        // against the live store would hand back.
+        expect(store.encodeTerm(PROBE)).not.toBe(codeBefore);
+        expect(store.decodeTerm(codeBefore!)).not.toBe(PROBE);
+
+        expect(held[0].subject.value).toBe('http://example.org/s3');
+        expect(held[0].predicate.value).toBe('http://example.org/p3');
+        expect(held[0].object.value).toBe('42');
+        expect((held[0].object as Literal).datatype.value)
+            .toBe('http://www.w3.org/2001/XMLSchema#integer');
+    });
+
+    test('match() results survive the rebuild', async () => {
+        const store = await VortexRdfStore.fromString(NQUADS, 'nquads', dictOpts);
+        const held = await collect(store.match(null, df.namedNode('http://example.org/p4'), null, null));
+        expect(held.length).toBe(1);
+
+        const codeBefore = store.encodeTerm(PROBE);
+        await store.addQuads(compactionTrigger());
+        expect(store.encodeTerm(PROBE)).not.toBe(codeBefore);
+
+        expect(held[0].subject.value).toBe('http://example.org/s4');
+        expect(held[0].object.value).toBe('hola');
+        expect((held[0].object as Literal).language).toBe('es');
+    });
+
+    test('reads taken after the rebuild see the new dictionary', async () => {
+        const store = await VortexRdfStore.fromString(NQUADS, 'nquads', dictOpts);
+        await store.addQuads(compactionTrigger());
+
+        const after = await store.getQuads(null, df.namedNode('http://example.org/p3'), null, null);
+        expect(after.length).toBe(1);
+        expect(after[0].subject.value).toBe('http://example.org/s3');
+        expect(after[0].object.value).toBe('42');
+    });
+});
+
 describe('option validation', () => {
     test('rejects an unknown builder', async () => {
         await expect(VortexRdfStore.fromString(NQUADS, 'nquads', { builder: 'Nope' as any })).rejects

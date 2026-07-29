@@ -34,6 +34,12 @@ pub static VORTEX_LIGHT_SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
         .with::<ScalarFnSession>();
     #[cfg(feature = "file-io")]
     vortex_file::register_default_encodings(&session);
+    // The term dictionary is held and written FSST-compressed, so this
+    // encoding must be resolvable even in the light session — which is the
+    // only one wasm has, and which `register_default_encodings` above does not
+    // reach because `file-io` is off there.
+    #[cfg(not(feature = "file-io"))]
+    vortex_fsst::initialize(&session);
     session
 });
 
@@ -44,6 +50,7 @@ pub use de::{load_vortex_file_ref, open_vortex_file};
 pub use ser::write_array_to_ipc;
 #[cfg(feature = "file-io")]
 pub use ser::{
-    quads_stream_to_vortex, quads_stream_to_vortex_writer,
-    quads_stream_to_vortex_writer_with_builder, serialize,
+    quads_stream_to_vortex, quads_stream_to_vortex_file_with_builder,
+    quads_stream_to_vortex_writer, quads_stream_to_vortex_writer_with_builder, serialize,
+    write_sidecar_dictionary,
 };

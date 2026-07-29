@@ -3,10 +3,9 @@
 //!
 //! [`LayoutStrategy::Default`]: super::LayoutStrategy::Default
 
-use std::fmt::Write as _;
 use std::sync::Arc;
 
-use oxrdf::{GraphName, Quad};
+use oxrdf::Quad;
 use vortex_array::arrays::VarBinViewArray;
 use vortex_array::arrays::struct_::{StructArray, StructArrayExt};
 use vortex_array::builders::VarBinViewBuilder;
@@ -14,16 +13,16 @@ use vortex_array::dtype::{DType, Nullability};
 use vortex_array::validity::Validity;
 use vortex_array::{ArrayRef, IntoArray, VortexSessionExecute};
 
-use crate::common::utils::{
-    StrColReader, get_as_term, make_string_array, parse_graph_name, parse_named_node, parse_subject,
-};
+use crate::common::array::{StrColReader, make_string_array};
+use crate::common::terms::{get_as_term, parse_graph_name, parse_named_node, parse_subject};
 use crate::error::{Result, VortexRdfError};
 use crate::io::VORTEX_LIGHT_SESSION;
 use crate::store::RawQuad;
+use crate::store::schema::{COL_G, COL_O, COL_P, COL_S, PRIMARY_COLUMNS};
 
 /// Field names of the primary columns: `s`, `p`, `o`, `g`.
 pub(crate) fn field_names() -> Vec<Arc<str>> {
-    vec!["s".into(), "p".into(), "o".into(), "g".into()]
+    PRIMARY_COLUMNS.iter().map(|&n| n.into()).collect()
 }
 
 /// Build the primary column arrays from raw quads. An empty slice yields
@@ -64,10 +63,10 @@ pub(crate) fn decode_chunk(chunk: &ArrayRef) -> Vec<Result<Quad>> {
         };
     }
 
-    let s_col = get_str_col!("s");
-    let p_col = get_str_col!("p");
-    let o_col = get_str_col!("o");
-    let g_col = get_str_col!("g");
+    let s_col = get_str_col!(COL_S);
+    let p_col = get_str_col!(COL_P);
+    let o_col = get_str_col!(COL_O);
+    let g_col = get_str_col!(COL_G);
 
     let s = StrColReader::new(&s_col);
     let p = StrColReader::new(&p_col);
@@ -94,16 +93,15 @@ pub(crate) fn decode_spog(s: &str, p: &str, o: &str, g: &str) -> Result<Quad> {
 
 /// Column builders for the Default layout, filled directly from quads.
 ///
-/// Terms are formatted (via `Display`, the same N-Triples form `RawQuad` uses)
-/// into a single reused `String` buffer and appended into the column builders,
-/// so steady-state ingestion performs no per-quad heap allocations.
+/// The quad's terms are already in the N-Triples form the columns store, so
+/// they are appended straight into the column builders: steady-state ingestion
+/// performs no per-quad heap allocations and no formatting at all.
 pub(crate) struct DirectChunkBuilder {
     s: VarBinViewBuilder,
     p: VarBinViewBuilder,
     o: VarBinViewBuilder,
     g: VarBinViewBuilder,
     len: usize,
-    fmt_buf: String,
 }
 
 impl DirectChunkBuilder {
@@ -116,7 +114,6 @@ impl DirectChunkBuilder {
             o: col(),
             g: col(),
             len: 0,
-            fmt_buf: String::with_capacity(256),
         }
     }
 
@@ -128,28 +125,12 @@ impl DirectChunkBuilder {
         self.len == 0
     }
 
-    pub(crate) fn push(&mut self, q: &Quad) {
-        self.fmt_buf.clear();
-        write!(self.fmt_buf, "{}", q.subject).expect("write to String");
-        self.s.append_value(&self.fmt_buf);
-
-        self.fmt_buf.clear();
-        write!(self.fmt_buf, "{}", q.predicate).expect("write to String");
-        self.p.append_value(&self.fmt_buf);
-
-        self.fmt_buf.clear();
-        write!(self.fmt_buf, "{}", q.object).expect("write to String");
-        self.o.append_value(&self.fmt_buf);
-
-        match &q.graph_name {
-            GraphName::DefaultGraph => self.g.append_value(""),
-            other => {
-                self.fmt_buf.clear();
-                write!(self.fmt_buf, "{}", other).expect("write to String");
-                self.g.append_value(&self.fmt_buf);
-            }
-        }
-
+    pub(crate) fn push(&mut self, q: &RawQuad) {
+        self.s.append_value(&q.s);
+        self.p.append_value(&q.p);
+        self.o.append_value(&q.o);
+        // The default graph is already the empty string in `RawQuad`.
+        self.g.append_value(&q.g);
         self.len += 1;
     }
 

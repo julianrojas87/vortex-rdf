@@ -11,25 +11,26 @@ use vortex_array::arrays::struct_::{StructArray, StructArrayExt};
 use vortex_array::arrays::{PrimitiveArray, VarBinViewArray};
 use vortex_array::{ArrayRef, IntoArray, VortexSessionExecute};
 
-use crate::common::utils::{
-    StrColReader, get_as_term, make_nullable_string_array, make_string_array, parse_graph_name,
-    parse_named_node, parse_subject,
-};
+use crate::common::array::{StrColReader, make_nullable_string_array, make_string_array};
+use crate::common::terms::{get_as_term, parse_graph_name, parse_named_node, parse_subject};
 use crate::error::{Result, VortexRdfError};
 use crate::io::VORTEX_LIGHT_SESSION;
 use crate::store::RawQuad;
+use crate::store::schema::{
+    COL_G, COL_O_DATATYPE, COL_O_KIND, COL_O_LANG, COL_O_VALUE, COL_P, COL_S,
+};
 
 /// Field names of the primary columns:
 /// `s`, `p`, `o_kind`, `o_value`, `o_datatype`, `o_lang`, `g`.
 pub(crate) fn field_names() -> Vec<Arc<str>> {
     vec![
-        "s".into(),
-        "p".into(),
-        "o_kind".into(),
-        "o_value".into(),
-        "o_datatype".into(),
-        "o_lang".into(),
-        "g".into(),
+        COL_S.into(),
+        COL_P.into(),
+        COL_O_KIND.into(),
+        COL_O_VALUE.into(),
+        COL_O_DATATYPE.into(),
+        COL_O_LANG.into(),
+        COL_G.into(),
     ]
 }
 
@@ -95,20 +96,23 @@ fn compose_object(
     datatype: Option<&str>,
     lang: Option<&str>,
 ) -> Result<Term> {
+    // Trusted-input decode path — see `parse_named_node`: the sub-columns
+    // were decomposed from already-validated terms at build time, so the
+    // checked constructors' re-validation (a full `oxiri::Iri::parse` per
+    // IRI) is skipped, matching `get_as_term`.
     match kind {
-        0 => NamedNode::new(value)
-            .map(Term::NamedNode)
-            .map_err(|e| VortexRdfError::Deserialization(e.to_string())),
+        0 => Ok(Term::NamedNode(NamedNode::new_unchecked(value))),
         1 => Ok(Term::BlankNode(BlankNode::new_unchecked(value))),
         2 => Ok(Term::Literal(Literal::new_simple_literal(value))),
-        3 => Literal::new_language_tagged_literal(value, lang.unwrap_or(""))
-            .map(Term::Literal)
-            .map_err(|e| VortexRdfError::Deserialization(e.to_string())),
+        3 => Ok(Term::Literal(
+            Literal::new_language_tagged_literal_unchecked(value, lang.unwrap_or("")),
+        )),
         4 => {
             let dt_str = datatype.unwrap_or("http://www.w3.org/2001/XMLSchema#string");
-            let dt = NamedNode::new(dt_str)
-                .map_err(|e| VortexRdfError::Deserialization(e.to_string()))?;
-            Ok(Term::Literal(Literal::new_typed_literal(value, dt)))
+            Ok(Term::Literal(Literal::new_typed_literal(
+                value,
+                NamedNode::new_unchecked(dt_str),
+            )))
         }
         _ => Err(VortexRdfError::Deserialization(format!(
             "Unknown object kind: {}",
@@ -128,24 +132,24 @@ pub(crate) fn object_terms(struct_arr: &StructArray) -> Result<Vec<String>> {
     let mut ctx = VORTEX_LIGHT_SESSION.create_execution_ctx();
 
     let kind_col = struct_arr
-        .unmasked_field_by_name("o_kind")
+        .unmasked_field_by_name(COL_O_KIND)
         .map_err(VortexRdfError::Vortex)?
         .clone()
         .execute::<PrimitiveArray>(&mut ctx)
         .map_err(VortexRdfError::Vortex)?;
     let val_col = struct_arr
-        .unmasked_field_by_name("o_value")
+        .unmasked_field_by_name(COL_O_VALUE)
         .map_err(VortexRdfError::Vortex)?
         .clone()
         .execute::<VarBinViewArray>(&mut ctx)
         .map_err(VortexRdfError::Vortex)?;
     // Nullable columns — try VarBinViewArray; fall back to all-None on error.
     let dt_col: Option<VarBinViewArray> = struct_arr
-        .unmasked_field_by_name("o_datatype")
+        .unmasked_field_by_name(COL_O_DATATYPE)
         .ok()
         .and_then(|c| c.clone().execute::<VarBinViewArray>(&mut ctx).ok());
     let lang_col: Option<VarBinViewArray> = struct_arr
-        .unmasked_field_by_name("o_lang")
+        .unmasked_field_by_name(COL_O_LANG)
         .ok()
         .and_then(|c| c.clone().execute::<VarBinViewArray>(&mut ctx).ok());
 
@@ -204,10 +208,10 @@ pub(crate) fn decode_chunk(chunk: &ArrayRef) -> Vec<Result<Quad>> {
         };
     }
 
-    let s_col = get_str_col!("s");
-    let p_col = get_str_col!("p");
+    let s_col = get_str_col!(COL_S);
+    let p_col = get_str_col!(COL_P);
     let kind_col = match struct_arr
-        .unmasked_field_by_name("o_kind")
+        .unmasked_field_by_name(COL_O_KIND)
         .map_err(VortexRdfError::Vortex)
         .and_then(|c| {
             c.clone()
@@ -217,16 +221,16 @@ pub(crate) fn decode_chunk(chunk: &ArrayRef) -> Vec<Result<Quad>> {
         Ok(a) => a,
         Err(e) => return vec![Err(e)],
     };
-    let val_col = get_str_col!("o_value");
-    let g_col = get_str_col!("g");
+    let val_col = get_str_col!(COL_O_VALUE);
+    let g_col = get_str_col!(COL_G);
 
     // Nullable columns — try VarBinViewArray; fall back to all-None on error.
     let dt_col: Option<VarBinViewArray> = struct_arr
-        .unmasked_field_by_name("o_datatype")
+        .unmasked_field_by_name(COL_O_DATATYPE)
         .ok()
         .and_then(|c| c.clone().execute::<VarBinViewArray>(&mut ctx).ok());
     let lang_col: Option<VarBinViewArray> = struct_arr
-        .unmasked_field_by_name("o_lang")
+        .unmasked_field_by_name(COL_O_LANG)
         .ok()
         .and_then(|c| c.clone().execute::<VarBinViewArray>(&mut ctx).ok());
 

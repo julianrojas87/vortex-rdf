@@ -7,16 +7,14 @@ use std::io::{Read, Write, stdin, stdout};
 use std::path::PathBuf;
 use std::time::Instant;
 
-use tokio::fs::File as TokioFile;
-
 use vortex_rdf_core::common::formats::{Format, detect_format};
-use vortex_rdf_core::common::utils::{
+use vortex_rdf_core::common::terms::{
     parse_graph_name, parse_named_node, parse_quads_from_reader, parse_subject, parse_term,
 };
 use vortex_rdf_core::{
-    BuilderStrategy, IndexType, LayoutStrategy, SortedInMemoryBuilder, SortedStreamBuilder,
-    UnsortedStreamBuilder, VortexRdfStore,
-    io::{deserialize, quads_stream_to_vortex_writer_with_builder},
+    BuilderStrategy, DictionaryPlacement, IndexType, LayoutStrategy, SortedInMemoryBuilder,
+    SortedStreamBuilder, UnsortedStreamBuilder, VortexRdfStore,
+    io::{deserialize, quads_stream_to_vortex_file_with_builder},
 };
 
 #[derive(Parser)]
@@ -57,6 +55,12 @@ enum Action {
         /// Builder strategy to use when serializing (defaults to unsorted-stream)
         #[arg(short, long, value_enum, default_value = "unsorted-stream")]
         builder_strategy: BuilderStrategy,
+
+        /// Where the Dictionary layout's term dictionary is written: padded
+        /// into the quads file (one self-contained file) or as a
+        /// `<stem>.dict.vortex` sidecar beside it. Ignored by other layouts.
+        #[arg(long, value_enum, default_value = "padded")]
+        dictionary_placement: DictionaryPlacement,
     },
     /// Convert from Vortex-RDF to RDF
     Deserialize {
@@ -117,6 +121,7 @@ async fn main() -> Result<()> {
             output,
             format,
             builder_strategy,
+            dictionary_placement,
         } => {
             let start = Instant::now();
             let format = format
@@ -130,38 +135,38 @@ async fn main() -> Result<()> {
                 Some(p) => Box::new(File::open(p).context("Failed to open input file")?),
                 None => Box::new(stdin()),
             };
-            let writer = TokioFile::create(&output)
-                .await
-                .context("Failed to create output file")?;
             let quads_stream = parse_quads_from_reader(reader, format);
 
             // Chunks are streamed into the Vortex writer as they are built;
             // streaming-capable builders never materialize the full dataset.
             match builder_strategy {
                 BuilderStrategy::UnsortedStream => {
-                    quads_stream_to_vortex_writer_with_builder::<UnsortedStreamBuilder, _, _>(
+                    quads_stream_to_vortex_file_with_builder::<UnsortedStreamBuilder, _>(
                         quads_stream,
-                        writer,
+                        &output,
                         layout,
                         indexes,
+                        dictionary_placement,
                     )
                     .await
                 }
                 BuilderStrategy::SortedInMemory => {
-                    quads_stream_to_vortex_writer_with_builder::<SortedInMemoryBuilder, _, _>(
+                    quads_stream_to_vortex_file_with_builder::<SortedInMemoryBuilder, _>(
                         quads_stream,
-                        writer,
+                        &output,
                         layout,
                         indexes,
+                        dictionary_placement,
                     )
                     .await
                 }
                 BuilderStrategy::SortedStream => {
-                    quads_stream_to_vortex_writer_with_builder::<SortedStreamBuilder, _, _>(
+                    quads_stream_to_vortex_file_with_builder::<SortedStreamBuilder, _>(
                         quads_stream,
-                        writer,
+                        &output,
                         layout,
                         indexes,
+                        dictionary_placement,
                     )
                     .await
                 }

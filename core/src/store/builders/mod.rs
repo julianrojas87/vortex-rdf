@@ -1,12 +1,13 @@
-use crate::common::utils::stamp_is_sorted;
+use crate::common::array::stamp_is_sorted;
 use crate::error::{Result, VortexRdfError};
 use crate::io::VORTEX_LIGHT_SESSION;
 use crate::store::RawQuad;
 use crate::store::indexes::{GlobalIndexes, IndexType, Indexes, unique_indexes};
 use crate::store::layouts::LayoutStrategy;
+use crate::store::layouts::term_dictionary::TermDictionary;
 use futures::{Stream, StreamExt, stream};
-use oxrdf::Quad;
 use std::future::Future;
+use std::sync::Arc;
 use vortex_array::arrays::StructArray;
 use vortex_array::arrays::struct_::StructArrayExt;
 use vortex_array::dtype::DType;
@@ -31,6 +32,25 @@ pub(crate) fn into_vortex_error(e: VortexRdfError) -> vortex_error::VortexError 
     }
 }
 
+/// A built dataset: the quad array plus whatever layout state cannot be
+/// derived from the array alone — for the Dictionary layout, its term
+/// dictionary (the array holds only u32 code columns; the terms travel
+/// beside it and reach serialized forms as trailing dictionary rows or a
+/// sidecar file).
+pub struct BuiltArray {
+    pub array: ArrayRef,
+    pub(crate) dict: Option<Arc<TermDictionary>>,
+}
+
+/// The streaming counterpart of [`BuiltArray`]: the schema dtype, the lazy
+/// chunk stream, and the dictionary the serializer must place (trailing rows
+/// or sidecar).
+pub struct BuiltStream {
+    pub dtype: DType,
+    pub chunks: ChunkStream,
+    pub(crate) dict: Option<Arc<TermDictionary>>,
+}
+
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum, Debug)]
 pub enum BuilderStrategy {
     /// Natural insertion order, no sorting. Chunks stream directly to the
@@ -52,12 +72,14 @@ pub use sorted_stream::SortedStreamBuilder;
 pub use unsorted_stream::UnsortedStreamBuilder;
 
 pub trait VortexArrayBuilder {
-    /// Build the complete dataset as a single (possibly chunked) in-memory array.
+    /// Build the complete dataset as a single (possibly chunked) in-memory
+    /// array, together with the layout state the array alone cannot carry
+    /// (the Dictionary layout's term dictionary).
     fn build_vortex_array(
-        quad_stream: Box<dyn Stream<Item = Result<Quad>> + Unpin + Send + 'static>,
+        quad_stream: Box<dyn Stream<Item = Result<RawQuad>> + Unpin + Send + 'static>,
         layout: LayoutStrategy,
         indexes: Indexes,
-    ) -> impl Future<Output = Result<ArrayRef>> + Send;
+    ) -> impl Future<Output = Result<BuiltArray>> + Send;
 
     /// Produce the schema dtype and a lazily-evaluated stream of StructArray
     /// chunks, for feeding directly into the Vortex file writer.
@@ -67,15 +89,20 @@ pub trait VortexArrayBuilder {
     /// that can emit chunks incrementally should override this so that writing
     /// a file needs only O(chunk) memory instead of O(dataset).
     fn build_vortex_stream(
-        quad_stream: Box<dyn Stream<Item = Result<Quad>> + Unpin + Send + 'static>,
+        quad_stream: Box<dyn Stream<Item = Result<RawQuad>> + Unpin + Send + 'static>,
         layout: LayoutStrategy,
         indexes: Indexes,
-    ) -> impl Future<Output = Result<(DType, ChunkStream)>> + Send {
+    ) -> impl Future<Output = Result<BuiltStream>> + Send {
         async move {
-            let array = Self::build_vortex_array(quad_stream, layout, indexes).await?;
-            let dtype = array.dtype().clone();
+            let built = Self::build_vortex_array(quad_stream, layout, indexes).await?;
+            let dtype = built.array.dtype().clone();
+            let array = built.array;
             let chunks: ChunkStream = futures::stream::once(async move { Ok(array) }).boxed();
-            Ok((dtype, chunks))
+            Ok(BuiltStream {
+                dtype,
+                chunks,
+                dict: built.dict,
+            })
         }
     }
 }
@@ -173,13 +200,9 @@ pub(crate) fn canonicalize_sorted(arr: ArrayRef) -> Result<ArrayRef> {
         .execute::<StructArray>(&mut ctx)
         .map_err(VortexRdfError::Vortex)?;
 
-    for field in [
-        "s",
-        "_idx_o_val",
-        "_idx_p_val",
-        "_idx_posg_p",
-        "_idx_ospg_o",
-    ] {
+    for field in std::iter::once(crate::store::schema::COL_S)
+        .chain(crate::store::indexes::globally_sorted_columns())
+    {
         if let Ok(col) = struct_arr.unmasked_field_by_name(field) {
             stamp_is_sorted(col);
         }

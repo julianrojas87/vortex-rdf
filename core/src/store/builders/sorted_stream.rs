@@ -2,10 +2,10 @@ use super::spill::{
     PairMerger, PairRunSpiller, Run, RunWriter, TempRunsGuard, make_temp_dir, write_run,
 };
 use super::{
-    ChunkStream, DEFAULT_CHUNK_SIZE, VortexArrayBuilder, assemble_chunks, build_struct_array,
-    canonicalize_sorted, into_vortex_error, make_empty_struct,
+    BuiltArray, BuiltStream, ChunkStream, DEFAULT_CHUNK_SIZE, VortexArrayBuilder, assemble_chunks,
+    build_struct_array, canonicalize_sorted, into_vortex_error, make_empty_struct,
 };
-use crate::common::utils::stamp_is_sorted;
+use crate::common::array::stamp_is_sorted;
 use crate::error::{Result, VortexRdfError};
 use crate::store::RawQuad;
 use crate::store::indexes::secondary_by_copy::{self, CopyKey};
@@ -17,7 +17,6 @@ use crate::store::layouts::term_dictionary::{TermDictionary, TermDictionaryBuild
 use crate::store::layouts::{LayoutStrategy, dictionary};
 
 use futures::{Stream, StreamExt, TryStreamExt, stream};
-use oxrdf::Quad;
 use rkyv::api::high::{HighDeserializer, HighSerializer};
 use rkyv::rancor::Error as RkyvError;
 use rkyv::ser::allocator::ArenaHandle;
@@ -71,20 +70,20 @@ impl PartialOrd for HeapItem {
 
 impl VortexArrayBuilder for SortedStreamBuilder {
     async fn build_vortex_array(
-        quad_stream: Box<dyn Stream<Item = Result<Quad>> + Unpin + Send + 'static>,
+        quad_stream: Box<dyn Stream<Item = Result<RawQuad>> + Unpin + Send + 'static>,
         layout: LayoutStrategy,
         indexes: Indexes,
-    ) -> Result<ArrayRef> {
+    ) -> Result<BuiltArray> {
         build_sorted_stream_array(quad_stream, layout, indexes, DEFAULT_CHUNK_SIZE).await
     }
 
     /// True streaming implementation: after the (inherently blocking) run-sort
     /// phase, merged chunks are built on demand as the file writer polls.
     async fn build_vortex_stream(
-        quad_stream: Box<dyn Stream<Item = Result<Quad>> + Unpin + Send + 'static>,
+        quad_stream: Box<dyn Stream<Item = Result<RawQuad>> + Unpin + Send + 'static>,
         layout: LayoutStrategy,
         indexes: Indexes,
-    ) -> Result<(DType, ChunkStream)> {
+    ) -> Result<BuiltStream> {
         build_sorted_stream_chunk_stream(quad_stream, layout, indexes, DEFAULT_CHUNK_SIZE).await
     }
 }
@@ -96,16 +95,20 @@ impl VortexArrayBuilder for SortedStreamBuilder {
 /// array, but assembling chunks loses the per-chunk stats that `match_pattern`
 /// gates its binary searches on.
 pub(crate) async fn build_sorted_stream_array(
-    quad_stream: Box<dyn Stream<Item = Result<Quad>> + Unpin + Send + 'static>,
+    quad_stream: Box<dyn Stream<Item = Result<RawQuad>> + Unpin + Send + 'static>,
     layout: LayoutStrategy,
     indexes: Indexes,
     chunk_size: usize,
-) -> Result<ArrayRef> {
+) -> Result<BuiltArray> {
     let start = Instant::now();
 
-    let (_dtype, chunks) =
+    let built =
         build_sorted_stream_chunk_stream(quad_stream, layout, indexes.clone(), chunk_size).await?;
-    let chunks: Vec<ArrayRef> = chunks.try_collect().await.map_err(VortexRdfError::Vortex)?;
+    let chunks: Vec<ArrayRef> = built
+        .chunks
+        .try_collect()
+        .await
+        .map_err(VortexRdfError::Vortex)?;
 
     let result = canonicalize_sorted(assemble_chunks(chunks, layout, &indexes)?)?;
     log::debug!(
@@ -113,7 +116,10 @@ pub(crate) async fn build_sorted_stream_array(
         result.len(),
         start.elapsed()
     );
-    Ok(result)
+    Ok(BuiltArray {
+        array: result,
+        dict: built.dict,
+    })
 }
 
 /// External merge sort producing a lazily-evaluated stream of sorted chunks.
@@ -126,11 +132,11 @@ pub(crate) async fn build_sorted_stream_array(
 /// only chunk emission stays lazy. Temp run files are removed when the stream
 /// is dropped.
 pub(crate) async fn build_sorted_stream_chunk_stream(
-    mut quads_in: Box<dyn Stream<Item = Result<Quad>> + Unpin + Send + 'static>,
+    mut quads_in: Box<dyn Stream<Item = Result<RawQuad>> + Unpin + Send + 'static>,
     layout: LayoutStrategy,
     indexes: Indexes,
     chunk_size: usize,
-) -> Result<(DType, ChunkStream)> {
+) -> Result<BuiltStream> {
     let build_start = Instant::now();
     // ── Phase 1: Ingest and write sorted runs ──
     let ingest_start = Instant::now();
@@ -148,7 +154,7 @@ pub(crate) async fn build_sorted_stream_chunk_stream(
     let mut total_ingested = 0usize;
 
     while let Some(res) = quads_in.next().await {
-        let raw = RawQuad::from_quad(&res?);
+        let raw = res?;
         if let Some(b) = dict_builder.as_mut() {
             b.insert_quad(&raw);
         }
@@ -271,7 +277,13 @@ pub(crate) async fn build_sorted_stream_chunk_stream(
             want_copy,
             |q| Ok([q.s.clone(), q.p.clone(), q.o.clone(), q.g.clone()]),
         )?;
-        return emit_presorted_chunks(merged, spilled, layout, indexes, chunk_size, guard);
+        let (dtype, chunks) =
+            emit_presorted_chunks(merged, spilled, layout, indexes, chunk_size, guard)?;
+        return Ok(BuiltStream {
+            dtype,
+            chunks,
+            dict: None,
+        });
     }
 
     // ── No secondary indexes: lazily emit merged chunks ──
@@ -330,7 +342,11 @@ pub(crate) async fn build_sorted_stream_chunk_stream(
     );
 
     let chunks: ChunkStream = stream::once(async move { Ok(first) }).chain(rest).boxed();
-    Ok((dtype, chunks))
+    Ok(BuiltStream {
+        dtype,
+        chunks,
+        dict: None,
+    })
 }
 
 /// The two `SecondaryByReference` mergers of a build: (objects, predicates).
@@ -596,7 +612,7 @@ fn emit_presorted_chunks(
 }
 
 /// Dictionary-layout variant of [`emit_presorted_chunks`]: the entries hold
-/// u32 codes, and the dictionary payload is carried only by the first chunk.
+/// u32 codes; the dictionary rides beside the stream for the serializer.
 fn emit_presorted_dict_chunks(
     mut merged: Run<RawQuad>,
     mut spilled: SpilledIndexes<u32>,
@@ -605,18 +621,19 @@ fn emit_presorted_dict_chunks(
     indexes: Indexes,
     chunk_size: usize,
     guard: TempRunsGuard,
-) -> Result<(DType, ChunkStream)> {
+) -> Result<BuiltStream> {
     let buf = read_merged_batch(&mut merged, chunk_size)?;
     let first = if buf.is_empty() {
         dictionary::empty_struct(&indexes)?
     } else {
         let batches = next_index_batches(&mut spilled, buf.len())?;
-        build_presorted_dict_chunk(&buf, &dict, &id_map, &batches, true)?
+        build_presorted_dict_chunk(&buf, &dict, &id_map, &batches)?
     };
     let dtype = first.dtype().clone();
 
+    let stream_dict = Arc::clone(&dict);
     let rest = stream::unfold(
-        (merged, spilled, dict, id_map, guard),
+        (merged, spilled, stream_dict, id_map, guard),
         move |(mut merged, mut spilled, dict, id_map, guard)| async move {
             let chunk = (|| {
                 let buf = read_merged_batch(&mut merged, chunk_size)?;
@@ -624,7 +641,7 @@ fn emit_presorted_dict_chunks(
                     return Ok(None);
                 }
                 let batches = next_index_batches(&mut spilled, buf.len())?;
-                build_presorted_dict_chunk(&buf, &dict, &id_map, &batches, false).map(Some)
+                build_presorted_dict_chunk(&buf, &dict, &id_map, &batches).map(Some)
             })();
             match chunk {
                 Ok(None) => None,
@@ -638,7 +655,11 @@ fn emit_presorted_dict_chunks(
     );
 
     let chunks: ChunkStream = stream::once(async move { Ok(first) }).chain(rest).boxed();
-    Ok((dtype, chunks))
+    Ok(BuiltStream {
+        dtype,
+        chunks,
+        dict: Some(dict),
+    })
 }
 
 /// Adapt an [`IndexBatches`] window to `dictionary::build_chunk_presorted_indexes`.
@@ -647,7 +668,6 @@ fn build_presorted_dict_chunk(
     dict: &TermDictionary,
     id_map: &crate::store::layouts::term_dictionary::TermIdMap,
     batches: &IndexBatches<u32>,
-    carry_dict: bool,
 ) -> Result<ArrayRef> {
     dictionary::build_chunk_presorted_indexes(
         quads,
@@ -662,13 +682,12 @@ fn build_presorted_dict_chunk(
             .as_ref()
             .map(|(posg, ospg)| (posg.as_slice(), ospg.as_slice())),
         true,
-        carry_dict,
     )
 }
 
 /// Dictionary-layout emission over the K-way merge (no secondary indexes):
-/// chunks of u32 codes encoded against the completed global dictionary, with
-/// the dictionary payload carried only by the first chunk.
+/// chunks of u32 codes encoded against the completed global dictionary,
+/// which rides beside the stream for the serializer to place.
 fn emit_dict_chunks(
     mut runs: Vec<Run<RawQuad>>,
     mut heap: BinaryHeap<HeapItem>,
@@ -677,19 +696,20 @@ fn emit_dict_chunks(
     indexes: Indexes,
     chunk_size: usize,
     guard: TempRunsGuard,
-) -> Result<(DType, ChunkStream)> {
+) -> Result<BuiltStream> {
     let first_buf = next_sorted_chunk(&mut runs, &mut heap, chunk_size)?;
     let first = if first_buf.is_empty() {
         dictionary::empty_struct(&indexes)?
     } else {
-        dictionary::build_chunk(&first_buf, &dict, &id_map, &indexes, 0, true, true, false)?
+        dictionary::build_chunk(&first_buf, &dict, &id_map, &indexes, 0, true, false)?
     };
     let dtype = first.dtype().clone();
     let next_row = first_buf.len() as u32;
     drop(first_buf);
 
+    let stream_dict = Arc::clone(&dict);
     let rest = stream::unfold(
-        (runs, heap, dict, id_map, indexes, next_row, guard),
+        (runs, heap, stream_dict, id_map, indexes, next_row, guard),
         move |(mut runs, mut heap, dict, id_map, indexes, row, guard)| async move {
             let buf = match next_sorted_chunk(&mut runs, &mut heap, chunk_size) {
                 Ok(b) => b,
@@ -704,15 +724,18 @@ fn emit_dict_chunks(
                 return None;
             }
             let n = buf.len() as u32;
-            let chunk =
-                dictionary::build_chunk(&buf, &dict, &id_map, &indexes, row, true, false, false)
-                    .map_err(into_vortex_error);
+            let chunk = dictionary::build_chunk(&buf, &dict, &id_map, &indexes, row, true, false)
+                .map_err(into_vortex_error);
             Some((chunk, (runs, heap, dict, id_map, indexes, row + n, guard)))
         },
     );
 
     let chunks: ChunkStream = stream::once(async move { Ok(first) }).chain(rest).boxed();
-    Ok((dtype, chunks))
+    Ok(BuiltStream {
+        dtype,
+        chunks,
+        dict: Some(dict),
+    })
 }
 
 /// Pull up to `chunk_size` quads off the K-way merge in global sort order.

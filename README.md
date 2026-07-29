@@ -74,12 +74,12 @@ Same as `Default` for `s`, `p`, `g`, but the object column is decomposed into ty
 | `o_lang` | `VarBin<Utf8>` (nullable) | Language tag — non-null when `o_kind = 3` |
 
 #### `Dictionary`
-All four quad fields are stored as `u32` codes into a **single global term dictionary**: the lexicographically sorted set of unique term strings. The dictionary is intrinsic to the layout — it lives inside the array itself, in a `_dict_terms` column (`list<utf8>`, with the whole dictionary carried as row 0's list), so no external auxiliary structure is needed and the zero-copy principle is upheld.
+All four quad fields are stored as `u32` codes into a **single global term dictionary**: the lexicographically sorted set of unique term strings. In memory the dictionary is held beside the code columns in its compact columnar form. Serialized files carry it in one of two placements: **padded** (the default and the IPC form — a nullable `_dict_term` column that is null on quad rows, with the sorted terms appended as trailing dictionary rows, keeping the file a single self-describing artifact) or **sidecar** (bare code columns plus a `<stem>.dict.vortex` companion holding the term column). Because the dictionary rows are a plain scannable `utf8` column, large dictionaries can stay file-backed and be probed by pruned scans instead of being lifted into memory.
 
 | Column | Type | Content |
 |---|---|---|
 | `s`, `p`, `o`, `g` | `PrimitiveArray<u32>` | code = position of the term in the sorted dictionary |
-| `_dict_terms` | `list<utf8>` | row 0 = the sorted unique terms as one list; all other rows empty |
+| `_dict_term` | `utf8` (nullable; padded serialized form only) | null on quad rows; the sorted unique terms on the trailing dictionary rows |
 
 Because term IDs are **lexicographic ranks**:
 - ID comparisons are order-isomorphic to string comparisons, so sorted builders keep the subject binary-search fast path directly on the `u32` column.
@@ -216,7 +216,7 @@ Vortex compresses the repeated strings internally (FSST, dictionary encodings), 
 
 ### `Dictionary` layout
 
-**Term dictionary** (`_dict_terms`): the lexicographically sorted set of unique terms. IDs are implicit — a term's ID is simply its position:
+**Term dictionary** (the `_dict_term` rows): the lexicographically sorted set of unique terms. IDs are implicit — a term's ID is simply its position:
 
 | ID* | Term |
 |---|---|

@@ -3452,7 +3452,6 @@ dependencies = [
  "uuid",
  "vortex",
  "vortex-array",
- "vortex-btrblocks",
  "vortex-buffer",
  "vortex-error",
  "vortex-file",

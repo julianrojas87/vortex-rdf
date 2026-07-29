@@ -18,7 +18,7 @@ set -euo pipefail
 
 cd "$(git rev-parse --show-toplevel)"
 
-# A GitHub token lets us link each commit's author to their GitHub profile. Prefer
+# A GitHub token lets us resolve each commit's author to their GitHub @handle. Prefer
 # an explicit GITHUB_TOKEN; otherwise borrow one from an authenticated `gh` CLI.
 # Used by both git-cliff and enrich_handles() below. No token/offline -> plain name.
 if [ -z "${GITHUB_TOKEN:-}" ] && command -v gh >/dev/null 2>&1; then
@@ -26,7 +26,8 @@ if [ -z "${GITHUB_TOKEN:-}" ] && command -v gh >/dev/null 2>&1; then
   [ -n "$GITHUB_TOKEN" ] && export GITHUB_TOKEN
 fi
 
-# Rewrite "by <name>" -> a linked GitHub @handle, resolved PER COMMIT via the API
+# Rewrite "by <name>" -> a bare GitHub @handle (GitHub auto-links a leading @, so no
+# markdown link is needed), resolved PER COMMIT via the API
 # (GET /repos/:o/:r/commits/:sha -> author.login). Unlike git-cliff's built-in
 # enrichment (which only matches the DEFAULT branch), this resolves any commit that
 # is PUSHED to GitHub — including feature branches. Reads git-cliff markdown on
@@ -65,7 +66,7 @@ entry = re.compile(
 )
 def repl(m):
     login = login_for(m.group(2), m.group(3), m.group(4))
-    return f'{m.group(1)}[@{login}](https://github.com/{login}){m.group(6)}' if login else m.group(0)
+    return f'{m.group(1)}@{login}{m.group(6)}' if login else m.group(0)
 
 for raw in sys.stdin:
     sys.stdout.write(entry.sub(repl, raw.rstrip("\n")) + "\n")

@@ -2,7 +2,7 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use clap::ValueEnum;
-use oxrdf::{GraphName, NamedNode, NamedOrBlankNode, Quad, Term};
+use oxrdf::Quad;
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::struct_::{StructArray, StructArrayExt};
 use vortex_array::dtype::{DType, FieldName, FieldNames};
@@ -21,8 +21,9 @@ use vortex_mask::Mask;
 
 use crate::error::{Result, VortexRdfError};
 use crate::io::VORTEX_LIGHT_SESSION;
-use crate::store::layouts::ResolvedLayout;
-use crate::store::{QuadCodes, RawQuad};
+use crate::store::RawQuad;
+use crate::store::layouts::dictionary::QuadCodes;
+use crate::store::layouts::{PatternCodes, QuadPattern, ResolvedLayout};
 
 pub mod secondary_by_copy;
 pub mod secondary_by_reference;
@@ -186,18 +187,16 @@ impl IndexType {
         self,
         struct_arr: &StructArray,
         layout: &ResolvedLayout,
-        subject: Option<&NamedOrBlankNode>,
-        predicate: Option<&NamedNode>,
-        object: Option<&Term>,
-        graph: Option<&GraphName>,
+        pattern: QuadPattern<'_>,
+        codes: &mut PatternCodes,
     ) -> Result<IndexResolution> {
         match self {
-            IndexType::SecondaryByCopy => secondary_by_copy::resolve_in_memory(
-                struct_arr, layout, subject, predicate, object, graph,
-            ),
-            IndexType::SecondaryByReference => secondary_by_reference::resolve_in_memory(
-                struct_arr, layout, subject, predicate, object, graph,
-            ),
+            IndexType::SecondaryByCopy => {
+                secondary_by_copy::resolve_in_memory(struct_arr, layout, pattern, codes)
+            }
+            IndexType::SecondaryByReference => {
+                secondary_by_reference::resolve_in_memory(struct_arr, layout, pattern, codes)
+            }
         }
     }
 
@@ -210,22 +209,17 @@ impl IndexType {
     pub(crate) async fn resolve_file(
         self,
         file: &VortexFile,
+        quad_rows: u64,
         layout: &ResolvedLayout,
-        subject: Option<&NamedOrBlankNode>,
-        predicate: Option<&NamedNode>,
-        object: Option<&Term>,
-        graph: Option<&GraphName>,
+        pattern: QuadPattern<'_>,
+        codes: &mut PatternCodes,
     ) -> Result<IndexResolution> {
         match self {
             IndexType::SecondaryByCopy => {
-                secondary_by_copy::resolve_file(file, layout, subject, predicate, object, graph)
-                    .await
+                secondary_by_copy::resolve_file(file, quad_rows, layout, pattern, codes).await
             }
             IndexType::SecondaryByReference => {
-                secondary_by_reference::resolve_file(
-                    file, layout, subject, predicate, object, graph,
-                )
-                .await
+                secondary_by_reference::resolve_file(file, quad_rows, layout, pattern, codes).await
             }
         }
     }
@@ -246,22 +240,21 @@ pub(crate) enum IndexedComponent {
 impl IndexedComponent {
     /// The pattern with this (index-resolved) component cleared: what still
     /// needs checking against the rows the index returned.
-    pub(crate) fn clear<'a>(
-        self,
-        subject: Option<&'a NamedOrBlankNode>,
-        predicate: Option<&'a NamedNode>,
-        object: Option<&'a Term>,
-        graph: Option<&'a GraphName>,
-    ) -> (
-        Option<&'a NamedOrBlankNode>,
-        Option<&'a NamedNode>,
-        Option<&'a Term>,
-        Option<&'a GraphName>,
-    ) {
+    pub(crate) fn clear<'a>(self, pattern: QuadPattern<'a>) -> QuadPattern<'a> {
         match self {
-            IndexedComponent::Predicate => (subject, None, object, graph),
-            IndexedComponent::Object => (subject, predicate, None, graph),
-            IndexedComponent::PredicateObject => (subject, None, None, graph),
+            IndexedComponent::Predicate => QuadPattern {
+                predicate: None,
+                ..pattern
+            },
+            IndexedComponent::Object => QuadPattern {
+                object: None,
+                ..pattern
+            },
+            IndexedComponent::PredicateObject => QuadPattern {
+                predicate: None,
+                object: None,
+                ..pattern
+            },
         }
     }
 }
@@ -272,6 +265,10 @@ impl IndexedComponent {
 /// — so the store folds either one into a [`RowSelection`] the same way.
 ///
 /// [`RowSelection`]: crate::store::selection::RowSelection
+// `Resolved` dwarfs the dataless `Declined`, but the enum is a transient
+// per-match return value that is destructured immediately, never stored in
+// bulk — boxing its fields would buy nothing but an allocation per query.
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum IndexResolution {
     /// The index does not accelerate this pattern: either its shape isn't one
     /// this index covers, or (in memory) its value column isn't in a usable
@@ -423,6 +420,21 @@ impl ServePlan {
         }
     }
 
+    /// [`decode_columns`](Self::decode_columns) through the layout's async
+    /// decode — for serving a store whose term dictionary is file-backed,
+    /// where each chunk's codes are resolved with a dictionary scan.
+    #[cfg(feature = "file-io")]
+    pub(crate) async fn decode_columns_async(
+        &self,
+        chunk: &ArrayRef,
+        deleted: Option<&Mask>,
+    ) -> Vec<Result<Quad>> {
+        match self.chunk_rows(chunk, deleted) {
+            Ok(rows) => self.decode_layout.decode_chunk_async(&rows).await,
+            Err(e) => vec![Err(e)],
+        }
+    }
+
     /// A chunk's live rows as a primary-named `(s, p, o, g)` struct: relabel the
     /// source columns, then drop any whose primary row id is tombstoned.
     fn chunk_rows(&self, chunk: &ArrayRef, deleted: Option<&Mask>) -> Result<ArrayRef> {
@@ -440,7 +452,7 @@ impl ServePlan {
         let [s, p, o, g] = self.primary_columns;
         let len = struct_arr.len();
         let rows = StructArray::try_new(
-            FieldNames::from(["s", "p", "o", "g"]),
+            FieldNames::from(crate::store::schema::PRIMARY_COLUMNS),
             vec![col(s)?, col(p)?, col(o)?, col(g)?],
             len,
             Validity::NonNullable,
@@ -547,6 +559,7 @@ pub(crate) fn sorted_row_ids(row_id_column: ArrayRef) -> Result<Buffer<u64>> {
 #[cfg(feature = "file-io")]
 pub(crate) async fn scan_index_row_ids(
     file: &VortexFile,
+    quad_rows: u64,
     value_constraints: &[(&'static str, Scalar)],
     row_id_column: &'static str,
 ) -> Result<Buffer<u64>> {
@@ -567,9 +580,12 @@ pub(crate) async fn scan_index_row_ids(
         return Ok(Buffer::empty());
     };
 
+    // Quad rows only: a padded file's dictionary tail carries zero sentinels
+    // in every index column, which a probe for term code 0 would match.
     let arr = file
         .scan()
         .map_err(VortexRdfError::Vortex)?
+        .with_row_range(0..quad_rows)
         .with_projection(select([row_id_column], root()))
         .with_filter(filter)
         .with_ordered(false)
@@ -622,13 +638,11 @@ pub(crate) fn resolve_indexes_in_memory(
     indexes: &[IndexType],
     struct_arr: &StructArray,
     layout: &ResolvedLayout,
-    subject: Option<&NamedOrBlankNode>,
-    predicate: Option<&NamedNode>,
-    object: Option<&Term>,
-    graph: Option<&GraphName>,
+    pattern: QuadPattern<'_>,
+    codes: &mut PatternCodes,
 ) -> Result<IndexResolution> {
     for index in indexes {
-        match index.resolve_in_memory(struct_arr, layout, subject, predicate, object, graph)? {
+        match index.resolve_in_memory(struct_arr, layout, pattern, codes)? {
             IndexResolution::Declined => continue,
             resolved => return Ok(resolved),
         }
@@ -647,15 +661,14 @@ pub(crate) fn resolve_indexes_in_memory(
 pub(crate) async fn resolve_indexes_file(
     indexes: &[IndexType],
     file: &VortexFile,
+    quad_rows: u64,
     layout: &ResolvedLayout,
-    subject: Option<&NamedOrBlankNode>,
-    predicate: Option<&NamedNode>,
-    object: Option<&Term>,
-    graph: Option<&GraphName>,
+    pattern: QuadPattern<'_>,
+    codes: &mut PatternCodes,
 ) -> Result<IndexResolution> {
     for index in indexes {
         match index
-            .resolve_file(file, layout, subject, predicate, object, graph)
+            .resolve_file(file, quad_rows, layout, pattern, codes)
             .await?
         {
             IndexResolution::Declined => continue,
@@ -682,6 +695,19 @@ pub(crate) fn indexes_need_global_sorted_emission(indexes: &[IndexType]) -> bool
 /// for the compact (value, row-id) predicate/object indexes, or
 /// `vec![IndexType::SecondaryByCopy]` for the full sorted quad copies.
 pub type Indexes = Vec<IndexType>;
+
+/// The index value columns a globally sorted emission guarantees sorted —
+/// what the sorted builders (re-)stamp `IsSorted` after canonicalization,
+/// which drops per-chunk stats. Sourced from the index modules' own name
+/// accessors so the names live in exactly one place each.
+pub(crate) fn globally_sorted_columns() -> [&'static str; 4] {
+    [
+        secondary_by_reference::O_VAL_COL,
+        secondary_by_reference::P_VAL_COL,
+        secondary_by_copy::Family::Posg.lead_col(),
+        secondary_by_copy::Family::Ospg.lead_col(),
+    ]
+}
 
 /// Deduplicate the requested indexes, preserving first-seen order, so a
 /// repeated index (e.g. the same `--indexes` flag passed twice) cannot
@@ -766,7 +792,7 @@ impl GlobalIndexes {
 }
 
 /// Project away secondary-index columns (`_idx_*`), keeping the layout's
-/// primary and intrinsic columns (e.g. `_dict_terms`). Returns the array
+/// primary and intrinsic columns (e.g. `_dict_term`). Returns the array
 /// unchanged when it carries no index columns.
 pub(crate) fn strip_index_columns(arr: ArrayRef) -> Result<ArrayRef> {
     // Figure out which field names to keep; bail out unchanged if there are
@@ -811,7 +837,7 @@ pub(crate) fn strip_index_columns(arr: ArrayRef) -> Result<ArrayRef> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use oxrdf::Literal;
+    use oxrdf::{GraphName, Literal, NamedNode, NamedOrBlankNode, Term};
     use vortex_array::dtype::{Nullability, StructFields};
 
     fn struct_dtype(names: &[&str]) -> DType {
@@ -920,16 +946,21 @@ mod tests {
         let o = Term::Literal(Literal::new_simple_literal("o"));
         let g = GraphName::NamedNode(NamedNode::new("http://example.org/g").unwrap());
 
-        let (rs, rp, ro, rg) =
-            IndexedComponent::Object.clear(Some(&s), Some(&p), Some(&o), Some(&g));
-        assert!(rs.is_some() && rp.is_some() && ro.is_none() && rg.is_some());
+        let bound = QuadPattern::new(Some(&s), Some(&p), Some(&o), Some(&g));
 
-        let (rs, rp, ro, rg) =
-            IndexedComponent::Predicate.clear(Some(&s), Some(&p), Some(&o), Some(&g));
-        assert!(rs.is_some() && rp.is_none() && ro.is_some() && rg.is_some());
+        let r = IndexedComponent::Object.clear(bound);
+        assert!(
+            r.subject.is_some() && r.predicate.is_some() && r.object.is_none() && r.graph.is_some()
+        );
 
-        let (rs, rp, ro, rg) =
-            IndexedComponent::PredicateObject.clear(Some(&s), Some(&p), Some(&o), Some(&g));
-        assert!(rs.is_some() && rp.is_none() && ro.is_none() && rg.is_some());
+        let r = IndexedComponent::Predicate.clear(bound);
+        assert!(
+            r.subject.is_some() && r.predicate.is_none() && r.object.is_some() && r.graph.is_some()
+        );
+
+        let r = IndexedComponent::PredicateObject.clear(bound);
+        assert!(
+            r.subject.is_some() && r.predicate.is_none() && r.object.is_none() && r.graph.is_some()
+        );
     }
 }

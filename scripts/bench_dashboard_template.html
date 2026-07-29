@@ -163,45 +163,21 @@
   .panel h3 { margin:0 0 2px; font-size:14.5px; font-weight:650; }
   .panel .note { color:var(--ink-2); font-size:12.5px; margin: 0 0 12px; max-width:60ch; }
 
-  .legend { display:flex; flex-wrap:wrap; gap:14px; margin-bottom:12px; }
-  .legend-item { display:flex; align-items:center; gap:6px; font-size:12px; color:var(--ink-2); }
-  .swatch { width:10px; height:10px; border-radius:2px; flex:none; }
-
-  .filmstrip { display:grid; grid-template-columns:repeat(auto-fit, minmax(96px,1fr)); gap:10px; }
-  .filmstrip.simple { grid-template-columns: minmax(0,1fr); max-width: 340px; }
-  .filmstrip.simple.wide { max-width: none; }
-  .filmstrip.cols-3 { grid-template-columns: repeat(3, minmax(0,1fr)); gap:20px; }
-  .filmstrip.cols-3 .mini .cap { font-size:12px; }
-  .mini { display:flex; flex-direction:column; align-items:center; gap:4px; }
-  .mini svg { width:100%; height:auto; overflow:visible; }
-  .mini .cap { font-size:11px; color:var(--ink-muted); font-weight:600; letter-spacing:0.03em; }
-  .bar-label { font-size:9.5px; fill:var(--ink-2); font-family: ui-monospace, monospace; }
-  .bar-label.best { fill:var(--ink); font-weight:700; }
-  .best-badge { font-size:9px; fill:var(--good); font-weight:700; }
-  .baseline-rule { stroke:var(--baseline); stroke-width:1; }
-
-  .insight {
-    margin-top:12px; padding-top:10px; border-top:1px solid var(--border);
-    font-size:12.5px; color:var(--ink-2);
-  }
-  .insight b { color:var(--ink); font-weight:650; }
-
-  .rank-list { list-style:none; margin:12px 0 0; padding:0; display:flex; flex-direction:column; gap:6px; }
-  .rank-list li {
-    display:flex; align-items:center; gap:10px; font-size:13px;
-    padding:6px 8px; border-radius:5px; background:var(--surface-2);
-  }
-  .rank-list li.win { background: color-mix(in srgb, var(--good) 12%, var(--surface-2)); }
-  .rank-pos { font-family: ui-monospace, monospace; font-weight:700; color:var(--ink-muted); width:1.4em; text-align:right; flex:none; }
-  .rank-list li.win .rank-pos { color: var(--good); }
-  .rank-name { flex:1; display:flex; align-items:center; gap:7px; }
-  .rank-val { font-family: ui-monospace, monospace; font-variant-numeric: tabular-nums; font-weight:600; }
-  .rank-delta { font-family: ui-monospace, monospace; font-size:11.5px; color:var(--ink-muted); min-width:5.5em; text-align:right; }
-
   .interact-table { width:100%; border-collapse:collapse; margin-top:10px; font-size:12.5px; }
   .interact-table th, .interact-table td { text-align:left; padding:6px 8px; border-bottom:1px solid var(--border); }
   .interact-table th { color:var(--ink-muted); font-weight:600; font-size:11px; text-transform:uppercase; letter-spacing:0.05em; }
   .interact-table td.num { font-family: ui-monospace, monospace; font-variant-numeric: tabular-nums; }
+
+  /* ---- matrix tables (variant rows × measurement columns) ---- */
+  .matrix-table { width:100%; border-collapse:collapse; margin-top:10px; font-size:12.5px; }
+  .matrix-table th, .matrix-table td { padding:7px 10px; border-bottom:1px solid var(--border); text-align:right; white-space:nowrap; }
+  .matrix-table th { color:var(--ink-muted); font-weight:600; font-size:11px; text-transform:uppercase; letter-spacing:0.05em; }
+  .matrix-table th.rowh, .matrix-table td.rowh { text-align:left; }
+  .matrix-table td.rowh.sub { color:var(--ink-muted); }
+  .matrix-table td.num { font-family: ui-monospace, monospace; font-variant-numeric: tabular-nums; }
+  .matrix-table td.num .ratio { color:var(--ink-muted); font-size:10.5px; margin-left:5px; }
+  .matrix-table td.num.best { color:var(--good); font-weight:700; }
+  .matrix-table tbody tr.group-break td { border-top:1px solid var(--border-strong); }
 
   /* ---- data table ---- */
   .table-toolbar { display:flex; align-items:center; gap:10px; margin-bottom:10px; flex-wrap:wrap; }
@@ -235,22 +211,10 @@
     color:var(--ink-muted); font-size:11.5px;
   }
 
-  #tooltip {
-    position:fixed; pointer-events:none; z-index:50;
-    background:var(--ink); color:var(--page); font-size:12px;
-    padding:6px 9px; border-radius:5px; transform:translate(-50%,-100%);
-    margin-top:-8px; opacity:0; transition:opacity 0.08s ease; max-width:240px;
-  }
-  #tooltip.show { opacity:1; }
-  #tooltip .tt-val { font-family: ui-monospace, monospace; font-weight:700; font-variant-numeric: tabular-nums; }
-  #tooltip .tt-name { opacity:0.8; margin-top:2px; }
-
   @media (prefers-reduced-motion: reduce) {
     * { transition:none !important; animation:none !important; }
   }
 </style>
-
-<div id="tooltip" role="tooltip"></div>
 
 <header class="topbar">
   <div class="topbar-row">
@@ -272,6 +236,7 @@
     <a href="#write">Write</a>
     <a href="#query">Query</a>
     <a href="#decode">Decode</a>
+    <a href="#dict">Dictionary</a>
     <a href="#data">Raw data</a>
   </nav>
   <section id="overview" class="group">
@@ -318,12 +283,30 @@
     <div class="panel-grid" id="decode-panels"></div>
   </section>
 
+  <section id="dict" class="group">
+    <div class="group-head">
+      <span class="chan-tag mono">DICT</span>
+      <h2>Dictionary — placement &amp; residency</h2>
+    </div>
+    <p class="group-desc">
+      The Dictionary layout's term dictionary has two independent knobs. <em>Placement</em>:
+      inside the quads file as trailing rows (<span class="mono">padded</span> — the
+      self-contained default and the IPC form) or in a companion file
+      (<span class="mono">sidecar</span>). <em>Residency</em>: lifted into memory at open
+      (<span class="mono">resident</span>) or left in the file and reached by pruned scans
+      (<span class="mono">file-backed</span>). What each placement costs a match is visible in
+      the match matrix above (the Dictionary padded vs sidecar file rows); the table below
+      shows which phase — open, cold probe, decode — the residency choice moves the cost into.
+    </p>
+    <div class="panel-grid" id="dict-panels"></div>
+  </section>
+
   <section id="data" class="group">
     <div class="group-head">
       <span class="chan-tag mono">DATA</span>
       <h2>Every measured configuration</h2>
     </div>
-    <p class="group-desc">All 66 leaf benchmarks from this run. Click a column to sort.</p>
+    <p class="group-desc">Every leaf benchmark from this run. Click a column to sort.</p>
     <div class="table-toolbar">
       <input id="table-filter" type="text" placeholder="filter by name…" autocomplete="off" />
       <span class="count" id="table-count"></span>
@@ -362,11 +345,20 @@
       One <code>npm run bench</code> run of <code>js/bench/compare.bench.ts</code> — the
       <code>VortexRdfStore</code> WASM bindings compared against
       <a href="https://github.com/rubensworks/rdf-stores.js">rdf-stores.js</a> and
-      <a href="https://github.com/oxigraph/oxigraph/tree/main/js">oxigraph</a>, on an
-      rdf-stores.js-style synthetic dataset across four phases: ingest, query, add, delete.
+      <a href="https://github.com/oxigraph/oxigraph/tree/main/js">oxigraph</a>, on a
+      synthetic dataset whose <em>distinct term count scales with the rows</em>
+      (each subject described by about ten triples, a small closed predicate vocabulary,
+      a mix of IRI and literal objects), across four phases: ingest, query, add, delete.
       Wall-clock (tinybench) — deliberately <em>not</em> uploaded to CodSpeed.
     </p>
+    <p class="lede">
+      Term cardinality matters because it is what exercises each library's dictionary and
+      string handling; selectivity follows the data, so
+      each pattern's matched-row count is recorded in <code>config.matchedRows</code>
+      alongside its timing.
+    </p>
     <div class="kpi-row" id="js-kpi-row"></div>
+    <p class="lede mono" id="js-matched-rows"></p>
   </section>
 
   <section id="js-ingest" class="group">
@@ -463,280 +455,185 @@ const RUST_PROVENANCE = __PROVENANCE__;
 const JS_PROVENANCE = __JS_PROVENANCE__;
 const rustById = new Map(RUST_DATA.map(d => [d.id, d]));
 const jsById = new Map(JS_DATA.map(d => [d.id, d]));
-// Reshaped to the same {median, median_ns} shape drawBarGroup/renderSimplePanel
-// already read, so the memory panels reuse those renderers instead of a parallel
-// set just for a different unit (MB peak RSS in place of a time duration).
+// Reshaped to the same {median, median_ns} shape renderMatrixPanel already
+// reads, so the memory panels reuse the same renderer instead of a parallel
+// one just for a different unit (MB peak RSS in place of a time duration).
 const jsMemById = new Map(JS_MEMORY.map(m => [`${m.slug}::${m.role}`, {
   median: (m.peakRssMb ?? "?") + " MB", median_ns: m.peakRssMb ?? 0,
 }]));
 
 const RUST_PATTERNS = ["S","P","O","PO","G","SPOG"];
 const JS_PATTERNS = ["S","P","O","PO","SPO","full","G","SPOG"];
-const COLORS = ["var(--c1)","var(--c2)","var(--c3)","var(--c4)","#9b59b6","#16a085"];
-const NS = { ns:1, "µs":1e3, us:1e3, ms:1e6, s:1e9 };
 
 function get(map, id){ const r = map.get(id); if(!r) console.warn("missing bench id", id); return r; }
 function fmtRatio(a,b){ return (a/b).toFixed(2) + "×"; }
-function fmtNs(ns){
-  if (ns < 1e3) return ns.toFixed(0) + " ns";
-  if (ns < 1e6) return (ns/1e3).toPrecision(3) + " µs";
-  if (ns < 1e9) return (ns/1e6).toPrecision(3) + " ms";
-  return (ns/1e9).toPrecision(3) + " s";
-}
 
-const svgNS = "http://www.w3.org/2000/svg";
-function svgEl(tag, attrs){
-  const el = document.createElementNS(svgNS, tag);
-  for (const k in attrs) el.setAttribute(k, attrs[k]);
-  return el;
+// ---- panel configs (Rust tab) ----
+// Serialize: every measured builder × layout × index configuration in one
+// table, grouped (ruled rows) by the axis varied around the sorted-stream /
+// Default / no-index baseline; the last group holds the two interaction
+// configs that don't reduce to a single axis.
+function serRow(builder, layout, index, id, brk){
+  return { labels:[builder, layout, index], ids:[`serialize::${id}`], break:brk };
 }
-function roundedTopPath(x, y, w, h, r){
-  r = Math.min(r, w/2, Math.max(h,0.01));
-  const top = y;
-  const bottom = y + h;
-  return `M${x},${bottom} L${x},${top+r} Q${x},${top} ${x+r},${top} L${x+w-r},${top} Q${x+w},${top} ${x+w},${top+r} L${x+w},${bottom} Z`;
-}
+const serializePanel = {
+  title:"Serialize: builder × layout × index",
+  note:"Median time to build and write the dataset. Row groups vary one axis at a time around the sorted-stream / Default / no-index baseline; the last group is the two interaction configs.",
+  rowHeaders:["Builder","Layout","Index"], columns:["Serialize"],
+  rows:[
+    serRow("Sorted stream","Default","none","sorted_stream_default_no_index"),
+    serRow("Sorted in-memory","Default","none","sorted_in_memory_default_no_index"),
+    serRow("Unsorted","Default","none","unsorted_default_no_index"),
+    serRow("Sorted stream","Typed-object","none","sorted_stream_typed_object_no_index", true),
+    serRow("Sorted stream","Dictionary","none","sorted_stream_dictionary_no_index"),
+    serRow("Sorted stream","Default","by-reference","sorted_stream_default_by_reference", true),
+    serRow("Sorted stream","Default","by-copy","sorted_stream_default_by_copy"),
+    serRow("Sorted stream","Dictionary","by-copy","sorted_stream_dictionary_by_copy", true),
+    serRow("Unsorted","Default","by-copy","unsorted_default_by_copy"),
+  ],
+};
 
-const tooltip = document.getElementById("tooltip");
-function showTip(evt, name, valueStr){
-  tooltip.innerHTML = "";
-  const v = document.createElement("div"); v.className = "tt-val"; v.textContent = valueStr;
-  const n = document.createElement("div"); n.className = "tt-name"; n.textContent = name;
-  tooltip.append(v, n);
-  tooltip.classList.add("show");
-  moveTip(evt);
-}
-function moveTip(evt){
-  const x = evt.clientX ?? (evt.target.getBoundingClientRect().left + evt.target.getBoundingClientRect().width/2);
-  const y = evt.clientY ?? evt.target.getBoundingClientRect().top;
-  tooltip.style.left = x + "px";
-  tooltip.style.top = y + "px";
-}
-function hideTip(){ tooltip.classList.remove("show"); }
 
-function attachTip(el, name, valueStr){
-  el.addEventListener("pointerenter", e => showTip(e, name, valueStr));
-  el.addEventListener("pointermove", moveTip);
-  el.addEventListener("pointerleave", hideTip);
-  el.addEventListener("focus", e => showTip(e, name, valueStr));
-  el.addEventListener("blur", hideTip);
-}
+/** The dashboard's one panel form: a matrix table of variant rows ×
+ * measurement columns. Cells print the median; the column-fastest cell is
+ * green and every other cell carries its slowdown multiplier vs that best.
+ * cfg: { title, note, wide, rowHeaders:[...], columns:[...],
+ *        rows:[{ labels:[...], ids:[... parallel to columns, null → "—"],
+ *                break: true rules off a row group }] } */
+function renderMatrixPanel(container, cfg, map){
+  const rows = cfg.rows
+    .map(r => ({...r, recs: r.ids.map(id => id ? get(map, id) : null)}))
+    .filter(r => r.recs.some(Boolean));
+  if (!rows.length) return;
 
-function legend(container, series){
-  const row = document.createElement("div");
-  row.className = "legend";
-  for (const s of series){
-    const item = document.createElement("span");
-    item.className = "legend-item";
-    const sw = document.createElement("span");
-    sw.className = "swatch";
-    sw.style.background = s.color;
-    const label = document.createElement("span");
-    label.textContent = s.label;
-    item.append(sw, label);
-    row.appendChild(item);
+  // cfg.sortByColumn: order rows ascending by that column's value (best
+  // first). Value order supersedes declared grouping, so break rules drop.
+  if (cfg.sortByColumn != null){
+    rows.sort((a,b) => (a.recs[cfg.sortByColumn]?.median_ns ?? Infinity)
+                     - (b.recs[cfg.sortByColumn]?.median_ns ?? Infinity));
+    rows.forEach(r => delete r.break);
   }
-  container.appendChild(row);
-}
 
-/** One small bar-group: series = [{label, color, id}], drawn on its own scale.
- * `opts.logScale` switches from linear to log height mapping, for groups where
- * the min and max span multiple orders of magnitude and a linear scale would
- * flatten every bar but the largest into invisibility. */
-function drawBarGroup(host, series, caption, map, opts){
-  opts = opts || {};
-  const recs = series.map(s => ({...s, rec: get(map, s.id)})).filter(s => s.rec);
-  if (!recs.length) return;
-  const values = recs.map(s => s.rec.median_ns);
-  const rawMax = Math.max(...values);
-  const rawMin = Math.min(...values);
-  const logScale = !!opts.logScale && rawMin > 0 && rawMax > rawMin;
-  const n = recs.length;
-  const slot = 40, barW = Math.min(24, slot*0.62), gap = slot - barW;
-  const chartW = n*slot, chartH = 110, baseY = 92, topPad = 20;
-  const avail = baseY - topPad;
+  // Column-wise best, so each column reads as its own ranking.
+  const best = cfg.columns.map((_, i) => Math.min(
+    ...rows.map(r => r.recs[i]?.median_ns ?? Infinity)));
 
-  // The log floor sits a third-decade below the smallest bar (not exactly at
-  // it) so that bar still renders with a sliver of height instead of
-  // collapsing onto the baseline.
-  const maxV = rawMax * (logScale ? 1.08 : 1.18);
-  const floor = logScale ? rawMin / 3 : 0;
-  const logSpan = logScale ? Math.log(maxV) - Math.log(floor) : 0;
-  function heightFor(v){
-    return logScale ? avail * (Math.log(v) - Math.log(floor)) / logSpan : avail * (v / maxV);
-  }
+  const panel = document.createElement("div");
+  panel.className = "panel" + (cfg.wide ? " wide" : "");
+  panel.innerHTML = `<h3>${cfg.title}</h3><p class="note">${cfg.note}</p>`;
 
   const wrap = document.createElement("div");
-  wrap.className = "mini";
-  const svg = svgEl("svg", { viewBox: `0 0 ${chartW} ${chartH}`, role:"img",
-    "aria-label": (caption ? caption+": " : "") + recs.map(s=>`${s.label} ${s.rec.median}`).join(", ") });
+  wrap.className = "table-wrap";
+  const table = document.createElement("table");
+  table.className = "matrix-table";
+  table.innerHTML = "<thead><tr>" +
+    cfg.rowHeaders.map(h => `<th class="rowh">${h}</th>`).join("") +
+    cfg.columns.map(c => `<th>${c}</th>`).join("") + "</tr></thead>";
+  const tbody = document.createElement("tbody");
 
-  svg.appendChild(svgEl("line", { x1:0, y1:baseY, x2:chartW, y2:baseY, class:"baseline-rule" }));
-
-  recs.forEach((s, i) => {
-    const h = heightFor(s.rec.median_ns);
-    const x = i*slot + gap/2;
-    const y = baseY - h;
-    const isBest = s.rec.median_ns === rawMin;
-    const path = svgEl("path", { d: roundedTopPath(x, y, barW, h, 4), class: "s"+((i%4)+1) });
-    path.style.fill = s.color;
-    path.tabIndex = 0;
-    svg.appendChild(path);
-    attachTip(path, (caption ? caption+" · " : "") + s.label, s.rec.median);
-
-    const label = svgEl("text", { x: x+barW/2, y: y-9, "text-anchor":"middle",
-      class: "bar-label" + (isBest ? " best" : "") });
-    label.textContent = s.rec.median;
-    svg.appendChild(label);
-    if (isBest){
-      const badge = svgEl("text", { x: x+barW/2, y: y-19, "text-anchor":"middle", class:"best-badge" });
-      badge.textContent = "✓";
-      svg.appendChild(badge);
-    }
-  });
-
-  wrap.appendChild(svg);
-  if (caption){
-    const cap = document.createElement("div");
-    cap.className = "cap mono";
-    cap.textContent = caption;
-    wrap.appendChild(cap);
+  for (const r of rows){
+    const tr = document.createElement("tr");
+    if (r.break) tr.className = "group-break";
+    tr.innerHTML =
+      r.labels.map((l, i) => `<td class="rowh${i ? " sub" : ""}">${l}</td>`).join("") +
+      r.recs.map((rec, i) => {
+        if (!rec) return `<td class="num">—</td>`;
+        const isBest = rec.median_ns === best[i];
+        const mult = rec.median_ns / best[i];
+        const multStr = mult >= 100 ? Math.round(mult).toLocaleString() : mult.toFixed(1);
+        const ratio = isBest ? "" : `<span class="ratio">${multStr}×</span>`;
+        return `<td class="num${isBest ? " best" : ""}">${rec.median}${ratio}</td>`;
+      }).join("");
+    tbody.appendChild(tr);
   }
-  host.appendChild(wrap);
-}
-
-/** Axis panel with a pattern dimension: one mini bar-group per pattern. */
-function renderPatternPanel(container, cfg, map, patterns){
-  const panel = document.createElement("div");
-  panel.className = "panel" + (cfg.wide ? " wide" : "");
-  const noteSuffix = cfg.logScale ? " <strong>Log scale</strong> — bar height shows order of magnitude, not raw proportion; read the printed numbers." : "";
-  panel.innerHTML = `<h3>${cfg.title}</h3><p class="note">${cfg.note}${noteSuffix}</p>`;
-  legend(panel, cfg.series);
-
-  const strip = document.createElement("div");
-  strip.className = "filmstrip" + (cfg.cols ? " cols-"+cfg.cols : "");
-  const wins = new Map(cfg.series.map(s => [s.label, 0]));
-
-  for (const p of patterns){
-    const series = cfg.series.map(s => ({ label:s.label, color:s.color, id:`${s.group}::${p}` }));
-    drawBarGroup(strip, series, p, map, { logScale: cfg.logScale });
-    const recs = series.map(s => ({...s, rec: get(map, s.id)})).filter(s => s.rec);
-    if (recs.length){
-      const best = recs.reduce((a,b) => a.rec.median_ns < b.rec.median_ns ? a : b);
-      wins.set(best.label, (wins.get(best.label)||0) + 1);
-    }
-  }
-  panel.appendChild(strip);
-
-  const ranked = [...wins.entries()].sort((a,b) => b[1]-a[1]).filter(([,n]) => n>0);
-  const insight = document.createElement("div");
-  insight.className = "insight";
-  insight.innerHTML = "Fastest most often: " +
-    ranked.map(([label,n]) => `<b>${label}</b> (${n}/${patterns.length})`).join(", ");
-  panel.appendChild(insight);
-
+  table.appendChild(tbody);
+  wrap.appendChild(table);
+  panel.appendChild(wrap);
   container.appendChild(panel);
 }
 
-/** Axis panel without a pattern dimension: one bar-group + explicit rank list. */
-function renderSimplePanel(container, cfg, map){
-  const panel = document.createElement("div");
-  panel.className = "panel" + (cfg.wide ? " wide" : "");
-  const noteSuffix = cfg.logScale ? " <strong>Log scale</strong> — bar height shows order of magnitude, not raw proportion; read the printed numbers." : "";
-  panel.innerHTML = `<h3>${cfg.title}</h3><p class="note">${cfg.note}${noteSuffix}</p>`;
-  legend(panel, cfg.series);
+function patternIds(group, patterns){ return patterns.map(p => `${group}::${p}`); }
 
-  const strip = document.createElement("div");
-  strip.className = "filmstrip simple" + (cfg.wide ? " wide" : "");
-  drawBarGroup(strip, cfg.series, null, map, { logScale: cfg.logScale });
-  panel.appendChild(strip);
-
-  const recs = cfg.series.map(s => ({...s, rec: get(map, s.id)})).filter(s => s.rec)
-    .sort((a,b) => a.rec.median_ns - b.rec.median_ns);
-  const fastest = recs[0];
-  const list = document.createElement("ol");
-  list.className = "rank-list";
-  recs.forEach((s, i) => {
-    const li = document.createElement("li");
-    if (i===0) li.classList.add("win");
-    const pos = document.createElement("span"); pos.className="rank-pos mono"; pos.textContent = (i+1)+".";
-    const name = document.createElement("span"); name.className="rank-name";
-    const sw = document.createElement("span"); sw.className="swatch"; sw.style.background=s.color;
-    const nm = document.createElement("span"); nm.textContent = s.label;
-    name.append(sw, nm);
-    const val = document.createElement("span"); val.className="rank-val"; val.textContent = s.rec.median;
-    const delta = document.createElement("span"); delta.className="rank-delta";
-    const deltaWord = cfg.deltaWord || "slower";
-    delta.textContent = i===0 ? "baseline" : fmtRatio(s.rec.median_ns, fastest.rec.median_ns) + " " + deltaWord;
-    li.append(pos, name, val, delta);
-    list.appendChild(li);
-  });
-  panel.appendChild(list);
-  container.appendChild(panel);
+// The consolidated match matrix: every layout × source × index variant
+// (sorted-stream builder throughout) as rows, grouped by secondary-index
+// configuration, the six routing patterns as columns. Placement (padded vs
+// sidecar) is a file-storage concept, so the Dictionary layout contributes
+// one in-memory row but two file rows per index group.
+const MATCH_INDEXES = [["No index","noindex"],["By reference","byref"],["By copy","bycopy"]];
+const MATCH_LAYOUTS = [
+  {labels:["Default","in-memory"],         group: ix => `match_sorted_default_${ix}_mem`},
+  {labels:["Default","file"],              group: ix => `match_sorted_default_${ix}_file`},
+  {labels:["Typed-object","in-memory"],    group: ix => `match_sorted_typedobj_${ix}_mem`},
+  {labels:["Typed-object","file"],         group: ix => `match_sorted_typedobj_${ix}_file`},
+  {labels:["Dictionary","in-memory"],      group: ix => `match_sorted_dict_${ix}_mem`},
+  {labels:["Dictionary (padded)","file"],  group: ix => `match_sorted_dict_${ix}_file`},
+  {labels:["Dictionary (sidecar)","file"], group: ix => `match_sorted_dict_${ix}_sidecar_file`},
+];
+// Row set shared by the materializing and lazy match tables; the lazy bench
+// target names each group `lazy_` + its materializing twin.
+function matchMatrixRows(groupPrefix){
+  return MATCH_INDEXES.flatMap(([ixLabel, ix]) => MATCH_LAYOUTS.map((v, vi) => ({
+    labels:[vi === 0 ? ixLabel : "", ...v.labels],
+    ids: patternIds(groupPrefix + v.group(ix), RUST_PATTERNS),
+    break: vi === 0,
+  })));
 }
 
-// ---- panel configs ----
-const writePanels = [
-  { title:"Builder", note:"Default layout, no secondary index.", series:[
-    {label:"Sorted stream", color:"var(--c1)", id:"serialize::sorted_stream_default_no_index"},
-    {label:"Sorted in-memory", color:"var(--c2)", id:"serialize::sorted_in_memory_default_no_index"},
-    {label:"Unsorted", color:"var(--c3)", id:"serialize::unsorted_default_no_index"},
-  ]},
-  { title:"Layout", note:"Sorted-stream builder, no secondary index.", series:[
-    {label:"Default", color:"var(--c1)", id:"serialize::sorted_stream_default_no_index"},
-    {label:"Typed-object", color:"var(--c2)", id:"serialize::sorted_stream_typed_object_no_index"},
-    {label:"Dictionary", color:"var(--c3)", id:"serialize::sorted_stream_dictionary_no_index"},
-  ]},
-  { title:"Secondary index", note:"Sorted-stream builder, default layout.", series:[
-    {label:"No index", color:"var(--c1)", id:"serialize::sorted_stream_default_no_index"},
-    {label:"By reference", color:"var(--c2)", id:"serialize::sorted_stream_default_by_reference"},
-    {label:"By copy", color:"var(--c3)", id:"serialize::sorted_stream_default_by_copy"},
-  ]},
-];
+const matchMatrixPanel = {
+  title:"Match matrix: index × layout × source, per pattern",
+  note:"Median <code>match_pattern</code> + materialization time; sorted-stream builder throughout. Rows are grouped by secondary-index configuration; within a group only layout and source vary. <b>Green</b> marks the fastest variant in each pattern column across all groups; the grey multiplier is the slowdown vs that column's best.",
+  wide:true, rowHeaders:["Index","Layout","Source"], columns:RUST_PATTERNS,
+  rows: matchMatrixRows(""),
+};
 
-const queryPanels = [
-  { title:"Source: file vs in-memory", note:"Baseline sorted-stream / default layout / by-copy index.", series:[
-    {label:"File", color:"var(--c1)", group:"match_sorted_default_bycopy_file"},
-    {label:"In-memory", color:"var(--c2)", group:"match_sorted_default_bycopy_mem"},
-  ]},
-  { title:"Layout: default vs typed-object vs dictionary", note:"Sorted-stream builder, by-copy index, file-backed.", series:[
-    {label:"Default", color:"var(--c1)", group:"match_sorted_default_bycopy_file"},
-    {label:"Typed-object", color:"var(--c2)", group:"match_sorted_typedobj_bycopy_file"},
-    {label:"Dictionary", color:"var(--c3)", group:"match_sorted_dict_bycopy_file"},
-  ]},
-  { title:"Secondary index: none vs by-reference vs by-copy", note:"Sorted-stream builder, default layout, file-backed.", series:[
-    {label:"No index", color:"var(--c1)", group:"match_sorted_default_noindex_file"},
-    {label:"By reference", color:"var(--c2)", group:"match_sorted_default_byref_file"},
-    {label:"By copy", color:"var(--c3)", group:"match_sorted_default_bycopy_file"},
-  ]},
-  { title:"Builder × source: sorted vs unsorted, file vs in-memory", note:"Default layout, by-copy index. An unsorted builder leaves nothing stamped, so every index declines and the resolver falls back to a full mask scan.", series:[
-    {label:"Sorted / file", color:"var(--c1)", group:"match_sorted_default_bycopy_file"},
-    {label:"Sorted / mem", color:"var(--c2)", group:"match_sorted_default_bycopy_mem"},
-    {label:"Unsorted / file", color:"var(--c3)", group:"match_unsorted_default_bycopy_file"},
-    {label:"Unsorted / mem", color:"var(--c4)", group:"match_unsorted_default_bycopy_mem"},
-  ]},
-];
+const lazyMatchMatrixPanel = {
+  title:"Match matrix without materialization, per pattern",
+  note:"The same variants and probes, timing <code>match_pattern</code> alone — index resolution and row-selection composition into the narrowed view, before any quad is decoded. The difference against the table above is materialization's share of a match: it is what an iterative query plan defers by refining views and decoding only the final result. Local-only benchmarks (<code>match_lazy</code> target), not uploaded to CodSpeed.",
+  wide:true, rowHeaders:["Index","Layout","Source"], columns:RUST_PATTERNS,
+  rows: matchMatrixRows("lazy_"),
+};
 
-const chainedPanel = { title:"Chained refinement (match P, then O)", note:"Two sequential match_pattern calls on the same view — the “views narrow the same coordinate space” feature.", series:[
-  {label:"File", color:"var(--c1)", id:"match_chained::file"},
-  {label:"In-memory", color:"var(--c2)", id:"match_chained::in_memory"},
-]};
+const chainedPanel = {
+  title:"Chained refinement (match P, then O)",
+  note:"Two sequential match_pattern calls on the same view — the “views narrow the same coordinate space” feature. Sorted-stream builder, Default layout, by-copy index; only the source varies.",
+  rowHeaders:["Source"], columns:["Time"],
+  rows:[
+    {labels:["File"], ids:["match_chained::file"]},
+    {labels:["In-memory"], ids:["match_chained::in_memory"]},
+  ],
+};
 
-const decodePanels = [
-  { title:"Layout", note:"Sorted-stream builder, file-backed, full-scan decode.", series:[
-    {label:"Default", color:"var(--c1)", id:"decode_all::default_file"},
-    {label:"Typed-object", color:"var(--c2)", id:"decode_all::typed_object_file"},
-    {label:"Dictionary", color:"var(--c3)", id:"decode_all::dictionary_file"},
-  ]},
-  { title:"Source", note:"Default layout, full-scan decode.", series:[
-    {label:"File", color:"var(--c1)", id:"decode_all::default_file"},
-    {label:"In-memory", color:"var(--c2)", id:"decode_all::default_in_memory"},
-  ]},
-  { title:"Open file (footer read only)", note:"Time to open a file-backed store, before any decode.", series:[
-    {label:"Default", color:"var(--c1)", id:"open_file::default"},
-    {label:"Dictionary", color:"var(--c2)", id:"open_file::dictionary"},
-  ]},
-];
+const decodeLifecyclePanel = {
+  title:"Open & full decode, per layout",
+  note:"Sorted-stream builder. Open reads only the file footer (Dictionary additionally lifts its term dictionary), before any decode; decode materializes every quad back out.",
+  wide:true, rowHeaders:["Layout"],
+  columns:["Open (file)","Decode all (file)","Decode all (in-memory)"],
+  rows:[
+    {labels:["Default"],      ids:["open_file::default","decode_all::default_file","decode_all::default_in_memory"]},
+    {labels:["Typed-object"], ids:["open_file::typed_object","decode_all::typed_object_file","decode_all::typed_object_in_memory"]},
+    {labels:["Dictionary"],   ids:["open_file::dictionary","decode_all::dictionary_file","decode_all::dictionary_in_memory"]},
+  ],
+};
+
+// What each placement costs a match lives in the match matrix (its padded vs
+// sidecar file rows); this section covers the residency axis, which has no
+// pattern dimension — it moves cost between fixed phases.
+const dictResidencyPanel = {
+  title:"Residency: cost per phase, placement × residency",
+  note:"<b>Open</b>: resident lifts the whole term column at open; file-backed reads footer metadata only (the padded extent comes from the footer's null-count statistic). <b>Cold probe</b>: four bound terms (SPOG) on a fresh store — resident binary-searches in memory; file-backed builds its fence, then evaluates one pruned split per term. <b>Decode matched</b>: match a predicate, then materialize the ~1–2k matching quads.",
+  wide:true, rowHeaders:["Placement","Residency"],
+  columns:["Open","Cold probe (SPOG)","Decode matched"],
+  rows:[
+    {labels:["Padded","resident"],      slug:"padded_resident"},
+    {labels:["Padded","file-backed"],   slug:"padded_file_backed"},
+    {labels:["Sidecar","resident"],     slug:"sidecar_resident", break:true},
+    {labels:["Sidecar","file-backed"],  slug:"sidecar_file_backed"},
+  ].map(r => ({...r, ids:[
+    `dict_open::${r.slug}`,
+    `dict_probe_cold::${r.slug}`,
+    `dict_decode_matched::${r.slug}`,
+  ]})),
+};
 
 // ---- generic KPI + data table (used by both tabs) ----
 function renderKpis(hostSel, tiles){
@@ -748,6 +645,19 @@ function renderKpis(hostSel, tiles){
     el.innerHTML = `<span class="label">${t.label}</span><span class="value mono">${t.value}</span><span class="sub mono">${t.sub}</span>`;
     host.appendChild(el);
   }
+}
+
+// How many rows each query pattern actually matched. Selectivity is a property
+// of the dataset's term cardinality rather than a fixed dimension, so a timing
+// is only interpretable next to the number of rows it touched.
+function renderMatchedRows(matched){
+  const host = document.getElementById("js-matched-rows");
+  if (!host) return;
+  const entries = Object.entries(matched || {});
+  if (!entries.length){ host.textContent = ""; return; }
+  host.innerHTML = "Rows matched per pattern: " + entries
+    .map(([pat, n]) => `<strong>${pat}</strong> ${Number(n).toLocaleString()}`)
+    .join(" · ");
 }
 
 function makeTable(data, tableSel, filterSel, countSel){
@@ -808,14 +718,17 @@ function makeTable(data, tableSel, filterSel, countSel){
 // ---- Rust tab ----
 function renderRust(){
   const writeHost = document.getElementById("write-panels");
-  writePanels.forEach(cfg => renderSimplePanel(writeHost, cfg, rustById));
+  renderMatrixPanel(writeHost, serializePanel, rustById);
 
   const queryHost = document.getElementById("query-panels");
-  queryPanels.forEach(cfg => renderPatternPanel(queryHost, cfg, rustById, RUST_PATTERNS));
-  renderSimplePanel(queryHost, chainedPanel, rustById);
+  [matchMatrixPanel, lazyMatchMatrixPanel, chainedPanel]
+    .forEach(cfg => renderMatrixPanel(queryHost, cfg, rustById));
 
   const decodeHost = document.getElementById("decode-panels");
-  decodePanels.forEach(cfg => renderSimplePanel(decodeHost, cfg, rustById));
+  renderMatrixPanel(decodeHost, decodeLifecyclePanel, rustById);
+
+  const dictHost = document.getElementById("dict-panels");
+  renderMatrixPanel(dictHost, dictResidencyPanel, rustById);
 
   // serialize interaction effects, folded into the write section as a table
   const panel = document.createElement("div");
@@ -849,16 +762,38 @@ function renderRust(){
   panel.appendChild(itable);
   writeHost.appendChild(panel);
 
-  const withMedian = RUST_DATA.filter(d => d.median_ns != null);
-  const fastest = withMedian.reduce((a,b) => a.median_ns < b.median_ns ? a : b);
-  const slowest = withMedian.reduce((a,b) => a.median_ns > b.median_ns ? a : b);
-  renderKpis("#kpi-row", [
-    { label:"Dataset size", value:"100,000", sub:"generated quads" },
+  // Read-side headline KPIs, computed from the run itself: the fastest
+  // fully-selective lookup across the whole match matrix, the best full-scan
+  // throughput, and the cost of opening a file — next to the context tiles.
+  const RUST_QUADS = 100000;
+  let bestS = null;
+  for (const [ixLabel, ix] of MATCH_INDEXES){
+    for (const v of MATCH_LAYOUTS){
+      const rec = rustById.get(`${v.group(ix)}::S`);
+      if (rec && (!bestS || rec.median_ns < bestS.rec.median_ns))
+        bestS = { rec, desc:`${v.labels[0]} · ${v.labels[1]} · ${ixLabel.toLowerCase()}` };
+    }
+  }
+  const decodeBest = ["default_file","typed_object_file","dictionary_file",
+    "default_in_memory","typed_object_in_memory","dictionary_in_memory"]
+    .map(v => ({ v, rec: rustById.get(`decode_all::${v}`) }))
+    .filter(d => d.rec)
+    .sort((a,b) => a.rec.median_ns - b.rec.median_ns)[0];
+  const openRec = rustById.get("open_file::default");
+
+  const tiles = [
+    { label:"Dataset size", value:RUST_QUADS.toLocaleString(), sub:"generated quads" },
     { label:"Benchmarks", value:String(RUST_DATA.length), sub:"leaf measurements" },
     { label:"Samples / benchmark", value:String(RUST_DATA[0].samples), sub:"iterations" },
-    { label:"Fastest op", value:fastest.median, sub:fastest.id },
-    { label:"Slowest op", value:slowest.median, sub:slowest.id },
-  ]);
+  ];
+  if (bestS) tiles.push({ label:"Fastest point lookup", value:bestS.rec.median,
+    sub:`S — ${bestS.desc}` });
+  if (decodeBest) tiles.push({ label:"Full-scan throughput",
+    value:(RUST_QUADS / (decodeBest.rec.median_ns/1e9) / 1e6).toFixed(1) + "M quads/s",
+    sub:`decode_all — ${decodeBest.v} (${decodeBest.rec.median})` });
+  if (openRec) tiles.push({ label:"File open", value:openRec.median,
+    sub:"footer-only read — Default layout" });
+  renderKpis("#kpi-row", tiles);
   makeTable(RUST_DATA, "#data-table", "#table-filter", "#table-count");
   document.getElementById("provenance").textContent = RUST_PROVENANCE;
 }
@@ -897,73 +832,62 @@ function renderJs(){
     return;
   }
 
-  // Ingest — every adapter
-  renderSimplePanel(document.getElementById("js-ingest-panels"), {
-    title:"Ingest (bulk build)", note:"Time to build a queryable store from the generated triples.",
-    series: JS_ADAPTERS.map((a,i) => ({ label:a.label, color:COLORS[i%COLORS.length], id:`ingest::${a.slug}` })),
-    wide: true,
+  // Ingest — every adapter, fastest first
+  renderMatrixPanel(document.getElementById("js-ingest-panels"), {
+    title:"Ingest (bulk build)",
+    note:"Time to build a queryable store from the generated triples, fastest first. Green = fastest store; the multiplier is the slowdown vs it.",
+    rowHeaders:["Store"], columns:["Ingest"], sortByColumn:0,
+    rows: JS_ADAPTERS.map(a => ({ labels:[a.label], ids:[`ingest::${a.slug}`] })),
   }, jsById);
 
   // Query — cross-library, per routing shape
-  renderPatternPanel(document.getElementById("js-query-panels"), {
+  renderMatrixPanel(document.getElementById("js-query-panels"), {
     title:"Cross-library match, by routing shape",
-    note:"Six Vortex build variants vs rdf-stores (both index configs) vs oxigraph.",
-    series: CROSS_LIB_SERIES.map((a,i) => ({ label:a.label, color:COLORS[i%COLORS.length], group:a.slug })),
-    wide: true, cols: 3, logScale: true,
-  }, jsById, JS_PATTERNS);
+    note:"Six Vortex build variants vs rdf-stores (both index configs) vs oxigraph. Green = fastest store in each pattern column; the grey multiplier is the slowdown vs that column's best.",
+    wide:true, rowHeaders:["Store"], columns:JS_PATTERNS,
+    rows: CROSS_LIB_SERIES.map(a => ({ labels:[a.label], ids: patternIds(a.slug, JS_PATTERNS),
+      break: a.slug === "rdfstores_default" })),
+  }, jsById);
 
-  // Mutations — add & delete
-  const mutHost = document.getElementById("js-mut-panels");
-  renderSimplePanel(mutHost, {
-    title:"Add — incremental", note:"Per-quad additions of a fixed batch to an empty store, plus Vortex's recommended addQuads batch path.",
-    series:[
-      {label:"Vortex addQuad (per-quad)", color:COLORS[0], id:"add::vortex"},
-      {label:"Vortex addQuads (batch)",   color:COLORS[1], id:"add_batch::vortex"},
-      {label:"rdf-stores",                color:COLORS[2], id:"add::rdfstores_default"},
-      {label:"oxigraph",                  color:COLORS[4], id:"add::oxigraph"},
+  // Mutations — add & delete in one table
+  renderMatrixPanel(document.getElementById("js-mut-panels"), {
+    title:"Mutations: add & delete",
+    note:"Per-quad add/delete of a fixed batch, plus Vortex's recommended addQuads batch path (batch has no per-quad equivalent in the other stores).",
+    rowHeaders:["Store"], columns:["Add (per-quad)","Add (batch)","Delete (per-quad)"],
+    rows:[
+      {labels:["Vortex"],     ids:["add::vortex","add_batch::vortex","delete::vortex"]},
+      {labels:["rdf-stores"], ids:["add::rdfstores_default",null,"delete::rdfstores_default"], break:true},
+      {labels:["oxigraph"],   ids:["add::oxigraph",null,"delete::oxigraph"]},
     ],
-    logScale: true,
-  }, jsById);
-  renderSimplePanel(mutHost, {
-    title:"Delete — per-quad", note:"Per-quad deletions of a fixed batch from a populated store.",
-    series:[
-      {label:"Vortex",     color:COLORS[0], id:"delete::vortex"},
-      {label:"rdf-stores", color:COLORS[2], id:"delete::rdfstores_default"},
-      {label:"oxigraph",   color:COLORS[4], id:"delete::oxigraph"},
-    ],
-    logScale: true,
   }, jsById);
 
-  // Vortex variants — star design
-  const varHost = document.getElementById("js-variant-panels");
-  renderPatternPanel(varHost, {
-    title:"Vortex variants, match by routing shape",
-    note:"Every reachable JS build variant across the query shapes.",
-    series: JS_VORTEX.map((a,i) => ({ label:a.label, color:COLORS[i%COLORS.length], group:a.slug })),
-    wide: true, cols: 3, logScale: true,
-  }, jsById, JS_PATTERNS);
-  renderSimplePanel(varHost, {
-    title:"Vortex variants, ingest", note:"Bulk build time per Vortex build variant.",
-    series: JS_VORTEX.map((a,i) => ({ label:a.label, color:COLORS[i%COLORS.length], id:`ingest::${a.slug}` })),
-    logScale: true,
+  // Vortex variants — ingest + match, one table
+  renderMatrixPanel(document.getElementById("js-variant-panels"), {
+    title:"Vortex variants: ingest + match by routing shape",
+    note:"Every reachable JS build variant. The Ingest column is the bulk build; the remaining columns are the query shapes.",
+    wide:true, rowHeaders:["Variant"], columns:["Ingest", ...JS_PATTERNS],
+    rows: JS_VORTEX.map(a => ({ labels:[a.label],
+      ids:[`ingest::${a.slug}`, ...patternIds(a.slug, JS_PATTERNS)] })),
   }, jsById);
 
-  // Memory — peak RSS per adapter's own process (see JS_MEMORY / jsMemById above)
+  // Memory — peak RSS per adapter's own process (see JS_MEMORY / jsMemById
+  // above), one table per phase, smallest footprint first
   const memHost = document.getElementById("js-memory-panels");
-  renderSimplePanel(memHost, {
-    title:"Query phase — peak RSS", note:"Build (triples + quads) + query + ingest, all in one process per adapter.",
-    series: JS_ADAPTERS.map((a,i) => ({ label:a.label, color:COLORS[i%COLORS.length], id:`${a.slug}::query` })),
-    deltaWord: "more",
+  renderMatrixPanel(memHost, {
+    title:"Query phase — peak RSS",
+    note:"Peak resident set size of each adapter's own process: build (triples + quads) + query + ingest, all in one process. Smallest first; green = smallest footprint, the multiplier is vs it.",
+    rowHeaders:["Store"], columns:["Peak RSS"], sortByColumn:0,
+    rows: JS_ADAPTERS.map(a => ({ labels:[a.label], ids:[`${a.slug}::query`] })),
   }, jsMemById);
-  const MUT_LABELS = [
-    { slug:"vortex", label:"Vortex" },
-    { slug:"rdfstores_default", label:"rdf-stores (default)" },
-    { slug:"oxigraph", label:"oxigraph" },
-  ];
-  renderSimplePanel(memHost, {
-    title:"Mutation phase — peak RSS", note:"Add (batch of 10,000) + delete, in one process per adapter.",
-    series: MUT_LABELS.map((a,i) => ({ label:a.label, color:COLORS[i%COLORS.length], id:`${a.slug}::mutate` })),
-    deltaWord: "more",
+  renderMatrixPanel(memHost, {
+    title:"Mutation phase — peak RSS",
+    note:"Add (batch of 10,000) + delete, in one process per adapter — the mutable-store processes only. Smallest first.",
+    rowHeaders:["Store"], columns:["Peak RSS"], sortByColumn:0,
+    rows:[
+      {labels:["Vortex (mutable store)"], ids:["vortex::mutate"]},
+      {labels:["rdf-stores (default)"],   ids:["rdfstores_default::mutate"]},
+      {labels:["oxigraph"],               ids:["oxigraph::mutate"]},
+    ],
   }, jsMemById);
 
   renderKpis("#js-kpi-row", [
@@ -971,8 +895,13 @@ function renderJs(){
     { label:"Vortex variants", value:String(JS_VORTEX.length), sub:"builder × layout × index" },
     { label:"Benchmarks", value:String(JS_DATA.length), sub:"leaf measurements" },
     { label:"Quads", value:(JS_CONFIG.triplesCount||0).toLocaleString(), sub:(JS_CONFIG.quadsCount||0).toLocaleString()+" named-graph quads" },
+    // Distinct terms is the dimension this dataset exists to exercise; without
+    // it a reader cannot tell whether a store's dictionary was under any load.
+    { label:"Distinct terms", value:(JS_CONFIG.cardinality?.triples?.terms||0).toLocaleString(),
+      sub:(JS_CONFIG.cardinality?.quads?.terms||0).toLocaleString()+" in the quads dataset" },
     { label:"Iterations", value:`${JS_CONFIG.queryIterations??"?"} / ${JS_CONFIG.heavyIterations??"?"}`, sub:"query / ingest·mutate" },
   ]);
+  renderMatchedRows(JS_CONFIG.matchedRows);
   makeTable(JS_DATA, "#js-data-table", "#js-table-filter", "#js-table-count");
   document.getElementById("js-provenance").textContent = JS_PROVENANCE;
 }

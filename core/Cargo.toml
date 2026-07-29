@@ -25,7 +25,6 @@ vortex-layout.workspace = true
 vortex-file.workspace = true
 vortex-scan.workspace = true
 vortex-buffer.workspace = true
-vortex-btrblocks = { workspace = true }
 
 tokio.workspace = true
 
@@ -66,3 +65,12 @@ tokio = { workspace = true, features = ["time", "rt-multi-thread"] }
 [[bench]]
 name = "benchmark"
 harness = false
+required-features = ["file-io"]
+
+# Local-only lazy-match matrix (match_pattern without materialization).
+# CodSpeed CI runs `cargo codspeed run --bench benchmark`, so this target is
+# never uploaded; it feeds the dashboard's lazy-match table.
+[[bench]]
+name = "match_lazy"
+harness = false
+required-features = ["file-io"]
