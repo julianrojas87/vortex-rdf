@@ -1783,6 +1783,7 @@ where
         temp_dir.path(),
     )?;
     drop(string_runs);
+    let subject_range_runs = id_runs.clone();
     let arrays = merge_sorted_id_runs_to_array_stream(id_runs, config.ordering, row_group_size)?;
     let dtype = empty_spog_array()?.dtype().clone();
     let stream = ArrayStreamAdapter::new(dtype, arrays);
@@ -1860,12 +1861,37 @@ where
         // FUTURE(performance): add a sparse lexical fence/search component after
         // measuring zone-map pruning, range requests, and bytes read. The sorted
         // dictionary remains the correctness-preserving baseline.
+        let subject_ranges_source = Arc::new(NativeSubjectRangesSource::new(
+            &subject_range_runs,
+            config.dict_row_group_size,
+        )?);
+        let subject_ranges_strategy: Arc<dyn LayoutStrategy> = WriteStrategyBuilder::default()
+            .with_row_block_size(config.dict_row_group_size.max(1))
+            .with_btrblocks_builder(BtrBlocksCompressorBuilder::default().with_compact())
+            .build();
+        let subject_ranges_component = NativeComponentWrite::new(
+            StoreComponentDescriptor {
+                name: "index.subject-ranges".into(),
+                role: StoreComponentRole::Index,
+                implementation: "native-subject-ranges-v1-compact".into(),
+                version: 1,
+                required: false,
+                dtype: subject_ranges_source.dtype().clone(),
+            },
+            subject_ranges_source,
+            subject_ranges_strategy,
+        )
+        .map_err(VortexRdfError::from)?;
         let summary = crate::io::vortex_rdf_store_layout::write_native_rdf_store(
             &NATIVE_FILE_SESSION,
             &mut writer,
             stream,
             inner.build(),
-            vec![id_to_term_component, term_to_id_component],
+            vec![
+                id_to_term_component,
+                term_to_id_component,
+                subject_ranges_component,
+            ],
         )
         .await
         .map_err(VortexRdfError::from)?;
@@ -1889,17 +1915,18 @@ where
         let root = reopened.footer().layout();
         if root.encoding_id().as_ref()
             != crate::io::vortex_rdf_store_layout::VORTEX_RDF_STORE_LAYOUT_ID
-            || root.nchildren() != 3
+            || root.nchildren() != 4
             || root.child_names().collect::<Vec<_>>()
                 != vec![
                     Arc::<str>::from("quad-source"),
                     Arc::<str>::from("dictionary.id-to-term"),
                     Arc::<str>::from("dictionary.term-to-id"),
+                    Arc::<str>::from("index.subject-ranges"),
                 ]
             || root.row_count() != summary.row_count()
         {
             return Err(VortexRdfError::Deserialization(
-                "native RDF store QuadSource/bidirectional-dictionary validation failed".into(),
+                "native RDF store QuadSource/dictionaries/subject-index validation failed".into(),
             ));
         }
         reopened.scan().map_err(VortexRdfError::from)?;
@@ -7188,6 +7215,138 @@ impl NativeComponentSource for PairRunDictionarySource {
 
     // FUTURE(performance): report file-reader buffers once run-backed sources
     // expose explicit buffered-memory accounting.
+}
+
+// VORTEX_RDF_NATIVE_SUBJECT_RANGES_COMPONENT_V1
+fn build_native_subject_range_array(
+    subject_ids: Vec<u32>,
+    row_starts: Vec<u64>,
+    row_ends: Vec<u64>,
+) -> Result<ArrayRef> {
+    StructArray::from_fields(&[
+        (
+            "subject_id",
+            PrimitiveArray::from_iter(subject_ids).into_array(),
+        ),
+        (
+            "row_start",
+            PrimitiveArray::from_iter(row_starts).into_array(),
+        ),
+        ("row_end", PrimitiveArray::from_iter(row_ends).into_array()),
+    ])
+    .map_err(VortexRdfError::Vortex)
+    .map(|array| array.into_array())
+}
+
+fn empty_native_subject_range_array() -> Result<ArrayRef> {
+    build_native_subject_range_array(Vec::new(), Vec::new(), Vec::new())
+}
+
+fn native_subject_range_stream(
+    run_paths: Vec<PathBuf>,
+    batch_size: usize,
+) -> Result<impl Stream<Item = VortexResult<ArrayRef>> + Send> {
+    let batch_size = batch_size.max(1);
+    Ok(async_stream::try_stream! {
+        let mut readers = Vec::with_capacity(run_paths.len());
+        for path in &run_paths {
+            readers.push(NativeIdRunReader::new(path).map_err(rdf_err_to_vortex_err)?);
+        }
+        let mut heap = BinaryHeap::new();
+        for run_idx in 0..readers.len() {
+            if let Some(triple) = readers[run_idx].read_one().map_err(rdf_err_to_vortex_err)? {
+                heap.push(IdRunHeapItem { triple, run_idx, ordering: TripleOrdering::SPO });
+            }
+        }
+        let mut current_subject = None;
+        let mut current_start = 0u64;
+        let mut row = 0u64;
+        let mut subject_ids = Vec::with_capacity(batch_size);
+        let mut row_starts = Vec::with_capacity(batch_size);
+        let mut row_ends = Vec::with_capacity(batch_size);
+        while let Some(item) = heap.pop() {
+            let run_idx = item.run_idx;
+            let subject = item.triple.s;
+            match current_subject {
+                None => {
+                    current_subject = Some(subject);
+                    current_start = row;
+                }
+                Some(previous) if previous != subject => {
+                    if subject < previous {
+                        Err(vortex_error::vortex_err!("SPO merge is not ordered by subject ID"))?;
+                    }
+                    subject_ids.push(previous);
+                    row_starts.push(current_start);
+                    row_ends.push(row);
+                    current_subject = Some(subject);
+                    current_start = row;
+                }
+                Some(_) => {}
+            }
+            row += 1;
+            if let Some(next) = readers[run_idx].read_one().map_err(rdf_err_to_vortex_err)? {
+                heap.push(IdRunHeapItem {
+                    triple: next,
+                    run_idx,
+                    ordering: TripleOrdering::SPO,
+                });
+            }
+            if subject_ids.len() >= batch_size {
+                yield build_native_subject_range_array(
+                    std::mem::take(&mut subject_ids),
+                    std::mem::take(&mut row_starts),
+                    std::mem::take(&mut row_ends),
+                ).map_err(rdf_err_to_vortex_err)?;
+                subject_ids = Vec::with_capacity(batch_size);
+                row_starts = Vec::with_capacity(batch_size);
+                row_ends = Vec::with_capacity(batch_size);
+            }
+        }
+        if let Some(subject) = current_subject {
+            subject_ids.push(subject);
+            row_starts.push(current_start);
+            row_ends.push(row);
+        }
+        if !subject_ids.is_empty() {
+            yield build_native_subject_range_array(subject_ids, row_starts, row_ends)
+                .map_err(rdf_err_to_vortex_err)?;
+        } else if readers.is_empty() {
+            yield empty_native_subject_range_array().map_err(rdf_err_to_vortex_err)?;
+        }
+    })
+}
+
+#[derive(Clone)]
+struct NativeSubjectRangesSource {
+    run_paths: Arc<[PathBuf]>,
+    batch_size: usize,
+    dtype: vortex_array::dtype::DType,
+}
+
+impl NativeSubjectRangesSource {
+    fn new(run_paths: &[PathBuf], batch_size: usize) -> Result<Self> {
+        Ok(Self {
+            run_paths: run_paths.to_vec().into(),
+            batch_size: batch_size.max(1),
+            dtype: empty_native_subject_range_array()?.dtype().clone(),
+        })
+    }
+}
+
+impl NativeComponentSource for NativeSubjectRangesSource {
+    fn dtype(&self) -> &vortex_array::dtype::DType {
+        &self.dtype
+    }
+
+    fn open(&self) -> VortexResult<vortex_array::stream::SendableArrayStream> {
+        let stream = native_subject_range_stream(self.run_paths.to_vec(), self.batch_size)
+            .map_err(rdf_err_to_vortex_err)?;
+        Ok(ArrayStreamExt::boxed(ArrayStreamAdapter::new(
+            self.dtype.clone(),
+            stream,
+        )))
+    }
 }
 
 async fn write_native_dictionary_component(
