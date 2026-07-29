@@ -3155,6 +3155,123 @@ impl NativeRdfStoreFile {
         )))
     }
 
+    // VORTEX_RDF_NATIVE_DICTIONARY_LOOKUPS_V1
+    /// Resolve one lexical RDF term through the native lexically sorted dictionary.
+    pub async fn lookup_term_id(&self, term: &str) -> Result<Option<u32>> {
+        let scan = self
+            .component_scan("dictionary.term-to-id")?
+            .ok_or_else(|| {
+                VortexRdfError::Deserialization(
+                    "native RDF store is missing required dictionary.term-to-id component".into(),
+                )
+            })?;
+        let result = scan
+            .with_filter(eq(col("term"), lit(term.to_owned())))
+            .with_projection(vortex_array::expr::select(
+                ["id"],
+                vortex_array::expr::root(),
+            ))
+            .into_array_stream()
+            .map_err(VortexRdfError::from)?
+            .read_all()
+            .await
+            .map_err(VortexRdfError::from)?;
+        match result.len() {
+            0 => Ok(None),
+            1 => {
+                let ids = extract_projected_u32_column(&result, "id")?;
+                if ids.len() != 1 {
+                    return Err(VortexRdfError::Deserialization(format!(
+                        "dictionary.term-to-id returned {} IDs for one matching row",
+                        ids.len()
+                    )));
+                }
+                Ok(Some(ids[0]))
+            }
+            rows => Err(VortexRdfError::Deserialization(format!(
+                "dictionary.term-to-id returned {rows} rows for one lexical term"
+            ))),
+        }
+    }
+
+    /// Resolve IDs through the native ID-ordered dictionary.
+    ///
+    /// Row selection uses the persisted `row number == ID` invariant and then
+    /// validates every returned ID, preventing silent positional corruption.
+    pub async fn lookup_terms_by_ids(&self, ids: &[u32]) -> Result<HashMap<u32, String>> {
+        if ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let layout = self
+            .component_layout("dictionary.id-to-term")?
+            .ok_or_else(|| {
+                VortexRdfError::Deserialization(
+                    "native RDF store is missing required dictionary.id-to-term component".into(),
+                )
+            })?;
+        let mut requested = ids.to_vec();
+        requested.sort_unstable();
+        requested.dedup();
+        let row_count = layout.row_count();
+        if let Some(invalid) = requested
+            .iter()
+            .copied()
+            .find(|id| u64::from(*id) >= row_count)
+        {
+            return Err(VortexRdfError::InvalidOperation(format!(
+                "dictionary ID {invalid} is outside dictionary row range 0..{row_count}"
+            )));
+        }
+        let scan = self
+            .component_scan("dictionary.id-to-term")?
+            .ok_or_else(|| {
+                VortexRdfError::Deserialization(
+                    "native RDF store is missing required dictionary.id-to-term component".into(),
+                )
+            })?;
+        let result = scan
+            .with_row_indices(Buffer::from(
+                requested
+                    .iter()
+                    .map(|id| u64::from(*id))
+                    .collect::<Vec<_>>(),
+            ))
+            .with_projection(vortex_array::expr::select(
+                ["id", "term"],
+                vortex_array::expr::root(),
+            ))
+            .into_array_stream()
+            .map_err(VortexRdfError::from)?
+            .read_all()
+            .await
+            .map_err(VortexRdfError::from)?;
+        let loaded_ids = extract_projected_u32_column(&result, "id")?;
+        let terms = extract_projected_utf8_column(&result, "term")?;
+        if loaded_ids.len() != requested.len() || terms.len() != requested.len() {
+            return Err(VortexRdfError::Deserialization(format!(
+                "dictionary.id-to-term returned ids={}, terms={}, requested={}",
+                loaded_ids.len(),
+                terms.len(),
+                requested.len()
+            )));
+        }
+        let mut resolved = HashMap::with_capacity(requested.len());
+        for ((expected, actual), term) in requested.iter().zip(loaded_ids).zip(terms) {
+            if *expected != actual {
+                return Err(VortexRdfError::Deserialization(format!(
+                    "dictionary.id-to-term positional invariant failed: requested ID {}, row contained ID {}",
+                    expected, actual
+                )));
+            }
+            if resolved.insert(actual, term).is_some() {
+                return Err(VortexRdfError::Deserialization(format!(
+                    "dictionary.id-to-term returned duplicate ID {actual}"
+                )));
+            }
+        }
+        Ok(resolved)
+    }
+
     /// Render stable logical names even when a generic explorer displays
     /// unregistered custom-layout children positionally as 0, 1, 2, ...
     pub fn named_layout_tree(&self) -> Result<String> {
