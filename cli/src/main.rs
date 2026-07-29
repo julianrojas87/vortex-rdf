@@ -240,8 +240,9 @@ enum StoreLayout {
 
     #[value(alias = "cottas-native")]
     CottasNativeIds,
-    /// Experimental native v10 root with a QuadSource child and no v9 subfiles.
-    CottasNativeIdsV10,
+    /// Native RDF store layout. The old cottas-native-ids-v10 name is retained as an alias.
+    #[value(name = "native-rdf-store", aliases = ["native-rdf-store-v10", "cottas-native-ids-v10"])]
+    NativeRdfStore,
     CottasNativeStrings,
 }
 
@@ -362,10 +363,10 @@ async fn main() -> Result<()> {
                 return Ok(());
             }
 
-            if storage_layout == StoreLayout::CottasNativeIdsV10 {
+            if storage_layout == StoreLayout::NativeRdfStore {
                 if index_type != IndexType::SimpleDictionary {
                     return Err(anyhow!(
-                        "cottas-native-ids-v10 currently supports only --index-type simple-dictionary"
+                        "native-rdf-store currently supports only --index-type simple-dictionary"
                     ));
                 }
                 let config = CottasNativeConfig {
@@ -379,9 +380,9 @@ async fn main() -> Result<()> {
                     config,
                 )
                 .await
-                .context("Failed to serialize native v10 QuadSource artifact")?;
+                .context("Failed to serialize native RDF store artifact")?;
                 info!(
-                    "Serialized experimental native v10 QuadSource in {:?}",
+                    "Serialized native RDF store with streamed ID dictionary in {:?}",
                     start.elapsed()
                 );
                 return Ok(());
@@ -447,7 +448,7 @@ async fn main() -> Result<()> {
                 },
 
                 StoreLayout::CottasNativeIds => unreachable!("handled above"),
-                StoreLayout::CottasNativeIdsV10 => unreachable!("handled above"),
+                StoreLayout::NativeRdfStore => unreachable!("handled above"),
                 StoreLayout::CottasNativeStrings => unreachable!("handled above"),
             };
 
@@ -560,7 +561,7 @@ async fn main() -> Result<()> {
                                 .context("Failed to deserialize from Vortex")?;
                         }
 
-                        (_, StoreLayout::CottasNativeIds | StoreLayout::CottasNativeIdsV10) => {
+                        (_, StoreLayout::CottasNativeIds | StoreLayout::NativeRdfStore) => {
                             return Err(anyhow!(
                                 "cottas-native deserialization is not handled by generic VortexRdfStore"
                             ));
@@ -629,7 +630,7 @@ async fn main() -> Result<()> {
                                 .context("Failed to deserialize from Vortex")?;
                         }
 
-                        (_, StoreLayout::CottasNativeIds | StoreLayout::CottasNativeIdsV10) => {
+                        (_, StoreLayout::CottasNativeIds | StoreLayout::NativeRdfStore) => {
                             return Err(anyhow!(
                                 "cottas-native deserialization from stdin is not supported here"
                             ));
@@ -995,7 +996,7 @@ async fn main() -> Result<()> {
                         }
                     },
                     StoreLayout::CottasNativeIds => unreachable!("handled in Serialize arm"),
-                    StoreLayout::CottasNativeIdsV10 => unreachable!("handled in Serialize arm"),
+                    StoreLayout::NativeRdfStore => unreachable!("handled in Serialize arm"),
                     StoreLayout::CottasNativeStrings => unreachable!("handled above"),
                 };
                 debug!("Vortex index created in {:?}", load_start.elapsed());
@@ -1129,7 +1130,7 @@ async fn main() -> Result<()> {
                 (IndexType::ChainedHash, StoreLayout::CottasNativeIds) => {
                     unreachable!("handled above");
                 }
-                (_, StoreLayout::CottasNativeIdsV10) => {
+                (_, StoreLayout::NativeRdfStore) => {
                     unreachable!("handled above");
                 }
                 (_, StoreLayout::CottasNativeStrings) => {

@@ -636,6 +636,28 @@ pub fn vortex_rdf_store_quad_source(layout: &VortexRdfStoreLayout) -> VortexResu
 }
 
 // VORTEX_RDF_NATIVE_STORE_QUAD_SOURCE_ROUNDTRIP_V1
+/// Write a native RDF store with independently streamed auxiliary components.
+pub async fn write_native_rdf_store<W, S>(
+    session: &VortexSession,
+    writer: W,
+    stream: S,
+    quad_source_strategy: Arc<dyn LayoutStrategy>,
+    components: Vec<NativeComponentWrite>,
+) -> VortexResult<vortex_file::WriteSummary>
+where
+    W: VortexWrite + Unpin,
+    S: ArrayStream + Send + 'static,
+{
+    register_vortex_rdf_store_layout(session);
+    let strategy =
+        VortexRdfStoreLayoutStrategy::new(quad_source_strategy).with_components(components)?;
+    session
+        .write_options()
+        .with_strategy(Arc::new(strategy))
+        .write(writer, stream)
+        .await
+}
+
 /// Write a QuadSource-only v10 artifact with a native Vortex-RDF root.
 pub async fn write_vortex_rdf_quad_source_v10<W, S>(
     session: &VortexSession,
@@ -647,14 +669,7 @@ where
     W: VortexWrite + Unpin,
     S: ArrayStream + Send + 'static,
 {
-    register_vortex_rdf_store_layout(session);
-    session
-        .write_options()
-        .with_strategy(Arc::new(VortexRdfStoreLayoutStrategy::new(
-            quad_source_strategy,
-        )))
-        .write(writer, stream)
-        .await
+    write_native_rdf_store(session, writer, stream, quad_source_strategy, Vec::new()).await
 }
 
 /// Validate the native root and delegated scan of an in-memory v10 artifact.

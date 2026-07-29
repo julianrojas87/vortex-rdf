@@ -18,6 +18,9 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use vortex::VortexSessionDefault;
 use vortex_error::{VortexError, VortexResult};
 
+use crate::io::vortex_rdf_store_layout::{
+    NativeComponentSource, NativeComponentWrite, StoreComponentDescriptor, StoreComponentRole,
+};
 use std::collections::{BTreeSet, BinaryHeap, HashMap, HashSet};
 use vortex_array::VortexSessionExecute;
 use vortex_array::arrays::chunked::ChunkedArrayExt;
@@ -32,6 +35,7 @@ use vortex_file::{OpenOptionsSessionExt, WriteOptionsSessionExt, WriteStrategyBu
 use vortex_io::session::RuntimeSessionExt;
 use vortex_io::std_file::FileReadAt;
 use vortex_io::{CoalesceConfig, VortexReadAt, VortexWrite};
+use vortex_layout::LayoutStrategy;
 use vortex_layout::segments::SegmentId;
 use vortex_session::VortexSession;
 
@@ -1760,8 +1764,8 @@ where
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(row_group_size.saturating_mul(8).max(1_000_000));
-    let temp_dir = tempfile::tempdir()
-        .map_err(|error| VortexRdfError::Serialization(error.to_string()))?;
+    let temp_dir =
+        tempfile::tempdir().map_err(|error| VortexRdfError::Serialization(error.to_string()))?;
     let string_runs = spill_sorted_native_id_string_runs(
         quad_stream,
         config.ordering,
@@ -1770,7 +1774,7 @@ where
     )
     .await?;
     let mut dictionary = Dict::new();
-    let _pair_runs =
+    let pair_runs =
         build_dictionary_and_pair_runs::<Dict>(&mut dictionary, &string_runs, temp_dir.path())?;
     let id_runs = encode_string_runs_to_id_runs::<Dict>(
         &dictionary,
@@ -1779,18 +1783,15 @@ where
         temp_dir.path(),
     )?;
     drop(string_runs);
-    let arrays = merge_sorted_id_runs_to_array_stream(
-        id_runs,
-        config.ordering,
-        row_group_size,
-    )?;
+    let arrays = merge_sorted_id_runs_to_array_stream(id_runs, config.ordering, row_group_size)?;
     let dtype = empty_spog_array()?.dtype().clone();
     let stream = ArrayStreamAdapter::new(dtype, arrays);
     let inner = WriteStrategyBuilder::default().with_row_block_size(row_group_size);
     let inner = match config.compression_profile {
         CottasVortexCompressionProfile::Balanced => inner,
-        CottasVortexCompressionProfile::Compact => inner
-            .with_btrblocks_builder(BtrBlocksCompressorBuilder::default().with_compact()),
+        CottasVortexCompressionProfile::Compact => {
+            inner.with_btrblocks_builder(BtrBlocksCompressorBuilder::default().with_compact())
+        }
     };
     let staging_path = output_path.with_file_name(format!(
         ".{}.v10-writing.{}.tmp",
@@ -1802,18 +1803,41 @@ where
     ));
     if staging_path.exists() {
         return Err(VortexRdfError::InvalidOperation(format!(
-            "native v10 staging path already exists: {:?}", staging_path
+            "native v10 staging path already exists: {:?}",
+            staging_path
         )));
     }
     let result: Result<()> = async {
         let mut writer = tokio::fs::File::create(&staging_path)
             .await
             .map_err(|error| VortexRdfError::Serialization(error.to_string()))?;
-        let summary = crate::io::vortex_rdf_store_layout::write_vortex_rdf_quad_source_v10(
+        let dictionary_source = Arc::new(PairRunDictionarySource::new(
+            &pair_runs.id_run_paths,
+            PairRunOrder::Id,
+            config.dict_row_group_size,
+        )?);
+        let dictionary_strategy: Arc<dyn LayoutStrategy> = WriteStrategyBuilder::default()
+            .with_row_block_size(config.dict_row_group_size.max(1))
+            .build();
+        let dictionary_component = NativeComponentWrite::new(
+            StoreComponentDescriptor {
+                name: "dictionary.id-to-term".into(),
+                role: StoreComponentRole::Dictionary,
+                implementation: "native-id-row-v1-balanced".into(),
+                version: 1,
+                required: true,
+                dtype: dictionary_source.dtype().clone(),
+            },
+            dictionary_source,
+            dictionary_strategy,
+        )
+        .map_err(VortexRdfError::from)?;
+        let summary = crate::io::vortex_rdf_store_layout::write_native_rdf_store(
             &NATIVE_FILE_SESSION,
             &mut writer,
             stream,
             inner.build(),
+            vec![dictionary_component],
         )
         .await
         .map_err(VortexRdfError::from)?;
@@ -1837,12 +1861,16 @@ where
         let root = reopened.footer().layout();
         if root.encoding_id().as_ref()
             != crate::io::vortex_rdf_store_layout::VORTEX_RDF_STORE_LAYOUT_ID
-            || root.nchildren() != 1
-            || root.child_names().next().as_deref() != Some("quad-source")
+            || root.nchildren() != 2
+            || root.child_names().collect::<Vec<_>>()
+                != vec![
+                    Arc::<str>::from("quad-source"),
+                    Arc::<str>::from("dictionary.id-to-term"),
+                ]
             || root.row_count() != summary.row_count()
         {
             return Err(VortexRdfError::Deserialization(
-                "native v10 QuadSource validation failed".into(),
+                "native RDF store QuadSource/dictionary validation failed".into(),
             ));
         }
         reopened.scan().map_err(VortexRdfError::from)?;
@@ -6664,6 +6692,45 @@ fn dictionary_pair_stream(
             yield empty_native_dictionary_array().map_err(rdf_err_to_vortex_err)?;
         }
     })
+}
+
+// VORTEX_RDF_NATIVE_ID_TO_TERM_COMPONENT_V1
+#[derive(Clone)]
+struct PairRunDictionarySource {
+    run_paths: Arc<[PathBuf]>,
+    order: PairRunOrder,
+    row_group_size: usize,
+    dtype: vortex_array::dtype::DType,
+}
+
+impl PairRunDictionarySource {
+    fn new(run_paths: &[PathBuf], order: PairRunOrder, row_group_size: usize) -> Result<Self> {
+        Ok(Self {
+            run_paths: run_paths.to_vec().into(),
+            order,
+            row_group_size: row_group_size.max(1),
+            dtype: empty_native_dictionary_array()?.dtype().clone(),
+        })
+    }
+}
+
+impl NativeComponentSource for PairRunDictionarySource {
+    fn dtype(&self) -> &vortex_array::dtype::DType {
+        &self.dtype
+    }
+
+    fn open(&self) -> VortexResult<vortex_array::stream::SendableArrayStream> {
+        let stream =
+            dictionary_pair_stream(self.run_paths.to_vec(), self.order, self.row_group_size)
+                .map_err(rdf_err_to_vortex_err)?;
+        Ok(ArrayStreamExt::boxed(ArrayStreamAdapter::new(
+            self.dtype.clone(),
+            stream,
+        )))
+    }
+
+    // FUTURE(performance): report file-reader buffers once run-backed sources
+    // expose explicit buffered-memory accounting.
 }
 
 async fn write_native_dictionary_component(
