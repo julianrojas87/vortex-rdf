@@ -13,14 +13,19 @@ The [`vortex-rdflib`](https://pypi.org/project/vortex-rdflib/) package, which im
 pip install vortex-rdf
 ```
 
-Development build:
+Development build (managed with [uv](https://docs.astral.sh/uv/); maturin
+runs under the hood as the build backend):
 
 ```bash
 cd python
-python -m venv .venv && . .venv/bin/activate
-pip install maturin
-maturin develop --release
+uv sync                      # creates .venv, builds + installs the extension
+uv run pytest tests          # run the test suite
+uv run maturin develop --uv  # fast rebuild while iterating on Rust code
 ```
+
+Rust source changes are picked up by `uv sync` automatically (see
+`[tool.uv] cache-keys` in pyproject.toml). Without uv, the classic flow
+works too: `python -m venv .venv && pip install maturin && maturin develop`.
 
 ## Usage
 

@@ -65,20 +65,22 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - name: Setup Python
-        uses: actions/setup-python@v6
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v6
         with:
-          python-version: "3.11"
+          enable-cache: true
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable
       - name: Cache Rust artifacts
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: python
-      - name: Build and install bindings
-        run: pip install ./python[test]
+      - name: Build bindings and install environment
+        working-directory: python
+        run: uv sync --locked
       - name: Run tests
-        run: pytest python/tests -q
+        working-directory: python
+        run: uv run pytest tests -q
 
   js-tests:
     name: JS Tests

@@ -22,8 +22,8 @@ classifiers = [
 # on this one.
 dependencies = []
 
-[project.optional-dependencies]
-test = ["pytest>=8"]
+[dependency-groups]
+dev = ["pytest>=8", "maturin>=1.8,<2"]
 
 [project.urls]
 Repository = "https://github.com/vortex-rdf/vortex-rdf"
@@ -34,3 +34,14 @@ Issues = "https://github.com/vortex-rdf/vortex-rdf/issues"
 # Python package as the private module `vortex_rdf._native`.
 module-name = "vortex_rdf._native"
 python-source = "."
+
+[tool.uv]
+# The extension must be rebuilt when the Rust sources change — the binding
+# crate's own and the core crate's it wraps (a path dependency).
+cache-keys = [
+  { file = "pyproject.toml" },
+  { file = "Cargo.toml" },
+  { file = "src/**/*.rs" },
+  { file = "../core/Cargo.toml" },
+  { file = "../core/src/**/*.rs" },
+]
