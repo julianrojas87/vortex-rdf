@@ -1,6 +1,7 @@
 pub mod cottas_native_ids;
 pub mod cottas_native_strings;
 pub mod de;
+pub mod native_rdf_store;
 pub mod ser;
 pub mod utils;
 pub mod vortex_rdf_store_layout;
@@ -35,3 +36,5 @@ pub use cottas_native_strings::{
 };
 
 pub use utils::CottasVortexCompressionProfile;
+
+pub use native_rdf_store::{NativeIndexProfile, NativeIndexSelection, NativeIndexSpec};

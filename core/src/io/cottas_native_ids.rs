@@ -1,5 +1,6 @@
 use crate::error::{Result, VortexRdfError};
 use crate::index::{RdfDictionary, SimpleDictionaryView};
+use crate::io::native_rdf_store::{NativeIndexSelection, NativeIndexSpec};
 use crate::io::utils::CottasVortexCompressionProfile;
 use crate::store::layout::cottas::TripleOrdering;
 use async_trait::async_trait;
@@ -74,6 +75,7 @@ pub struct CottasNativeConfig {
     pub row_group_size: usize,
     pub dict_row_group_size: usize,
     pub compression_profile: CottasVortexCompressionProfile,
+    pub native_indexes: NativeIndexSelection,
 }
 
 impl Default for CottasNativeConfig {
@@ -83,6 +85,10 @@ impl Default for CottasNativeConfig {
             row_group_size: 122_880,
             dict_row_group_size: 1_024,
             compression_profile: CottasVortexCompressionProfile::Balanced,
+            native_indexes: NativeIndexSelection {
+                profile: crate::io::native_rdf_store::NativeIndexProfile::Bootstrap,
+                explicit: Vec::new(),
+            },
         }
     }
 }
@@ -1758,6 +1764,7 @@ where
     Dict: RdfDictionary + Send + Sync + 'static,
     S: Stream<Item = Result<Quad>> + Unpin + Send + 'static,
 {
+    config.native_indexes.ensure_materializable_now()?;
     if config.ordering != TripleOrdering::SPO {
         return Err(VortexRdfError::InvalidOperation(format!(
             "native v10 QuadSource serialization requires SPO ordering; got {:?}",
@@ -1788,8 +1795,15 @@ where
         temp_dir.path(),
     )?;
     drop(string_runs);
-    let subject_range_runs = id_runs.clone();
-    let predicate_run_paths = id_runs.clone();
+    // VORTEX_RDF_DYNAMIC_NATIVE_INDEX_WRITER_REGISTRY_V1
+    let subject_range_runs = config
+        .native_indexes
+        .contains(NativeIndexSpec::SubjectRangesV1)
+        .then(|| id_runs.clone());
+    let predicate_run_paths = config
+        .native_indexes
+        .contains(NativeIndexSpec::PredicateRunsV1)
+        .then(|| id_runs.clone());
     let arrays = merge_sorted_id_runs_to_array_stream(id_runs, config.ordering, row_group_size)?;
     let dtype = empty_spog_array()?.dtype().clone();
     let stream = ArrayStreamAdapter::new(dtype, arrays);
@@ -1867,60 +1881,89 @@ where
         // FUTURE(performance): add a sparse lexical fence/search component after
         // measuring zone-map pruning, range requests, and bytes read. The sorted
         // dictionary remains the correctness-preserving baseline.
-        let subject_ranges_source = Arc::new(NativeSubjectRangesSource::new(
-            &subject_range_runs,
-            config.dict_row_group_size,
-        )?);
-        let subject_ranges_strategy: Arc<dyn LayoutStrategy> = WriteStrategyBuilder::default()
-            .with_row_block_size(config.dict_row_group_size.max(1))
-            .with_btrblocks_builder(BtrBlocksCompressorBuilder::default().with_compact())
-            .build();
-        let subject_ranges_component = NativeComponentWrite::new(
-            StoreComponentDescriptor {
-                name: "index.subject-ranges".into(),
-                role: StoreComponentRole::Index,
-                implementation: "native-subject-ranges-v1-compact".into(),
-                version: 1,
-                required: false,
-                dtype: subject_ranges_source.dtype().clone(),
-            },
-            subject_ranges_source,
-            subject_ranges_strategy,
-        )
-        .map_err(VortexRdfError::from)?;
-
-        let predicate_runs_source = Arc::new(NativePredicateRunsSource::new(
-            &predicate_run_paths,
-            config.dict_row_group_size,
-        )?);
-        let predicate_runs_strategy: Arc<dyn LayoutStrategy> = WriteStrategyBuilder::default()
-            .with_row_block_size(config.dict_row_group_size.max(1))
-            .with_btrblocks_builder(BtrBlocksCompressorBuilder::default().with_compact())
-            .build();
-        let predicate_runs_component = NativeComponentWrite::new(
-            StoreComponentDescriptor {
-                name: "index.predicate-runs".into(),
-                role: StoreComponentRole::Index,
-                implementation: "native-predicate-runs-v1-compact".into(),
-                version: 1,
-                required: false,
-                dtype: predicate_runs_source.dtype().clone(),
-            },
-            predicate_runs_source,
-            predicate_runs_strategy,
-        )
-        .map_err(VortexRdfError::from)?;
+        let mut components = vec![id_to_term_component, term_to_id_component];
+        for spec in config.native_indexes.resolved() {
+            match spec {
+                NativeIndexSpec::SubjectRangesV1 => {
+                    let run_paths = subject_range_runs.as_ref().ok_or_else(|| {
+                        VortexRdfError::Serialization(
+                            "subject range replay paths were not retained".into(),
+                        )
+                    })?;
+                    let source = Arc::new(NativeSubjectRangesSource::new(
+                        run_paths,
+                        config.dict_row_group_size,
+                    )?);
+                    let strategy: Arc<dyn LayoutStrategy> = WriteStrategyBuilder::default()
+                        .with_row_block_size(config.dict_row_group_size.max(1))
+                        .with_btrblocks_builder(BtrBlocksCompressorBuilder::default().with_compact())
+                        .build();
+                    components.push(
+                        NativeComponentWrite::new(
+                            StoreComponentDescriptor {
+                                name: "index.subject-ranges".into(),
+                                role: StoreComponentRole::Index,
+                                implementation: "native-subject-ranges-v1-compact".into(),
+                                version: 1,
+                                required: false,
+                                dtype: source.dtype().clone(),
+                            },
+                            source,
+                            strategy,
+                        )
+                        .map_err(VortexRdfError::from)?,
+                    );
+                }
+                NativeIndexSpec::PredicateRunsV1 => {
+                    let run_paths = predicate_run_paths.as_ref().ok_or_else(|| {
+                        VortexRdfError::Serialization(
+                            "predicate run replay paths were not retained".into(),
+                        )
+                    })?;
+                    let source = Arc::new(NativePredicateRunsSource::new(
+                        run_paths,
+                        config.dict_row_group_size,
+                    )?);
+                    let strategy: Arc<dyn LayoutStrategy> = WriteStrategyBuilder::default()
+                        .with_row_block_size(config.dict_row_group_size.max(1))
+                        .with_btrblocks_builder(BtrBlocksCompressorBuilder::default().with_compact())
+                        .build();
+                    components.push(
+                        NativeComponentWrite::new(
+                            StoreComponentDescriptor {
+                                name: "index.predicate-runs".into(),
+                                role: StoreComponentRole::Index,
+                                implementation: "native-predicate-runs-v1-compact".into(),
+                                version: 1,
+                                required: false,
+                                dtype: source.dtype().clone(),
+                            },
+                            source,
+                            strategy,
+                        )
+                        .map_err(VortexRdfError::from)?,
+                    );
+                }
+                unsupported => {
+                    return Err(VortexRdfError::InvalidOperation(format!(
+                        "native index {unsupported} passed materialization validation without a registered component producer"
+                    )));
+                }
+            }
+        }
+        let expected_component_names: Vec<Arc<str>> = std::iter::once(Arc::<str>::from("quad-source"))
+            .chain(
+                components
+                    .iter()
+                    .map(|component| component.descriptor.name.clone()),
+            )
+            .collect();
         let summary = crate::io::vortex_rdf_store_layout::write_native_rdf_store(
             &NATIVE_FILE_SESSION,
             &mut writer,
             stream,
             inner.build(),
-            vec![
-                id_to_term_component,
-                term_to_id_component,
-                subject_ranges_component,
-                predicate_runs_component,
-            ],
+            components,
         )
         .await
         .map_err(VortexRdfError::from)?;
@@ -1944,19 +1987,12 @@ where
         let root = reopened.footer().layout();
         if root.encoding_id().as_ref()
             != crate::io::vortex_rdf_store_layout::VORTEX_RDF_STORE_LAYOUT_ID
-            || root.nchildren() != 5
-            || root.child_names().collect::<Vec<_>>()
-                != vec![
-                    Arc::<str>::from("quad-source"),
-                    Arc::<str>::from("dictionary.id-to-term"),
-                    Arc::<str>::from("dictionary.term-to-id"),
-                    Arc::<str>::from("index.subject-ranges"),
-                    Arc::<str>::from("index.predicate-runs"),
-                ]
+            || root.nchildren() != expected_component_names.len()
+            || root.child_names().collect::<Vec<_>>() != expected_component_names
             || root.row_count() != summary.row_count()
         {
             return Err(VortexRdfError::Deserialization(
-                "native RDF store QuadSource/dictionaries/subject/predicate-index validation failed".into(),
+                "native RDF store configured component inventory validation failed".into(),
             ));
         }
         reopened.scan().map_err(VortexRdfError::from)?;

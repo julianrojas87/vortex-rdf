@@ -29,8 +29,8 @@ use vortex_rdf_core::{
     index::{ChainedHash, SimpleDictionary},
     io::{
         CottasNativeConfig, CottasNativeStringConfig, CottasVortexCompressionProfile,
-        NativeIdsCountMode, NativeIndexPolicy, NativeStringCountMode,
-        count_cottas_native_ids_file_with_diagnostics_mode,
+        NativeIdsCountMode, NativeIndexPolicy, NativeIndexProfile, NativeIndexSelection,
+        NativeIndexSpec, NativeStringCountMode, count_cottas_native_ids_file_with_diagnostics_mode,
         count_cottas_native_string_file_with_diagnostics_mode, load_vortex_file_ref,
         match_cottas_native_file, match_cottas_native_file_with_diagnostics,
         match_cottas_native_string_file, match_cottas_native_string_file_with_diagnostics,
@@ -87,6 +87,14 @@ enum Action {
 
         #[arg(long, default_value = "SPO")]
         ordering: TripleOrdering,
+
+        /// Native index profile for native-rdf-store serialization.
+        #[arg(long, value_enum, default_value_t = NativeIndexProfileArg::Bootstrap)]
+        native_index_profile: NativeIndexProfileArg,
+
+        /// Explicit native index specification; repeat to override the profile.
+        #[arg(long = "native-index")]
+        native_indexes: Vec<String>,
     },
     /// Convert from Vortex-RDF to RDF
     Deserialize {
@@ -238,6 +246,26 @@ fn to_native_ids_count_mode(mode: CountMode) -> NativeIdsCountMode {
 
 #[derive(Copy, Clone, PartialEq, Eq, ValueEnum, Debug)]
 #[clap(rename_all = "kebab_case")]
+enum NativeIndexProfileArg {
+    None,
+    Bootstrap,
+    Standard,
+    All,
+}
+
+impl From<NativeIndexProfileArg> for NativeIndexProfile {
+    fn from(value: NativeIndexProfileArg) -> Self {
+        match value {
+            NativeIndexProfileArg::None => NativeIndexProfile::None,
+            NativeIndexProfileArg::Bootstrap => NativeIndexProfile::Bootstrap,
+            NativeIndexProfileArg::Standard => NativeIndexProfile::Standard,
+            NativeIndexProfileArg::All => NativeIndexProfile::All,
+        }
+    }
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, ValueEnum, Debug)]
+#[clap(rename_all = "kebab_case")]
 enum NativeIndexPolicyArg {
     Auto,
     Disabled,
@@ -349,6 +377,8 @@ async fn main() -> Result<()> {
             builder_strategy,
             compression_profile,
             ordering,
+            native_index_profile,
+            native_indexes,
         } => {
             let start = Instant::now();
             let format = format
@@ -391,9 +421,21 @@ async fn main() -> Result<()> {
                         "native-rdf-store currently supports only --index-type simple-dictionary"
                     ));
                 }
+                let explicit_indexes = native_indexes
+                    .iter()
+                    .map(|value| {
+                        value
+                            .parse::<NativeIndexSpec>()
+                            .map_err(anyhow::Error::from)
+                    })
+                    .collect::<Result<Vec<_>>>()?;
                 let config = CottasNativeConfig {
                     ordering,
                     compression_profile: compression_profile.into(),
+                    native_indexes: NativeIndexSelection {
+                        profile: native_index_profile.into(),
+                        explicit: explicit_indexes,
+                    },
                     ..CottasNativeConfig::default()
                 };
                 serialize_cottas_native_quad_source_v10_file::<SimpleDictionary, _>(
