@@ -6,7 +6,7 @@ members = ["core", "js", "cli", "python"]
 default-members = ["core", "js", "cli"]
 
 [workspace.package]
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.91"
 authors = ["Julián Rojas <julianandres.rojasmelendez@ugent.be>"]
@@ -18,7 +18,7 @@ keywords = ["rdf", "columnar", "vortex", "semantic-web", "quad-store"]
 categories = ["database-implementations", "encoding", "data-structures"]
 
 [workspace.dependencies]
-vortex-rdf-core = { path = "core", version = "0.3.0" }
+vortex-rdf-core = { path = "core", version = "0.4.0" }
 vortex = { version = "0.83.0", default-features = false }
 vortex-array = { version = "0.83.0" }
 vortex-error = "0.83.0"
