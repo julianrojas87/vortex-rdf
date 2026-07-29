@@ -3027,6 +3027,167 @@ async fn plan_native_access<I: NativeIndexProvider + ?Sized>(
     })
 }
 
+// VORTEX_RDF_NATIVE_COMPONENT_READER_V1
+/// One named top-level component visible through the native RDF store reader.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NativeRdfStoreComponentInfo {
+    pub name: Arc<str>,
+    pub role: Option<StoreComponentRole>,
+    pub implementation: Arc<str>,
+    pub version: u32,
+    pub required: bool,
+    pub dtype: vortex_array::dtype::DType,
+    pub row_count: u64,
+}
+
+/// File-level reader for a transparent native RDF store generation.
+///
+/// The generic Vortex file scan remains the QuadSource scan. Auxiliary layouts
+/// are addressed explicitly by their stable persisted component names.
+#[derive(Clone)]
+pub struct NativeRdfStoreFile {
+    file: vortex_file::VortexFile,
+}
+
+impl NativeRdfStoreFile {
+    pub async fn open(path: impl AsRef<Path>) -> Result<Self> {
+        let file = NATIVE_FILE_SESSION
+            .open_options()
+            .open_path(path.as_ref())
+            .await
+            .map_err(VortexRdfError::from)?
+            .with_caching();
+        Self::try_new(file)
+    }
+
+    pub fn try_new(file: vortex_file::VortexFile) -> Result<Self> {
+        let root = file.footer().layout();
+        if root.encoding_id().as_ref()
+            != crate::io::vortex_rdf_store_layout::VORTEX_RDF_STORE_LAYOUT_ID
+        {
+            return Err(VortexRdfError::Deserialization(format!(
+                "expected {}, found {}",
+                crate::io::vortex_rdf_store_layout::VORTEX_RDF_STORE_LAYOUT_ID,
+                root.encoding_id()
+            )));
+        }
+        let typed = root
+            .as_opt::<crate::io::vortex_rdf_store_layout::VortexRdfStore>()
+            .ok_or_else(|| {
+                VortexRdfError::Deserialization(
+                    "native RDF store layout was not registered in the opening session".into(),
+                )
+            })?;
+        // Materialize every child once to validate persisted dtypes and metadata.
+        for index in 0..root.nchildren() {
+            root.child(index).map_err(VortexRdfError::from)?;
+        }
+        let _ = typed;
+        Ok(Self { file })
+    }
+
+    pub fn vortex_file(&self) -> &vortex_file::VortexFile {
+        &self.file
+    }
+
+    pub fn component_names(&self) -> Vec<Arc<str>> {
+        self.file.footer().layout().child_names().collect()
+    }
+
+    pub fn components(&self) -> Result<Vec<NativeRdfStoreComponentInfo>> {
+        let root = self.file.footer().layout();
+        let typed = root.as_::<crate::io::vortex_rdf_store_layout::VortexRdfStore>();
+        let metadata = crate::io::vortex_rdf_store_layout::vortex_rdf_store_components(typed);
+        let mut components = Vec::with_capacity(root.nchildren());
+        components.push(NativeRdfStoreComponentInfo {
+            name: "quad-source".into(),
+            role: None,
+            implementation: "configured-quad-source".into(),
+            version: 1,
+            required: true,
+            dtype: root.child(0).map_err(VortexRdfError::from)?.dtype().clone(),
+            row_count: root.child(0).map_err(VortexRdfError::from)?.row_count(),
+        });
+        for (index, descriptor) in metadata.iter().enumerate() {
+            let child_index = index + 1;
+            components.push(NativeRdfStoreComponentInfo {
+                name: descriptor.name.clone(),
+                role: Some(descriptor.role),
+                implementation: descriptor.implementation.clone(),
+                version: descriptor.version,
+                required: descriptor.required,
+                dtype: descriptor.dtype.clone(),
+                row_count: root
+                    .child(child_index)
+                    .map_err(VortexRdfError::from)?
+                    .row_count(),
+            });
+        }
+        Ok(components)
+    }
+
+    pub fn component_layout(&self, name: &str) -> Result<Option<vortex_layout::LayoutRef>> {
+        let root = self.file.footer().layout();
+        let Some(index) = root.child_names().position(|child| child.as_ref() == name) else {
+            return Ok(None);
+        };
+        root.child(index).map(Some).map_err(VortexRdfError::from)
+    }
+
+    pub fn component_scan(
+        &self,
+        name: &str,
+    ) -> Result<Option<vortex_layout::scan::scan_builder::ScanBuilder<ArrayRef>>> {
+        let Some(layout) = self.component_layout(name)? else {
+            return Ok(None);
+        };
+        let reader = layout
+            .new_reader(
+                name.into(),
+                self.file.segment_source(),
+                self.file.session(),
+                &Default::default(),
+            )
+            .map_err(VortexRdfError::from)?;
+        Ok(Some(vortex_layout::scan::scan_builder::ScanBuilder::new(
+            self.file.session().clone(),
+            reader,
+        )))
+    }
+
+    /// Render stable logical names even when a generic explorer displays
+    /// unregistered custom-layout children positionally as 0, 1, 2, ...
+    pub fn named_layout_tree(&self) -> Result<String> {
+        let components = self.components()?;
+        let mut tree = String::from("vortex.rdf.store.v1\n");
+        for (index, component) in components.iter().enumerate() {
+            let branch = if index + 1 == components.len() {
+                "└──"
+            } else {
+                "├──"
+            };
+            use std::fmt::Write as _;
+            writeln!(
+                tree,
+                "{branch} {} (role={}, rows={}, dtype={})",
+                component.name,
+                component
+                    .role
+                    .map(|role| format!("{role:?}"))
+                    .unwrap_or_else(|| "QuadSource".to_string()),
+                component.row_count,
+                component.dtype
+            )
+            .expect("writing to String cannot fail");
+        }
+        Ok(tree)
+    }
+}
+
+pub async fn inspect_native_rdf_store_file(path: impl AsRef<Path>) -> Result<String> {
+    NativeRdfStoreFile::open(path).await?.named_layout_tree()
+}
+
 /// Controls whether matching may use optional native index components.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum NativeIndexPolicy {
