@@ -105,6 +105,14 @@ scripts/DBBench/run_big_dbbench_engines.sh \
   between bytecodes), so a stuck query hangs the driver — use the other
   modes for unattended runs.
 
+### BGP pushdown
+
+The vortex engine registers a SPARQL BGP pushdown into rdflib
+(joins evaluated in native code space rather than per-binding `triples()`
+probes) — active by default and decisive for the JOINS group. Set
+`VORTEX_RDF_DISABLE_PUSHDOWN=1` to benchmark the plain rdflib evaluation
+path instead.
+
 ### File-backed vs in-memory
 
 By default the vortex engine queries the `.vortex` file in place (lazy,

@@ -7,6 +7,7 @@ from rdflib.term import BNode, Literal, Node, URIRef
 from rdflib.util import from_n3
 
 from ._native import VortexRdfStore
+from .pushdown import register_sparql_pushdown
 
 # The cottas-bench branch's layout names are accepted as aliases so its
 # benchmark scripts keep working. The layout is only a label here: VortexRdfStore
@@ -74,6 +75,10 @@ class VortexStore(Store):
         self._dict = None
         self._decode_cache: dict = {}
         self._use_codes = os.environ.get("VORTEX_RDF_DISABLE_CODE_PATH") != "1"
+
+        # Whole-BGP pushdown into code space (no-op for non-Vortex graphs;
+        # VORTEX_RDF_DISABLE_PUSHDOWN=1 keeps rdflib's default evaluator).
+        register_sparql_pushdown()
 
         # Do not pass configuration here, otherwise RDFLib calls open()
         # before our initialization logic is fully under control.

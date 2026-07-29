@@ -61,6 +61,19 @@ Rust memory directly) plus a `term_dict()` handle — `VortexStore.triples()`
 uses this automatically, decoding each distinct code to an rdflib term once
 and caching it. Set `VORTEX_RDF_DISABLE_CODE_PATH=1` to force the string path.
 
+## SPARQL BGP pushdown
+
+Constructing a `VortexStore` registers an rdflib `CUSTOM_EVALS` hook that
+evaluates whole basic graph patterns in one pass: each triple pattern is
+matched natively once and the join runs as hash joins over `u32` codes,
+decoding terms only for the final solutions. This replaces rdflib's default
+nested-loop evaluation (one `triples()` call per candidate binding) and is
+what makes joins fast — measured ~6x on an in-memory store and ~50x on a
+file-backed one, 3x faster than rdflib's own in-memory store. The hook only
+fires for VortexStore graphs with the code path available and falls back to
+the default evaluator otherwise (other stores, RDF-star patterns, non-BGP
+algebra). Set `VORTEX_RDF_DISABLE_PUSHDOWN=1` to keep the default evaluator.
+
 ## Layouts
 
 `serialize_rdf(..., layout=...)` accepts `"default"`, `"typed-object"` and
