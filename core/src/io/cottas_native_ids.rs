@@ -1811,33 +1811,61 @@ where
         let mut writer = tokio::fs::File::create(&staging_path)
             .await
             .map_err(|error| VortexRdfError::Serialization(error.to_string()))?;
-        let dictionary_source = Arc::new(PairRunDictionarySource::new(
+        // VORTEX_RDF_NATIVE_BIDIRECTIONAL_DICTIONARIES_V1
+        let id_to_term_source = Arc::new(PairRunDictionarySource::new(
             &pair_runs.id_run_paths,
             PairRunOrder::Id,
             config.dict_row_group_size,
         )?);
-        let dictionary_strategy: Arc<dyn LayoutStrategy> = WriteStrategyBuilder::default()
+        let id_to_term_strategy: Arc<dyn LayoutStrategy> = WriteStrategyBuilder::default()
             .with_row_block_size(config.dict_row_group_size.max(1))
             .build();
-        let dictionary_component = NativeComponentWrite::new(
+        let id_to_term_component = NativeComponentWrite::new(
             StoreComponentDescriptor {
                 name: "dictionary.id-to-term".into(),
                 role: StoreComponentRole::Dictionary,
                 implementation: "native-id-row-v1-balanced".into(),
                 version: 1,
                 required: true,
-                dtype: dictionary_source.dtype().clone(),
+                dtype: id_to_term_source.dtype().clone(),
             },
-            dictionary_source,
-            dictionary_strategy,
+            id_to_term_source,
+            id_to_term_strategy,
         )
         .map_err(VortexRdfError::from)?;
+
+        let term_to_id_source = Arc::new(PairRunDictionarySource::new(
+            &pair_runs.term_run_paths,
+            PairRunOrder::Term,
+            config.dict_row_group_size,
+        )?);
+        let term_to_id_strategy: Arc<dyn LayoutStrategy> = WriteStrategyBuilder::default()
+            .with_row_block_size(config.dict_row_group_size.max(1))
+            .with_btrblocks_builder(BtrBlocksCompressorBuilder::default().with_compact())
+            .build();
+        let term_to_id_component = NativeComponentWrite::new(
+            StoreComponentDescriptor {
+                name: "dictionary.term-to-id".into(),
+                role: StoreComponentRole::Dictionary,
+                implementation: "native-lexical-sorted-v1-compact".into(),
+                version: 1,
+                required: true,
+                dtype: term_to_id_source.dtype().clone(),
+            },
+            term_to_id_source,
+            term_to_id_strategy,
+        )
+        .map_err(VortexRdfError::from)?;
+
+        // FUTURE(performance): add a sparse lexical fence/search component after
+        // measuring zone-map pruning, range requests, and bytes read. The sorted
+        // dictionary remains the correctness-preserving baseline.
         let summary = crate::io::vortex_rdf_store_layout::write_native_rdf_store(
             &NATIVE_FILE_SESSION,
             &mut writer,
             stream,
             inner.build(),
-            vec![dictionary_component],
+            vec![id_to_term_component, term_to_id_component],
         )
         .await
         .map_err(VortexRdfError::from)?;
@@ -1861,16 +1889,17 @@ where
         let root = reopened.footer().layout();
         if root.encoding_id().as_ref()
             != crate::io::vortex_rdf_store_layout::VORTEX_RDF_STORE_LAYOUT_ID
-            || root.nchildren() != 2
+            || root.nchildren() != 3
             || root.child_names().collect::<Vec<_>>()
                 != vec![
                     Arc::<str>::from("quad-source"),
                     Arc::<str>::from("dictionary.id-to-term"),
+                    Arc::<str>::from("dictionary.term-to-id"),
                 ]
             || root.row_count() != summary.row_count()
         {
             return Err(VortexRdfError::Deserialization(
-                "native RDF store QuadSource/dictionary validation failed".into(),
+                "native RDF store QuadSource/bidirectional-dictionary validation failed".into(),
             ));
         }
         reopened.scan().map_err(VortexRdfError::from)?;
@@ -2997,6 +3026,21 @@ async fn plan_native_access<I: NativeIndexProvider + ?Sized>(
         ..NativeAccessPlan::default()
     })
 }
+
+/// Controls whether matching may use optional native index components.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum NativeIndexPolicy {
+    /// Use compatible indexes when available and otherwise scan the QuadSource.
+    #[default]
+    Auto,
+    /// Ignore indexes and execute the correctness baseline scan path.
+    Disabled,
+    /// Require a compatible index for the query shape or return an error.
+    Required,
+}
+
+// Indexes only select candidate rows. Exact QuadSource filters remain mandatory,
+// so indexed and index-free matching have identical semantics.
 
 enum NativePatternFilter {
     /// No bound RDF terms, so scan all rows.
