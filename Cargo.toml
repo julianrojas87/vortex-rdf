@@ -1,9 +1,12 @@
 [workspace]
 resolver = "2"
-members = ["core", "js", "cli"]
+members = ["core", "js", "cli", "python"]
+# The python crate is a PyO3 extension module built by maturin; keep it out of
+# the default cargo build/test surface.
+default-members = ["core", "js", "cli"]
 
 [workspace.package]
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 rust-version = "1.91"
 authors = ["Julián Rojas <julianandres.rojasmelendez@ugent.be>"]
@@ -15,7 +18,7 @@ keywords = ["rdf", "columnar", "vortex", "semantic-web", "quad-store"]
 categories = ["database-implementations", "encoding", "data-structures"]
 
 [workspace.dependencies]
-vortex-rdf-core = { path = "core", version = "0.4.0" }
+vortex-rdf-core = { path = "core", version = "0.5.0" }
 vortex = { version = "0.83.0", default-features = false }
 vortex-array = { version = "0.83.0" }
 vortex-error = "0.83.0"
@@ -39,6 +42,7 @@ thiserror = "2.0"
 anyhow = "1.0.104"
 
 clap = { version = "4.6", features = ["derive"] }
+pyo3 = "0.29.0"
 wasm-bindgen = "0.2.126"
 js-sys = "0.3.103"
 console_error_panic_hook = "0.1.7"

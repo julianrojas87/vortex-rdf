@@ -16,6 +16,9 @@ on:
       - '**.md'
       - 'LICENSE'
       - '.gitignore'
+  # Lets the release workflow run the full CI suite against the exact ref
+  # being published before anything reaches a registry.
+  workflow_call:
 
 permissions:
   contents: read
@@ -56,6 +59,28 @@ jobs:
         uses: Swatinem/rust-cache@v2
       - name: Run Rust tests
         run: ${{ matrix.command }}
+
+  python-tests:
+    name: Python Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: python
+      - name: Build bindings and install environment
+        working-directory: python
+        run: uv sync --locked
+      - name: Run tests
+        working-directory: python
+        run: uv run pytest tests -q
 
   js-tests:
     name: JS Tests

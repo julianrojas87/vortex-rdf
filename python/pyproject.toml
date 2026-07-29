@@ -1,0 +1,47 @@
+[build-system]
+requires = ["maturin>=1.8,<2"]
+build-backend = "maturin"
+
+[project]
+name = "vortex-rdf"
+version = "0.5.0"
+description = "Python bindings for Vortex-RDF, a high-performance columnar RDF store format"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+keywords = ["rdf", "vortex", "columnar", "quad-store", "semantic-web"]
+classifiers = [
+  "Programming Language :: Rust",
+  "Programming Language :: Python :: Implementation :: CPython",
+  "Programming Language :: Python :: 3 :: Only",
+  "Topic :: Database",
+  "Intended Audience :: Developers",
+]
+# No runtime dependencies: this is the pure binding layer. The rdflib
+# integration lives in the separate `vortex-rdflib` package, which depends
+# on this one.
+dependencies = []
+
+[dependency-groups]
+dev = ["pytest>=8", "maturin>=1.8,<2"]
+
+[project.urls]
+Repository = "https://github.com/vortex-rdf/vortex-rdf"
+Issues = "https://github.com/vortex-rdf/vortex-rdf/issues"
+
+[tool.maturin]
+# Mixed Rust/Python layout: the compiled extension lands inside the pure
+# Python package as the private module `vortex_rdf._native`.
+module-name = "vortex_rdf._native"
+python-source = "."
+
+[tool.uv]
+# The extension must be rebuilt when the Rust sources change — the binding
+# crate's own and the core crate's it wraps (a path dependency).
+cache-keys = [
+  { file = "pyproject.toml" },
+  { file = "Cargo.toml" },
+  { file = "src/**/*.rs" },
+  { file = "../core/Cargo.toml" },
+  { file = "../core/src/**/*.rs" },
+]

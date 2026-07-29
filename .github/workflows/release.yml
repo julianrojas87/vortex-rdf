@@ -1,0 +1,168 @@
+name: Release
+
+# Manually dispatched publishing for every registry this repo releases to:
+#   crates.io  vortex-rdf-core + vortex-rdf-cli  (cargo publish --workspace
+#              skips the publish = false js/python members and orders deps)
+#   npm        @vortex-rdf/vortex-rdf-store      (js/, wasm-pack build)
+#   PyPI       vortex-rdf                        (python/, maturin abi3 wheels)
+#
+# All three use GitHub OIDC trusted publishing — no long-lived tokens. Each
+# registry must be configured once to trust this repo, this workflow file
+# (release.yml) and the "release" GitHub environment:
+#   crates.io: crate Settings -> Trusted Publishing
+#   npm:       package Settings -> Trusted publisher
+#   PyPI:      project publishing settings (pending publisher for vortex-rdf)
+#
+# dry_run builds everything and runs the registries' dry-run modes without
+# publishing (PyPI has no dry run: its publish job is skipped instead).
+
+on:
+  workflow_dispatch:
+    inputs:
+      crates:
+        description: "Publish Rust crates to crates.io"
+        type: boolean
+        default: false
+      npm:
+        description: "Publish @vortex-rdf/vortex-rdf-store to npm"
+        type: boolean
+        default: false
+      pypi:
+        description: "Publish vortex-rdf to PyPI"
+        type: boolean
+        default: false
+      dry_run:
+        description: "Build and validate only; publish nothing"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  # The full CI suite runs against the exact ref being released; every
+  # publish job is gated on it. Dispatching from a commit whose CI was
+  # skipped (docs-only path filters) or never ran is therefore still safe.
+  ci:
+    name: CI
+    uses: ./.github/workflows/ci.yml
+
+  crates:
+    name: crates.io
+    needs: ci
+    if: ${{ inputs.crates }}
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Authenticate with crates.io
+        if: ${{ !inputs.dry_run }}
+        id: auth
+        uses: rust-lang/crates-io-auth-action@v1
+      - name: Publish workspace crates
+        run: cargo publish --workspace ${{ inputs.dry_run && '--dry-run' || '' }}
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+
+  npm:
+    name: npm
+    needs: ci
+    if: ${{ inputs.npm }}
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      id-token: write
+    env:
+      # Keep wasm codegen deterministic and memory-friendly; opt-level stays
+      # whatever the crate/profile configures (unlike the CI test job, which
+      # trades optimization for memory).
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "1"
+    steps:
+      - uses: actions/checkout@v7
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          registry-url: "https://registry.npmjs.org"
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - name: Install wasm-pack
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+      - name: Install dependencies
+        working-directory: js
+        run: npm ci
+      - name: Publish (prepublishOnly builds the wasm package)
+        working-directory: js
+        run: npm publish --access public ${{ inputs.dry_run && '--dry-run' || '' }}
+
+  pypi-wheels:
+    name: PyPI wheel (${{ matrix.platform.name }})
+    needs: ci
+    if: ${{ inputs.pypi }}
+    runs-on: ${{ matrix.platform.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - { name: linux-x86_64, runner: ubuntu-latest, target: x86_64 }
+          - { name: linux-aarch64, runner: ubuntu-24.04-arm, target: aarch64 }
+          - { name: macos-arm64, runner: macos-14, target: aarch64 }
+          - { name: macos-x86_64, runner: macos-13, target: x86_64 }
+          - { name: windows-x64, runner: windows-latest, target: x64 }
+    steps:
+      - uses: actions/checkout@v7
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - name: Build wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.platform.target }}
+          args: --release --strip --out dist --manifest-path python/Cargo.toml
+          manylinux: auto
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.platform.name }}
+          path: dist
+
+  pypi-sdist:
+    name: PyPI sdist
+    needs: ci
+    if: ${{ inputs.pypi }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build sdist
+        uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist --manifest-path python/Cargo.toml
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: dist
+
+  pypi-publish:
+    name: Publish to PyPI
+    needs: [pypi-wheels, pypi-sdist]
+    if: ${{ inputs.pypi && !inputs.dry_run }}
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist

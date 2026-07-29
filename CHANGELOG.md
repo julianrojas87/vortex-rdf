@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0](https://github.com/vortex-rdf/vortex-rdf/compare/v0.4.0...v0.5.0) - 2026-07-29
+
+### Added
+
+- Add PyO3 bindings with an rdflib Store integration (python) ([`c851392`](https://github.com/vortex-rdf/vortex-rdf/commit/c8513929cd96ca1f2f0675812eb1c4faf50e6f49) by @julianrojas87)
+- Port the DBBench harness from feat/cottas-bench (bench) ([`946211b`](https://github.com/vortex-rdf/vortex-rdf/commit/946211baebc485befd3a69f0e560d34499963651) by @julianrojas87)
+- Push SPARQL BGP evaluation down into code space (python) ([`5c77b33`](https://github.com/vortex-rdf/vortex-rdf/commit/5c77b335d7e4b5b6ea6c29b39e8266c8e0f9a835) by @julianrojas87)
+- Split the bindings into a standalone vortex-rdf package (python) ([`9e01f89`](https://github.com/vortex-rdf/vortex-rdf/commit/9e01f894d9293d0d1397cae635fe918ba2583b6f) by @julianrojas87)
+- PyPi badges for published Python bindings ([`372b800`](https://github.com/vortex-rdf/vortex-rdf/commit/372b8005c9bddb5e2d31e703dab9073836878dc3) by @julianrojas87)
+
+### Fixed
+
+- Parse language-tagged and typed literals in parse_term (core) ([`618a7a8`](https://github.com/vortex-rdf/vortex-rdf/commit/618a7a83f67352b8924c5dcbcdd189ac8e624a05) by @julianrojas87)
+
 ## [0.4.0](https://github.com/vortex-rdf/vortex-rdf/compare/v0.3.0...v0.4.0) - 2026-07-29
 
 ### Added

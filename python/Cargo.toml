@@ -1,0 +1,32 @@
+[package]
+name = "vortex-rdf-python"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Python bindings for Vortex-RDF (published to PyPI as vortex-rdf)"
+publish = false
+
+# The compiled module is imported as `vortex_rdf._native` (see
+# `[tool.maturin] module-name` in pyproject.toml). `test = false` keeps
+# `cargo test --workspace` from producing a test binary that would need to
+# link libpython — the crate's behavior is covered by the pytest suite.
+[lib]
+name = "_native"
+crate-type = ["cdylib"]
+test = false
+doctest = false
+
+[dependencies]
+# Default features on: `file-io` is the point of these bindings (lazy
+# file-backed stores). `mimalloc` must stay off — a #[global_allocator]
+# inside a cdylib loaded by CPython is a footgun.
+vortex-rdf-core = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread"] }
+# abi3-py311: the buffer protocol slots (zero-copy u32 code columns) entered
+# the limited API in Python 3.11.
+pyo3 = { workspace = true, features = ["extension-module", "abi3-py311"] }
+oxrdf.workspace = true
+vortex-array.workspace = true
