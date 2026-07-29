@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "vortex-rdf"
-version = "0.4.0"
+version = "0.5.0"
 description = "Python bindings for Vortex-RDF, a high-performance columnar RDF store format"
 readme = "README.md"
 license = "MIT"
