@@ -134,6 +134,7 @@ impl NativeIndexSelection {
                         | NativeIndexSpec::PredicateRunsV1
                         | NativeIndexSpec::PredicateExactRangesV2
                         | NativeIndexSpec::PredicateObjectExactRangesV2
+                        | NativeIndexSpec::ObjectExactRangesV2
                 )
             })
             .map(|spec| spec.to_string())
@@ -203,6 +204,15 @@ mod tests {
         let selection = NativeIndexSelection {
             profile: NativeIndexProfile::None,
             explicit: vec![NativeIndexSpec::PredicateExactRangesV2],
+        };
+        assert!(selection.ensure_materializable_now().is_ok());
+    }
+
+    #[test]
+    fn object_exact_v2_passes_configuration_validation() {
+        let selection = NativeIndexSelection {
+            profile: NativeIndexProfile::None,
+            explicit: vec![NativeIndexSpec::ObjectExactRangesV2],
         };
         assert!(selection.ensure_materializable_now().is_ok());
     }

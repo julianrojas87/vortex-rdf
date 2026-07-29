@@ -1986,6 +1986,27 @@ where
                     components.push(NativeComponentWrite::new(StoreComponentDescriptor { name: "index.predicate-object.exact-ranges.directory".into(), role: StoreComponentRole::Index, implementation: "native-predicate-object-exact-directory-v2-compact".into(), version: 2, required: false, dtype: directory.dtype().clone() }, directory, Arc::clone(&strategy)).map_err(VortexRdfError::from)?);
                     components.push(NativeComponentWrite::new(StoreComponentDescriptor { name: "index.predicate-object.exact-ranges.payload".into(), role: StoreComponentRole::Index, implementation: "native-predicate-object-exact-payload-v2-compact".into(), version: 2, required: false, dtype: payload.dtype().clone() }, payload, strategy).map_err(VortexRdfError::from)?);
                 }
+                NativeIndexSpec::ObjectExactRangesV2 => {
+                    let run_paths = index_build_context.selected_run_paths(spec).ok_or_else(||
+                        VortexRdfError::Serialization("object exact-range replay paths were not retained".into()))?;
+                    let prepared = Arc::new(prepare_native_object_exact_v2(run_paths, temp_dir.path())?);
+                    let directory = Arc::new(NativeObjectExactDirectorySource::new(Arc::clone(&prepared))?);
+                    let payload = Arc::new(NativeObjectExactPayloadSource::new(
+                        prepared.payload_path.clone(), index_build_context.index_row_group_size)?);
+                    let strategy: Arc<dyn LayoutStrategy> = WriteStrategyBuilder::default()
+                        .with_row_block_size(index_build_context.index_row_group_size)
+                        .with_btrblocks_builder(BtrBlocksCompressorBuilder::default().with_compact()).build();
+                    components.push(NativeComponentWrite::new(StoreComponentDescriptor {
+                        name: "index.object.exact-ranges.directory".into(), role: StoreComponentRole::Index,
+                        implementation: "native-object-exact-directory-v2-compact".into(), version: 2,
+                        required: false, dtype: directory.dtype().clone(),
+                    }, directory, Arc::clone(&strategy)).map_err(VortexRdfError::from)?);
+                    components.push(NativeComponentWrite::new(StoreComponentDescriptor {
+                        name: "index.object.exact-ranges.payload".into(), role: StoreComponentRole::Index,
+                        implementation: "native-object-exact-payload-v2-compact".into(), version: 2,
+                        required: false, dtype: payload.dtype().clone(),
+                    }, payload, strategy).map_err(VortexRdfError::from)?);
+                }
                 unsupported => {
                     return Err(VortexRdfError::InvalidOperation(format!(
                         "native index {unsupported} passed materialization validation without a registered component producer"
@@ -3407,6 +3428,79 @@ impl NativeRdfStoreFile {
         Ok(resolved)
     }
 
+    async fn lookup_native_object_exact_ranges(
+        &self,
+        object_id: u32,
+    ) -> Result<Option<Vec<Range<u64>>>> {
+        let Some(directory) = self.component_scan("index.object.exact-ranges.directory")? else {
+            return Ok(None);
+        };
+        let Some(payload) = self.component_scan("index.object.exact-ranges.payload")? else {
+            return Err(VortexRdfError::Deserialization(
+                "object exact v2 directory exists without payload".into(),
+            ));
+        };
+        let entry = directory
+            .with_filter(eq(col("object_id"), lit(object_id)))
+            .with_projection(vortex_array::expr::select(
+                ["range_offset", "range_count", "candidate_rows"],
+                vortex_array::expr::root(),
+            ))
+            .into_array_stream()
+            .map_err(VortexRdfError::from)?
+            .read_all()
+            .await
+            .map_err(VortexRdfError::from)?;
+        if entry.len() == 0 {
+            return Ok(Some(Vec::new()));
+        }
+        if entry.len() != 1 {
+            return Err(VortexRdfError::Deserialization(
+                "object exact v2 directory entry is not unique".into(),
+            ));
+        }
+        let offsets = extract_projected_u64_column(&entry, "range_offset")?;
+        let counts = extract_projected_u32_column(&entry, "range_count")?;
+        let candidates = extract_projected_u64_column(&entry, "candidate_rows")?;
+        let end = offsets[0]
+            .checked_add(u64::from(counts[0]))
+            .ok_or_else(|| {
+                VortexRdfError::Deserialization("object exact v2 payload range overflow".into())
+            })?;
+        let selected = payload
+            .with_row_range(offsets[0]..end)
+            .with_projection(vortex_array::expr::select(
+                ["row_start", "row_end"],
+                vortex_array::expr::root(),
+            ))
+            .into_array_stream()
+            .map_err(VortexRdfError::from)?
+            .read_all()
+            .await
+            .map_err(VortexRdfError::from)?;
+        let starts = extract_projected_u64_column(&selected, "row_start")?;
+        let ends = extract_projected_u64_column(&selected, "row_end")?;
+        if starts.len() != counts[0] as usize || starts.len() != ends.len() {
+            return Err(VortexRdfError::Deserialization(
+                "object exact v2 payload length mismatch".into(),
+            ));
+        }
+        let ranges: Vec<_> = starts
+            .into_iter()
+            .zip(ends)
+            .map(|(start, end)| start..end)
+            .collect();
+        if ranges.iter().any(|range| range.start >= range.end)
+            || ranges.windows(2).any(|pair| pair[0].end > pair[1].start)
+            || range_rows(&ranges) != candidates[0]
+        {
+            return Err(VortexRdfError::Deserialization(
+                "object exact v2 payload invariant failed".into(),
+            ));
+        }
+        Ok(Some(ranges))
+    }
+
     async fn lookup_native_predicate_object_exact_ranges(
         &self,
         predicate_id: u32,
@@ -3758,6 +3852,12 @@ impl NativeRdfStoreFile {
             && self
                 .component_layout("index.predicate-object.exact-ranges.payload")?
                 .is_some();
+        let object_index_available = self
+            .component_layout("index.object.exact-ranges.directory")?
+            .is_some()
+            && self
+                .component_layout("index.object.exact-ranges.payload")?
+                .is_some();
         let quad_source_rows = self.file.footer().layout().row_count();
         let mut available_index = "none";
         let mut fallback_reason = "none";
@@ -3853,9 +3953,28 @@ impl NativeRdfStoreFile {
                 fallback_reason = "predicate-index-absent";
                 (None, "full-scan")
             }
+        } else if let Some(object_id) = resolved.o {
+            available_index = if object_index_available {
+                "index.object.exact-ranges"
+            } else {
+                "none"
+            };
+            if object_index_available {
+                let ranges = self
+                    .lookup_native_object_exact_ranges(object_id)
+                    .await?
+                    .unwrap_or_default();
+                (Some(ranges), available_index)
+            } else if policy == NativeIndexPolicy::Required {
+                return Err(VortexRdfError::InvalidOperation(
+                    "NativeIndexPolicy::Required requested for an object-bound pattern, but the complete object exact-ranges v2 component set is absent".into()));
+            } else {
+                fallback_reason = "object-index-absent";
+                (None, "full-scan")
+            }
         } else if policy == NativeIndexPolicy::Required {
             return Err(VortexRdfError::InvalidOperation(
-                "NativeIndexPolicy::Required requested, but the query has neither a bound subject nor a bound predicate"
+                "NativeIndexPolicy::Required requested, but the query has no compatible bound subject, predicate, or object"
                     .into(),
             ));
         } else {
@@ -7625,6 +7744,265 @@ fn build_object_directory_array(
     ])
     .map_err(VortexRdfError::Vortex)
     .map(|a| a.into_array())
+}
+
+// VORTEX_RDF_INTEGRATED_NATIVE_OBJECT_EXACT_RANGES_V2
+#[derive(Clone)]
+struct PreparedNativeObjectExactV2 {
+    payload_path: PathBuf,
+    object_ids: Arc<[u32]>,
+    range_offsets: Arc<[u64]>,
+    range_counts: Arc<[u32]>,
+    candidate_rows: Arc<[u64]>,
+}
+
+fn prepare_native_object_exact_v2(
+    run_paths: &[PathBuf],
+    temp_dir: &Path,
+) -> Result<PreparedNativeObjectExactV2> {
+    let sort_batch = std::env::var("VORTEX_RDF_O_V2_SORT_BATCH_RANGES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(1_000_000)
+        .max(1);
+    let mut readers = run_paths
+        .iter()
+        .map(|path| NativeIdRunReader::new(path))
+        .collect::<Result<Vec<_>>>()?;
+    let mut heap = BinaryHeap::new();
+    for (run_idx, reader) in readers.iter_mut().enumerate() {
+        if let Some(triple) = reader.read_one()? {
+            heap.push(IdRunHeapItem {
+                triple,
+                run_idx,
+                ordering: TripleOrdering::SPO,
+            });
+        }
+    }
+    let mut records = Vec::with_capacity(sort_batch);
+    let mut sorted_runs = Vec::new();
+    let mut row = 0u64;
+    let mut active_object = None;
+    let mut active_start = 0u64;
+    while let Some(item) = heap.pop() {
+        let object_id = item.triple.o;
+        match active_object {
+            None => {
+                active_object = Some(object_id);
+                active_start = row;
+            }
+            Some(previous) if previous != object_id => {
+                records.push(NativeObjectRangeRecord {
+                    object_id: previous,
+                    row_start: active_start,
+                    row_end: row,
+                });
+                active_object = Some(object_id);
+                active_start = row;
+                if records.len() >= sort_batch {
+                    let index = sorted_runs.len();
+                    flush_object_range_run(&mut records, temp_dir, index, &mut sorted_runs)?;
+                }
+            }
+            Some(_) => {}
+        }
+        row = row
+            .checked_add(1)
+            .ok_or_else(|| VortexRdfError::Serialization("object exact v2 row overflow".into()))?;
+        if let Some(next) = readers[item.run_idx].read_one()? {
+            heap.push(IdRunHeapItem {
+                triple: next,
+                run_idx: item.run_idx,
+                ordering: TripleOrdering::SPO,
+            });
+        }
+    }
+    if let Some(object_id) = active_object {
+        records.push(NativeObjectRangeRecord {
+            object_id,
+            row_start: active_start,
+            row_end: row,
+        });
+    }
+    if !records.is_empty() {
+        let index = sorted_runs.len();
+        flush_object_range_run(&mut records, temp_dir, index, &mut sorted_runs)?;
+    }
+
+    let payload_path = temp_dir.join("native_object_exact_v2_payload.bin");
+    let mut payload = BufWriter::new(
+        std::fs::File::create(&payload_path)
+            .map_err(|error| VortexRdfError::Serialization(error.to_string()))?,
+    );
+    let mut range_readers = sorted_runs
+        .iter()
+        .map(|path| NativeObjectRangeRunReader::new(path))
+        .collect::<Result<Vec<_>>>()?;
+    let mut range_heap = BinaryHeap::new();
+    for (run_idx, reader) in range_readers.iter_mut().enumerate() {
+        if let Some(value) = reader.read_one()? {
+            range_heap.push(NativeObjectRangeHeapItem { value, run_idx });
+        }
+    }
+    let (mut ids, mut offsets, mut counts, mut rows) =
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let mut payload_offset = 0u64;
+    let mut current = None;
+    let mut current_offset = 0u64;
+    let mut current_count = 0u32;
+    let mut current_rows = 0u64;
+    let mut previous_range_end = None;
+    while let Some(item) = range_heap.pop() {
+        let value = item.value;
+        if current != Some(value.object_id) {
+            if let Some(object_id) = current {
+                ids.push(object_id);
+                offsets.push(current_offset);
+                counts.push(current_count);
+                rows.push(current_rows);
+            }
+            current = Some(value.object_id);
+            current_offset = payload_offset;
+            current_count = 0;
+            current_rows = 0;
+            previous_range_end = None;
+        }
+        if value.row_start >= value.row_end
+            || previous_range_end.is_some_and(|end| value.row_start < end)
+        {
+            return Err(VortexRdfError::Serialization(
+                "object exact v2 contains an invalid or overlapping range".into(),
+            ));
+        }
+        write_object_range_record(&mut payload, value)?;
+        current_count = current_count.checked_add(1).ok_or_else(|| {
+            VortexRdfError::Serialization("object exact v2 range-count overflow".into())
+        })?;
+        current_rows = current_rows
+            .checked_add(value.row_end - value.row_start)
+            .ok_or_else(|| {
+                VortexRdfError::Serialization("object exact v2 candidate-row overflow".into())
+            })?;
+        payload_offset = payload_offset.checked_add(1).ok_or_else(|| {
+            VortexRdfError::Serialization("object exact v2 payload-offset overflow".into())
+        })?;
+        previous_range_end = Some(value.row_end);
+        if let Some(next) = range_readers[item.run_idx].read_one()? {
+            range_heap.push(NativeObjectRangeHeapItem {
+                value: next,
+                run_idx: item.run_idx,
+            });
+        }
+    }
+    if let Some(object_id) = current {
+        ids.push(object_id);
+        offsets.push(current_offset);
+        counts.push(current_count);
+        rows.push(current_rows);
+    }
+    payload
+        .flush()
+        .map_err(|error| VortexRdfError::Serialization(error.to_string()))?;
+    if ids.windows(2).any(|pair| pair[0] >= pair[1])
+        || offsets.first().copied().unwrap_or(0) != 0
+        || offsets
+            .iter()
+            .zip(counts.iter())
+            .zip(offsets.iter().skip(1))
+            .any(|((&offset, &count), &next)| offset + u64::from(count) != next)
+        || offsets
+            .last()
+            .zip(counts.last())
+            .is_some_and(|(&offset, &count)| offset + u64::from(count) != payload_offset)
+    {
+        return Err(VortexRdfError::Serialization(
+            "object exact v2 directory is not sorted and payload-contiguous".into(),
+        ));
+    }
+    Ok(PreparedNativeObjectExactV2 {
+        payload_path,
+        object_ids: ids.into(),
+        range_offsets: offsets.into(),
+        range_counts: counts.into(),
+        candidate_rows: rows.into(),
+    })
+}
+
+#[derive(Clone)]
+struct NativeObjectExactDirectorySource {
+    prepared: Arc<PreparedNativeObjectExactV2>,
+    dtype: vortex_array::dtype::DType,
+}
+impl NativeObjectExactDirectorySource {
+    fn new(prepared: Arc<PreparedNativeObjectExactV2>) -> Result<Self> {
+        Ok(Self {
+            prepared,
+            dtype: build_object_directory_array(Vec::new(), Vec::new(), Vec::new(), Vec::new())?
+                .dtype()
+                .clone(),
+        })
+    }
+}
+impl NativeComponentSource for NativeObjectExactDirectorySource {
+    fn dtype(&self) -> &vortex_array::dtype::DType {
+        &self.dtype
+    }
+    fn open(&self) -> VortexResult<vortex_array::stream::SendableArrayStream> {
+        let array = build_object_directory_array(
+            self.prepared.object_ids.to_vec(),
+            self.prepared.range_offsets.to_vec(),
+            self.prepared.range_counts.to_vec(),
+            self.prepared.candidate_rows.to_vec(),
+        )
+        .map_err(rdf_err_to_vortex_err)?;
+        Ok(ArrayStreamExt::boxed(ArrayStreamAdapter::new(
+            self.dtype.clone(),
+            futures::stream::iter(vec![Ok(array)]),
+        )))
+    }
+}
+
+#[derive(Clone)]
+struct NativeObjectExactPayloadSource {
+    path: PathBuf,
+    batch_size: usize,
+    dtype: vortex_array::dtype::DType,
+}
+impl NativeObjectExactPayloadSource {
+    fn new(path: PathBuf, batch_size: usize) -> Result<Self> {
+        Ok(Self {
+            path,
+            batch_size: batch_size.max(1),
+            dtype: build_object_payload_array(Vec::new(), Vec::new())?
+                .dtype()
+                .clone(),
+        })
+    }
+}
+impl NativeComponentSource for NativeObjectExactPayloadSource {
+    fn dtype(&self) -> &vortex_array::dtype::DType {
+        &self.dtype
+    }
+    fn open(&self) -> VortexResult<vortex_array::stream::SendableArrayStream> {
+        let path = self.path.clone();
+        let batch_size = self.batch_size;
+        let stream = async_stream::try_stream! {
+            let mut reader = NativeObjectRangeRunReader::new(&path).map_err(rdf_err_to_vortex_err)?;
+            loop {
+                let (mut starts, mut ends) = (Vec::with_capacity(batch_size), Vec::with_capacity(batch_size));
+                while starts.len() < batch_size {
+                    let Some(value) = reader.read_one().map_err(rdf_err_to_vortex_err)? else { break; };
+                    starts.push(value.row_start); ends.push(value.row_end);
+                }
+                if starts.is_empty() { break; }
+                yield build_object_payload_array(starts, ends).map_err(rdf_err_to_vortex_err)?;
+            }
+        };
+        Ok(ArrayStreamExt::boxed(ArrayStreamAdapter::new(
+            self.dtype.clone(),
+            stream,
+        )))
+    }
 }
 
 pub async fn build_cottas_native_o_exact_ranges_index(
