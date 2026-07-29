@@ -45,6 +45,11 @@ use oxrdfio::{RdfFormat, RdfSerializer};
 use vortex::expr::{Expression, and, col, eq, lit, or};
 use vortex_array::stream::ArrayStreamExt;
 
+// VORTEX_RDF_NATIVE_COST_AWARE_PREDICATE_PLANNER_V1
+const NATIVE_AUTO_MAX_PREDICATE_SELECTIVITY_NUMERATOR: u64 = 35;
+const NATIVE_AUTO_MAX_PREDICATE_SELECTIVITY_DENOMINATOR: u64 = 100;
+const NATIVE_AUTO_MAX_PREDICATE_RANGES: usize = 16_384;
+
 static NATIVE_FILE_SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
     use vortex_array::scalar_fn::session::ScalarFnSession;
     use vortex_array::session::ArraySession;
@@ -3456,9 +3461,18 @@ impl NativeRdfStoreFile {
 
         let subject_index_available = self.component_layout("index.subject-ranges")?.is_some();
         let predicate_index_available = self.component_layout("index.predicate-runs")?.is_some();
+        let quad_source_rows = self.file.footer().layout().row_count();
+        let mut available_index = "none";
+        let mut fallback_reason = "none";
         let (candidate_ranges, access) = if policy == NativeIndexPolicy::Disabled {
+            fallback_reason = "policy-disabled";
             (None, "full-scan")
         } else if let Some(subject_id) = resolved.s {
+            available_index = if subject_index_available {
+                "index.subject-ranges"
+            } else {
+                "none"
+            };
             if subject_index_available {
                 (
                     self.lookup_native_subject_range(subject_id)
@@ -3472,20 +3486,48 @@ impl NativeRdfStoreFile {
                         .into(),
                 ));
             } else {
+                fallback_reason = "subject-index-absent";
                 (None, "full-scan")
             }
         } else if let Some(predicate_id) = resolved.p {
+            available_index = if predicate_index_available {
+                "index.predicate-runs"
+            } else {
+                "none"
+            };
             if predicate_index_available {
-                (
-                    self.lookup_native_predicate_ranges(predicate_id).await?,
-                    "index.predicate-runs",
-                )
+                let ranges = self
+                    .lookup_native_predicate_ranges(predicate_id)
+                    .await?
+                    .unwrap_or_default();
+                let candidate_rows = ranges
+                    .iter()
+                    .map(|range| range.end - range.start)
+                    .sum::<u64>();
+                let range_cost_ok = ranges.len() <= NATIVE_AUTO_MAX_PREDICATE_RANGES;
+                let row_cost_ok = candidate_rows
+                    .saturating_mul(NATIVE_AUTO_MAX_PREDICATE_SELECTIVITY_DENOMINATOR)
+                    <= quad_source_rows
+                        .saturating_mul(NATIVE_AUTO_MAX_PREDICATE_SELECTIVITY_NUMERATOR);
+                if policy == NativeIndexPolicy::Required || (range_cost_ok && row_cost_ok) {
+                    (Some(ranges), "index.predicate-runs")
+                } else {
+                    fallback_reason = if !range_cost_ok && !row_cost_ok {
+                        "predicate-index-too-fragmented-and-unselective"
+                    } else if !range_cost_ok {
+                        "predicate-index-too-fragmented"
+                    } else {
+                        "predicate-index-not-selective"
+                    };
+                    (None, "full-scan")
+                }
             } else if policy == NativeIndexPolicy::Required {
                 return Err(VortexRdfError::InvalidOperation(
                     "NativeIndexPolicy::Required requested for a predicate-bound pattern, but index.predicate-runs is absent"
                         .into(),
                 ));
             } else {
+                fallback_reason = "predicate-index-absent";
                 (None, "full-scan")
             }
         } else if policy == NativeIndexPolicy::Required {
@@ -3494,6 +3536,7 @@ impl NativeRdfStoreFile {
                     .into(),
             ));
         } else {
+            fallback_reason = "no-compatible-bound-column";
             (None, "full-scan")
         };
         if candidate_ranges.as_ref().is_some_and(Vec::is_empty)
@@ -3520,15 +3563,28 @@ impl NativeRdfStoreFile {
             NativePatternFilter::Empty => return Ok(Vec::new()),
             NativePatternFilter::Expr(expr) => scan.with_filter(expr),
         };
-        log::debug!(
-            "[native-rdf-store] match policy={:?} access={} candidate_ranges={} candidate_rows={} setup={:?}",
-            policy,
-            access,
-            candidate_ranges.as_ref().map_or(0, Vec::len),
-            candidate_ranges.as_ref().map_or(0, |ranges| ranges
+        let candidate_range_count = candidate_ranges.as_ref().map_or(0, Vec::len);
+        let candidate_row_count = candidate_ranges.as_ref().map_or(0, |ranges| {
+            ranges
                 .iter()
                 .map(|range| range.end - range.start)
-                .sum()),
+                .sum::<u64>()
+        });
+        let candidate_selectivity = if quad_source_rows == 0 {
+            0.0
+        } else {
+            candidate_row_count as f64 / quad_source_rows as f64
+        };
+        log::debug!(
+            "[native-rdf-store] match policy={:?} available_index={} selected={} candidate_ranges={} candidate_rows={} total_rows={} selectivity={:.6} fallback={} setup={:?}",
+            policy,
+            available_index,
+            access,
+            candidate_range_count,
+            candidate_row_count,
+            quad_source_rows,
+            candidate_selectivity,
+            fallback_reason,
             scan_started.elapsed()
         );
         let stream = scan
