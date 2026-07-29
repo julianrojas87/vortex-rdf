@@ -1,6 +1,6 @@
 use crate::error::{Result, VortexRdfError};
 use crate::index::{RdfDictionary, SimpleDictionaryView};
-use crate::io::native_rdf_store::{NativeIndexSelection, NativeIndexSpec};
+use crate::io::native_rdf_store::{NativeIndexBuildContext, NativeIndexSelection, NativeIndexSpec};
 use crate::io::utils::CottasVortexCompressionProfile;
 use crate::store::layout::cottas::TripleOrdering;
 use async_trait::async_trait;
@@ -1795,15 +1795,11 @@ where
         temp_dir.path(),
     )?;
     drop(string_runs);
-    // VORTEX_RDF_DYNAMIC_NATIVE_INDEX_WRITER_REGISTRY_V1
-    let subject_range_runs = config
-        .native_indexes
-        .contains(NativeIndexSpec::SubjectRangesV1)
-        .then(|| id_runs.clone());
-    let predicate_run_paths = config
-        .native_indexes
-        .contains(NativeIndexSpec::PredicateRunsV1)
-        .then(|| id_runs.clone());
+    let index_build_context = NativeIndexBuildContext::new(
+        id_runs.clone(),
+        config.dict_row_group_size,
+        config.native_indexes.clone(),
+    );
     let arrays = merge_sorted_id_runs_to_array_stream(id_runs, config.ordering, row_group_size)?;
     let dtype = empty_spog_array()?.dtype().clone();
     let stream = ArrayStreamAdapter::new(dtype, arrays);
@@ -1878,21 +1874,44 @@ where
         )
         .map_err(VortexRdfError::from)?;
 
-        // FUTURE(performance): add a sparse lexical fence/search component after
-        // measuring zone-map pruning, range requests, and bytes read. The sorted
-        // dictionary remains the correctness-preserving baseline.
-        let mut components = vec![id_to_term_component, term_to_id_component];
+        let term_directory_source = Arc::new(NativeTermDirectorySource::new(
+            &pair_runs.term_run_paths,
+            NATIVE_TERM_DIRECTORY_FENCE_ROWS,
+            config.dict_row_group_size,
+        )?);
+        let term_directory_strategy: Arc<dyn LayoutStrategy> = WriteStrategyBuilder::default()
+            .with_row_block_size(config.dict_row_group_size.max(1))
+            .with_btrblocks_builder(BtrBlocksCompressorBuilder::default().with_compact())
+            .build();
+        let term_directory_component = NativeComponentWrite::new(
+            StoreComponentDescriptor {
+                name: "dictionary.term-directory".into(),
+                role: StoreComponentRole::Dictionary,
+                implementation: "native-sparse-lexical-fence-v1-compact".into(),
+                version: 1,
+                required: true,
+                dtype: term_directory_source.dtype().clone(),
+            },
+            term_directory_source,
+            term_directory_strategy,
+        )
+        .map_err(VortexRdfError::from)?;
+        let mut components = vec![
+            id_to_term_component,
+            term_to_id_component,
+            term_directory_component,
+        ];
         for spec in config.native_indexes.resolved() {
             match spec {
                 NativeIndexSpec::SubjectRangesV1 => {
-                    let run_paths = subject_range_runs.as_ref().ok_or_else(|| {
+                    let run_paths = index_build_context.run_paths_for(spec).ok_or_else(|| {
                         VortexRdfError::Serialization(
                             "subject range replay paths were not retained".into(),
                         )
                     })?;
                     let source = Arc::new(NativeSubjectRangesSource::new(
                         run_paths,
-                        config.dict_row_group_size,
+                        index_build_context.index_row_group_size,
                     )?);
                     let strategy: Arc<dyn LayoutStrategy> = WriteStrategyBuilder::default()
                         .with_row_block_size(config.dict_row_group_size.max(1))
@@ -1915,14 +1934,14 @@ where
                     );
                 }
                 NativeIndexSpec::PredicateRunsV1 => {
-                    let run_paths = predicate_run_paths.as_ref().ok_or_else(|| {
+                    let run_paths = index_build_context.run_paths_for(spec).ok_or_else(|| {
                         VortexRdfError::Serialization(
                             "predicate run replay paths were not retained".into(),
                         )
                     })?;
                     let source = Arc::new(NativePredicateRunsSource::new(
                         run_paths,
-                        config.dict_row_group_size,
+                        index_build_context.index_row_group_size,
                     )?);
                     let strategy: Arc<dyn LayoutStrategy> = WriteStrategyBuilder::default()
                         .with_row_block_size(config.dict_row_group_size.max(1))
@@ -1943,6 +1962,19 @@ where
                         )
                         .map_err(VortexRdfError::from)?,
                     );
+                }
+                NativeIndexSpec::PredicateExactRangesV2 => {
+                    let _shared_paths = index_build_context
+                        .selected_run_paths(spec)
+                        .ok_or_else(|| {
+                            VortexRdfError::Serialization(
+                                "predicate exact-range replay paths were not retained".into(),
+                            )
+                        })?;
+                    return Err(VortexRdfError::InvalidOperation(
+                        "predicate:exact-ranges-v2 is configuration-valid, but its directory and payload producers must be installed by the native predicate exact-range producer patch"
+                            .into(),
+                    ));
                 }
                 unsupported => {
                     return Err(VortexRdfError::InvalidOperation(format!(
@@ -7495,6 +7527,130 @@ impl NativeComponentSource for PairRunDictionarySource {
 
     // FUTURE(performance): report file-reader buffers once run-backed sources
     // expose explicit buffered-memory accounting.
+}
+
+// VORTEX_RDF_SHARED_NATIVE_BUILD_CONTEXT_TERM_DIRECTORY_V1
+fn native_term_directory_stream(
+    run_paths: Vec<PathBuf>,
+    fence_rows: usize,
+    batch_size: usize,
+) -> Result<impl Stream<Item = VortexResult<ArrayRef>> + Send> {
+    let fence_rows = fence_rows.max(1);
+    let batch_size = batch_size.max(1);
+    Ok(async_stream::try_stream! {
+        let mut readers = Vec::with_capacity(run_paths.len());
+        for path in &run_paths {
+            readers.push(PairRunReader::new(path).map_err(rdf_err_to_vortex_err)?);
+        }
+        let mut heap = BinaryHeap::new();
+        for run_idx in 0..readers.len() {
+            if let Some(pair) = readers[run_idx].read_one().map_err(rdf_err_to_vortex_err)? {
+                heap.push(PairHeapItem { pair, run_idx, order: PairRunOrder::Term });
+            }
+        }
+        let mut first = Vec::with_capacity(batch_size);
+        let mut last = Vec::with_capacity(batch_size);
+        let mut starts = Vec::with_capacity(batch_size);
+        let mut ends = Vec::with_capacity(batch_size);
+        let mut previous: Option<String> = None;
+        let mut fence_first: Option<String> = None;
+        let mut fence_last: Option<String> = None;
+        let mut fence_start = 0u64;
+        let mut fence_len = 0usize;
+        let mut row = 0u64;
+        while let Some(item) = heap.pop() {
+            let run_idx = item.run_idx;
+            let pair = item.pair;
+            if previous.as_ref().is_some_and(|value| value >= &pair.term) {
+                Err(vortex_error::vortex_err!("term directory source is not strictly lexical"))?;
+            }
+            if fence_first.is_none() {
+                fence_start = row;
+                fence_first = Some(pair.term.clone());
+            }
+            fence_last = Some(pair.term.clone());
+            previous = Some(pair.term);
+            fence_len += 1;
+            row += 1;
+            if let Some(next) = readers[run_idx].read_one().map_err(rdf_err_to_vortex_err)? {
+                heap.push(PairHeapItem { pair: next, run_idx, order: PairRunOrder::Term });
+            }
+            if fence_len == fence_rows {
+                first.push(fence_first.take().expect("fence first is present"));
+                last.push(fence_last.take().expect("fence last is present"));
+                starts.push(fence_start);
+                ends.push(row);
+                fence_len = 0;
+            }
+            if first.len() >= batch_size {
+                yield build_native_term_directory_array(
+                    std::mem::take(&mut first),
+                    std::mem::take(&mut last),
+                    std::mem::take(&mut starts),
+                    std::mem::take(&mut ends),
+                ).map_err(rdf_err_to_vortex_err)?;
+                first = Vec::with_capacity(batch_size);
+                last = Vec::with_capacity(batch_size);
+                starts = Vec::with_capacity(batch_size);
+                ends = Vec::with_capacity(batch_size);
+            }
+        }
+        if fence_len != 0 {
+            first.push(fence_first.take().expect("partial fence first is present"));
+            last.push(fence_last.take().expect("partial fence last is present"));
+            starts.push(fence_start);
+            ends.push(row);
+        }
+        if !first.is_empty() {
+            yield build_native_term_directory_array(first, last, starts, ends)
+                .map_err(rdf_err_to_vortex_err)?;
+        } else if readers.is_empty() {
+            yield build_native_term_directory_array(Vec::new(), Vec::new(), Vec::new(), Vec::new())
+                .map_err(rdf_err_to_vortex_err)?;
+        }
+    })
+}
+
+#[derive(Clone)]
+struct NativeTermDirectorySource {
+    run_paths: Arc<[PathBuf]>,
+    fence_rows: usize,
+    batch_size: usize,
+    dtype: vortex_array::dtype::DType,
+}
+
+impl NativeTermDirectorySource {
+    fn new(run_paths: &[PathBuf], fence_rows: usize, batch_size: usize) -> Result<Self> {
+        Ok(Self {
+            run_paths: run_paths.to_vec().into(),
+            fence_rows: fence_rows.max(1),
+            batch_size: batch_size.max(1),
+            dtype: build_native_term_directory_array(
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            )?
+            .dtype()
+            .clone(),
+        })
+    }
+}
+
+impl NativeComponentSource for NativeTermDirectorySource {
+    fn dtype(&self) -> &vortex_array::dtype::DType {
+        &self.dtype
+    }
+
+    fn open(&self) -> VortexResult<vortex_array::stream::SendableArrayStream> {
+        let stream =
+            native_term_directory_stream(self.run_paths.to_vec(), self.fence_rows, self.batch_size)
+                .map_err(rdf_err_to_vortex_err)?;
+        Ok(ArrayStreamExt::boxed(ArrayStreamAdapter::new(
+            self.dtype.clone(),
+            stream,
+        )))
+    }
 }
 
 // VORTEX_RDF_NATIVE_SUBJECT_RANGES_COMPONENT_V1

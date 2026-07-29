@@ -116,13 +116,23 @@ impl NativeIndexSelection {
     /// Reject specifications whose proven builders are not native component
     /// producers yet. This prevents silently writing an incomplete artifact.
     pub fn ensure_materializable_now(&self) -> Result<()> {
-        let unavailable: Vec<_> = self
-            .resolved()
+        let resolved = self.resolved();
+        if resolved.contains(&NativeIndexSpec::PredicateRunsV1)
+            && resolved.contains(&NativeIndexSpec::PredicateExactRangesV2)
+        {
+            return Err(VortexRdfError::InvalidOperation(
+                "predicate:runs-v1 and predicate:exact-ranges-v2 are alternative implementations; select exactly one"
+                    .into(),
+            ));
+        }
+        let unavailable: Vec<_> = resolved
             .into_iter()
             .filter(|spec| {
                 !matches!(
                     spec,
-                    NativeIndexSpec::SubjectRangesV1 | NativeIndexSpec::PredicateRunsV1
+                    NativeIndexSpec::SubjectRangesV1
+                        | NativeIndexSpec::PredicateRunsV1
+                        | NativeIndexSpec::PredicateExactRangesV2
                 )
             })
             .map(|spec| spec.to_string())
@@ -173,6 +183,27 @@ mod tests {
                 NativeIndexSpec::ObjectExactRangesV2,
             ]
         );
+    }
+
+    #[test]
+    fn competing_predicate_implementations_are_rejected() {
+        let selection = NativeIndexSelection {
+            profile: NativeIndexProfile::None,
+            explicit: vec![
+                NativeIndexSpec::PredicateRunsV1,
+                NativeIndexSpec::PredicateExactRangesV2,
+            ],
+        };
+        assert!(selection.ensure_materializable_now().is_err());
+    }
+
+    #[test]
+    fn predicate_exact_v2_passes_configuration_validation() {
+        let selection = NativeIndexSelection {
+            profile: NativeIndexProfile::None,
+            explicit: vec![NativeIndexSpec::PredicateExactRangesV2],
+        };
+        assert!(selection.ensure_materializable_now().is_ok());
     }
 
     #[test]
