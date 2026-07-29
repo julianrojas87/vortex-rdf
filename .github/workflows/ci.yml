@@ -57,6 +57,26 @@ jobs:
       - name: Run Rust tests
         run: ${{ matrix.command }}
 
+  python-tests:
+    name: Python Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: python
+      - name: Build and install bindings
+        run: pip install ./python[test]
+      - name: Run tests
+        run: pytest python/tests -q
+
   js-tests:
     name: JS Tests
     runs-on: ubuntu-latest
