@@ -1,5 +1,8 @@
 use crate::error::{Result, VortexRdfError};
 use crate::index::{RdfDictionary, SimpleDictionaryView};
+use crate::io::native_rdf_store::exact_ranges::{
+    checked_payload_end, range_rows, validate_exact_ranges,
+};
 use crate::io::native_rdf_store::{NativeIndexBuildContext, NativeIndexSelection, NativeIndexSpec};
 use crate::io::utils::CottasVortexCompressionProfile;
 use crate::store::layout::cottas::TripleOrdering;
@@ -3460,11 +3463,7 @@ impl NativeRdfStoreFile {
         let offsets = extract_projected_u64_column(&entry, "range_offset")?;
         let counts = extract_projected_u32_column(&entry, "range_count")?;
         let candidates = extract_projected_u64_column(&entry, "candidate_rows")?;
-        let end = offsets[0]
-            .checked_add(u64::from(counts[0]))
-            .ok_or_else(|| {
-                VortexRdfError::Deserialization("object exact v2 payload range overflow".into())
-            })?;
+        let end = checked_payload_end(offsets[0], counts[0], "object exact v2")?;
         let selected = payload
             .with_row_range(offsets[0]..end)
             .with_projection(vortex_array::expr::select(
@@ -3583,11 +3582,7 @@ impl NativeRdfStoreFile {
         let offsets = extract_projected_u64_column(&entry, "range_offset")?;
         let counts = extract_projected_u32_column(&entry, "range_count")?;
         let candidates = extract_projected_u64_column(&entry, "candidate_rows")?;
-        let end = offsets[0]
-            .checked_add(u64::from(counts[0]))
-            .ok_or_else(|| {
-                VortexRdfError::Deserialization("predicate-object payload range overflow".into())
-            })?;
+        let end = checked_payload_end(offsets[0], counts[0], "predicate-object")?;
         let payload = self
             .component_scan("index.predicate-object.exact-ranges.payload")?
             .unwrap()
@@ -3661,9 +3656,7 @@ impl NativeRdfStoreFile {
                 "predicate exact v2 directory exists without payload".into(),
             ));
         };
-        let end = offset.checked_add(u64::from(count)).ok_or_else(|| {
-            VortexRdfError::Deserialization("predicate exact v2 payload range overflow".into())
-        })?;
+        let end = checked_payload_end(offset, count, "predicate exact v2")?;
         let payload_result = payload
             .with_row_range(offset..end)
             .with_projection(vortex_array::expr::select(
@@ -5760,28 +5753,12 @@ fn decode_exact_range_payload(
             "{context} returned inconsistent range columns"
         )));
     }
-    let mut ranges = Vec::with_capacity(payload.len());
-    let mut previous_end = None;
-    for (start, end) in starts.into_iter().zip(ends) {
-        if start >= end {
-            return Err(VortexRdfError::Deserialization(format!(
-                "{context} contains invalid range {start}..{end}"
-            )));
-        }
-        if previous_end.is_some_and(|value| start < value) {
-            return Err(VortexRdfError::Deserialization(format!(
-                "{context} contains overlapping or unsorted ranges"
-            )));
-        }
-        previous_end = Some(end);
-        ranges.push(start..end);
-    }
-    let actual_rows = range_rows(&ranges);
-    if actual_rows != expected_candidate_rows {
-        return Err(VortexRdfError::Deserialization(format!(
-            "{context} candidate-row mismatch: expected={expected_candidate_rows}, actual={actual_rows}"
-        )));
-    }
+    let ranges: Vec<_> = starts
+        .into_iter()
+        .zip(ends)
+        .map(|(start, end)| start..end)
+        .collect();
+    validate_exact_ranges(&ranges, expected_candidate_rows, context)?;
     Ok(ranges)
 }
 
@@ -6084,13 +6061,6 @@ async fn lookup_predicate_access_from_vortex_v2(
         }
     }
     Ok(Some(access))
-}
-
-fn range_rows(ranges: &[std::ops::Range<u64>]) -> u64 {
-    ranges
-        .iter()
-        .map(|range| range.end.saturating_sub(range.start))
-        .sum()
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -10508,6 +10478,206 @@ async fn lookup_term_id_from_sidecar_with_stats(
     stats.found_id = id;
     stats.total_ms = elapsed_ms(lookup_start);
     Ok((id, stats))
+}
+
+// VORTEX_RDF_NATIVE_INDEX_BASELINE_EQUIVALENCE_TESTS_V1
+#[cfg(test)]
+mod native_index_baseline_equivalence_tests {
+    use super::*;
+    use crate::index::SimpleDictionary;
+
+    const SKOS_SUBJECT: &str = "http://www.w3.org/2004/02/skos/core#subject";
+    const EDUARD: &str = "http://dbpedia.org/resource/Eduard_Winkelmann";
+    const BOWER: &str = "http://dbpedia.org/resource/Bower_Manuscript";
+    const ANKLESHWAR: &str = "http://dbpedia.org/resource/Ankleshwar";
+    const TARTU: &str = "http://dbpedia.org/resource/Category%3AUniversity_of_Tartu_faculty";
+    const HEIDELBERG: &str =
+        "http://dbpedia.org/resource/Category%3AUniversity_of_Heidelberg_faculty";
+    const CENTRAL_ASIA: &str = "http://dbpedia.org/resource/Category%3AHistory_of_Central_Asia";
+    const CENTRAL_ASIAN_STUDIES: &str =
+        "http://dbpedia.org/resource/Category%3ACentral_Asian_studies";
+    const GUJARAT: &str = "http://dbpedia.org/resource/Category%3ACities_and_towns_in_Gujarat";
+    const RELATED: &str = "http://example.com/related";
+
+    fn named(value: &str) -> NamedNode {
+        NamedNode::new(value).unwrap()
+    }
+
+    fn quad(subject: &str, predicate: &str, object: &str) -> Quad {
+        Quad::new(
+            named(subject),
+            named(predicate),
+            named(object),
+            GraphName::DefaultGraph,
+        )
+    }
+
+    fn fixture() -> Vec<Quad> {
+        vec![
+            quad(BOWER, SKOS_SUBJECT, CENTRAL_ASIA),
+            quad(BOWER, SKOS_SUBJECT, CENTRAL_ASIAN_STUDIES),
+            quad(ANKLESHWAR, SKOS_SUBJECT, GUJARAT),
+            quad(EDUARD, SKOS_SUBJECT, TARTU),
+            quad(EDUARD, SKOS_SUBJECT, HEIDELBERG),
+            // The repeated object is deliberately separated by SPO order so the
+            // object index must preserve multiple exact payload ranges.
+            quad(BOWER, RELATED, TARTU),
+            quad(ANKLESHWAR, RELATED, CENTRAL_ASIA),
+            // Preserve duplicate-row semantics as well as set membership.
+            quad(EDUARD, SKOS_SUBJECT, TARTU),
+        ]
+    }
+
+    fn sorted(mut triples: Vec<(String, String, String)>) -> Vec<(String, String, String)> {
+        triples.sort_unstable();
+        triples
+    }
+
+    async fn assert_auto_equals_disabled(
+        store: &NativeRdfStoreFile,
+        subject: Option<&NamedOrBlankNode>,
+        predicate: Option<&NamedNode>,
+        object: Option<&Term>,
+    ) {
+        let auto = store
+            .match_pattern_with_policy(subject, predicate, object, None, NativeIndexPolicy::Auto)
+            .await
+            .unwrap();
+        let disabled = store
+            .match_pattern_with_policy(
+                subject,
+                predicate,
+                object,
+                None,
+                NativeIndexPolicy::Disabled,
+            )
+            .await
+            .unwrap();
+        assert_eq!(sorted(auto), sorted(disabled));
+    }
+
+    #[tokio::test]
+    async fn standard_indexes_match_index_free_quad_source_results() {
+        let temp = tempfile::tempdir().unwrap();
+        let artifact = temp.path().join("native-standard-equivalence.vortex");
+        let quads = fixture().into_iter().map(Ok);
+        let config = CottasNativeConfig {
+            row_group_size: 2,
+            dict_row_group_size: 2,
+            ..CottasNativeConfig::default()
+        };
+        serialize_cottas_native_quad_source_v10_file::<SimpleDictionary, _>(
+            futures::stream::iter(quads),
+            &artifact,
+            config,
+        )
+        .await
+        .unwrap();
+
+        let store = NativeRdfStoreFile::open(&artifact).await.unwrap();
+        assert_eq!(
+            store.component_names(),
+            vec![
+                Arc::<str>::from("quad-source"),
+                Arc::<str>::from("dictionary.id-to-term"),
+                Arc::<str>::from("dictionary.term-to-id"),
+                Arc::<str>::from("dictionary.term-directory"),
+                Arc::<str>::from("index.subject-ranges"),
+                Arc::<str>::from("index.predicate.exact-ranges.directory"),
+                Arc::<str>::from("index.predicate.exact-ranges.payload"),
+                Arc::<str>::from("index.predicate-object.predicate-partitions"),
+                Arc::<str>::from("index.predicate-object.exact-ranges.directory"),
+                Arc::<str>::from("index.predicate-object.exact-ranges.payload"),
+                Arc::<str>::from("index.object.exact-ranges.directory"),
+                Arc::<str>::from("index.object.exact-ranges.payload"),
+            ]
+        );
+
+        let eduard = NamedOrBlankNode::NamedNode(named(EDUARD));
+        let bower = NamedOrBlankNode::NamedNode(named(BOWER));
+        let missing =
+            NamedOrBlankNode::NamedNode(named("http://dbpedia.org/resource/Definitely_Missing"));
+        let predicate = named(SKOS_SUBJECT);
+        let related = named(RELATED);
+        let tartu = Term::NamedNode(named(TARTU));
+        let central_asia = Term::NamedNode(named(CENTRAL_ASIA));
+
+        // Subject index, including duplicate preservation.
+        assert_auto_equals_disabled(&store, Some(&eduard), None, None).await;
+        // Predicate exact ranges over multiple disjoint SPO subject groups.
+        assert_auto_equals_disabled(&store, None, Some(&predicate), None).await;
+        // Predicate-object exact ranges.
+        assert_auto_equals_disabled(&store, None, Some(&predicate), Some(&tartu)).await;
+        // Object exact ranges with matches under two predicates and subjects.
+        assert_auto_equals_disabled(&store, None, None, Some(&tartu)).await;
+        // Fully bound matching keeps the subject-first priority and exact filter.
+        assert_auto_equals_disabled(&store, Some(&eduard), Some(&predicate), Some(&tartu)).await;
+        // Dictionary miss short-circuits identically.
+        assert_auto_equals_disabled(&store, Some(&missing), None, None).await;
+        // Every term exists, but this combination does not.
+        assert_auto_equals_disabled(&store, Some(&bower), Some(&related), Some(&central_asia))
+            .await;
+
+        let predicate_id = store
+            .lookup_term_id(&named(SKOS_SUBJECT).to_string())
+            .await
+            .unwrap()
+            .unwrap();
+        let object_id = store
+            .lookup_term_id(&named(TARTU).to_string())
+            .await
+            .unwrap()
+            .unwrap();
+        let subject_id = store
+            .lookup_term_id(&named(EDUARD).to_string())
+            .await
+            .unwrap()
+            .unwrap();
+
+        let subject_range = store
+            .lookup_native_subject_range(subject_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!subject_range.is_empty());
+        let predicate_ranges = store
+            .lookup_native_predicate_exact_ranges(predicate_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            predicate_ranges.len() > 1,
+            "fixture must exercise disjoint predicate ranges"
+        );
+        let po_ranges = store
+            .lookup_native_predicate_object_exact_ranges(predicate_id, object_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!po_ranges.is_empty());
+        let object_ranges = store
+            .lookup_native_object_exact_ranges(object_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            object_ranges.len() > 1,
+            "fixture must exercise disjoint object ranges"
+        );
+
+        // Required proves that every intended query shape has a compatible index.
+        for (s, p, o) in [
+            (Some(&eduard), None, None),
+            (None, Some(&predicate), None),
+            (None, Some(&predicate), Some(&tartu)),
+            (None, None, Some(&tartu)),
+        ] {
+            store
+                .match_pattern_with_policy(s, p, o, None, NativeIndexPolicy::Required)
+                .await
+                .unwrap();
+        }
+    }
 }
 
 #[cfg(test)]
