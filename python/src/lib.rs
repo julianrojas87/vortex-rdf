@@ -84,48 +84,6 @@ fn match_triples(
     }
 }
 
-// VORTEX_RDF_COMPACT_PYTHON_RESULT_V1
-#[pyfunction]
-fn match_triples_compact(
-    path: String,
-    subject_n3: Option<String>,
-    predicate_n3: Option<String>,
-    object_n3: Option<String>,
-    layout: Option<String>,
-) -> PyResult<(Vec<String>, Vec<(u32, u32, u32)>)> {
-    let layout = layout.unwrap_or_else(|| "cottas-native-ids".to_string());
-    if !matches!(layout.as_str(), "cottas-native-ids" | "cottas-native") {
-        return Err(PyRuntimeError::new_err(
-            "compact results require a native-ID layout",
-        ));
-    }
-    let subject = subject_n3
-        .as_deref()
-        .map(parse_subject)
-        .transpose()
-        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-    let predicate = predicate_n3
-        .as_deref()
-        .map(parse_named_node)
-        .transpose()
-        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-    let object = object_n3
-        .as_deref()
-        .map(parse_term)
-        .transpose()
-        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-    let batch = PY_NATIVE_RUNTIME
-        .block_on(match_cottas_native_file_as_compact_triples(
-            Path::new(&path),
-            subject.as_ref(),
-            predicate.as_ref(),
-            object.as_ref(),
-            None,
-        ))
-        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-    Ok((batch.terms, batch.rows))
-}
-
 // VORTEX_RDF_DIRECT_COMPACT_TIMINGS_V1
 #[pyfunction]
 fn diagnose_direct_compact<'py>(

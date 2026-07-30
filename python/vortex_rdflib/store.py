@@ -7,7 +7,7 @@ from rdflib.store import Store, NO_STORE, VALID_STORE
 from rdflib.util import from_n3
 
 from .vortex_rdf_native import (
-    match_triples, match_triples_compact, count_triples, diagnose_match, diagnose_direct_compact
+    match_triples, count_triples, diagnose_match, diagnose_direct_compact
 )
 
 
@@ -66,99 +66,7 @@ class VortexStore(Store):
             return NO_STORE
 
         if self.backend == "duckdb":
-            if self.layout in {"cottas-native-ids", "cottas-native"}:
-                raise ValueError(
-                    "DuckDB backend does not currently support cottas-native-ids. "
-                    "Use backend='native' for native-ID files."
-                )
-
-            from .duckdb_backend import DuckDBVortexBackend
-
-            self._backend = DuckDBVortexBackend(self.path)
-
-        return VALID_STORE
-
-    def close(self, commit_pending_transaction=False):
-        if self._backend is not None:
-            self._backend.close()
-            self._backend = None
-
-    def triples(self, triple_pattern, context=None):
-        """
-        RDFLib Store API.
-
-        Input:
-            triple_pattern = (subject, predicate, object)
-
-        Output:
-            yields ((s, p, o), context)
-        """
-        if self.path is None:
-            return
-
-        s, p, o = triple_pattern
-
-        # RDFLib can propagate an object binding into subject or predicate
-        # position during joins. That pattern is unsatisfiable, not an error.
-        if s is not None and not isinstance(s, (URIRef, BNode)):
-            return
-        if p is not None and not isinstance(p, URIRef):
-            return
-
-        trace = os.environ.get("VORTEX_RDF_TRACE_TRIPLES") == "1"
-        n = 0
-
-        if self.backend == "duckdb":
-            if self._backend is None:
-                from .duckdb_backend import DuckDBVortexBackend
-
-                self._backend = DuckDBVortexBackend(self.path)
-
-            for triple in self._backend.triples(s, p, o):
-                yield triple, None
-            return
-
-        if self.backend != "native":
-            raise ValueError(f"Unsupported Vortex backend: {self.backend}")
-
-        s_n3 = self._node_to_n3(s)
-        p_n3 = self._node_to_n3(p)
-        o_n3 = self._node_to_n3(o)
-
-        if trace:
-            print(
-                "[VortexStore.triples:start] "
-                f"layout={getattr(self, 'layout', None)} "
-                f"backend={type(self.backend).__name__} "
-                f"s={_term_debug(s)} "
-                f"p={_term_debug(p)} "
-                f"o={_term_debug(o)}",
-                f"s_n3={s_n3} ",
-                f"p_n3={p_n3} ",
-                f"o_n3={o_n3} ",
-                flush=True,
-            )
-
-        if self.layout in {"cottas-native-ids", "cottas-native"}:
-            lexical_terms, indexed_rows = match_triples_compact(
-                self.path, s_n3, p_n3, o_n3, self.layout,
-            )
-            parsed_terms = [self._from_n3_safe(value) for value in lexical_terms]
-            term_count = len(parsed_terms)
-            for s_idx, p_idx, o_idx in indexed_rows:
-                if s_idx >= term_count or p_idx >= term_count or o_idx >= term_count:
-                    raise ValueError(
-                        "Compact native result has an invalid term index: "
-                        f"{(s_idx, p_idx, o_idx)!r}, terms={term_count}"
-                    )
-                yield (
-                    parsed_terms[s_idx],
-                    parsed_terms[p_idx],
-                    parsed_terms[o_idx],
-                ), None
-            return
-
-        triples_out = match_triples(
+            triples_out = match_triples(
             self.path, s_n3, p_n3, o_n3, self.layout,
         )
         for ss, pp, oo in triples_out:
