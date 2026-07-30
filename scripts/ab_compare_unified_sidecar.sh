@@ -38,7 +38,7 @@ if [[ -n "$queries" ]]; then cp "$queries" "$query_file"; else printf '%s\n' $'-
 normalize() { LC_ALL=C sort "$1" > "$2"; }
 run_match() {
   local artifact=$1 layout=$2 policy=$3 subject=$4 predicate=$5 object=$6 graph=$7 output=$8
-  local args=(match --input "$artifact" --output "$output" --format n-quads --storage-layout "$layout" --native-index-policy "$policy")
+  local args=(match --input "$artifact" --output "$output" --storage-layout "$layout" --native-index-policy "$policy")
   [[ "$subject" == - ]] || args+=(--subject "$subject")
   [[ "$predicate" == - ]] || args+=(--predicate "$predicate")
   [[ "$object" == - ]] || args+=(--object "$object")
