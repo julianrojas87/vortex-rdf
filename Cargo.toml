@@ -12,7 +12,7 @@ repository = "https://github.com/julianrojas87/vortex-rdf"
 description = "Modern and high-performance columnar RDF serialization format"
 
 [workspace.dependencies]
-vortex-rdf-core = { path = "core" }
+vortex-rdf-core = { path = "core", default-features = false, features = ["file-io"] }
 vortex = { version = "0.83.0", default-features = false }
 vortex-array = { version = "0.83.0" }
 vortex-error = "0.83.0"

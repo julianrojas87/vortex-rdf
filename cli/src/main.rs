@@ -10,6 +10,13 @@ use std::{
     time::Instant,
 };
 
+#[cfg(feature = "legacy-sidecars")]
+use vortex_rdf_core::io::{
+    NativeIdsCountMode, count_cottas_native_ids_file_with_diagnostics_mode,
+    match_cottas_native_file, match_cottas_native_file_with_diagnostics,
+    serialize_cottas_native_file,
+};
+
 use tokio::{fs::File as TokioFile, io::AsyncWriteExt};
 
 use vortex::{VortexSessionDefault, buffer::Buffer, session::VortexSession};
@@ -29,13 +36,12 @@ use vortex_rdf_core::{
     index::{ChainedHash, SimpleDictionary},
     io::{
         CottasNativeConfig, CottasNativeStringConfig, CottasVortexCompressionProfile,
-        NativeIdsCountMode, NativeIndexPolicy, NativeIndexProfile, NativeIndexSelection,
-        NativeIndexSpec, NativeStringCountMode, count_cottas_native_ids_file_with_diagnostics_mode,
-        count_cottas_native_string_file_with_diagnostics_mode, load_vortex_file_ref,
-        match_cottas_native_file, match_cottas_native_file_with_diagnostics,
-        match_cottas_native_string_file, match_cottas_native_string_file_with_diagnostics,
-        match_native_rdf_store_file, open_vortex_file, serialize, serialize_cottas_native_file,
-        serialize_cottas_native_quad_source_v10_file, serialize_cottas_native_string_file,
+        NativeIndexPolicy, NativeIndexProfile, NativeIndexSelection, NativeIndexSpec,
+        NativeStringCountMode, count_cottas_native_string_file_with_diagnostics_mode,
+        load_vortex_file_ref, match_cottas_native_string_file,
+        match_cottas_native_string_file_with_diagnostics, match_native_rdf_store_file,
+        open_vortex_file, serialize, serialize_cottas_native_quad_source_v10_file,
+        serialize_cottas_native_string_file,
     },
     store::layout::{
         cottas::{CottasLayout, TripleOrdering},
@@ -230,6 +236,7 @@ impl From<CountMode> for NativeStringCountMode {
     }
 }
 
+#[cfg(feature = "legacy-sidecars")]
 fn to_native_ids_count_mode(mode: CountMode) -> NativeIdsCountMode {
     match mode {
         CountMode::NativeFilter => NativeIdsCountMode::NativeFilter,
@@ -451,6 +458,7 @@ async fn main() -> Result<()> {
                 );
                 return Ok(());
             }
+            #[cfg(feature = "legacy-sidecars")]
             if storage_layout == StoreLayout::CottasNativeIds {
                 if index_type != IndexType::SimpleDictionary {
                     return Err(anyhow!(
@@ -784,6 +792,7 @@ async fn main() -> Result<()> {
 
                     return Ok(());
                 }
+                #[cfg(feature = "legacy-sidecars")]
                 StoreLayout::CottasNativeIds => {
                     let diag = count_cottas_native_ids_file_with_diagnostics_mode(
                         &input,
@@ -964,6 +973,7 @@ async fn main() -> Result<()> {
                 return Ok(());
             }
 
+            #[cfg(feature = "legacy-sidecars")]
             if is_vortex_file && storage_layout == Some(StoreLayout::CottasNativeIds) {
                 let output_format = format
                     .map(RdfFormat::from)

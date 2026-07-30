@@ -47,8 +47,11 @@ mimalloc.workspace = true
 libc = "0.2"
 
 [features]
-default = ["file-io"]
+default = ["file-io", "legacy-sidecars"]
 file-io = ["vortex-io/tokio", "vortex/zstd", "vortex/files"]
+# Temporary compatibility surface for v9 and sidecar-backed native artifacts.
+# Remove after representative unified-vs-sidecar A/B equivalence is accepted.
+legacy-sidecars = []
 
 [dev-dependencies]
 divan = { version = "*", package = "codspeed-divan-compat" }
