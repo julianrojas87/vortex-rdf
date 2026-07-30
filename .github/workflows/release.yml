@@ -1,6 +1,11 @@
 name: Release
 
-# Manually dispatched publishing for every registry this repo releases to:
+# Publishing for every registry this repo releases to. A version tag push
+# (v*.*.*) publishes everywhere; workflow_dispatch offers per-registry
+# toggles for dry runs and for re-publishing a single registry after a
+# partial failure (registries reject re-publishing an existing version).
+#
+# Registries:
 #   crates.io  vortex-rdf-core + vortex-rdf-cli  (cargo publish --workspace
 #              skips the publish = false js/python members and orders deps)
 #   npm        @vortex-rdf/vortex-rdf-store      (js/, wasm-pack build)
@@ -17,6 +22,9 @@ name: Release
 # publishing (PyPI has no dry run: its publish job is skipped instead).
 
 on:
+  push:
+    tags:
+      - "v*.*.*"
   workflow_dispatch:
     inputs:
       crates:
@@ -47,10 +55,13 @@ jobs:
     name: CI
     uses: ./.github/workflows/ci.yml
 
+  # A tag push publishes everywhere: the inputs.* context is empty on push
+  # events (falsy toggles, and !inputs.dry_run is true), so each publish
+  # gate ORs in the event check.
   crates:
     name: crates.io
     needs: ci
-    if: ${{ inputs.crates }}
+    if: ${{ github.event_name == 'push' || inputs.crates }}
     runs-on: ubuntu-latest
     environment: release
     permissions:
@@ -71,7 +82,7 @@ jobs:
   npm:
     name: npm
     needs: ci
-    if: ${{ inputs.npm }}
+    if: ${{ github.event_name == 'push' || inputs.npm }}
     runs-on: ubuntu-latest
     environment: release
     permissions:
@@ -104,7 +115,7 @@ jobs:
   pypi-wheels:
     name: PyPI wheel (${{ matrix.platform.name }})
     needs: ci
-    if: ${{ inputs.pypi }}
+    if: ${{ github.event_name == 'push' || inputs.pypi }}
     runs-on: ${{ matrix.platform.runner }}
     strategy:
       fail-fast: false
@@ -146,7 +157,7 @@ jobs:
   pypi-sdist:
     name: PyPI sdist
     needs: ci
-    if: ${{ inputs.pypi }}
+    if: ${{ github.event_name == 'push' || inputs.pypi }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -163,7 +174,7 @@ jobs:
   pypi-publish:
     name: Publish to PyPI
     needs: [pypi-wheels, pypi-sdist]
-    if: ${{ inputs.pypi && !inputs.dry_run }}
+    if: ${{ (github.event_name == 'push' || inputs.pypi) && !inputs.dry_run }}
     runs-on: ubuntu-latest
     environment: release
     permissions:
