@@ -17,7 +17,6 @@ use std::collections::BinaryHeap;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use vortex_array::ArrayRef;
 use vortex_array::stream::{ArrayStreamAdapter, ArrayStreamExt};
 use vortex_btrblocks::BtrBlocksCompressorBuilder;
 use vortex_error::VortexResult;

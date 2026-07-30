@@ -47,7 +47,7 @@ mimalloc.workspace = true
 libc = "0.2"
 
 [features]
-default = ["file-io", "legacy-sidecars"]
+default = ["file-io"]
 file-io = ["vortex-io/tokio", "vortex/zstd", "vortex/files"]
 # Temporary compatibility surface for v9 and sidecar-backed native artifacts.
 # Remove after representative unified-vs-sidecar A/B equivalence is accepted.
@@ -65,3 +65,6 @@ harness = false
 [[bench]]
 name = "chained_hash_bench"
 harness = false
+[[test]]
+name = "cottas_native"
+required-features = ["legacy-sidecars"]

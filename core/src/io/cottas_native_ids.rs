@@ -464,13 +464,6 @@ enum NativeArtifactKind {
 }
 
 impl NativeArtifactKind {
-    fn from_optional_manifest(manifest: Option<NativeArtifactManifest>) -> Self {
-        match manifest {
-            Some(manifest) => Self::ManifestExternal(manifest),
-            None => Self::LegacyExternal,
-        }
-    }
-
     fn manifest(&self) -> Option<&NativeArtifactManifest> {
         match self {
             Self::LegacyExternal => None,
@@ -621,20 +614,6 @@ impl VortexReadAt for BoundedNativeComponentReader {
         };
         self.source.read_at(absolute_offset, length, alignment)
     }
-}
-
-async fn open_bounded_native_component(
-    source: Arc<dyn VortexReadAt>,
-    offset: u64,
-    length: u64,
-) -> Result<vortex_file::VortexFile> {
-    let reader = BoundedNativeComponentReader::new(source, offset, length)?;
-    NATIVE_FILE_SESSION
-        .open_options()
-        .with_file_size(length)
-        .open_read(reader)
-        .await
-        .map_err(VortexRdfError::from)
 }
 
 // VORTEX_RDF_EMBEDDED_COMPONENT_RESOLUTION_V1
@@ -9885,21 +9864,6 @@ mod native_artifact_manifest_tests {
         assert!(metadata_segment_id(usize::MAX, 1).is_err());
         #[cfg(target_pointer_width = "64")]
         assert!(metadata_segment_id(u32::MAX as usize, 1).is_err());
-    }
-
-    #[test]
-    fn artifact_kind_classifies_missing_manifest_as_legacy_external() {
-        let kind = NativeArtifactKind::from_optional_manifest(None);
-        assert_eq!(kind, NativeArtifactKind::LegacyExternal);
-        assert!(kind.manifest().is_none());
-    }
-
-    #[test]
-    fn artifact_kind_classifies_valid_manifest_as_manifest_external() {
-        let manifest = NativeArtifactManifest::production_defaults();
-        let kind = NativeArtifactKind::from_optional_manifest(Some(manifest.clone()));
-        assert_eq!(kind, NativeArtifactKind::ManifestExternal(manifest.clone()));
-        assert_eq!(kind.manifest(), Some(&manifest));
     }
 
     #[test]

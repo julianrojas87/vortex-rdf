@@ -21,7 +21,7 @@ trap 'if [[ $cleanup -eq 1 ]]; then rm -rf "$work"; fi' EXIT
 
 bin=${VORTEX_RDF_BIN:-target/release/vortex-rdf-cli}
 echo "+ RUST_LOG=$RUST_LOG cargo build --release -p vortex-rdf-cli"
-cargo build --release -p vortex-rdf-cli
+cargo build --release -p vortex-rdf-cli --features legacy-sidecars
 
 sidecar="$work/sidecar.vortex"
 unified="$work/unified.vortex"
