@@ -13,8 +13,7 @@ use vortex_rdf_core::io::{
     NativeIdsCountMode, NativeIndexPolicy, NativeRdfStoreFile,
     count_cottas_native_ids_file_with_diagnostics_mode, count_cottas_native_string_file,
     diagnose_cottas_native_direct_compact, diagnose_cottas_native_term_windows,
-    match_cottas_native_file_as_compact_triples, match_cottas_native_file_with_diagnostics,
-    match_cottas_native_string_file_as_triples,
+    match_cottas_native_file_with_diagnostics, match_cottas_native_string_file_as_triples,
 };
 
 static PY_NATIVE_RUNTIME: LazyLock<Runtime> =
