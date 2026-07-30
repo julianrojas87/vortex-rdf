@@ -10,10 +10,10 @@ use std::time::Instant;
 use tokio::runtime::Runtime;
 use vortex_rdf_core::common::utils::{parse_named_node, parse_subject, parse_term};
 use vortex_rdf_core::io::{
-    NativeIdsCountMode, count_cottas_native_ids_file_with_diagnostics_mode,
-    count_cottas_native_string_file, diagnose_cottas_native_direct_compact,
-    diagnose_cottas_native_term_windows, match_cottas_native_file_as_compact_triples,
-    match_cottas_native_file_as_triples_optimized, match_cottas_native_file_with_diagnostics,
+    NativeIdsCountMode, NativeIndexPolicy, NativeRdfStoreFile,
+    count_cottas_native_ids_file_with_diagnostics_mode, count_cottas_native_string_file,
+    diagnose_cottas_native_direct_compact, diagnose_cottas_native_term_windows,
+    match_cottas_native_file_as_compact_triples, match_cottas_native_file_with_diagnostics,
     match_cottas_native_string_file_as_triples,
 };
 
@@ -59,15 +59,24 @@ fn match_triples(
             ))
             .map_err(|e| PyRuntimeError::new_err(e.to_string())),
 
-        "cottas-native-ids" | "cottas-native" => PY_NATIVE_RUNTIME
-            .block_on(match_cottas_native_file_as_triples_optimized(
-                Path::new(&path),
-                subject.as_ref(),
-                predicate.as_ref(),
-                object.as_ref(),
-                None,
-            ))
-            .map_err(|e| PyRuntimeError::new_err(e.to_string())),
+        "cottas-native-ids" | "cottas-native" => {
+            let store = PY_NATIVE_RUNTIME
+                .block_on(NativeRdfStoreFile::open(Path::new(&path)))
+                .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+            let quads = PY_NATIVE_RUNTIME
+                .block_on(store.match_pattern_with_policy(
+                    subject.as_ref(),
+                    predicate.as_ref(),
+                    object.as_ref(),
+                    None,
+                    NativeIndexPolicy::Auto,
+                ))
+                .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+            Ok(quads
+                .into_iter()
+                .map(|(subject, predicate, object, _graph)| (subject, predicate, object))
+                .collect())
+        }
 
         other => Err(PyRuntimeError::new_err(format!(
             "Unsupported native Vortex RDF layout: {other}"

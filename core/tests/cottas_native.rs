@@ -1,63 +1,202 @@
 use futures::stream;
-use oxrdf::{GraphName, NamedNode, Quad, Term};
-use vortex_rdf_core::common::utils::parse_subject;
+use oxrdf::{GraphName, NamedNode, NamedOrBlankNode, Quad, Term};
 use vortex_rdf_core::index::SimpleDictionary;
 use vortex_rdf_core::io::{
-    CottasNativeConfig, match_cottas_native_file, serialize_cottas_native_file,
+    CottasNativeConfig, NativeIndexPolicy, match_cottas_native_file, match_native_rdf_store_file,
+    serialize_cottas_native_file, serialize_cottas_native_quad_source_v10_file,
 };
 
+const S1: &str = "http://example.org/s1";
+const S2: &str = "http://example.org/s2";
+const S3: &str = "http://example.org/s3";
+const MISSING: &str = "http://example.org/missing";
+const P1: &str = "http://example.org/p1";
+const P2: &str = "http://example.org/p2";
+const O1: &str = "http://example.org/o1";
+const O2: &str = "http://example.org/o2";
+const G1: &str = "http://example.org/g1";
+
+fn named(value: &str) -> NamedNode {
+    NamedNode::new(value).unwrap()
+}
+
+fn subject(value: &str) -> NamedOrBlankNode {
+    NamedOrBlankNode::NamedNode(named(value))
+}
+
+fn term(value: &str) -> Term {
+    Term::NamedNode(named(value))
+}
+
+fn fixture() -> Vec<Quad> {
+    vec![
+        Quad::new(named(S1), named(P1), term(O1), GraphName::DefaultGraph),
+        Quad::new(named(S1), named(P1), term(O1), GraphName::DefaultGraph),
+        Quad::new(named(S1), named(P1), term(O2), GraphName::DefaultGraph),
+        Quad::new(named(S2), named(P1), term(O1), GraphName::DefaultGraph),
+        Quad::new(named(S2), named(P2), term(O2), GraphName::DefaultGraph),
+        Quad::new(
+            named(S3),
+            named(P2),
+            term(O1),
+            GraphName::NamedNode(named(G1)),
+        ),
+    ]
+}
+
+#[derive(Clone)]
+struct Query {
+    name: &'static str,
+    subject: Option<NamedOrBlankNode>,
+    predicate: Option<NamedNode>,
+    object: Option<Term>,
+    graph: Option<GraphName>,
+}
+
+fn query_matrix() -> Vec<Query> {
+    vec![
+        Query {
+            name: "unbound",
+            subject: None,
+            predicate: None,
+            object: None,
+            graph: None,
+        },
+        Query {
+            name: "subject",
+            subject: Some(subject(S1)),
+            predicate: None,
+            object: None,
+            graph: None,
+        },
+        Query {
+            name: "predicate",
+            subject: None,
+            predicate: Some(named(P1)),
+            object: None,
+            graph: None,
+        },
+        Query {
+            name: "object",
+            subject: None,
+            predicate: None,
+            object: Some(term(O1)),
+            graph: None,
+        },
+        Query {
+            name: "predicate_object",
+            subject: None,
+            predicate: Some(named(P1)),
+            object: Some(term(O1)),
+            graph: None,
+        },
+        Query {
+            name: "fully_bound_duplicate",
+            subject: Some(subject(S1)),
+            predicate: Some(named(P1)),
+            object: Some(term(O1)),
+            graph: Some(GraphName::DefaultGraph),
+        },
+        Query {
+            name: "named_graph",
+            subject: None,
+            predicate: None,
+            object: None,
+            graph: Some(GraphName::NamedNode(named(G1))),
+        },
+        Query {
+            name: "missing_dictionary_term",
+            subject: Some(subject(MISSING)),
+            predicate: None,
+            object: None,
+            graph: None,
+        },
+        Query {
+            name: "nonexistent_combination",
+            subject: Some(subject(S1)),
+            predicate: Some(named(P2)),
+            object: Some(term(O1)),
+            graph: None,
+        },
+    ]
+}
+
+fn canonical_lines(path: &std::path::Path) -> Vec<String> {
+    let text = std::fs::read_to_string(path).expect("read match output");
+    let mut lines: Vec<_> = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_owned)
+        .collect();
+    lines.sort_unstable();
+    lines
+}
+
 #[tokio::test]
-async fn native_cottas_subject_match_returns_expected_rows() {
+async fn legacy_sidecars_and_unified_v10_match_identically() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let data_path = dir.path().join("data.vortex");
-    let output_path = dir.path().join("out.nq");
-
-    let s1 = NamedNode::new("http://example.org/s1").unwrap();
-    let s2 = NamedNode::new("http://example.org/s2").unwrap();
-    let p = NamedNode::new("http://example.org/p").unwrap();
-    let o1 = NamedNode::new("http://example.org/o1").unwrap();
-    let o2 = NamedNode::new("http://example.org/o2").unwrap();
-
-    let q1 = Quad::new(
-        s1.clone(),
-        p.clone(),
-        Term::NamedNode(o1),
-        GraphName::DefaultGraph,
-    );
-
-    let q2 = Quad::new(s2, p, Term::NamedNode(o2), GraphName::DefaultGraph);
-
-    let quads = vec![Ok(q1), Ok(q2)];
+    let legacy_path = dir.path().join("legacy.vortex");
+    let unified_path = dir.path().join("unified.vortex");
+    let config = CottasNativeConfig {
+        row_group_size: 2,
+        dict_row_group_size: 2,
+        ..Default::default()
+    };
 
     serialize_cottas_native_file::<SimpleDictionary, _>(
-        stream::iter(quads),
-        &data_path,
-        CottasNativeConfig {
-            row_group_size: 1,
-            ..Default::default()
-        },
+        stream::iter(fixture().into_iter().map(Ok)),
+        &legacy_path,
+        config.clone(),
     )
     .await
-    .expect("serialize native cottas");
-
-    let writer = std::fs::File::create(&output_path).expect("create output");
-
-    let subject = parse_subject("<http://example.org/s1>").expect("parse subject");
-
-    match_cottas_native_file(
-        &data_path,
-        Some(&subject),
-        None,
-        None,
-        None,
-        writer,
-        oxrdfio::RdfFormat::NQuads,
+    .expect("serialize legacy sidecar artifact");
+    serialize_cottas_native_quad_source_v10_file::<SimpleDictionary, _>(
+        stream::iter(fixture().into_iter().map(Ok)),
+        &unified_path,
+        config,
     )
     .await
-    .expect("native match");
+    .expect("serialize unified v10 artifact");
 
-    let output = std::fs::read_to_string(output_path).expect("read output");
-
-    assert!(output.contains("http://example.org/s1"));
-    assert!(!output.contains("http://example.org/s2"));
+    for (index, query) in query_matrix().into_iter().enumerate() {
+        let legacy_output = dir.path().join(format!("{index}-legacy.nq"));
+        let unified_output = dir.path().join(format!("{index}-unified.nq"));
+        match_cottas_native_file(
+            &legacy_path,
+            query.subject.as_ref(),
+            query.predicate.as_ref(),
+            query.object.as_ref(),
+            query.graph.as_ref(),
+            std::fs::File::create(&legacy_output).unwrap(),
+            oxrdfio::RdfFormat::NQuads,
+        )
+        .await
+        .unwrap_or_else(|error| panic!("legacy query {} failed: {error}", query.name));
+        match_native_rdf_store_file(
+            &unified_path,
+            query.subject.as_ref(),
+            query.predicate.as_ref(),
+            query.object.as_ref(),
+            query.graph.as_ref(),
+            NativeIndexPolicy::Auto,
+            std::fs::File::create(&unified_output).unwrap(),
+            oxrdfio::RdfFormat::NQuads,
+        )
+        .await
+        .unwrap_or_else(|error| panic!("unified query {} failed: {error}", query.name));
+        let legacy = canonical_lines(&legacy_output);
+        let unified = canonical_lines(&unified_output);
+        assert_eq!(
+            legacy, unified,
+            "cross-format mismatch for query {}",
+            query.name
+        );
+        if query.name == "fully_bound_duplicate" {
+            assert_eq!(legacy.len(), 2, "duplicate multiplicity must be preserved");
+        }
+        if query.name == "named_graph" {
+            assert_eq!(legacy.len(), 1, "named graph filter must select one row");
+        }
+    }
 }

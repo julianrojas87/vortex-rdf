@@ -13,7 +13,7 @@ name = "vortex_rdf_native"
 crate-type = ["cdylib"]
 
 [dependencies]
-vortex-rdf-core = { workspace = true }
+vortex-rdf-core = { workspace = true, features = ["legacy-sidecars"] }
 tokio = { workspace = true, features = ["rt-multi-thread"] }
 pyo3 = { workspace = true, features = ["extension-module"] }
 oxrdfio.workspace = true

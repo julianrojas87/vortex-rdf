@@ -1862,7 +1862,7 @@ impl NativeRdfStoreFile {
         object: Option<&Term>,
         graph: Option<&GraphName>,
         policy: NativeIndexPolicy,
-    ) -> Result<Vec<(String, String, String)>> {
+    ) -> Result<Vec<(String, String, String, String)>> {
         let bound = BoundNativeRdfTerms::from_pattern(subject, predicate, object, graph);
         let requested = [
             (bound.s.as_deref(), "s"),
@@ -2103,18 +2103,25 @@ impl NativeRdfStoreFile {
 
         let requested_ids = rows.unique_unbound_ids(&bound);
         let id_to_term = self.lookup_terms_by_ids(&requested_ids).await?;
-        let mut triples = Vec::with_capacity(rows.rows);
+        let mut quads = Vec::with_capacity(rows.rows);
         for row in 0..rows.rows {
             let subject_id = rows.id_at(NativeIdColumn::Subject, &bound, row)?;
             let predicate_id = rows.id_at(NativeIdColumn::Predicate, &bound, row)?;
             let object_id = rows.id_at(NativeIdColumn::Object, &bound, row)?;
+            let graph_id = rows.id_at(NativeIdColumn::Graph, &bound, row)?;
             let subject = lookup_projected_or_use_bound(&id_to_term, &bound.s, subject_id, "S")?;
             let predicate =
                 lookup_projected_or_use_bound(&id_to_term, &bound.p, predicate_id, "P")?;
             let object = lookup_projected_or_use_bound(&id_to_term, &bound.o, object_id, "O")?;
-            triples.push((subject.to_owned(), predicate.to_owned(), object.to_owned()));
+            let graph = lookup_projected_or_use_bound(&id_to_term, &bound.g, graph_id, "G")?;
+            quads.push((
+                subject.to_owned(),
+                predicate.to_owned(),
+                object.to_owned(),
+                graph.to_owned(),
+            ));
         }
-        Ok(triples)
+        Ok(quads)
     }
 
     /// Convenience correctness-baseline matcher that never uses indexes.
@@ -2124,7 +2131,7 @@ impl NativeRdfStoreFile {
         predicate: Option<&NamedNode>,
         object: Option<&Term>,
         graph: Option<&GraphName>,
-    ) -> Result<Vec<(String, String, String)>> {
+    ) -> Result<Vec<(String, String, String, String)>> {
         self.match_pattern_with_policy(
             subject,
             predicate,
@@ -2183,19 +2190,20 @@ where
     W: Write,
 {
     let store = NativeRdfStoreFile::open(input_path).await?;
-    let triples = store
+    let quads = store
         .match_pattern_with_policy(subject, predicate, object, graph, policy)
         .await?;
-    let count = triples.len();
+    let count = quads.len();
     let mut serializer = RdfSerializer::from_format(format).for_writer(writer);
-    for (subject, predicate, object) in triples {
-        let triple = oxrdf::Triple::new(
+    for (subject, predicate, object, graph) in quads {
+        let quad = oxrdf::Quad::new(
             crate::common::utils::parse_subject(&subject)?,
             crate::common::utils::parse_named_node(&predicate)?,
             crate::common::utils::parse_term(&object)?,
+            crate::common::utils::parse_graph_name(&graph)?,
         );
         serializer
-            .serialize_triple(&triple)
+            .serialize_quad(&quad)
             .map_err(|error| VortexRdfError::Deserialization(error.to_string()))?;
     }
     serializer
@@ -2396,7 +2404,6 @@ enum NativeIdColumn {
     Subject,
     Predicate,
     Object,
-    #[cfg_attr(not(feature = "legacy-sidecars"), allow(dead_code))]
     Graph,
 }
 
@@ -2873,9 +2880,11 @@ mod native_index_baseline_equivalence_tests {
         ]
     }
 
-    fn sorted(mut triples: Vec<(String, String, String)>) -> Vec<(String, String, String)> {
-        triples.sort_unstable();
-        triples
+    fn sorted(
+        mut quads: Vec<(String, String, String, String)>,
+    ) -> Vec<(String, String, String, String)> {
+        quads.sort_unstable();
+        quads
     }
 
     async fn assert_auto_equals_disabled(
