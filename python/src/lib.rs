@@ -414,7 +414,6 @@ fn count_triples(path: String, layout: Option<String>) -> PyResult<usize> {
 #[pymodule]
 fn vortex_rdf_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(match_triples, m)?)?;
-    m.add_function(wrap_pyfunction!(match_triples_compact, m)?)?;
     m.add_function(wrap_pyfunction!(diagnose_direct_compact, m)?)?;
     m.add_function(wrap_pyfunction!(diagnose_match, m)?)?;
     m.add_function(wrap_pyfunction!(diagnose_term_windows, m)?)?;
