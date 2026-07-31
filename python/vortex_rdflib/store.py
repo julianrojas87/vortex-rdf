@@ -7,7 +7,7 @@ from rdflib.store import Store, NO_STORE, VALID_STORE
 from rdflib.util import from_n3
 
 from .vortex_rdf_native import (
-    match_triples, count_triples, diagnose_match, diagnose_direct_compact
+    NativeRdfStoreHandle, match_triples, count_triples, diagnose_match, diagnose_direct_compact
 )
 
 
@@ -75,6 +75,10 @@ class VortexStore(Store):
             from .duckdb_backend import DuckDBVortexBackend
 
             self._backend = DuckDBVortexBackend(self.path)
+        elif self.backend == "native" and self.layout in {
+            "cottas-native-ids", "cottas-native"
+        }:
+            self._backend = NativeRdfStoreHandle(self.path)
 
         return VALID_STORE
 
@@ -144,9 +148,14 @@ class VortexStore(Store):
             )
 
         native_started_ns = __import__("time").perf_counter_ns()
-        triples_out = match_triples(
-            self.path, s_n3, p_n3, o_n3, self.layout,
-        )
+        if self.layout in {"cottas-native-ids", "cottas-native"}:
+            if self._backend is None:
+                self._backend = NativeRdfStoreHandle(self.path)
+            triples_out = self._backend.match_triples(s_n3, p_n3, o_n3)
+        else:
+            triples_out = match_triples(
+                self.path, s_n3, p_n3, o_n3, self.layout,
+            )
         native_finished_ns = __import__("time").perf_counter_ns()
         parse_started_ns = native_finished_ns
         parsed_rows = [
