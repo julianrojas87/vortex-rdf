@@ -6,8 +6,8 @@ use vortex_rdf_core::common::formats::{detect_format, format_from_name};
 use vortex_rdf_core::common::terms::parse_quads_from_reader;
 use vortex_rdf_core::io::quads_stream_to_vortex_file_with_builder;
 use vortex_rdf_core::{
-    BuilderStrategy, DictionaryPlacement, LayoutStrategy, SortedInMemoryBuilder,
-    SortedStreamBuilder, UnsortedStreamBuilder, VortexRdfError,
+    BuilderStrategy, LayoutStrategy, SortedInMemoryBuilder, SortedStreamBuilder,
+    UnsortedStreamBuilder, VortexRdfError,
 };
 
 use crate::{RUNTIME, store_err};
@@ -21,16 +21,6 @@ fn parse_layout(name: &str) -> PyResult<LayoutStrategy> {
         "dictionary" | "cottas-native-ids" | "cottas-native" => Ok(LayoutStrategy::Dictionary),
         other => Err(PyValueError::new_err(format!(
             "unknown layout {other:?}; expected \"default\", \"typed-object\" or \"dictionary\""
-        ))),
-    }
-}
-
-fn parse_placement(name: &str) -> PyResult<DictionaryPlacement> {
-    match name.to_ascii_lowercase().as_str() {
-        "padded" => Ok(DictionaryPlacement::Padded),
-        "sidecar" => Ok(DictionaryPlacement::Sidecar),
-        other => Err(PyValueError::new_err(format!(
-            "unknown dictionary placement {other:?}; expected \"padded\" or \"sidecar\""
         ))),
     }
 }
@@ -55,7 +45,6 @@ fn parse_builder(name: &str) -> PyResult<BuilderStrategy> {
     input_path,
     output_path,
     layout="default",
-    dictionary_placement="padded",
     format=None,
     builder="unsorted-stream",
 ))]
@@ -64,12 +53,10 @@ pub fn serialize_rdf(
     input_path: PathBuf,
     output_path: PathBuf,
     layout: &str,
-    dictionary_placement: &str,
     format: Option<&str>,
     builder: &str,
 ) -> PyResult<()> {
     let layout = parse_layout(layout)?;
-    let placement = parse_placement(dictionary_placement)?;
     let builder = parse_builder(builder)?;
     let format = match format {
         Some(name) => format_from_name(name)
@@ -92,7 +79,6 @@ pub fn serialize_rdf(
                         &output_path,
                         layout,
                         Vec::new(),
-                        placement,
                     )
                     .await
                 }
@@ -102,7 +88,6 @@ pub fn serialize_rdf(
                         &output_path,
                         layout,
                         Vec::new(),
-                        placement,
                     )
                     .await
                 }
@@ -112,7 +97,6 @@ pub fn serialize_rdf(
                         &output_path,
                         layout,
                         Vec::new(),
-                        placement,
                     )
                     .await
                 }

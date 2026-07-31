@@ -74,12 +74,13 @@ pushdown.
 ## Layouts
 
 `serialize_rdf(..., layout=...)` accepts `"default"`, `"typed-object"` and
-`"dictionary"` (with `dictionary_placement="padded"|"sidecar"`). Opening
-auto-detects the layout — `VortexRdfStore` takes no layout argument.
+`"dictionary"`. Opening auto-detects the layout — `VortexRdfStore` takes no
+layout argument.
 
-For Dictionary-layout files, the term dictionary is held in memory when it
-fits the residency budget; pass `VortexRdfStore(path, max_resident_terms=...)`
-to raise the budget (recommended for benchmarking large stores).
+For Dictionary-layout files, the term dictionary (embedded in the file as a
+metadata-segment blob) is held in memory when its byte size fits the residency
+budget; pass `VortexRdfStore(path, max_resident_bytes=...)` to change the
+budget (recommended for benchmarking large stores).
 
 ## File-backed vs in-memory
 

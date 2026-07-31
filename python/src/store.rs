@@ -8,7 +8,7 @@ use vortex_array::VortexSessionExecute;
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::struct_::{StructArray, StructArrayExt};
 use vortex_rdf_core::common::terms::{get_as_term, parse_graph_name};
-use vortex_rdf_core::io::VORTEX_LIGHT_SESSION;
+use vortex_rdf_core::io::VORTEX_SESSION;
 use vortex_rdf_core::{LayoutStrategy, VortexRdfError, VortexRdfStore as CoreStore};
 
 use crate::codes::{TermDict, U32Column};
@@ -111,15 +111,15 @@ impl VortexRdfStore {
     /// footer is read up front). `in_memory=True` loads the whole store into
     /// memory instead — every subsequent match skips the per-call file-scan
     /// pipeline, which is worth ~1 ms per `triples()` call and decides join
-    /// performance under rdflib's per-binding probing. `max_resident_terms`
+    /// performance under rdflib's per-binding probing. `max_resident_bytes`
     /// overrides the Dictionary layout's term-dictionary residency budget
-    /// (terms, not bytes).
+    /// (the embedded blob's compressed size in bytes).
     #[new]
-    #[pyo3(signature = (path, max_resident_terms=None, in_memory=false))]
+    #[pyo3(signature = (path, max_resident_bytes=None, in_memory=false))]
     fn new(
         py: Python<'_>,
         path: String,
-        max_resident_terms: Option<u64>,
+        max_resident_bytes: Option<u64>,
         in_memory: bool,
     ) -> PyResult<Self> {
         if !std::path::Path::new(&path).is_file() {
@@ -130,16 +130,16 @@ impl VortexRdfStore {
         let store = py
             .detach(|| {
                 RUNTIME.block_on(async {
-                    let store = match max_resident_terms {
+                    let store = match max_resident_bytes {
                         Some(n) => CoreStore::from_file_with_dict_residency(&path, n).await?,
                         None => CoreStore::from_file(&path).await?,
                     };
                     if in_memory {
-                        // Round-trip through the serializable form: it writes
-                        // the resolved layout state (e.g. the term dictionary)
-                        // back into the array, exactly like `from_bytes`.
-                        let arr = store.to_serializable_array().await?;
-                        CoreStore::new(arr)
+                        // Round-trip through the serializable parts: rows plus
+                        // the dictionary those rows' codes address, exactly
+                        // what `from_built` reconstructs a store from.
+                        let parts = store.to_serializable_parts().await?;
+                        CoreStore::from_built(parts)
                     } else {
                         Ok(store)
                     }
@@ -244,7 +244,7 @@ impl VortexRdfStore {
                         .match_pattern(s.as_ref(), p.as_ref(), o.as_ref(), g.as_ref())
                         .await?;
                     let arr = matched.get_quads_array().await?;
-                    let mut ctx = VORTEX_LIGHT_SESSION.create_execution_ctx();
+                    let mut ctx = VORTEX_SESSION.create_execution_ctx();
                     let struct_arr = arr.execute::<StructArray>(&mut ctx)?;
                     let mut cols = Vec::with_capacity(4);
                     for name in ["s", "p", "o", "g"] {

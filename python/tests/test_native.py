@@ -134,8 +134,6 @@ def test_serialize_rejects_unknown_options(fixture_nt_path, tmp_path):
     with pytest.raises(ValueError):
         serialize_rdf(str(fixture_nt_path), out, layout="nope")
     with pytest.raises(ValueError):
-        serialize_rdf(str(fixture_nt_path), out, dictionary_placement="nope")
-    with pytest.raises(ValueError):
         serialize_rdf(str(fixture_nt_path), out, builder="nope")
     with pytest.raises(ValueError):
         serialize_rdf(str(fixture_nt_path), out, format="nope")
@@ -148,11 +146,11 @@ def test_serialize_layout_aliases(fixture_nt_path, tmp_path):
     assert VortexRdfStore(str(out)).layout() == "dictionary"
 
 
-def test_sidecar_dictionary_placement(fixture_nt_path, tmp_path):
-    out = tmp_path / "sidecar.vortex"
-    serialize_rdf(
-        str(fixture_nt_path), str(out), layout="dictionary", dictionary_placement="sidecar"
-    )
+def test_dictionary_file_is_self_contained(fixture_nt_path, tmp_path):
+    out = tmp_path / "dict.vortex"
+    serialize_rdf(str(fixture_nt_path), str(out), layout="dictionary")
+    # The embedded form is one file: no companion appears beside it.
+    assert list(tmp_path.iterdir()) == [out]
     store = VortexRdfStore(str(out))
     assert store.layout() == "dictionary"
     assert len(store) == 5
