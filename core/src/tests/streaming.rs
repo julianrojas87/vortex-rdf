@@ -368,6 +368,116 @@ async fn test_sorted_builder_stamps_is_sorted() {
     check(unsorted.array, false, "unsorted");
 }
 
+/// An unsorted stream of *exactly* chunk_size quads is still a single-chunk,
+/// whole-dataset build: its index lead columns are globally sorted by
+/// construction and must be stamped so the ByCopy index serves the match
+/// instead of declining to the mask scan (the lookahead past a full first
+/// chunk decides this). One quad more spills into a second chunk, whose
+/// chunk-local sorts are not global order — then nothing may be stamped.
+#[tokio::test]
+async fn test_unsorted_exact_chunk_boundary_stamps_index_leads() {
+    use crate::common::array::column_is_sorted;
+    use crate::store::builders::assemble_chunks;
+    use crate::store::builders::unsorted_stream::build_chunk_stream;
+    use vortex_array::VortexSessionExecute;
+    use vortex_array::arrays::struct_::{StructArray, StructArrayExt};
+
+    let indexes = vec![IndexType::SecondaryByCopy];
+    let make = |n: usize| -> Vec<Quad> {
+        (0..n)
+            .rev()
+            .map(|i| {
+                make_quad(
+                    &format!("http://example.org/s{i:02}"),
+                    &format!("http://example.org/p{}", i % 3),
+                    &format!("object {}", i % 4),
+                    GraphName::DefaultGraph,
+                )
+            })
+            .collect()
+    };
+    let collect_chunks = |built: crate::store::builders::BuiltStream| async {
+        built
+            .chunks
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(|c| c.expect("chunk"))
+            .collect::<Vec<_>>()
+    };
+    let lead_sorted = |chunk: &vortex_array::ArrayRef, name: &str| {
+        let mut ctx = crate::io::VORTEX_SESSION.create_execution_ctx();
+        let sa = chunk.clone().execute::<StructArray>(&mut ctx).unwrap();
+        column_is_sorted(sa.unmasked_field_by_name(name).unwrap())
+    };
+
+    // Exactly one full chunk: both family leads stamped.
+    let quads = make(8);
+    let built = build_chunk_stream(
+        Box::new(quad_stream(quads.clone())),
+        LayoutStrategy::Default,
+        indexes.clone(),
+        8,
+    )
+    .await
+    .unwrap();
+    let chunks = collect_chunks(built).await;
+    assert_eq!(chunks.iter().map(|c| c.len()).collect::<Vec<_>>(), [8]);
+    assert!(
+        lead_sorted(&chunks[0], "_idx_posg_p"),
+        "posg lead unstamped"
+    );
+    assert!(
+        lead_sorted(&chunks[0], "_idx_ospg_o"),
+        "ospg lead unstamped"
+    );
+
+    // And the stamped index routes correctly: identical results to a
+    // no-index (mask scan) store over the same data.
+    let store =
+        VortexRdfStore::new(assemble_chunks(chunks, LayoutStrategy::Default, &indexes).unwrap())
+            .unwrap();
+    let baseline = VortexRdfStore::from_built(
+        VortexRdfStore::build_vortex_array_with_builder::<UnsortedStreamBuilder>(
+            quad_stream(quads),
+            LayoutStrategy::Default,
+            vec![],
+        )
+        .await
+        .unwrap(),
+    )
+    .unwrap();
+    let p1 = NamedNode::new("http://example.org/p1").unwrap();
+    let o1 = Term::Literal(Literal::new_simple_literal("object 1"));
+    for (p, o) in [(Some(&p1), None), (None, Some(&o1)), (Some(&p1), Some(&o1))] {
+        let via_index = store.match_pattern(None, p, o, None).await.unwrap();
+        let via_scan = baseline.match_pattern(None, p, o, None).await.unwrap();
+        let mut got = quad_strings(&via_index.quads_vec().await.unwrap());
+        let mut want = quad_strings(&via_scan.quads_vec().await.unwrap());
+        got.sort();
+        want.sort();
+        assert!(!want.is_empty(), "degenerate pattern");
+        assert_eq!(got, want, "index-served match diverged for {p:?}/{o:?}");
+    }
+
+    // One quad past the boundary: two chunks, chunk-local sorts only —
+    // no lead may claim sortedness.
+    let built = build_chunk_stream(
+        Box::new(quad_stream(make(9))),
+        LayoutStrategy::Default,
+        indexes,
+        8,
+    )
+    .await
+    .unwrap();
+    let chunks = collect_chunks(built).await;
+    assert_eq!(chunks.iter().map(|c| c.len()).collect::<Vec<_>>(), [8, 1]);
+    for chunk in &chunks {
+        assert!(!lead_sorted(chunk, "_idx_posg_p"), "multi-chunk stamped");
+        assert!(!lead_sorted(chunk, "_idx_ospg_o"), "multi-chunk stamped");
+    }
+}
+
 #[tokio::test]
 async fn test_sorted_subject_binary_search() {
     // Multiple quads per subject: the binary-search fast path must return

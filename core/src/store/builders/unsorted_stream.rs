@@ -236,13 +236,21 @@ async fn build_buffered_chunk_stream(
             None => break,
         }
     }
+    // A full first chunk may still be the whole dataset (a stream of exactly
+    // chunk_size quads); only a lookahead can tell. The peeked item, if any,
+    // becomes the next chunk's first quad below.
+    let pending = if buf.len() == chunk_size {
+        quads.next().await
+    } else {
+        None
+    };
 
     let first = if buf.is_empty() {
         make_empty_struct(layout, &indexes)?
     } else {
-        // A first chunk shorter than chunk_size means the stream is exhausted:
-        // the chunk is the whole dataset and its index columns are globally
-        // sorted (stamped for binary-search routing).
+        // Nothing follows the first chunk: it is the whole dataset and its
+        // index columns are globally sorted (stamped for binary-search
+        // routing).
         build_struct_array(
             &buf,
             layout,
@@ -250,7 +258,7 @@ async fn build_buffered_chunk_stream(
             buf.len(),
             0,
             false,
-            buf.len() < chunk_size,
+            pending.is_none(),
         )?
     };
     let dtype = first.dtype().clone();
@@ -258,14 +266,28 @@ async fn build_buffered_chunk_stream(
     drop(buf);
 
     let rest = stream::unfold(
-        (quads, layout, indexes, next_row),
-        move |(mut quads, layout, indexes, row)| async move {
+        (quads, pending, layout, indexes, next_row),
+        move |(mut quads, carried, layout, indexes, row)| async move {
             let mut buf: Vec<RawQuad> = Vec::with_capacity(chunk_size.min(4096));
+            if let Some(res) = carried {
+                match res {
+                    Ok(q) => buf.push(q),
+                    Err(e) => {
+                        return Some((
+                            Err(into_vortex_error(e)),
+                            (quads, None, layout, indexes, row),
+                        ));
+                    }
+                }
+            }
             while buf.len() < chunk_size {
                 match quads.next().await {
                     Some(Ok(q)) => buf.push(q),
                     Some(Err(e)) => {
-                        return Some((Err(into_vortex_error(e)), (quads, layout, indexes, row)));
+                        return Some((
+                            Err(into_vortex_error(e)),
+                            (quads, None, layout, indexes, row),
+                        ));
                     }
                     None => break,
                 }
@@ -276,7 +298,7 @@ async fn build_buffered_chunk_stream(
             let n = buf.len();
             let chunk = build_struct_array(&buf, layout, &indexes, n, row, false, false)
                 .map_err(into_vortex_error);
-            Some((chunk, (quads, layout, indexes, row + n as u32)))
+            Some((chunk, (quads, None, layout, indexes, row + n as u32)))
         },
     );
 
