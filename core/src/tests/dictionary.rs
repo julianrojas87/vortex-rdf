@@ -640,7 +640,7 @@ async fn test_large_dictionary_blob_lift_keeps_fsst() {
 
     let blob = crate::io::ser::dict_blob_bytes(&dict).await.unwrap();
     assert!(blob.len() > 1 << 20, "blob too small to force chunking");
-    let lifted = term_dictionary::dict_from_blob_bytes(vortex_buffer::ByteBuffer::from(blob), len)
+    let lifted = term_dictionary::dict_from_blob_bytes(blob, len)
         .await
         .unwrap();
 
@@ -661,6 +661,46 @@ async fn test_large_dictionary_blob_lift_keeps_fsst() {
         assert_eq!(lifted.term_at(code).as_deref(), Some(term.as_str()));
     }
     assert_eq!(lifted.get_id("\u{10FFFF}"), None);
+}
+
+/// The embedded blob is memoized per dictionary: a second serialization of
+/// the same store must reuse the first blob's buffer (pointer-equal), not
+/// re-run the nested file write.
+#[cfg(feature = "file-io")]
+#[tokio::test]
+async fn test_dictionary_blob_is_memoized_across_serializations() {
+    let quads: Vec<Quad> = (0..500)
+        .map(|i| {
+            make_quad(
+                &format!("http://example.org/subject/{i:04}"),
+                &format!("http://example.org/predicate/{}", i % 8),
+                &format!("object value {i:04}"),
+                GraphName::DefaultGraph,
+            )
+        })
+        .collect();
+    let arr = VortexRdfStore::build_vortex_array_with_builder::<SortedStreamBuilder>(
+        quad_stream(quads),
+        LayoutStrategy::Dictionary,
+        vec![],
+    )
+    .await
+    .unwrap();
+    let store = VortexRdfStore::from_built(arr).unwrap();
+    let dict = store.dictionary_snapshot().unwrap().0;
+
+    let first = crate::io::ser::dict_blob_bytes(&dict).await.unwrap();
+    let second = crate::io::ser::dict_blob_bytes(&dict).await.unwrap();
+    assert_eq!(
+        first.as_slice().as_ptr(),
+        second.as_slice().as_ptr(),
+        "second blob must be the cached buffer, not a rewrite"
+    );
+
+    // And the store-level round trip stays byte-stable through the cache.
+    let bytes_a = store.to_bytes().await.unwrap();
+    let bytes_b = store.to_bytes().await.unwrap();
+    assert_eq!(bytes_a, bytes_b);
 }
 
 // ─── 7b) File-backed dictionary ─────────────────────────────────────────

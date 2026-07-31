@@ -64,8 +64,15 @@ async fn write_bare_array<W: VortexWrite + Unpin + Send>(
 /// The embedded dictionary blob: the sorted term column serialized as its own
 /// complete Vortex file (zone maps intact, terms FSST as held), ready to ride
 /// in the quads file's dictionary metadata segment.
+///
+/// Memoized on the dictionary: it is frozen, so the nested file write runs
+/// once per dictionary and every later serialization of the same store (the
+/// wasm bindings' repeated `toBytes`) reuses the buffer.
 #[cfg(any(feature = "file-io", target_arch = "wasm32"))]
-pub(crate) async fn dict_blob_bytes(dict: &TermDictionary) -> Result<Vec<u8>> {
+pub(crate) async fn dict_blob_bytes(dict: &TermDictionary) -> Result<ByteBuffer> {
+    if let Some(blob) = dict.blob_cache().get() {
+        return Ok(blob.clone());
+    }
     let array = term_dictionary::embedded_dict_array(dict)?;
     let mut bytes = Vec::new();
     write_bare_array(super::VORTEX_SESSION.write_options(), array, &mut bytes).await?;
@@ -80,7 +87,11 @@ pub(crate) async fn dict_blob_bytes(dict: &TermDictionary) -> Result<Vec<u8>> {
             bytes.len()
         )));
     }
-    Ok(bytes)
+    // On a concurrent race the first writer wins; the contents are identical.
+    Ok(dict
+        .blob_cache()
+        .get_or_init(|| ByteBuffer::from(bytes))
+        .clone())
 }
 
 /// Serialize an already-materialized array as a self-describing store file:
@@ -108,10 +119,7 @@ pub(crate) async fn serialize_with_dictionary<W: VortexWrite + Unpin + Send>(
         .write_options()
         .with_metadata_segment(MANIFEST_SEGMENT_KEY, ByteBuffer::from(manifest.to_json()?));
     if let Some(dict) = dict {
-        options = options.with_metadata_segment(
-            DICT_SEGMENT_KEY,
-            ByteBuffer::from(dict_blob_bytes(dict).await?),
-        );
+        options = options.with_metadata_segment(DICT_SEGMENT_KEY, dict_blob_bytes(dict).await?);
     }
     write_bare_array(options, vortex_array, writer).await?;
 
@@ -174,10 +182,7 @@ where
         .write_options()
         .with_metadata_segment(MANIFEST_SEGMENT_KEY, ByteBuffer::from(manifest.to_json()?));
     if let Some(dict) = &built.dict {
-        options = options.with_metadata_segment(
-            DICT_SEGMENT_KEY,
-            ByteBuffer::from(dict_blob_bytes(dict).await?),
-        );
+        options = options.with_metadata_segment(DICT_SEGMENT_KEY, dict_blob_bytes(dict).await?);
     }
     let vortex_stream = ArrayStreamAdapter::new(built.dtype, built.chunks);
 

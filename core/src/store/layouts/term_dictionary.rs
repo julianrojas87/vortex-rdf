@@ -12,7 +12,7 @@
 use std::collections::{HashMap, HashSet};
 #[cfg(feature = "file-io")]
 use std::ops::Range;
-#[cfg(feature = "file-io")]
+#[cfg(any(feature = "file-io", target_arch = "wasm32"))]
 use std::sync::OnceLock;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -281,6 +281,14 @@ pub(crate) struct TermDictionary {
     terms: TermStore,
     /// Memo for [`get_id`](Self::get_id); see [`ProbeCache`].
     probes: ProbeCache,
+    /// Memo for the serialized embedded-blob form (see `io::ser`'s
+    /// `dict_blob_bytes`): the dictionary is frozen, so its blob never
+    /// changes, and repeated serializations of the same store (the wasm
+    /// bindings' `toBytes`) reuse it instead of re-running the nested file
+    /// write. Costs the blob's compressed size in memory once a dictionary
+    /// has been serialized, for as long as the dictionary lives.
+    #[cfg(any(feature = "file-io", target_arch = "wasm32"))]
+    blob: OnceLock<vortex_buffer::ByteBuffer>,
 }
 
 /// Cloning shares nothing: the memo starts empty rather than being copied.
@@ -294,6 +302,8 @@ impl Clone for TermDictionary {
         Self {
             terms: self.terms.clone(),
             probes: ProbeCache::new(),
+            #[cfg(any(feature = "file-io", target_arch = "wasm32"))]
+            blob: OnceLock::new(),
         }
     }
 }
@@ -304,7 +314,15 @@ impl TermDictionary {
         Self {
             terms,
             probes: ProbeCache::new(),
+            #[cfg(any(feature = "file-io", target_arch = "wasm32"))]
+            blob: OnceLock::new(),
         }
+    }
+
+    /// The serialized-blob memo cell; owned here, filled by `io::ser`.
+    #[cfg(any(feature = "file-io", target_arch = "wasm32"))]
+    pub(crate) fn blob_cache(&self) -> &OnceLock<vortex_buffer::ByteBuffer> {
+        &self.blob
     }
 
     pub(crate) fn empty() -> Self {
