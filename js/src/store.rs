@@ -11,9 +11,7 @@ use vortex_array::VortexSessionExecute;
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::struct_::{StructArray, StructArrayExt};
 use vortex_rdf_core::common::terms::parse_quads_from_reader;
-use vortex_rdf_core::io::{
-    VORTEX_LIGHT_SESSION, array_from_ipc_bytes, deserialize, write_array_to_ipc,
-};
+use vortex_rdf_core::io::{VORTEX_SESSION, deserialize};
 use vortex_rdf_core::{BuilderStrategy, DictSnapshot, LayoutStrategy, VortexRdfStore as CoreStore};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::future_to_promise;
@@ -135,8 +133,9 @@ impl VortexRdfStore {
 
     #[wasm_bindgen(js_name = fromBytes, skip_typescript)]
     pub async fn from_bytes(bytes: &[u8]) -> Result<VortexRdfStore, JsValue> {
-        let array = array_from_ipc_bytes(bytes).map_err(|e| JsValue::from_str(&e.to_string()))?;
-        let inner = CoreStore::new(array).map_err(|e| JsValue::from_str(&e.to_string()))?;
+        let inner = CoreStore::from_bytes(bytes)
+            .await
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
         Ok(VortexRdfStore::wrap(inner))
     }
 
@@ -189,19 +188,14 @@ impl VortexRdfStore {
 
     #[wasm_bindgen(js_name = toBytes, skip_typescript)]
     pub async fn to_bytes(&self) -> Result<Vec<u8>, JsValue> {
-        // `to_ipc_array` evaluates the lazy nodes a `match`-derived store holds
-        // and re-attaches the term dictionary afterwards, so the written bytes
-        // carry it in its compressed form rather than expanded.
-        let array = self
-            .inner
-            .to_ipc_array()
+        // Complete Vortex file bytes: the manifest and, under the Dictionary
+        // layout, the FSST-compressed term dictionary ride as metadata
+        // segments, so the bytes are self-describing and `fromBytes` (or a
+        // native `from_file` after writing them to disk) reads them back.
+        self.inner
+            .to_bytes()
             .await
-            .map_err(|e| JsValue::from_str(&format!("Vortex read error: {}", e)))?;
-
-        let mut buffer = Vec::new();
-        write_array_to_ipc(array, &mut buffer)
-            .map_err(|e| JsValue::from_str(&format!("Vortex serialization error: {}", e)))?;
-        Ok(buffer)
+            .map_err(|e| JsValue::from_str(&format!("Vortex serialization error: {}", e)))
     }
 
     #[wasm_bindgen(js_name = toRdf, skip_typescript)]
@@ -377,7 +371,7 @@ impl VortexRdfStore {
             .await
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
 
-        let mut ctx = VORTEX_LIGHT_SESSION.create_execution_ctx();
+        let mut ctx = VORTEX_SESSION.create_execution_ctx();
         let struct_arr = arr
             .execute::<StructArray>(&mut ctx)
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
@@ -475,7 +469,7 @@ async fn match_columns(
             .get_quads_array()
             .await
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        let mut ctx = VORTEX_LIGHT_SESSION.create_execution_ctx();
+        let mut ctx = VORTEX_SESSION.create_execution_ctx();
         let struct_arr = arr
             .execute::<StructArray>(&mut ctx)
             .map_err(|e| JsValue::from_str(&e.to_string()))?;

@@ -176,7 +176,6 @@ pub(crate) fn resolve_in_memory(
 #[cfg(feature = "file-io")]
 pub(crate) async fn resolve_file(
     file: &VortexFile,
-    quad_rows: u64,
     layout: &ResolvedLayout,
     pattern: QuadPattern<'_>,
     codes: &mut PatternCodes,
@@ -188,13 +187,9 @@ pub(crate) async fn resolve_file(
     let Some(native) = layout.probe_scalar_cached(probe.probe_term, codes) else {
         return Ok(IndexResolution::Empty);
     };
-    let row_ids = super::scan_index_row_ids(
-        file,
-        quad_rows,
-        &[(probe.value_column, native)],
-        probe.row_id_column,
-    )
-    .await?;
+    let row_ids =
+        super::scan_index_row_ids(file, &[(probe.value_column, native)], probe.row_id_column)
+            .await?;
     if row_ids.is_empty() {
         return Ok(IndexResolution::Empty);
     }

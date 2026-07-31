@@ -18,18 +18,18 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use web_time::Instant;
 
-#[cfg(feature = "file-io")]
 use vortex_array::arrays::struct_::{StructArray, StructArrayExt};
-use vortex_array::arrays::{PrimitiveArray, VarBinViewArray};
+use vortex_array::arrays::{ChunkedArray, PrimitiveArray, VarBinViewArray};
+use vortex_array::dtype::DType;
 #[cfg(feature = "file-io")]
-use vortex_array::expr::{eq, get_item, lit, root, select};
+use vortex_array::expr::{eq, get_item, lit};
+use vortex_array::expr::{root, select};
 use vortex_array::match_each_integer_ptype;
 #[cfg(feature = "file-io")]
 use vortex_array::stream::ArrayStreamExt as _;
-#[cfg(feature = "file-io")]
+#[cfg(any(feature = "file-io", target_arch = "wasm32", test))]
 use vortex_array::validity::Validity;
 use vortex_array::{ArrayRef, IntoArray, VortexSessionExecute};
-#[cfg(feature = "file-io")]
 use vortex_file::VortexFile;
 use vortex_fsst::{FSST, FSSTArray, FSSTArraySlotsExt as _, fsst_compress, fsst_train_compressor};
 #[cfg(feature = "file-io")]
@@ -37,10 +37,9 @@ use vortex_mask::{AllOr, Mask};
 
 use crate::common::array::{StrColReader, buf_as_str};
 use crate::error::{Result, VortexRdfError};
-use crate::io::VORTEX_LIGHT_SESSION;
+use crate::io::VORTEX_SESSION;
 use crate::store::RawQuad;
 use crate::store::layouts::dictionary::QuadCodes;
-#[cfg(feature = "file-io")]
 use crate::store::schema::TERM_FIELD;
 
 /// Build-only term-to-ID lookup table, keyed by owned terms. It is deliberately
@@ -242,6 +241,35 @@ enum TermStore {
     Canonical(VarBinViewArray),
     /// FSST-compressed terms: ~4x smaller, and every read decodes.
     Fsst(FsstTerms),
+    /// A multi-chunk term column read back from a serialized blob, each chunk
+    /// kept in the encoding it was written in. Holding the chunks (instead of
+    /// canonicalizing them into one array) is what keeps a large dictionary
+    /// FSST-compressed through the resident lift.
+    Chunked(ChunkedTerms),
+}
+
+/// The chunks of a multi-chunk term column, with a cumulative-start table
+/// mapping a global term index to (chunk, local index).
+#[derive(Clone)]
+pub(crate) struct ChunkedTerms {
+    chunks: Vec<TermChunk>,
+    /// `starts[i]` = global index of chunk i's first term; ascending.
+    starts: Vec<usize>,
+    len: usize,
+}
+
+#[derive(Clone)]
+enum TermChunk {
+    Canonical(VarBinViewArray),
+    Fsst(FsstTerms),
+}
+
+impl ChunkedTerms {
+    /// The chunk holding global index `i`, and `i` local to it.
+    fn locate(&self, i: usize) -> (usize, usize) {
+        let chunk = self.starts.partition_point(|&s| s <= i) - 1;
+        (chunk, i - self.starts[chunk])
+    }
 }
 
 /// The frozen, sorted term dictionary in columnar form.
@@ -321,39 +349,70 @@ impl TermDictionary {
         elements: ArrayRef,
         ctx: &mut vortex_array::ExecutionCtx,
     ) -> Result<Self> {
-        // Peel the structural wrappers a serialized term column can arrive
-        // in: the padded form's all-valid nullability wrapper (`Masked`), and
-        // a chunk-aligned slice still riding in a one-chunk `Chunked`
-        // container. Without this the FSST downcast below would miss and the
-        // dictionary would be canonicalized — decompressed — on open, which
-        // is exactly the copy holding it compressed exists to avoid.
-        let elements = {
-            use vortex_array::arrays::chunked::ChunkedArrayExt as _;
-            use vortex_array::arrays::masked::MaskedArraySlotsExt as _;
-            let mut cur = elements;
-            loop {
-                cur = match cur.try_downcast::<vortex_array::arrays::Masked>() {
-                    Ok(masked) => masked.child().clone(),
-                    Err(not_masked) => {
-                        match not_masked.try_downcast::<vortex_array::arrays::Chunked>() {
-                            Ok(chunked) if chunked.nchunks() == 1 => chunked.chunk(0).clone(),
-                            Ok(chunked) => break chunked.into_array(),
-                            Err(other) => break other,
-                        }
-                    }
-                };
+        // Flatten `Chunked` containers into their chunks: the blob's writer
+        // splits large dictionaries into several chunks, each independently
+        // FSST-compressed, and canonicalizing them into one array would
+        // decompress the dictionary on open — exactly the copy holding it
+        // compressed exists to avoid.
+        use vortex_array::arrays::chunked::ChunkedArrayExt as _;
+        let mut queue = vec![elements];
+        let mut flat = Vec::new();
+        while let Some(cur) = queue.pop() {
+            match cur.try_downcast::<vortex_array::arrays::Chunked>() {
+                // Reverse so the pop order preserves chunk order.
+                Ok(chunked) => queue.extend(chunked.chunks().iter().rev().cloned()),
+                Err(other) => flat.push(other),
+            }
+        }
+        Self::from_term_chunks(flat, ctx)
+    }
+
+    /// Adopt a term column's chunks, each kept FSST when it arrived FSST and
+    /// canonicalized otherwise (the write path compresses, but nothing in the
+    /// format obliges a producer to have done so).
+    pub(crate) fn from_term_chunks(
+        chunks: Vec<ArrayRef>,
+        ctx: &mut vortex_array::ExecutionCtx,
+    ) -> Result<Self> {
+        let mut adopted = Vec::with_capacity(chunks.len());
+        for chunk in chunks {
+            if chunk.is_empty() {
+                continue;
+            }
+            let chunk = match chunk.try_downcast::<FSST>() {
+                Ok(fsst) => TermChunk::Fsst(FsstTerms::new(fsst)?),
+                Err(other) => TermChunk::Canonical(
+                    other
+                        .execute::<VarBinViewArray>(ctx)
+                        .map_err(VortexRdfError::Vortex)?,
+                ),
+            };
+            adopted.push(chunk);
+        }
+        let store = match adopted.len() {
+            0 => TermStore::Canonical(VarBinViewArray::from_iter_str(std::iter::empty::<&str>())),
+            1 => match adopted.pop().expect("length checked above") {
+                TermChunk::Canonical(a) => TermStore::Canonical(a),
+                TermChunk::Fsst(f) => TermStore::Fsst(f),
+            },
+            _ => {
+                let mut starts = Vec::with_capacity(adopted.len());
+                let mut len = 0usize;
+                for chunk in &adopted {
+                    starts.push(len);
+                    len += match chunk {
+                        TermChunk::Canonical(a) => a.len(),
+                        TermChunk::Fsst(f) => f.len(),
+                    };
+                }
+                TermStore::Chunked(ChunkedTerms {
+                    chunks: adopted,
+                    starts,
+                    len,
+                })
             }
         };
-        let elements = match elements.try_downcast::<FSST>() {
-            Ok(fsst) => {
-                return Ok(Self::new(TermStore::Fsst(FsstTerms::new(fsst)?)));
-            }
-            Err(other) => other,
-        };
-        let plain = elements
-            .execute::<VarBinViewArray>(ctx)
-            .map_err(VortexRdfError::Vortex)?;
-        Ok(Self::new(TermStore::Canonical(plain)))
+        Ok(Self::new(store))
     }
 
     fn compress(plain: VarBinViewArray) -> Result<Self> {
@@ -362,7 +421,7 @@ impl TermDictionary {
         }
         let start = Instant::now();
         let array = plain.into_array();
-        let mut ctx = VORTEX_LIGHT_SESSION.create_execution_ctx();
+        let mut ctx = VORTEX_SESSION.create_execution_ctx();
         let compressor = fsst_train_compressor(&array, &mut ctx).map_err(VortexRdfError::Vortex)?;
         let fsst = fsst_compress(&array, &compressor, &mut ctx).map_err(VortexRdfError::Vortex)?;
         let terms = FsstTerms::new(fsst)?;
@@ -430,17 +489,34 @@ impl TermDictionary {
         match &self.terms {
             TermStore::Canonical(a) => a.len(),
             TermStore::Fsst(f) => f.len(),
+            TermStore::Chunked(c) => c.len,
         }
     }
 
     /// The sorted term column as it is held, for serialization.
     ///
     /// Returns the FSST array itself when the terms are compressed, so writing
-    /// a store out carries the compressed form rather than a re-expanded copy.
+    /// a store out carries the compressed form rather than a re-expanded copy;
+    /// a multi-chunk store round-trips as a chunked array of its held chunks.
+    #[cfg(any(feature = "file-io", target_arch = "wasm32", test))]
     pub(crate) fn terms_array(&self) -> ArrayRef {
         match &self.terms {
             TermStore::Canonical(a) => a.clone().into_array(),
             TermStore::Fsst(f) => f.array.clone().into_array(),
+            TermStore::Chunked(c) => {
+                let chunks: Vec<ArrayRef> = c
+                    .chunks
+                    .iter()
+                    .map(|chunk| match chunk {
+                        TermChunk::Canonical(a) => a.clone().into_array(),
+                        TermChunk::Fsst(f) => f.array.clone().into_array(),
+                    })
+                    .collect();
+                let dtype = chunks[0].dtype().clone();
+                ChunkedArray::try_new(chunks, dtype)
+                    .expect("term chunks share one dtype")
+                    .into_array()
+            }
         }
     }
 
@@ -453,6 +529,20 @@ impl TermDictionary {
             TermStore::Fsst(f) => DictReader::Fsst {
                 terms: f,
                 scratch: f.new_scratch(),
+            },
+            TermStore::Chunked(c) => DictReader::Chunked {
+                store: c,
+                cursors: c
+                    .chunks
+                    .iter()
+                    .map(|chunk| match chunk {
+                        TermChunk::Canonical(a) => ChunkCursor::Canonical(StrColReader::new(a)),
+                        TermChunk::Fsst(f) => ChunkCursor::Fsst {
+                            terms: f,
+                            scratch: f.new_scratch(),
+                        },
+                    })
+                    .collect(),
             },
         }
     }
@@ -660,7 +750,7 @@ pub(crate) struct FsstTerms {
 
 impl FsstTerms {
     fn new(array: FSSTArray) -> Result<Self> {
-        let mut ctx = VORTEX_LIGHT_SESSION.create_execution_ctx();
+        let mut ctx = VORTEX_SESSION.create_execution_ctx();
         let offsets = array
             .codes_offsets()
             .clone()
@@ -724,6 +814,35 @@ pub(crate) enum DictReader<'a> {
         terms: &'a FsstTerms,
         scratch: Vec<u8>,
     },
+    Chunked {
+        store: &'a ChunkedTerms,
+        /// One cursor per chunk, each with its own scratch, so a read maps
+        /// the global index to its chunk and delegates.
+        cursors: Vec<ChunkCursor<'a>>,
+    },
+}
+
+/// A [`DictReader`]'s per-chunk cursor over one chunk of a
+/// [`TermStore::Chunked`] store.
+pub(crate) enum ChunkCursor<'a> {
+    Canonical(StrColReader<'a>),
+    Fsst {
+        terms: &'a FsstTerms,
+        scratch: Vec<u8>,
+    },
+}
+
+impl ChunkCursor<'_> {
+    #[inline]
+    fn bytes_at(&mut self, local: usize) -> &[u8] {
+        match self {
+            ChunkCursor::Canonical(r) => r.bytes_at(local),
+            ChunkCursor::Fsst { terms, scratch } => {
+                scratch.clear();
+                terms.decode_into(local, scratch)
+            }
+        }
+    }
 }
 
 impl DictReader<'_> {
@@ -734,6 +853,10 @@ impl DictReader<'_> {
             DictReader::Fsst { terms, scratch } => {
                 scratch.clear();
                 terms.decode_into(i, scratch)
+            }
+            DictReader::Chunked { store, cursors } => {
+                let (chunk, local) = store.locate(i);
+                cursors[chunk].bytes_at(local)
             }
         }
     }
@@ -957,25 +1080,21 @@ struct Fence {
     splits: Vec<Range<u64>>,
 }
 
-/// A term dictionary left in its file: term→ID probes and ID→term decodes
+/// A term dictionary left in its blob: term→ID probes and ID→term decodes
 /// scan the sorted `_dict_term` column on demand instead of holding all terms
 /// resident.
 ///
-/// Both serialized placements collapse to `(file, base_row)`: the padded form
-/// probes the quads file's own trailing dictionary rows, the sidecar form its
-/// companion file from row 0. A term probe binary-searches the in-memory
-/// [`Fence`] for the one split that can hold the term, evaluates an equality
-/// filter over just that split, and memoizes the answer in a [`ProbeCache`].
-/// ID→term reads are row-index scans (`base_row + code`).
+/// `file` is the embedded dictionary blob opened as its own [`VortexFile`]
+/// (through the bounded reader — see `io::embedded`), so a term's code is its
+/// file row. A term probe binary-searches the in-memory [`Fence`] for the one
+/// split that can hold the term, evaluates an equality filter over just that
+/// split, and memoizes the answer in a [`ProbeCache`]. ID→term reads are
+/// row-index scans.
 #[cfg(feature = "file-io")]
 #[derive(Clone)]
 pub(crate) struct FileBackedDict {
-    /// The file holding the term column: the quads file itself (padded) or
-    /// the sidecar companion.
+    /// The dictionary blob as its own file.
     file: Arc<VortexFile>,
-    /// Absolute file row of term ID 0: the quad-row count (padded) or 0
-    /// (sidecar).
-    base_row: u64,
     /// Number of terms.
     len: u64,
     /// term → code memo, shared across clones (every derived view of a store
@@ -987,10 +1106,9 @@ pub(crate) struct FileBackedDict {
 
 #[cfg(feature = "file-io")]
 impl FileBackedDict {
-    pub(crate) fn new(file: Arc<VortexFile>, base_row: u64, len: u64) -> Self {
+    pub(crate) fn new(file: Arc<VortexFile>, len: u64) -> Self {
         Self {
             file,
-            base_row,
             len,
             probes: Arc::new(ProbeCache::new()),
             fence: Arc::new(OnceLock::new()),
@@ -1011,22 +1129,17 @@ impl FileBackedDict {
             .expect("the fence was just initialized above"))
     }
 
-    /// Collect the dictionary-bearing splits (clamped to the dictionary
-    /// rows) and resolve each one's first term with a single row-index scan.
+    /// Collect the dictionary's splits (clamped to its rows, defensively) and
+    /// resolve each one's first term with a single row-index scan.
     async fn build_fence(&self) -> Result<Fence> {
-        let end = self.base_row + self.len;
         let mut splits = Vec::new();
         for split in self.file.splits().map_err(VortexRdfError::Vortex)? {
-            let start = split.start.max(self.base_row);
-            let stop = split.end.min(end);
-            if start < stop {
-                splits.push(start..stop);
+            let stop = split.end.min(self.len);
+            if split.start < stop {
+                splits.push(split.start..stop);
             }
         }
-        let codes: Vec<u32> = splits
-            .iter()
-            .map(|range| (range.start - self.base_row) as u32)
-            .collect();
+        let codes: Vec<u32> = splits.iter().map(|range| range.start as u32).collect();
         let first_terms = self.resolve_terms(&codes).await?;
         Ok(Fence {
             first_terms,
@@ -1063,7 +1176,7 @@ impl FileBackedDict {
                     AllOr::None => None,
                     AllOr::Some(indices) => indices.first().map(|&i| range.start + i as u64),
                 };
-                row.map(|row| (row - self.base_row) as u32)
+                row.map(|row| row as u32)
             }
         };
         self.probes.put(term, code);
@@ -1084,10 +1197,7 @@ impl FileBackedDict {
                 max, self.len
             )));
         }
-        let rows: vortex_buffer::Buffer<u64> = codes
-            .iter()
-            .map(|&code| self.base_row + code as u64)
-            .collect();
+        let rows: vortex_buffer::Buffer<u64> = codes.iter().map(|&code| code as u64).collect();
         let arr = self
             .file
             .scan()
@@ -1099,7 +1209,7 @@ impl FileBackedDict {
             .read_all()
             .await
             .map_err(VortexRdfError::Vortex)?;
-        let mut ctx = VORTEX_LIGHT_SESSION.create_execution_ctx();
+        let mut ctx = VORTEX_SESSION.create_execution_ctx();
         let struct_arr = arr
             .execute::<StructArray>(&mut ctx)
             .map_err(VortexRdfError::Vortex)?;
@@ -1131,176 +1241,104 @@ impl FileBackedDict {
     }
 
     /// Lift the whole dictionary resident — the transient full-column read
-    /// behind [`DictAccess::ensure_resident`]. A padded file goes through the
-    /// aligned-tail extraction (which keeps the stored FSST encoding); a
-    /// sidecar file is one term-column range scan.
+    /// behind [`DictAccess::ensure_resident`].
     pub(crate) async fn load_resident(&self) -> Result<TermDictionary> {
-        if self.base_row > 0 {
-            let (_, dict) = dict_from_padded_file(&self.file).await?;
-            Ok(dict)
-        } else {
-            dict_from_term_rows(&self.file, self.base_row, self.len).await
-        }
+        dict_from_blob_file(&self.file).await
     }
 }
 
-/// Read the term dictionary from a padded Dictionary-layout file: a
-/// single-column projection scan of [`TERM_FIELD`] (the quad columns are
-/// never touched). Returns the quad row count (the split point) alongside the
-/// dictionary.
+/// Read a dictionary blob file's whole term column into a resident
+/// [`TermDictionary`], keeping each chunk's stored encoding (FSST where the
+/// writer compressed).
 ///
-/// The quad rows' term values are one all-null run, which decodes to almost
-/// nothing; the dictionary tail is lifted resident exactly as
-/// [`super::dictionary::split_padded`] does for in-memory arrays.
-#[cfg(feature = "file-io")]
-pub(crate) async fn dict_from_padded_file(file: &VortexFile) -> Result<(u64, TermDictionary)> {
+/// Drives the scan's per-split futures inline (no runtime handle), so it
+/// serves the native bounded-shim open, the buffered `open_buffer` open, and
+/// the wasm read path alike.
+pub(crate) async fn dict_from_blob_file(file: &VortexFile) -> Result<TermDictionary> {
     if file.row_count() == 0 {
-        return Ok((0, TermDictionary::empty()));
-    }
-    let arr = file
-        .scan()
-        .map_err(VortexRdfError::Vortex)?
-        .with_projection(select([TERM_FIELD], root()))
-        .into_array_stream()
-        .map_err(VortexRdfError::Vortex)?
-        .read_all()
-        .await
-        .map_err(VortexRdfError::Vortex)?;
-    let mut ctx = VORTEX_LIGHT_SESSION.create_execution_ctx();
-    let struct_arr = arr
-        .execute::<StructArray>(&mut ctx)
-        .map_err(VortexRdfError::Vortex)?;
-    let col = struct_arr
-        .unmasked_field_by_name(TERM_FIELD)
-        .map_err(VortexRdfError::Vortex)?
-        .clone();
-    let (n_quads, dict) = super::dictionary::split_term_column(&col, &mut ctx)?;
-    Ok((n_quads as u64, dict))
-}
-
-/// The sidecar dictionary path for a quads file: `<stem>.dict.vortex` beside
-/// it (`data.vortex` → `data.dict.vortex`).
-#[cfg(feature = "file-io")]
-pub(crate) fn sidecar_dict_path(quads_path: &std::path::Path) -> std::path::PathBuf {
-    let stem = quads_path
-        .file_stem()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "quads".to_string());
-    quads_path.with_file_name(format!("{stem}.dict.vortex"))
-}
-
-/// Open the sidecar dictionary file beside `quads_path`, erroring when the
-/// companion is missing (a bare-code quads file cannot decode without it).
-#[cfg(feature = "file-io")]
-pub(crate) async fn open_sidecar_file(quads_path: &std::path::Path) -> Result<Arc<VortexFile>> {
-    let path = sidecar_dict_path(quads_path);
-    if !path.is_file() {
-        return Err(VortexRdfError::Deserialization(format!(
-            "Dictionary-layout file {:?} has bare code columns and no sidecar \
-             dictionary at {:?}; the sidecar must travel with the quads file",
-            quads_path, path
-        )));
-    }
-    Ok(Arc::new(crate::io::de::open_vortex_file(&path).await?))
-}
-
-/// Read `len` dictionary rows starting at `base_row` into a resident
-/// [`TermDictionary`] — the whole term column of a sidecar file
-/// (`base_row == 0`), or a lift of any file-backed range.
-#[cfg(feature = "file-io")]
-pub(crate) async fn dict_from_term_rows(
-    file: &VortexFile,
-    base_row: u64,
-    len: u64,
-) -> Result<TermDictionary> {
-    if len == 0 {
         return Ok(TermDictionary::empty());
     }
-    let arr = file
+    let scan = file
         .scan()
         .map_err(VortexRdfError::Vortex)?
-        .with_row_range(base_row..base_row + len)
-        .with_projection(select([TERM_FIELD], root()))
-        .into_array_stream()
-        .map_err(VortexRdfError::Vortex)?
-        .read_all()
-        .await
-        .map_err(VortexRdfError::Vortex)?;
-    let mut ctx = VORTEX_LIGHT_SESSION.create_execution_ctx();
-    let struct_arr = arr
-        .execute::<StructArray>(&mut ctx)
-        .map_err(VortexRdfError::Vortex)?;
-    let col = struct_arr
-        .unmasked_field_by_name(TERM_FIELD)
-        .map_err(VortexRdfError::Vortex)?
-        .clone();
-    TermDictionary::from_terms_array(col, &mut ctx)
+        .with_projection(select([TERM_FIELD], root()));
+    let mut ctx = VORTEX_SESSION.create_execution_ctx();
+    let mut chunks = Vec::new();
+    for task in scan.build().map_err(VortexRdfError::Vortex)? {
+        if let Some(chunk) = task.await.map_err(VortexRdfError::Vortex)? {
+            let struct_arr = chunk
+                .execute::<StructArray>(&mut ctx)
+                .map_err(VortexRdfError::Vortex)?;
+            chunks.push(
+                struct_arr
+                    .unmasked_field_by_name(TERM_FIELD)
+                    .map_err(VortexRdfError::Vortex)?
+                    .clone(),
+            );
+        }
+    }
+    TermDictionary::from_terms_array(
+        match chunks.len() {
+            1 => chunks.pop().expect("length checked above"),
+            _ => {
+                let dtype = DType::Utf8(vortex_array::dtype::Nullability::NonNullable);
+                ChunkedArray::try_new(chunks, dtype)
+                    .map_err(VortexRdfError::Vortex)?
+                    .into_array()
+            }
+        },
+        &mut ctx,
+    )
 }
 
-/// Locate a padded file's dictionary rows without reading any row data:
-/// `(quad_rows, term_count)`, derived arithmetically from the footer's
-/// per-field file statistics. The term column is null on exactly the quad
-/// rows, so `quad_rows = null_count(_dict_term)` and the dictionary length
-/// is the remainder of the file's row count.
-///
-/// vortex-rdf writers always stamp file statistics (see
-/// `ser::write_options_with_subject_stats`, whose stat set includes
-/// `NullCount`); a padded file without an exact null count is rejected
-/// rather than scanned. The contiguous-tail invariant is the writer's
-/// (`pad_chunk_stream` appends the dictionary after every quad chunk) and is
-/// not re-validated here.
-#[cfg(feature = "file-io")]
-pub(crate) fn padded_dict_extent(file: &VortexFile) -> Result<(u64, u64)> {
-    use vortex_array::dtype::DType;
-    use vortex_array::expr::stats::Stat;
+/// Open a dictionary blob from its bytes (an embedded metadata segment),
+/// validate it against its manifest descriptor, and lift it resident.
+/// Synchronous segment resolution end to end — the resident tier and the
+/// wasm/`from_bytes` path.
+pub(crate) async fn dict_from_blob_bytes(
+    bytes: vortex_buffer::ByteBuffer,
+    expected_rows: u64,
+) -> Result<TermDictionary> {
+    use vortex_file::OpenOptionsSessionExt as _;
+    let file = VORTEX_SESSION
+        .open_options()
+        .open_buffer(bytes)
+        .map_err(VortexRdfError::Vortex)?;
+    validate_blob_file(&file, expected_rows)?;
+    dict_from_blob_file(&file).await
+}
 
-    let total = file.row_count();
-    if total == 0 {
-        return Ok((0, 0));
-    }
-    let DType::Struct(fields, _) = file.dtype() else {
-        return Err(VortexRdfError::Deserialization(
-            "padded Dictionary file does not hold a struct array".to_string(),
-        ));
-    };
-    let field_idx = fields
-        .names()
-        .iter()
-        .position(|n| n.as_ref() == TERM_FIELD)
-        .ok_or_else(|| {
-            VortexRdfError::Deserialization(format!(
-                "padded Dictionary file has no `{TERM_FIELD}` column"
-            ))
-        })?;
-    let missing_stats = || {
-        VortexRdfError::Deserialization(format!(
-            "padded Dictionary file has no exact null-count statistic for \
-             `{TERM_FIELD}`; re-serialize it with a current vortex-rdf build"
-        ))
-    };
-    let statistics = file.footer().statistics().ok_or_else(missing_stats)?;
-    let (stats_set, field_dtype) = statistics.get(field_idx);
-    let null_count_dtype = Stat::NullCount
-        .dtype(field_dtype)
-        .ok_or_else(missing_stats)?;
-    let null_count = stats_set
-        .get_as::<u64>(Stat::NullCount, &null_count_dtype)
-        .as_exact()
-        .ok_or_else(missing_stats)?;
-    if null_count > total {
+/// Validate an opened dictionary blob against its manifest descriptor: the
+/// expected one-column schema and the declared row count.
+pub(crate) fn validate_blob_file(file: &VortexFile, expected_rows: u64) -> Result<()> {
+    let ok_schema = matches!(file.dtype(), DType::Struct(fields, _)
+        if fields.names().len() == 1
+            && fields.names()[0].as_ref() == TERM_FIELD
+            && matches!(fields.field(TERM_FIELD), Some(DType::Utf8(vortex_array::dtype::Nullability::NonNullable))));
+    if !ok_schema {
         return Err(VortexRdfError::Deserialization(format!(
-            "padded Dictionary file is malformed: `{TERM_FIELD}` null count \
-             {null_count} exceeds row count {total}"
+            "embedded dictionary blob has schema {}, expected a single \
+             non-nullable `{TERM_FIELD}: utf8` column",
+            file.dtype()
         )));
     }
-    Ok((null_count, total - null_count))
+    if file.row_count() != expected_rows {
+        return Err(VortexRdfError::Deserialization(format!(
+            "embedded dictionary blob holds {} terms but the manifest declares {}",
+            file.row_count(),
+            expected_rows
+        )));
+    }
+    Ok(())
 }
 
-#[cfg(feature = "file-io")]
-/// The sidecar dictionary as a one-column `{_dict_term: utf8}` array, ready
-/// to serialize beside a bare-code quads file. Terms keep the encoding the
-/// dictionary is held in (FSST when compressed at the source).
-pub(crate) fn sidecar_dict_array(dict: &TermDictionary) -> Result<ArrayRef> {
+/// The embedded dictionary blob's body: a one-column `{_dict_term: utf8}`
+/// array, row i = the term with code i. Terms keep the encoding the
+/// dictionary is held in (FSST when compressed at the source). Serialized as
+/// a complete Vortex file into the quads file's dictionary metadata segment
+/// (`io::embedded::DICT_SEGMENT_KEY`).
+#[cfg(any(feature = "file-io", target_arch = "wasm32", test))]
+pub(crate) fn embedded_dict_array(dict: &TermDictionary) -> Result<ArrayRef> {
     StructArray::try_new(
         [TERM_FIELD].into(),
         vec![dict.terms_array()],

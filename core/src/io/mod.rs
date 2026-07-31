@@ -1,56 +1,51 @@
 pub mod de;
+pub mod embedded;
 pub mod ser;
 
 use std::sync::LazyLock;
 use vortex_array::scalar_fn::session::ScalarFnSession;
 use vortex_array::session::ArraySession;
+use vortex_io::session::RuntimeSession;
+use vortex_layout::session::LayoutSession;
 use vortex_session::VortexSession;
 
-#[cfg(feature = "file-io")]
-use vortex_io::session::RuntimeSession;
-#[cfg(feature = "file-io")]
+#[cfg(any(
+    all(feature = "file-io", not(target_arch = "wasm32")),
+    all(target_arch = "wasm32", target_os = "unknown")
+))]
 use vortex_io::session::RuntimeSessionExt;
-#[cfg(feature = "file-io")]
-use vortex_layout::session::LayoutSession;
 
-/// Full session including layout and async runtime — used for file I/O.
-#[cfg(feature = "file-io")]
+/// The one Vortex session: arrays, layouts, scalar kernels, and a runtime.
+///
+/// Every target reads and writes Vortex *files* (the wasm bindings exchange
+/// file bytes via `open_buffer`/`to_bytes`), so every target needs the same
+/// registries — a single session keeps the encoding registry from diverging
+/// between targets. The runtime handle is the only per-target piece: tokio
+/// natively, the microtask-queue `WasmRuntime` on wasm (required by the file
+/// writer's task spawning), and none for native no-file-io builds, whose code
+/// paths are all handle-free.
 pub static VORTEX_SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
     let session = VortexSession::empty()
         .with::<ArraySession>()
         .with::<LayoutSession>()
         .with::<ScalarFnSession>()
         .with::<RuntimeSession>();
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(all(feature = "file-io", not(target_arch = "wasm32")))]
     let session = session.with_tokio();
+    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    let session = session.with_handle(vortex_io::runtime::wasm::WasmRuntime::handle());
     vortex_file::register_default_encodings(&session);
     session
 });
 
-/// Minimal session for in-memory array operations and IPC.
-pub static VORTEX_LIGHT_SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
-    let session = VortexSession::empty()
-        .with::<ArraySession>()
-        .with::<ScalarFnSession>();
-    #[cfg(feature = "file-io")]
-    vortex_file::register_default_encodings(&session);
-    // The term dictionary is held and written FSST-compressed, so this
-    // encoding must be resolvable even in the light session — which is the
-    // only one wasm has, and which `register_default_encodings` above does not
-    // reach because `file-io` is off there.
-    #[cfg(not(feature = "file-io"))]
-    vortex_fsst::initialize(&session);
-    session
-});
-
-pub use de::{array_from_ipc_bytes, array_from_ipc_reader, deserialize};
+pub use de::deserialize;
 #[cfg(feature = "file-io")]
-pub use de::{load_vortex_file_ref, open_vortex_file};
+pub use de::open_vortex_file;
 
-pub use ser::write_array_to_ipc;
+#[cfg(any(feature = "file-io", target_arch = "wasm32"))]
+pub use ser::serialize;
 #[cfg(feature = "file-io")]
 pub use ser::{
     quads_stream_to_vortex, quads_stream_to_vortex_file_with_builder,
-    quads_stream_to_vortex_writer, quads_stream_to_vortex_writer_with_builder, serialize,
-    write_sidecar_dictionary,
+    quads_stream_to_vortex_writer, quads_stream_to_vortex_writer_with_builder,
 };

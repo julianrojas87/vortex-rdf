@@ -18,7 +18,6 @@ oxrdf.workspace = true
 oxrdfio.workspace = true
 anyhow.workspace = true
 vortex-array.workspace = true
-vortex-ipc.workspace = true
 vortex-session.workspace = true
 vortex.workspace = true
 tokio = { workspace = true, features = ["full"] }

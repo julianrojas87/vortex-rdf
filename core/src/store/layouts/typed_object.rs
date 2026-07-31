@@ -14,7 +14,7 @@ use vortex_array::{ArrayRef, IntoArray, VortexSessionExecute};
 use crate::common::array::{StrColReader, make_nullable_string_array, make_string_array};
 use crate::common::terms::{get_as_term, parse_graph_name, parse_named_node, parse_subject};
 use crate::error::{Result, VortexRdfError};
-use crate::io::VORTEX_LIGHT_SESSION;
+use crate::io::VORTEX_SESSION;
 use crate::store::RawQuad;
 use crate::store::schema::{
     COL_G, COL_O_DATATYPE, COL_O_KIND, COL_O_LANG, COL_O_VALUE, COL_P, COL_S,
@@ -129,7 +129,7 @@ fn compose_object(
 /// holds the full object term, which under this layout has to be recomposed
 /// from `o_kind`/`o_value`/`o_datatype`/`o_lang`.
 pub(crate) fn object_terms(struct_arr: &StructArray) -> Result<Vec<String>> {
-    let mut ctx = VORTEX_LIGHT_SESSION.create_execution_ctx();
+    let mut ctx = VORTEX_SESSION.create_execution_ctx();
 
     let kind_col = struct_arr
         .unmasked_field_by_name(COL_O_KIND)
@@ -183,7 +183,7 @@ pub(crate) fn object_terms(struct_arr: &StructArray) -> Result<Vec<String>> {
 
 /// Decode a StructArray chunk with typed object sub-columns into Quads.
 pub(crate) fn decode_chunk(chunk: &ArrayRef) -> Vec<Result<Quad>> {
-    let mut ctx = VORTEX_LIGHT_SESSION.create_execution_ctx();
+    let mut ctx = VORTEX_SESSION.create_execution_ctx();
 
     let struct_arr = match chunk.clone().execute::<StructArray>(&mut ctx) {
         Ok(a) => a,

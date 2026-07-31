@@ -62,11 +62,8 @@ async fn test_streaming_write_read_roundtrip() {
         .await
         .unwrap();
 
-    // ...then load it back as a Vortex file and decode.
-    let arr = load_vortex_file_ref(vortex::buffer::Buffer::from(bytes))
-        .await
-        .unwrap();
-    let store = VortexRdfStore::new(arr).unwrap();
+    // ...then load it back as a store from the file bytes.
+    let store = VortexRdfStore::from_bytes(&bytes).await.unwrap();
     assert_eq!(store.size().await.unwrap(), 25);
 
     let decoded: Vec<Quad> = store.quads().unwrap().try_collect().await.unwrap();
@@ -256,10 +253,7 @@ async fn run_sorted_streaming_write_test<B: VortexArrayBuilder>() {
     .await
     .unwrap();
 
-    let arr = load_vortex_file_ref(vortex::buffer::Buffer::from(buffer.clone()))
-        .await
-        .unwrap();
-    let store = VortexRdfStore::new(arr).unwrap();
+    let store = VortexRdfStore::from_bytes(&buffer).await.unwrap();
     assert_eq!(store.size().await.unwrap(), 25);
 
     let decoded: Vec<Quad> = store.quads().unwrap().try_collect().await.unwrap();
@@ -345,7 +339,7 @@ async fn test_sorted_builder_stamps_is_sorted() {
         .collect();
 
     let check = |arr: vortex_array::ArrayRef, expect_sorted: bool, name: &str| {
-        let mut ctx = crate::io::VORTEX_LIGHT_SESSION.create_execution_ctx();
+        let mut ctx = crate::io::VORTEX_SESSION.create_execution_ctx();
         let struct_arr = arr.execute::<StructArray>(&mut ctx).unwrap();
         let s_col = struct_arr.unmasked_field_by_name("s").unwrap();
         let is_sorted = match s_col.statistics().get(Stat::IsSorted) {
@@ -441,7 +435,6 @@ async fn test_quads_vec_matches_stream_collection() {
         &path,
         LayoutStrategy::Dictionary,
         dictionary_indexes(),
-        crate::store::DictionaryPlacement::Padded,
     )
     .await
     .unwrap();

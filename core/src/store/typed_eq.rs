@@ -10,7 +10,7 @@ use vortex_array::arrays::{Primitive, PrimitiveArray, StructArray, VarBinView, V
 use vortex_array::scalar::Scalar;
 use vortex_array::{ArrayRef, VortexSessionExecute};
 
-use crate::io::VORTEX_LIGHT_SESSION;
+use crate::io::VORTEX_SESSION;
 
 /// A residual equality constraint's probe value, extracted from its `Scalar`
 /// once per scan — not per chunk, the string extraction allocates.
@@ -188,7 +188,7 @@ pub(crate) fn typed_positions(
         return None;
     }
     let needles = Needle::extract(eqs)?;
-    let mut ctx = VORTEX_LIGHT_SESSION.create_execution_ctx();
+    let mut ctx = VORTEX_SESSION.create_execution_ctx();
     fn positions_of(
         sa: &StructArray,
         eqs: &[(&'static str, Scalar)],

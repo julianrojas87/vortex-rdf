@@ -286,17 +286,16 @@
   <section id="dict" class="group">
     <div class="group-head">
       <span class="chan-tag mono">DICT</span>
-      <h2>Dictionary — placement &amp; residency</h2>
+      <h2>Dictionary — residency</h2>
     </div>
     <p class="group-desc">
-      The Dictionary layout's term dictionary has two independent knobs. <em>Placement</em>:
-      inside the quads file as trailing rows (<span class="mono">padded</span> — the
-      self-contained default and the IPC form) or in a companion file
-      (<span class="mono">sidecar</span>). <em>Residency</em>: lifted into memory at open
+      The Dictionary layout's term dictionary rides inside the quads file as an
+      <em>embedded</em> metadata-segment blob (one self-contained file; the quad columns stay
+      bare). <em>Residency</em>: the blob is lifted into memory at open
       (<span class="mono">resident</span>) or left in the file and reached by pruned scans
-      (<span class="mono">file-backed</span>). What each placement costs a match is visible in
-      the match matrix above (the Dictionary padded vs sidecar file rows); the table below
-      shows which phase — open, cold probe, decode — the residency choice moves the cost into.
+      through a bounded reader (<span class="mono">file-backed</span>) — decided by the blob's
+      byte size. The table below shows which phase — open, cold probe, decode — the residency
+      choice moves the cost into.
     </p>
     <div class="panel-grid" id="dict-panels"></div>
   </section>
@@ -556,9 +555,7 @@ function patternIds(group, patterns){ return patterns.map(p => `${group}::${p}`)
 
 // The consolidated match matrix: every layout × source × index variant
 // (sorted-stream builder throughout) as rows, grouped by secondary-index
-// configuration, the six routing patterns as columns. Placement (padded vs
-// sidecar) is a file-storage concept, so the Dictionary layout contributes
-// one in-memory row but two file rows per index group.
+// configuration, the six routing patterns as columns.
 const MATCH_INDEXES = [["No index","noindex"],["By reference","byref"],["By copy","bycopy"]];
 const MATCH_LAYOUTS = [
   {labels:["Default","in-memory"],         group: ix => `match_sorted_default_${ix}_mem`},
@@ -566,8 +563,7 @@ const MATCH_LAYOUTS = [
   {labels:["Typed-object","in-memory"],    group: ix => `match_sorted_typedobj_${ix}_mem`},
   {labels:["Typed-object","file"],         group: ix => `match_sorted_typedobj_${ix}_file`},
   {labels:["Dictionary","in-memory"],      group: ix => `match_sorted_dict_${ix}_mem`},
-  {labels:["Dictionary (padded)","file"],  group: ix => `match_sorted_dict_${ix}_file`},
-  {labels:["Dictionary (sidecar)","file"], group: ix => `match_sorted_dict_${ix}_sidecar_file`},
+  {labels:["Dictionary","file"],           group: ix => `match_sorted_dict_${ix}_file`},
 ];
 // Row set shared by the materializing and lazy match tables; the lazy bench
 // target names each group `lazy_` + its materializing twin.
@@ -615,19 +611,16 @@ const decodeLifecyclePanel = {
   ],
 };
 
-// What each placement costs a match lives in the match matrix (its padded vs
-// sidecar file rows); this section covers the residency axis, which has no
-// pattern dimension — it moves cost between fixed phases.
+// The residency axis has no pattern dimension — it moves cost between fixed
+// phases.
 const dictResidencyPanel = {
-  title:"Residency: cost per phase, placement × residency",
-  note:"<b>Open</b>: resident lifts the whole term column at open; file-backed reads footer metadata only (the padded extent comes from the footer's null-count statistic). <b>Cold probe</b>: four bound terms (SPOG) on a fresh store — resident binary-searches in memory; file-backed builds its fence, then evaluates one pruned split per term. <b>Decode matched</b>: match a predicate, then materialize the ~1–2k matching quads.",
-  wide:true, rowHeaders:["Placement","Residency"],
+  title:"Residency: cost per phase",
+  note:"<b>Open</b>: resident reads and lifts the embedded dictionary blob at open; file-backed reads footer metadata only. <b>Cold probe</b>: four bound terms (SPOG) on a fresh store — resident binary-searches in memory; file-backed builds its fence, then evaluates one pruned split per term. <b>Decode matched</b>: match a predicate, then materialize the ~1–2k matching quads.",
+  wide:true, rowHeaders:["Residency"],
   columns:["Open","Cold probe (SPOG)","Decode matched"],
   rows:[
-    {labels:["Padded","resident"],      slug:"padded_resident"},
-    {labels:["Padded","file-backed"],   slug:"padded_file_backed"},
-    {labels:["Sidecar","resident"],     slug:"sidecar_resident", break:true},
-    {labels:["Sidecar","file-backed"],  slug:"sidecar_file_backed"},
+    {labels:["resident"],      slug:"resident"},
+    {labels:["file-backed"],   slug:"file_backed"},
   ].map(r => ({...r, ids:[
     `dict_open::${r.slug}`,
     `dict_probe_cold::${r.slug}`,

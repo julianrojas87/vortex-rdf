@@ -61,15 +61,10 @@ pub(crate) enum QuadsSource {
         /// result still knows which file to overwrite.
         path: PathBuf,
         /// The shared file handle, including its cached schema, metadata, and
-        /// layout reader used by scans and pruning.
+        /// layout reader used by scans and pruning. Every file row is a quad
+        /// row (the embedded dictionary rides in a metadata segment, not the
+        /// row space), so `file.row_count()` is the store's row space.
         file: Arc<VortexFile>,
-        /// The number of *quad* rows in the file. Equal to `file.row_count()`
-        /// except for padded Dictionary-layout files, whose trailing rows hold
-        /// the term dictionary: every row-space computation (selections,
-        /// masks, scan bounds, pruning) uses this instead of the file length,
-        /// so `RowSelection::All` always means "all quad rows" and the
-        /// dictionary tail can never surface as quads.
-        quad_rows: u64,
         /// Pattern components not resolved to row ids, pushed down to the scan.
         filter: Option<Expression>,
         /// The file row ids visible through this store or derived view,

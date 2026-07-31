@@ -179,7 +179,8 @@ impl RowSelection {
     /// range and a [`Selection`]), and the variants being exclusive is what
     /// keeps them from being set together — vortex's exact-range planning
     /// (`attempt_split_ranges`) bails out when a row range accompanies an
-    /// `IncludeByIndex` selection.
+    /// `IncludeByIndex` selection. `All` leaves the scan's full row range in
+    /// place (every file row is a quad row).
     ///
     /// Tombstoned rows are dropped inside the scan rather than by post-filtering
     /// its output, so this composes with a pushed-down filter (whose output
@@ -193,21 +194,12 @@ impl RowSelection {
         &self,
         scan: ScanBuilder<A>,
         deleted: Option<&Mask>,
-        quad_rows: u64,
     ) -> ScanBuilder<A> {
-        // `All` means "all quad rows", which is narrower than the file when a
-        // padded Dictionary file carries trailing dictionary rows — so it is
-        // bounded explicitly rather than left to the scan's full row range.
-        let bounded;
-        let selection = match self {
-            RowSelection::All => {
-                bounded = RowSelection::Range(0..quad_rows);
-                &bounded
+        match (self, deleted) {
+            (RowSelection::All, None) => scan,
+            (RowSelection::All, Some(deleted)) => {
+                scan.with_selection(Selection::ExcludeByIndex(deleted_ids(deleted)))
             }
-            other => other,
-        };
-        match (selection, deleted) {
-            (RowSelection::All, _) => unreachable!("All was just bounded to a Range"),
             (RowSelection::Range(range), None) => scan.with_row_range(range.clone()),
             (RowSelection::Range(range), Some(deleted)) => scan
                 .with_row_range(range.clone())

@@ -7,21 +7,11 @@ use oxrdfio::{RdfFormat, RdfSerializer};
 use std::io::Write;
 use web_time::Instant;
 
-use bytes::Bytes;
 use vortex_array::arrays::ChunkedArray;
-use vortex_array::dtype::DType;
 use vortex_array::{ArrayRef, IntoArray};
-use vortex_ipc::iterator::SyncIPCReader;
-use vortex_ipc::messages::{BufMessageReader, DecoderMessage};
 
 #[cfg(feature = "file-io")]
-use std::sync::Arc;
-#[cfg(feature = "file-io")]
-use vortex_array::stream::ArrayStreamExt;
-#[cfg(feature = "file-io")]
 use vortex_file::OpenOptionsSessionExt;
-#[cfg(feature = "file-io")]
-use vortex_io::VortexReadAt;
 
 /// High-level function to deserialize Vortex-RDF data store into an RDF writer.
 /// Pulls quads sequentially from the store and serializes them in the specified format (Turtle, N-Triples, etc.).
@@ -63,91 +53,25 @@ pub async fn deserialize<W: Write>(
     Ok(())
 }
 
-/// Reads a Vortex ArrayRef from a synchronous IPC reader stream.
-/// Used for decoding in-memory IPC message payloads.
+/// Materialize a whole file by driving its scan's per-split futures inline.
 ///
-/// [`write_array_to_ipc`](super::write_array_to_ipc) emits one IPC message per
-/// chunk, so a chunked array arrives as a sequence of arrays. All of them are
-/// collected and reassembled into the original [`ChunkedArray`]; reading only
-/// the first message would silently drop every quad past the first chunk.
-pub fn array_from_ipc_reader<R: std::io::Read>(reader: R) -> Result<ArrayRef> {
-    let ipc_reader = SyncIPCReader::try_new(reader, &super::VORTEX_LIGHT_SESSION)
-        .map_err(VortexRdfError::Vortex)?;
-
+/// `ScanBuilder::into_array_stream` spawns onto the session's runtime handle;
+/// this drives `ScanBuilder::build`'s futures directly instead, so it needs no
+/// handle at all — which is what lets buffer-backed files (whose segment reads
+/// resolve synchronously) be read on wasm and in no-file-io builds.
+pub(crate) async fn scan_all(file: &vortex_file::VortexFile) -> Result<ArrayRef> {
+    let dtype = file.dtype().clone();
+    let scan = file.scan().map_err(VortexRdfError::Vortex)?;
     let mut chunks = Vec::new();
-    for chunk in ipc_reader {
-        chunks.push(chunk.map_err(VortexRdfError::Vortex)?);
-    }
-    assemble_ipc_chunks(chunks)
-}
-
-/// Reads a Vortex ArrayRef from IPC bytes that are already in memory.
-///
-/// Prefer this over [`array_from_ipc_reader`] whenever the whole payload is a
-/// slice (loading a store from bytes, the wasm bindings): the `Read`-based
-/// reader stages every message through a `BytesMut` that it *zero-fills* before
-/// overwriting — profiling showed that `memset` alone at ~13% of `from_bytes`.
-/// Decoding off a `Bytes` copies the payload once and then splits each message
-/// out of that one buffer (`Bytes::copy_to_bytes` is a refcount bump), so the
-/// staging buffer disappears entirely.
-///
-/// Chunk handling matches [`array_from_ipc_reader`] exactly — see its note on
-/// why every message must be collected.
-pub fn array_from_ipc_bytes(bytes: &[u8]) -> Result<ArrayRef> {
-    let session = &super::VORTEX_LIGHT_SESSION;
-    // The one unavoidable copy: the caller lends a slice, and the decoder hands
-    // out refcounted slices of a buffer it must be able to keep alive.
-    let mut messages = BufMessageReader::new(Bytes::copy_from_slice(bytes));
-
-    // The stream opens with its schema; every later message is a chunk of it.
-    let dtype = match messages
-        .next()
-        .transpose()
-        .map_err(VortexRdfError::Vortex)?
-    {
-        Some(DecoderMessage::DType(fb_dtype)) => {
-            DType::from_flatbuffer(fb_dtype, session).map_err(VortexRdfError::Vortex)?
-        }
-        Some(other) => {
-            return Err(VortexRdfError::Deserialization(format!(
-                "Expected an IPC DType message, got {:?}",
-                other
-            )));
-        }
-        None => {
-            return Err(VortexRdfError::Deserialization(
-                "No array in IPC stream".to_string(),
-            ));
-        }
-    };
-
-    let mut chunks = Vec::new();
-    for message in messages {
-        match message.map_err(VortexRdfError::Vortex)? {
-            DecoderMessage::Array((parts, ctx, row_count)) => {
-                let chunk = parts
-                    .decode(&dtype, row_count, &ctx, session)
-                    .map_err(VortexRdfError::Vortex)?;
-                chunks.push(chunk);
-            }
-            other => {
-                return Err(VortexRdfError::Deserialization(format!(
-                    "Expected an IPC Array message, got {:?}",
-                    other
-                )));
-            }
+    for task in scan.build().map_err(VortexRdfError::Vortex)? {
+        if let Some(chunk) = task.await.map_err(VortexRdfError::Vortex)? {
+            chunks.push(chunk);
         }
     }
-    assemble_ipc_chunks(chunks)
-}
-
-/// Reassemble the arrays decoded from one IPC stream, shared by both readers.
-fn assemble_ipc_chunks(mut chunks: Vec<ArrayRef>) -> Result<ArrayRef> {
     match chunks.len() {
-        0 => Err(VortexRdfError::Deserialization(
-            "No array in IPC stream".to_string(),
-        )),
-        // Keep a single-chunk payload as the plain array it was written as.
+        0 => Ok(ChunkedArray::try_new(vec![], dtype)
+            .map_err(VortexRdfError::Vortex)?
+            .into_array()),
         1 => Ok(chunks.pop().expect("length checked above")),
         _ => {
             let dtype = chunks[0].dtype().clone();
@@ -156,45 +80,6 @@ fn assemble_ipc_chunks(mut chunks: Vec<ArrayRef>) -> Result<ArrayRef> {
                 .into_array())
         }
     }
-}
-
-/// Loads a fully in-memory Vortex array from a generic read-at source (e.g. a byte buffer in memory).
-#[cfg(feature = "file-io")]
-pub async fn load_vortex_file_ref<S: VortexReadAt + 'static>(source: S) -> Result<ArrayRef> {
-    let start = Instant::now();
-
-    // 1. Open the source under our file read session context.
-    let file = super::VORTEX_SESSION
-        .open_options()
-        .open(Arc::new(source))
-        .await
-        .map_err(VortexRdfError::from)?;
-    log::debug!(
-        "[de::read_array_from_vortex] File Open Session took {:?}",
-        start.elapsed()
-    );
-
-    // 2. Initiate a file scan and convert it to an array stream.
-    let scan_start = Instant::now();
-    let scan = file.scan().map_err(VortexRdfError::from)?;
-    let stream = scan.into_array_stream().map_err(VortexRdfError::from)?;
-    log::debug!(
-        "[de::read_array_from_vortex] Scan took {:?}",
-        scan_start.elapsed()
-    );
-
-    // 3. Read the stream fully to load the array in host memory.
-    let read_start = Instant::now();
-    let vortex_array: ArrayRef = stream
-        .read_all()
-        .await
-        .map_err(|e: vortex_error::VortexError| VortexRdfError::from(e))?;
-    log::debug!(
-        "[de::read_array_from_vortex] Stream read_all took {:?}",
-        read_start.elapsed()
-    );
-
-    Ok(vortex_array)
 }
 
 /// Open a Vortex file lazily — no data is read until the returned `VortexFile`

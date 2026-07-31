@@ -20,7 +20,7 @@ use vortex_file::VortexFile;
 use vortex_mask::Mask;
 
 use crate::error::{Result, VortexRdfError};
-use crate::io::VORTEX_LIGHT_SESSION;
+use crate::io::VORTEX_SESSION;
 use crate::store::RawQuad;
 use crate::store::layouts::dictionary::QuadCodes;
 use crate::store::layouts::{PatternCodes, QuadPattern, ResolvedLayout};
@@ -85,6 +85,15 @@ impl IndexType {
         match self {
             IndexType::SecondaryByCopy => true,
             IndexType::SecondaryByReference => true,
+        }
+    }
+
+    /// The stable identifier this index writes into the serialized manifest
+    /// (`io::embedded`), validated against the schema's index columns at open.
+    pub(crate) fn manifest_slug(self) -> &'static str {
+        match self {
+            IndexType::SecondaryByCopy => "secondary-by-copy",
+            IndexType::SecondaryByReference => "secondary-by-reference",
         }
     }
 
@@ -209,17 +218,16 @@ impl IndexType {
     pub(crate) async fn resolve_file(
         self,
         file: &VortexFile,
-        quad_rows: u64,
         layout: &ResolvedLayout,
         pattern: QuadPattern<'_>,
         codes: &mut PatternCodes,
     ) -> Result<IndexResolution> {
         match self {
             IndexType::SecondaryByCopy => {
-                secondary_by_copy::resolve_file(file, quad_rows, layout, pattern, codes).await
+                secondary_by_copy::resolve_file(file, layout, pattern, codes).await
             }
             IndexType::SecondaryByReference => {
-                secondary_by_reference::resolve_file(file, quad_rows, layout, pattern, codes).await
+                secondary_by_reference::resolve_file(file, layout, pattern, codes).await
             }
         }
     }
@@ -438,7 +446,7 @@ impl ServePlan {
     /// A chunk's live rows as a primary-named `(s, p, o, g)` struct: relabel the
     /// source columns, then drop any whose primary row id is tombstoned.
     fn chunk_rows(&self, chunk: &ArrayRef, deleted: Option<&Mask>) -> Result<ArrayRef> {
-        let mut ctx = VORTEX_LIGHT_SESSION.create_execution_ctx();
+        let mut ctx = VORTEX_SESSION.create_execution_ctx();
         let struct_arr = chunk
             .clone()
             .execute::<StructArray>(&mut ctx)
@@ -533,7 +541,7 @@ pub(crate) fn sorted_row_ids(row_id_column: ArrayRef) -> Result<Buffer<u64>> {
     if row_id_column.is_empty() {
         return Ok(Buffer::empty());
     }
-    let mut ctx = VORTEX_LIGHT_SESSION.create_execution_ctx();
+    let mut ctx = VORTEX_SESSION.create_execution_ctx();
     let ids = row_id_column
         .cast(DType::Primitive(PType::U64, Nullability::NonNullable))
         .map_err(VortexRdfError::Vortex)?
@@ -559,7 +567,6 @@ pub(crate) fn sorted_row_ids(row_id_column: ArrayRef) -> Result<Buffer<u64>> {
 #[cfg(feature = "file-io")]
 pub(crate) async fn scan_index_row_ids(
     file: &VortexFile,
-    quad_rows: u64,
     value_constraints: &[(&'static str, Scalar)],
     row_id_column: &'static str,
 ) -> Result<Buffer<u64>> {
@@ -580,12 +587,9 @@ pub(crate) async fn scan_index_row_ids(
         return Ok(Buffer::empty());
     };
 
-    // Quad rows only: a padded file's dictionary tail carries zero sentinels
-    // in every index column, which a probe for term code 0 would match.
     let arr = file
         .scan()
         .map_err(VortexRdfError::Vortex)?
-        .with_row_range(0..quad_rows)
         .with_projection(select([row_id_column], root()))
         .with_filter(filter)
         .with_ordered(false)
@@ -599,7 +603,7 @@ pub(crate) async fn scan_index_row_ids(
         return Ok(Buffer::empty());
     }
 
-    let mut ctx = VORTEX_LIGHT_SESSION.create_execution_ctx();
+    let mut ctx = VORTEX_SESSION.create_execution_ctx();
     let struct_arr = arr
         .execute::<StructArray>(&mut ctx)
         .map_err(VortexRdfError::Vortex)?;
@@ -661,16 +665,12 @@ pub(crate) fn resolve_indexes_in_memory(
 pub(crate) async fn resolve_indexes_file(
     indexes: &[IndexType],
     file: &VortexFile,
-    quad_rows: u64,
     layout: &ResolvedLayout,
     pattern: QuadPattern<'_>,
     codes: &mut PatternCodes,
 ) -> Result<IndexResolution> {
     for index in indexes {
-        match index
-            .resolve_file(file, quad_rows, layout, pattern, codes)
-            .await?
-        {
+        match index.resolve_file(file, layout, pattern, codes).await? {
             IndexResolution::Declined => continue,
             resolved => return Ok(resolved),
         }
@@ -815,7 +815,7 @@ pub(crate) fn strip_index_columns(arr: ArrayRef) -> Result<ArrayRef> {
     };
 
     // Rebuild the struct with only the kept columns.
-    let mut ctx = VORTEX_LIGHT_SESSION.create_execution_ctx();
+    let mut ctx = VORTEX_SESSION.create_execution_ctx();
     let struct_arr = arr
         .execute::<StructArray>(&mut ctx)
         .map_err(VortexRdfError::Vortex)?;

@@ -16,8 +16,8 @@ use tokio::runtime::Runtime;
 use vortex_rdf_core::common::testing::generate_rdf_data_stream;
 use vortex_rdf_core::store::RawQuad;
 use vortex_rdf_core::{
-    DictionaryPlacement, IndexType, LayoutStrategy, SortedInMemoryBuilder, SortedStreamBuilder,
-    UnsortedStreamBuilder, VortexRdfStore, io,
+    IndexType, LayoutStrategy, SortedInMemoryBuilder, SortedStreamBuilder, UnsortedStreamBuilder,
+    VortexRdfStore,
 };
 
 /// Single dataset size for the whole suite. In simulation mode CodSpeed counts
@@ -226,12 +226,8 @@ pub fn cached_file(builder: Builder, layout: Layout, index: Index, size: usize) 
         size
     ));
     rt().block_on(async {
-        let arr = store
-            .to_serializable_array()
-            .await
-            .expect("serializable array");
-        let writer = tokio::fs::File::create(&path).await.expect("create file");
-        io::serialize(arr, writer).await.expect("serialize file");
+        let bytes = store.to_bytes().await.expect("serialize store");
+        std::fs::write(&path, bytes).expect("write file");
     });
     cache.lock().unwrap().insert(key, path.clone());
     path
@@ -258,47 +254,6 @@ pub fn make_store(
         }
         Source::InMemory => cached_store(builder, layout, index, size),
     }
-}
-
-type DictIndexedFileKey = (DictionaryPlacement, Index, usize);
-static DICT_INDEXED_FILE_CACHE: OnceLock<Mutex<HashMap<DictIndexedFileKey, PathBuf>>> =
-    OnceLock::new();
-
-/// Like `cached_dict_file`, but with a secondary index — the files behind
-/// the placement rows of the match matrix benches.
-pub fn cached_dict_indexed_file(
-    placement: DictionaryPlacement,
-    index: Index,
-    size: usize,
-) -> PathBuf {
-    let cache = DICT_INDEXED_FILE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    let key = (placement, index, size);
-    if let Some(path) = cache.lock().unwrap().get(&key) {
-        return path.clone();
-    }
-    let dir = PathBuf::from("target/bench_vortex_files");
-    std::fs::create_dir_all(&dir).unwrap();
-    let placement_name = match placement {
-        DictionaryPlacement::Padded => "padded",
-        DictionaryPlacement::Sidecar => "sidecar",
-    };
-    let path = dir.join(format!(
-        "dict_{placement_name}_{}_{size}.vortex",
-        index.short()
-    ));
-    rt().block_on(async {
-        io::quads_stream_to_vortex_file_with_builder::<SortedStreamBuilder, _>(
-            generate_rdf_data_stream(size),
-            &path,
-            LayoutStrategy::Dictionary,
-            index.types(),
-            placement,
-        )
-        .await
-        .expect("write indexed dictionary bench file");
-    });
-    cache.lock().unwrap().insert(key, path.clone());
-    path
 }
 
 // ── match patterns ──────────────────────────────────────────────────────────

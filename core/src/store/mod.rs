@@ -13,9 +13,9 @@ pub use builders::{
     UnsortedStreamBuilder, VortexArrayBuilder,
 };
 pub use indexes::{IndexType, Indexes};
+pub use layouts::LayoutStrategy;
 pub use layouts::dictionary::DictionaryQuadSink;
 pub use layouts::term_dictionary::DictSnapshot;
-pub use layouts::{DictionaryPlacement, LayoutStrategy};
 pub use quad::RawQuad;
 pub use vortex_rdf_store::VortexRdfStore;
 

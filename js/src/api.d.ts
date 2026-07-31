@@ -105,7 +105,7 @@ export class VortexRdfStore {
     decodeTerm(code: number): string | undefined;
     /** Low-level. Encode an N-Triples term string to its Dictionary-layout code (inverse of decodeTerm). */
     encodeTerm(term: string): number | undefined;
-    /** Serialize to Vortex IPC bytes; read back with `VortexRdfStore.fromBytes`. */
+    /** Serialize to Vortex file bytes; read back with `VortexRdfStore.fromBytes` or write to disk as a `.vortex` file. */
     toBytes(): Promise<Uint8Array>;
     /** Serialize the quads to an RDF syntax. */
     toRdf(format: RdfFormatName): Promise<string>;

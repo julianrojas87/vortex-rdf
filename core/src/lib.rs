@@ -49,17 +49,19 @@ pub mod io;
 pub mod store;
 
 pub use error::VortexRdfError;
-pub use io::{array_from_ipc_bytes, array_from_ipc_reader, deserialize};
+pub use io::deserialize;
+#[cfg(any(feature = "file-io", target_arch = "wasm32"))]
+pub use io::serialize;
 #[cfg(feature = "file-io")]
 pub use io::{
-    load_vortex_file_ref, quads_stream_to_vortex, quads_stream_to_vortex_writer,
-    quads_stream_to_vortex_writer_with_builder, serialize,
+    quads_stream_to_vortex, quads_stream_to_vortex_writer,
+    quads_stream_to_vortex_writer_with_builder,
 };
 
 pub use store::{
-    BuilderStrategy, BuiltArray, BuiltStream, DictSnapshot, DictionaryPlacement,
-    DictionaryQuadSink, IndexType, Indexes, LayoutStrategy, SortedInMemoryBuilder,
-    SortedStreamBuilder, UnsortedStreamBuilder, VortexArrayBuilder, VortexRdfStore,
+    BuilderStrategy, BuiltArray, BuiltStream, DictSnapshot, DictionaryQuadSink, IndexType, Indexes,
+    LayoutStrategy, SortedInMemoryBuilder, SortedStreamBuilder, UnsortedStreamBuilder,
+    VortexArrayBuilder, VortexRdfStore,
 };
 
 #[cfg(all(feature = "mimalloc", not(target_arch = "wasm32")))]

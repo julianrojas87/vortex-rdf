@@ -12,8 +12,8 @@ use vortex_rdf_core::common::terms::{
     parse_graph_name, parse_named_node, parse_quads_from_reader, parse_subject, parse_term,
 };
 use vortex_rdf_core::{
-    BuilderStrategy, DictionaryPlacement, IndexType, LayoutStrategy, SortedInMemoryBuilder,
-    SortedStreamBuilder, UnsortedStreamBuilder, VortexRdfStore,
+    BuilderStrategy, IndexType, LayoutStrategy, SortedInMemoryBuilder, SortedStreamBuilder,
+    UnsortedStreamBuilder, VortexRdfStore,
     io::{deserialize, quads_stream_to_vortex_file_with_builder},
 };
 
@@ -55,12 +55,6 @@ enum Action {
         /// Builder strategy to use when serializing (defaults to unsorted-stream)
         #[arg(short, long, value_enum, default_value = "unsorted-stream")]
         builder_strategy: BuilderStrategy,
-
-        /// Where the Dictionary layout's term dictionary is written: padded
-        /// into the quads file (one self-contained file) or as a
-        /// `<stem>.dict.vortex` sidecar beside it. Ignored by other layouts.
-        #[arg(long, value_enum, default_value = "padded")]
-        dictionary_placement: DictionaryPlacement,
     },
     /// Convert from Vortex-RDF to RDF
     Deserialize {
@@ -121,7 +115,6 @@ async fn main() -> Result<()> {
             output,
             format,
             builder_strategy,
-            dictionary_placement,
         } => {
             let start = Instant::now();
             let format = format
@@ -146,7 +139,6 @@ async fn main() -> Result<()> {
                         &output,
                         layout,
                         indexes,
-                        dictionary_placement,
                     )
                     .await
                 }
@@ -156,7 +148,6 @@ async fn main() -> Result<()> {
                         &output,
                         layout,
                         indexes,
-                        dictionary_placement,
                     )
                     .await
                 }
@@ -166,7 +157,6 @@ async fn main() -> Result<()> {
                         &output,
                         layout,
                         indexes,
-                        dictionary_placement,
                     )
                     .await
                 }

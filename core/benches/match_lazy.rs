@@ -11,8 +11,6 @@
 
 use std::hint::black_box;
 
-use vortex_rdf_core::{DictionaryPlacement, VortexRdfStore};
-
 // The module is shared with `benchmark.rs` and compiled per-target; items
 // only the other target uses (unsorted builders, serialize helpers) are dead
 // here by design.
@@ -65,39 +63,6 @@ macro_rules! lazy_match_bench {
     };
 }
 
-/// The sidecar twin, opened from the path-based writer's file (see
-/// `benchmark.rs`'s `match_sidecar_bench!`).
-macro_rules! lazy_match_sidecar_bench {
-    ($name:ident, $index:expr) => {
-        #[divan::bench(args = PATTERNS)]
-        fn $name(bencher: divan::Bencher, pattern: &Pattern) {
-            bencher
-                .with_inputs(|| {
-                    let path = cached_dict_indexed_file(
-                        DictionaryPlacement::Sidecar,
-                        $index,
-                        bench_size(),
-                    );
-                    rt().block_on(async {
-                        VortexRdfStore::from_file(&path)
-                            .await
-                            .expect("open sidecar")
-                    })
-                })
-                .bench_refs(|store| {
-                    let (s, p, o, g) = terms_for(*pattern);
-                    rt().block_on(async {
-                        let matched = store
-                            .match_pattern(s.as_ref(), p.as_ref(), o.as_ref(), g.as_ref())
-                            .await
-                            .expect("match_pattern failed");
-                        black_box(matched)
-                    })
-                });
-        }
-    };
-}
-
 // The full matrix, named `lazy_` + the materializing twin's group name so the
 // dashboard derives one set of ids from the other.
 // No secondary index.
@@ -137,7 +102,6 @@ lazy_match_bench!(
     Index::None,
     Source::File
 );
-lazy_match_sidecar_bench!(lazy_match_sorted_dict_noindex_sidecar_file, Index::None);
 // Secondary by reference.
 lazy_match_bench!(
     lazy_match_sorted_default_byref_mem,
@@ -174,10 +138,6 @@ lazy_match_bench!(
     Layout::Dictionary,
     Index::ByReference,
     Source::File
-);
-lazy_match_sidecar_bench!(
-    lazy_match_sorted_dict_byref_sidecar_file,
-    Index::ByReference
 );
 // Secondary by copy.
 lazy_match_bench!(
@@ -216,4 +176,3 @@ lazy_match_bench!(
     Index::ByCopy,
     Source::File
 );
-lazy_match_sidecar_bench!(lazy_match_sorted_dict_bycopy_sidecar_file, Index::ByCopy);

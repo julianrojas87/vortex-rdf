@@ -45,8 +45,8 @@ use oxrdf::{GraphName, NamedNode, NamedOrBlankNode, Term};
 
 use vortex_rdf_core::common::testing::generate_rdf_data_stream;
 use vortex_rdf_core::{
-    DictionaryPlacement, LayoutStrategy, SortedInMemoryBuilder, SortedStreamBuilder,
-    UnsortedStreamBuilder, VortexRdfError, VortexRdfStore, io,
+    LayoutStrategy, SortedInMemoryBuilder, SortedStreamBuilder, UnsortedStreamBuilder,
+    VortexRdfError, VortexRdfStore, io,
 };
 
 mod support;
@@ -56,18 +56,16 @@ fn main() {
     divan::main();
 }
 
-static IPC_CACHE: OnceLock<Mutex<HashMap<CacheKey, Vec<u8>>>> = OnceLock::new();
+static BYTES_CACHE: OnceLock<Mutex<HashMap<CacheKey, Vec<u8>>>> = OnceLock::new();
 
-fn cached_ipc_bytes(builder: Builder, layout: Layout, index: Index, size: usize) -> Vec<u8> {
-    let cache = IPC_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+fn cached_store_bytes(builder: Builder, layout: Layout, index: Index, size: usize) -> Vec<u8> {
+    let cache = BYTES_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     let key = (builder, layout, index, size);
     if let Some(bytes) = cache.lock().unwrap().get(&key) {
         return bytes.clone();
     }
     let store = cached_store(builder, layout, index, size);
-    let arr = rt().block_on(store.to_ipc_array()).expect("ipc array");
-    let mut buf = Vec::new();
-    io::write_array_to_ipc(arr, &mut buf).expect("write ipc");
+    let buf = rt().block_on(store.to_bytes()).expect("store bytes");
     cache.lock().unwrap().insert(key, buf.clone());
     buf
 }
@@ -245,50 +243,9 @@ macro_rules! match_bench {
     };
 }
 
-/// The sidecar twin of a padded `match_bench!` row: the dictionary lives in
-/// a companion file, so the store is opened from a path written by the
-/// path-based writer (`make_store`'s writer-generic path always pads). The
-/// padded tail taxes every file match — extra rows/zones in the quads file,
-/// and at small scales the writer co-compresses quad codes with the sentinel
-/// tail — so the two placements are tracked side by side. Residency is the
-/// default (resident) for both.
-macro_rules! match_sidecar_bench {
-    ($name:ident, $index:expr) => {
-        #[divan::bench(args = PATTERNS)]
-        fn $name(bencher: divan::Bencher, pattern: &Pattern) {
-            bencher
-                .with_inputs(|| {
-                    let path = cached_dict_indexed_file(
-                        DictionaryPlacement::Sidecar,
-                        $index,
-                        bench_size(),
-                    );
-                    rt().block_on(async {
-                        VortexRdfStore::from_file(&path)
-                            .await
-                            .expect("open sidecar")
-                    })
-                })
-                .bench_refs(|store| {
-                    let (s, p, o, g) = terms_for(*pattern);
-                    rt().block_on(async {
-                        let matched = store
-                            .match_pattern(s.as_ref(), p.as_ref(), o.as_ref(), g.as_ref())
-                            .await
-                            .expect("match_pattern failed");
-                        let quads = matched.quads_vec().await.expect("execute match");
-                        black_box(quads)
-                    })
-                });
-        }
-    };
-}
-
 /// The full layout × source × index match matrix (sorted-stream builder
 /// throughout; the unsorted builder is its own axis below). One group per
-/// cell, named `match_sorted_{layout}_{index}_{source}`; the Dictionary
-/// layout contributes a padded and a sidecar file row per index because
-/// placement is a file-storage concept.
+/// cell, named `match_sorted_{layout}_{index}_{source}`.
 macro_rules! match_matrix {
     ($(($layout:expr, $index:expr, $source:expr) => $name:ident,)*) => {
         $(match_bench!($name, Builder::SortedStream, $layout, $index, $source);)*
@@ -317,9 +274,6 @@ match_matrix!(
     (Layout::Dictionary, Index::ByCopy, Source::InMemory) => match_sorted_dict_bycopy_mem,
     (Layout::Dictionary, Index::ByCopy, Source::File) => match_sorted_dict_bycopy_file,
 );
-match_sidecar_bench!(match_sorted_dict_noindex_sidecar_file, Index::None);
-match_sidecar_bench!(match_sorted_dict_byref_sidecar_file, Index::ByReference);
-match_sidecar_bench!(match_sorted_dict_bycopy_sidecar_file, Index::ByCopy);
 // Sortedness axis: unsorted builder leaves nothing stamped, so indexes decline
 // and everything falls to the mask scan — the worst case, and the typical
 // in-memory (JS bindings) case.
@@ -459,13 +413,13 @@ fn open_file(bencher: divan::Bencher, layout: &Layout) {
         });
 }
 
-/// Load a store from IPC bytes (`from_bytes`): full in-memory IPC decode plus
-/// layout detection.
+/// Load a store from file bytes (`from_bytes`): manifest validation plus a
+/// full in-memory materialization off the buffer-backed file.
 #[divan::bench]
 fn from_bytes(bencher: divan::Bencher) {
     bencher
         .with_inputs(|| {
-            cached_ipc_bytes(
+            cached_store_bytes(
                 Builder::SortedStream,
                 Layout::Default,
                 Index::None,
@@ -483,14 +437,13 @@ fn from_bytes(bencher: divan::Bencher) {
 // ══════════════════════════════════════════════════════════════════════════
 // Group 4 — DICTIONARY RESIDENCY (file-backed vs resident term dictionary)
 //
-// A Dictionary file's term dictionary can be lifted resident at open or left
-// in the file and reached by scans (`from_file_with_dict_residency`). The
-// residency axis moves cost between phases: resident pays a full term-column
-// scan at open and then probes/decodes from memory; file-backed opens on
-// footer metadata alone but pays a pruned column scan per cold term probe and
-// a row-index scan per decoded chunk. Placement (padded vs sidecar) decides
-// *which* file those scans hit. Sweeping residency × placement here is what
-// keeps both sides of the trade measured.
+// A Dictionary file's embedded term dictionary can be lifted resident at open
+// or left in its metadata-segment blob and reached by scans through the
+// bounded reader (`from_file_with_dict_residency`, byte threshold). The
+// residency axis moves cost between phases: resident pays one contiguous blob
+// read at open and then probes/decodes from memory; file-backed opens on
+// footer metadata alone but pays a pruned blob scan per cold term probe and a
+// row-index scan per decoded chunk.
 // ══════════════════════════════════════════════════════════════════════════
 
 #[derive(Copy, Clone, PartialEq, Eq, Hash)]
@@ -500,7 +453,7 @@ enum DictResidency {
 }
 
 impl DictResidency {
-    /// The `max_resident_terms` value that forces this residency.
+    /// The `max_resident_bytes` value that forces this residency.
     fn threshold(self) -> u64 {
         match self {
             Self::Resident => u64::MAX,
@@ -516,100 +469,56 @@ impl DictResidency {
     }
 }
 
-#[derive(Copy, Clone, PartialEq, Eq, Hash)]
-struct DictCfg {
-    placement: DictionaryPlacement,
-    residency: DictResidency,
-}
-
-impl fmt::Debug for DictCfg {
+impl fmt::Debug for DictResidency {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let placement = match self.placement {
-            DictionaryPlacement::Padded => "padded",
-            DictionaryPlacement::Sidecar => "sidecar",
-        };
-        write!(f, "{placement}_{}", self.residency.short())
+        f.write_str(self.short())
     }
 }
 
-const DICT_CONFIGS: &[DictCfg] = &[
-    DictCfg {
-        placement: DictionaryPlacement::Padded,
-        residency: DictResidency::Resident,
-    },
-    DictCfg {
-        placement: DictionaryPlacement::Padded,
-        residency: DictResidency::FileBacked,
-    },
-    DictCfg {
-        placement: DictionaryPlacement::Sidecar,
-        residency: DictResidency::Resident,
-    },
-    DictCfg {
-        placement: DictionaryPlacement::Sidecar,
-        residency: DictResidency::FileBacked,
-    },
-];
+const DICT_CONFIGS: &[DictResidency] = &[DictResidency::Resident, DictResidency::FileBacked];
 
-/// The residency axis alone (placement fixed to the padded default) for the
-/// benches where placement does not change the code path being measured.
-const DICT_PADDED_CONFIGS: &[DictCfg] = &[DICT_CONFIGS[0], DICT_CONFIGS[1]];
+static DICT_FILE_CACHE: OnceLock<Mutex<HashMap<usize, PathBuf>>> = OnceLock::new();
 
-static DICT_FILE_CACHE: OnceLock<Mutex<HashMap<(DictionaryPlacement, usize), PathBuf>>> =
-    OnceLock::new();
-
-/// A Dictionary-layout file written with the given placement (sorted-stream
-/// builder, no indexes), built once per placement and size.
-fn cached_dict_file(placement: DictionaryPlacement, size: usize) -> PathBuf {
+/// A Dictionary-layout file (sorted-stream builder, no indexes), built once
+/// per size.
+fn cached_dict_file(size: usize) -> PathBuf {
     let cache = DICT_FILE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    let key = (placement, size);
-    if let Some(path) = cache.lock().unwrap().get(&key) {
+    if let Some(path) = cache.lock().unwrap().get(&size) {
         return path.clone();
     }
     let dir = PathBuf::from("target/bench_vortex_files");
     std::fs::create_dir_all(&dir).unwrap();
-    let placement_name = match placement {
-        DictionaryPlacement::Padded => "padded",
-        DictionaryPlacement::Sidecar => "sidecar",
-    };
-    let path = dir.join(format!("dict_{placement_name}_{size}.vortex"));
+    let path = dir.join(format!("dict_{size}.vortex"));
     rt().block_on(async {
         io::quads_stream_to_vortex_file_with_builder::<SortedStreamBuilder, _>(
             generate_rdf_data_stream(size),
             &path,
             LayoutStrategy::Dictionary,
             Vec::new(),
-            placement,
         )
         .await
         .expect("write dictionary bench file");
     });
-    cache.lock().unwrap().insert(key, path.clone());
+    cache.lock().unwrap().insert(size, path.clone());
     path
 }
 
-fn open_dict_store(cfg: DictCfg, size: usize) -> VortexRdfStore {
-    let path = cached_dict_file(cfg.placement, size);
+fn open_dict_store(residency: DictResidency, size: usize) -> VortexRdfStore {
+    let path = cached_dict_file(size);
     rt().block_on(async {
-        VortexRdfStore::from_file_with_dict_residency(&path, cfg.residency.threshold())
+        VortexRdfStore::from_file_with_dict_residency(&path, residency.threshold())
             .await
             .expect("open dictionary store")
     })
 }
 
-/// Open cost across the matrix: resident pays the dictionary lift (a term-
-/// column scan), file-backed only the extent discovery (padded) or the
-/// companion's footer (sidecar).
+/// Open cost across the residency axis: resident pays the blob read and
+/// dictionary lift, file-backed only the footer reads.
 #[divan::bench(args = DICT_CONFIGS)]
-fn dict_open(bencher: divan::Bencher, cfg: &DictCfg) {
-    let cfg = *cfg;
+fn dict_open(bencher: divan::Bencher, residency: &DictResidency) {
+    let residency = *residency;
     bencher
-        .with_inputs(|| {
-            (
-                cached_dict_file(cfg.placement, bench_size()),
-                cfg.residency.threshold(),
-            )
-        })
+        .with_inputs(|| (cached_dict_file(bench_size()), residency.threshold()))
         .bench_refs(|(path, threshold)| {
             rt().block_on(async {
                 let store = VortexRdfStore::from_file_with_dict_residency(&*path, *threshold)
@@ -625,10 +534,10 @@ fn dict_open(bencher: divan::Bencher, cfg: &DictCfg) {
 /// warms. Resident probes are in-memory binary searches; file-backed ones are
 /// zone-pruned column scans.
 #[divan::bench(args = DICT_CONFIGS)]
-fn dict_probe_cold(bencher: divan::Bencher, cfg: &DictCfg) {
-    let cfg = *cfg;
+fn dict_probe_cold(bencher: divan::Bencher, residency: &DictResidency) {
+    let residency = *residency;
     bencher
-        .with_inputs(|| open_dict_store(cfg, bench_size()))
+        .with_inputs(|| open_dict_store(residency, bench_size()))
         .bench_refs(|store| {
             let s = NamedOrBlankNode::NamedNode(NamedNode::new_unchecked(
                 "http://example.org/subject/0",
@@ -649,9 +558,9 @@ fn dict_probe_cold(bencher: divan::Bencher, cfg: &DictCfg) {
 /// The same fully bound pattern on one shared store: after the first
 /// iteration every file-backed probe hits the memoized probe cache — the
 /// steady state of repeated lookups for the same terms.
-#[divan::bench(args = DICT_PADDED_CONFIGS)]
-fn dict_probe_warm(bencher: divan::Bencher, cfg: &DictCfg) {
-    let store = open_dict_store(*cfg, bench_size());
+#[divan::bench(args = DICT_CONFIGS)]
+fn dict_probe_warm(bencher: divan::Bencher, residency: &DictResidency) {
+    let store = open_dict_store(*residency, bench_size());
     let s = NamedOrBlankNode::NamedNode(NamedNode::new_unchecked("http://example.org/subject/0"));
     let p = NamedNode::new_unchecked("http://example.org/predicate/0");
     let o = Term::NamedNode(NamedNode::new_unchecked("http://example.org/object/0"));
@@ -672,8 +581,8 @@ fn dict_probe_warm(bencher: divan::Bencher, cfg: &DictCfg) {
 /// file-backed resolves each chunk's distinct codes with a row-index scan
 /// first.
 #[divan::bench(args = DICT_CONFIGS)]
-fn dict_decode_matched(bencher: divan::Bencher, cfg: &DictCfg) {
-    let store = open_dict_store(*cfg, bench_size());
+fn dict_decode_matched(bencher: divan::Bencher, residency: &DictResidency) {
+    let store = open_dict_store(*residency, bench_size());
     let p = NamedNode::new_unchecked("http://example.org/predicate/0");
     bencher.bench(|| {
         rt().block_on(async {

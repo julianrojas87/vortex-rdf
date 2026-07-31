@@ -2,7 +2,7 @@
 //! sortedness statistics, sorted-column binary search, and mask conversion.
 
 use crate::error::{Result, VortexRdfError};
-use crate::io::VORTEX_LIGHT_SESSION;
+use crate::io::VORTEX_SESSION;
 
 use vortex_array::arrays::varbinview::BinaryView;
 use vortex_array::arrays::{BoolArray, VarBinViewArray};
@@ -126,7 +126,7 @@ pub(crate) fn search_sorted_bounds(
 pub(crate) fn bool_array_to_mask(arr: ArrayRef) -> Result<Mask> {
     // Canonicalize to a concrete boolean array, then reinterpret its packed
     // bit buffer directly as a Mask (no per-bit conversion loop).
-    let mut ctx = VORTEX_LIGHT_SESSION.create_execution_ctx();
+    let mut ctx = VORTEX_SESSION.create_execution_ctx();
     let bool_arr = arr
         .execute::<BoolArray>(&mut ctx)
         .map_err(VortexRdfError::Vortex)?;

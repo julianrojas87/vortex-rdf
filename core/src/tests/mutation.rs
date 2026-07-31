@@ -486,9 +486,9 @@ async fn test_dictionary_add_probes_tail_by_string() {
     );
 
     // Serializing re-encodes base and tail against a fresh dictionary, so
-    // the written array stands alone.
-    let arr = added.to_serializable_array().await.unwrap();
-    let reloaded = VortexRdfStore::new(arr).unwrap();
+    // the written parts stand alone.
+    let parts = added.to_serializable_parts().await.unwrap();
+    let reloaded = VortexRdfStore::from_built(parts).unwrap();
     assert_eq!(reloaded.size().await.unwrap(), 13);
     assert_eq!(
         reloaded

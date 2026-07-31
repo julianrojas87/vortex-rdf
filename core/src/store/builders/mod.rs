@@ -1,6 +1,6 @@
 use crate::common::array::stamp_is_sorted;
 use crate::error::{Result, VortexRdfError};
-use crate::io::VORTEX_LIGHT_SESSION;
+use crate::io::VORTEX_SESSION;
 use crate::store::RawQuad;
 use crate::store::indexes::{GlobalIndexes, IndexType, Indexes, unique_indexes};
 use crate::store::layouts::LayoutStrategy;
@@ -35,16 +35,16 @@ pub(crate) fn into_vortex_error(e: VortexRdfError) -> vortex_error::VortexError 
 /// A built dataset: the quad array plus whatever layout state cannot be
 /// derived from the array alone — for the Dictionary layout, its term
 /// dictionary (the array holds only u32 code columns; the terms travel
-/// beside it and reach serialized forms as trailing dictionary rows or a
-/// sidecar file).
+/// beside it and reach serialized files as an embedded metadata-segment
+/// blob).
 pub struct BuiltArray {
     pub array: ArrayRef,
     pub(crate) dict: Option<Arc<TermDictionary>>,
 }
 
 /// The streaming counterpart of [`BuiltArray`]: the schema dtype, the lazy
-/// chunk stream, and the dictionary the serializer must place (trailing rows
-/// or sidecar).
+/// chunk stream, and the dictionary the serializer embeds as a metadata
+/// segment.
 pub struct BuiltStream {
     pub dtype: DType,
     pub chunks: ChunkStream,
@@ -195,7 +195,7 @@ pub(crate) fn build_struct_array_global(
 /// columns. Canonicalization loses the per-chunk stats, so without this
 /// multi-chunk in-memory stores would fall back to mask scans.
 pub(crate) fn canonicalize_sorted(arr: ArrayRef) -> Result<ArrayRef> {
-    let mut ctx = VORTEX_LIGHT_SESSION.create_execution_ctx();
+    let mut ctx = VORTEX_SESSION.create_execution_ctx();
     let struct_arr = arr
         .execute::<StructArray>(&mut ctx)
         .map_err(VortexRdfError::Vortex)?;

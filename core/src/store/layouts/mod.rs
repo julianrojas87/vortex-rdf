@@ -11,7 +11,7 @@ use vortex_array::{ArrayRef, IntoArray, VortexSessionExecute};
 
 use crate::common::array::StrColReader;
 use crate::error::{Result, VortexRdfError};
-use crate::io::VORTEX_LIGHT_SESSION;
+use crate::io::VORTEX_SESSION;
 use crate::store::RawQuad;
 
 pub mod default;
@@ -22,7 +22,7 @@ pub mod typed_object;
 use self::term_dictionary::DictAccess;
 use crate::store::schema::{
     COL_G, COL_O, COL_O_DATATYPE, COL_O_KIND, COL_O_LANG, COL_O_VALUE, COL_P, COL_S,
-    PRIMARY_COLUMNS, TERM_FIELD,
+    PRIMARY_COLUMNS,
 };
 
 /// Determines the columnar schema used to store RDF quads in the Vortex StructArray.
@@ -67,13 +67,13 @@ pub enum LayoutStrategy {
     /// ### `LayoutStrategy::Dictionary` column schema
     /// All four quad fields stored as u32 codes into a single global term
     /// dictionary. In memory the dictionary lives beside the columns (see
-    /// [`term_dictionary`]); serialized forms carry it as the `_dict_term`
-    /// column's trailing rows (padded) or as a sidecar file.
+    /// [`term_dictionary`]); a serialized file carries it as a complete
+    /// Vortex-file blob in a user metadata segment (the *embedded* form, see
+    /// [`crate::io::embedded`]), so the quad columns stay bare.
     ///
     /// | Column        | Type                  | Content                                             |
     /// |---------------|-----------------------|-----------------------------------------------------|
     /// | `s`,`p`,`o`,`g` | `PrimitiveArray<u32>` | code = position of the term in the sorted dictionary |
-    /// | `_dict_term`  | `utf8` (nullable, padded serialized form only) | null on quad rows; the sorted terms on the trailing dictionary rows |
     ///
     /// Term IDs are lexicographic ranks, so code comparisons are
     /// order-isomorphic to string comparisons (sorted builders keep the
@@ -90,10 +90,9 @@ impl LayoutStrategy {
     /// without materializing the array.
     pub(crate) fn from_dtype(dtype: &DType) -> LayoutStrategy {
         if let DType::Struct(fields, _) = dtype {
-            // A term column (padded serialized form) or u32 code columns (a
-            // bare/sidecar quads schema) both mean Dictionary.
-            if fields.names().iter().any(|n| n.as_ref() == TERM_FIELD)
-                || matches!(fields.field(COL_S), Some(DType::Primitive(ptype, _)) if ptype == PType::U32)
+            // u32 code columns mean Dictionary; the dictionary itself rides
+            // outside the schema, as an embedded metadata segment.
+            if matches!(fields.field(COL_S), Some(DType::Primitive(ptype, _)) if ptype == PType::U32)
             {
                 return LayoutStrategy::Dictionary;
             }
@@ -134,27 +133,6 @@ impl LayoutStrategy {
             )),
         }
     }
-}
-
-/// Where a serialized Dictionary-layout dataset keeps its term dictionary.
-///
-/// Both forms hold the same scannable sorted term column ([`TERM_FIELD`]);
-/// they differ in which file it lives in. Non-Dictionary layouts carry no
-/// dictionary, so the placement is a no-op for them.
-#[derive(Copy, Clone, PartialEq, Eq, Hash, ValueEnum, Debug, Default)]
-pub enum DictionaryPlacement {
-    /// One self-contained file: the dictionary rides as trailing rows of the
-    /// quads file, in a nullable term column that is null on every quad row
-    /// (see [`dictionary::pad_with_dictionary`]). The default, and the only
-    /// form IPC bytes use.
-    #[default]
-    Padded,
-    /// Two files: the quads file keeps bare code columns, and the dictionary
-    /// lives in a `<stem>.dict.vortex` companion beside it. The companion
-    /// must travel with the quads file — without it the codes cannot be
-    /// decoded — but it can be rebuilt or re-compressed without touching the
-    /// quads.
-    Sidecar,
 }
 
 /// Query-time layout: the build-time [`LayoutStrategy`] resolved against a
@@ -366,7 +344,7 @@ impl ResolvedLayout {
 
     /// Project an array down to this layout's primary (non-index) columns only.
     pub(crate) fn project_primary(&self, arr: &ArrayRef) -> Result<ArrayRef> {
-        let mut ctx = VORTEX_LIGHT_SESSION.create_execution_ctx();
+        let mut ctx = VORTEX_SESSION.create_execution_ctx();
         let struct_arr = arr
             .clone()
             .execute::<StructArray>(&mut ctx)
@@ -391,8 +369,7 @@ impl ResolvedLayout {
     }
 
     /// Decode a StructArray chunk into quads. Dictionary chunks are decoded
-    /// through the layout's own dictionary (any padded `_dict_term` column
-    /// was split off at open or lost to slicing/filtering/file re-blocking).
+    /// through the layout's own dictionary.
     pub(crate) fn decode_chunk(&self, chunk: &ArrayRef) -> Vec<Result<Quad>> {
         match self {
             ResolvedLayout::Default => default::decode_chunk(chunk),
@@ -423,28 +400,6 @@ impl ResolvedLayout {
             };
         }
         self.decode_chunk(chunk)
-    }
-
-    /// Write whatever state this layout holds intrinsically back into `array`,
-    /// so that it can be serialized and read back without this layout's help.
-    ///
-    /// This is the counterpart to the splitting done when a serialized form is
-    /// opened: state that lives in the array is hoisted into the variant at
-    /// construction, and derived arrays no longer carry it. Only the
-    /// Dictionary layout has such state (its term dictionary), appended as
-    /// trailing dictionary rows — the padded form (see
-    /// [`dictionary::pad_with_dictionary`]); the other layouts encode
-    /// everything in the columns themselves and pass `array` straight through.
-    pub(crate) async fn attach_intrinsic_state(&self, array: ArrayRef) -> Result<ArrayRef> {
-        match self {
-            ResolvedLayout::Default | ResolvedLayout::TypedObject => Ok(array),
-            ResolvedLayout::Dictionary(access) => {
-                // A file-backed dictionary is lifted resident transiently for
-                // the write — the serialized form must carry the whole column.
-                let dict = access.ensure_resident().await?;
-                dictionary::pad_with_dictionary(&array, &dict)
-            }
-        }
     }
 
     /// Pre-resolve a pattern's bound terms into `codes` before the
@@ -500,7 +455,7 @@ impl ResolvedLayout {
     /// its typed sub-columns, and Dictionary resolves each u32 code through
     /// this layout's term dictionary.
     pub(crate) fn raw_quads(&self, rows: &ArrayRef) -> Result<Vec<RawQuad>> {
-        let mut ctx = VORTEX_LIGHT_SESSION.create_execution_ctx();
+        let mut ctx = VORTEX_SESSION.create_execution_ctx();
         let struct_arr = rows
             .clone()
             .execute::<StructArray>(&mut ctx)
@@ -672,7 +627,7 @@ impl ResolvedLayout {
 
 /// Read a UTF-8 string column into owned term strings, one per row.
 fn read_string_column(struct_arr: &StructArray, name: &str) -> Result<Vec<String>> {
-    let mut ctx = VORTEX_LIGHT_SESSION.create_execution_ctx();
+    let mut ctx = VORTEX_SESSION.create_execution_ctx();
     let col = struct_arr
         .unmasked_field_by_name(name)
         .map_err(VortexRdfError::Vortex)?
@@ -687,7 +642,7 @@ fn read_string_column(struct_arr: &StructArray, name: &str) -> Result<Vec<String
 
 /// Read a u32 code column into owned codes, one per row.
 fn read_u32_column(struct_arr: &StructArray, name: &str) -> Result<Vec<u32>> {
-    let mut ctx = VORTEX_LIGHT_SESSION.create_execution_ctx();
+    let mut ctx = VORTEX_SESSION.create_execution_ctx();
     let col = struct_arr
         .unmasked_field_by_name(name)
         .map_err(VortexRdfError::Vortex)?

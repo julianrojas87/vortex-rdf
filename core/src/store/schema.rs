@@ -29,8 +29,6 @@ pub(crate) const COL_O_VALUE: &str = "o_value";
 pub(crate) const COL_O_DATATYPE: &str = "o_datatype";
 pub(crate) const COL_O_LANG: &str = "o_lang";
 
-/// The padded Dictionary form's term column: nullable utf8, null on quad rows,
-/// holding the sorted dictionary terms on the trailing dictionary rows (term
-/// ID = position among them). Also the single column of a sidecar dictionary
-/// file. Its presence in a schema is what marks a padded file.
+/// The single column of an embedded dictionary blob: non-nullable utf8, row i
+/// holding the term with code i (sorted, so codes are lexicographic ranks).
 pub(crate) const TERM_FIELD: &str = "_dict_term";
