@@ -28,9 +28,9 @@ use vortex_array::{ArrayRef, IntoArray, VortexSessionExecute};
 
 use futures::{Stream, StreamExt};
 
-use super::default::decode_spog;
 use super::term_dictionary::{DictReader, InterningQuadBuilder, TermDictionary, TermIdMap};
 use crate::common::array::stamp_is_sorted;
+use crate::common::terms::{get_as_term, parse_graph_name, parse_named_node, parse_subject};
 use crate::error::{Result, VortexRdfError};
 use crate::io::VORTEX_SESSION;
 use crate::store::RawQuad;
@@ -356,72 +356,185 @@ pub(crate) fn empty_struct(indexes: &[IndexType]) -> Result<ArrayRef> {
     )
 }
 
-/// Decode a Dictionary-layout StructArray chunk into Quads using the given
-/// (store-cached) dictionary.
-pub(crate) fn decode_chunk(chunk: &ArrayRef, dict: &TermDictionary) -> Vec<Result<Quad>> {
+/// The four primary code columns of a chunk, as arrays whose `u32` slices the
+/// decoders read. Returned rather than borrowed from a temporary: the slices
+/// borrow these arrays, so they must outlive the decode.
+fn code_columns(
+    chunk: &ArrayRef,
+) -> Result<(
+    PrimitiveArray,
+    PrimitiveArray,
+    PrimitiveArray,
+    PrimitiveArray,
+)> {
     let mut ctx = VORTEX_SESSION.create_execution_ctx();
-
-    let struct_arr = match chunk.clone().execute::<StructArray>(&mut ctx) {
-        Ok(a) => a,
-        Err(e) => return vec![Err(VortexRdfError::Vortex(e))],
+    let struct_arr = chunk
+        .clone()
+        .execute::<StructArray>(&mut ctx)
+        .map_err(VortexRdfError::Vortex)?;
+    let mut col = |name: &str| -> Result<PrimitiveArray> {
+        struct_arr
+            .unmasked_field_by_name(name)
+            .map_err(VortexRdfError::Vortex)?
+            .clone()
+            .execute::<PrimitiveArray>(&mut ctx)
+            .map_err(VortexRdfError::Vortex)
     };
+    Ok((col(COL_S)?, col(COL_P)?, col(COL_O)?, col(COL_G)?))
+}
 
-    let n = struct_arr.len();
+/// Where a decode reads a code's term string from: the four roles are asked
+/// separately so a dictionary-backed source can keep one reader (and, for a
+/// chunked dictionary, one warm chunk cursor) per role — the roles occupy
+/// different regions of the sorted term space.
+trait TermSource {
+    fn str_at(&mut self, role: usize, code: u32) -> Result<&str>;
+}
 
-    macro_rules! get_u32_col {
-        ($name:expr) => {
-            match struct_arr
-                .unmasked_field_by_name($name)
-                .map_err(VortexRdfError::Vortex)
-                .and_then(|c| {
-                    c.clone()
-                        .execute::<PrimitiveArray>(&mut ctx)
-                        .map_err(VortexRdfError::Vortex)
-                }) {
-                Ok(arr) => arr,
-                Err(e) => return vec![Err(e)],
-            }
+/// Term strings read from a resident dictionary.
+struct DictTerms<'a> {
+    readers: [DictReader<'a>; 4],
+    n_terms: usize,
+}
+
+impl TermSource for DictTerms<'_> {
+    fn str_at(&mut self, role: usize, code: u32) -> Result<&str> {
+        if code as usize >= self.n_terms {
+            return Err(VortexRdfError::Deserialization(format!(
+                "Term code {} out of dictionary bounds ({})",
+                code, self.n_terms
+            )));
+        }
+        self.readers[role].str_at(code as usize)
+    }
+}
+
+/// Term strings read from a pre-resolved map (the file-backed path).
+#[cfg(feature = "file-io")]
+struct MappedTerms<'a>(&'a HashMap<u32, String>);
+
+#[cfg(feature = "file-io")]
+impl TermSource for MappedTerms<'_> {
+    fn str_at(&mut self, _role: usize, code: u32) -> Result<&str> {
+        self.0.get(&code).map(String::as_str).ok_or_else(|| {
+            VortexRdfError::Deserialization(format!(
+                "Term code {} missing from the chunk's resolved term map",
+                code
+            ))
+        })
+    }
+}
+
+/// Upper bound on a role memo's slots. Sized to hold the distinct predicates
+/// and graph names of realistic datasets outright, while keeping the memo an
+/// L2-resident table rather than something that grows with the data.
+const MEMO_MAX_SLOTS: usize = 1024;
+
+/// Below this many rows a chunk decodes without a memo at all: the table's
+/// own allocation would cost more than the handful of repeats it could catch,
+/// and single-row decodes (an rdflib-style probe resolving one binding) are
+/// hot enough to notice.
+const MEMO_MIN_ROWS: usize = 16;
+
+/// A direct-mapped memo of one role's decoded terms, keyed by term code.
+///
+/// Codes repeat heavily down a column — a predicate or graph name recurs on
+/// nearly every row — and each repeat would otherwise pay the dictionary read
+/// (an FSST decompress) *and* the term parse again. Direct mapping rather
+/// than a hash map because the miss path must stay nearly free: a
+/// high-cardinality column like subjects would fill any growing structure
+/// with entries it never reads again, whereas here a miss costs one compare
+/// and one overwrite, and memory is fixed regardless of the column.
+struct TermMemo<T> {
+    slots: Vec<Option<(u32, T)>>,
+    mask: usize,
+}
+
+impl<T: Clone> TermMemo<T> {
+    /// Sized to the chunk (a power of two, capped): a short chunk cannot have
+    /// more distinct codes than rows, so it should not clear a big table, and
+    /// a tiny one gets no table at all (`vec![_; 0]` does not allocate).
+    fn new(rows: usize) -> Self {
+        let slots = if rows < MEMO_MIN_ROWS {
+            0
+        } else {
+            rows.next_power_of_two().clamp(1, MEMO_MAX_SLOTS)
         };
+        Self {
+            slots: vec![None; slots],
+            mask: slots.saturating_sub(1),
+        }
     }
 
-    let s_col = get_u32_col!(COL_S);
-    let p_col = get_u32_col!(COL_P);
-    let o_col = get_u32_col!(COL_O);
-    let g_col = get_u32_col!(COL_G);
-
-    let s_ids = s_col.as_slice::<u32>();
-    let p_ids = p_col.as_slice::<u32>();
-    let o_ids = o_col.as_slice::<u32>();
-    let g_ids = g_col.as_slice::<u32>();
-
-    // One reader per role: an FSST read decodes into the reader's scratch, so
-    // the four borrows a quad needs at once must come from four readers.
-    let (mut rs, mut rp, mut ro, mut rg) =
-        (dict.reader(), dict.reader(), dict.reader(), dict.reader());
-    let n_terms = dict.len();
-    let term_at = |reader: &mut DictReader<'_>, id: u32| -> Result<String> {
-        if (id as usize) < n_terms {
-            reader.str_at(id as usize).map(str::to_owned)
-        } else {
-            Err(VortexRdfError::Deserialization(format!(
-                "Term code {} out of dictionary bounds ({})",
-                id, n_terms
-            )))
+    fn get_or_insert(&mut self, code: u32, decode: impl FnOnce() -> Result<T>) -> Result<T> {
+        if self.slots.is_empty() {
+            return decode();
         }
-    };
+        let slot = &mut self.slots[code as usize & self.mask];
+        if let Some((cached, term)) = slot
+            && *cached == code
+        {
+            return Ok(term.clone());
+        }
+        let term = decode()?;
+        *slot = Some((code, term.clone()));
+        Ok(term)
+    }
+}
+
+/// Decode a chunk's code columns into quads, reading each distinct code's
+/// term at most once per role (see [`TermMemo`]).
+fn decode_codes(
+    s_ids: &[u32],
+    p_ids: &[u32],
+    o_ids: &[u32],
+    g_ids: &[u32],
+    src: &mut impl TermSource,
+) -> Vec<Result<Quad>> {
+    let n = s_ids.len();
+    let (mut sm, mut pm, mut om, mut gm) = (
+        TermMemo::new(n),
+        TermMemo::new(n),
+        TermMemo::new(n),
+        TermMemo::new(n),
+    );
 
     (0..n)
         .map(|i| {
-            // Zero-copy views over the dictionary's term bytes; the oxrdf
-            // constructors make the single owned copy.
-            decode_spog(
-                &term_at(&mut rs, s_ids[i])?,
-                &term_at(&mut rp, p_ids[i])?,
-                &term_at(&mut ro, o_ids[i])?,
-                &term_at(&mut rg, g_ids[i])?,
-            )
+            let subject = sm.get_or_insert(s_ids[i], || parse_subject(src.str_at(0, s_ids[i])?))?;
+            let predicate =
+                pm.get_or_insert(p_ids[i], || parse_named_node(src.str_at(1, p_ids[i])?))?;
+            let object = om.get_or_insert(o_ids[i], || {
+                let term = src.str_at(2, o_ids[i])?;
+                get_as_term(term).ok_or_else(|| {
+                    VortexRdfError::Deserialization(format!("Invalid object: {term}"))
+                })
+            })?;
+            let graph =
+                gm.get_or_insert(g_ids[i], || parse_graph_name(src.str_at(3, g_ids[i])?))?;
+            Ok(Quad::new(subject, predicate, object, graph))
         })
         .collect()
+}
+
+/// Decode a Dictionary-layout StructArray chunk into Quads using the given
+/// (store-cached) dictionary.
+pub(crate) fn decode_chunk(chunk: &ArrayRef, dict: &TermDictionary) -> Vec<Result<Quad>> {
+    let (s_col, p_col, o_col, g_col) = match code_columns(chunk) {
+        Ok(cols) => cols,
+        Err(e) => return vec![Err(e)],
+    };
+    let mut src = DictTerms {
+        readers: [dict.reader(), dict.reader(), dict.reader(), dict.reader()],
+        n_terms: dict.len(),
+    };
+    decode_codes(
+        s_col.as_slice::<u32>(),
+        p_col.as_slice::<u32>(),
+        o_col.as_slice::<u32>(),
+        g_col.as_slice::<u32>(),
+        &mut src,
+    )
 }
 
 /// The distinct term codes a chunk's four code columns reference, ascending —
@@ -457,57 +570,15 @@ pub(crate) fn decode_chunk_mapped(
     chunk: &ArrayRef,
     terms: &HashMap<u32, String>,
 ) -> Vec<Result<Quad>> {
-    let mut ctx = VORTEX_SESSION.create_execution_ctx();
-
-    let struct_arr = match chunk.clone().execute::<StructArray>(&mut ctx) {
-        Ok(a) => a,
-        Err(e) => return vec![Err(VortexRdfError::Vortex(e))],
+    let (s_col, p_col, o_col, g_col) = match code_columns(chunk) {
+        Ok(cols) => cols,
+        Err(e) => return vec![Err(e)],
     };
-    let n = struct_arr.len();
-
-    macro_rules! get_u32_col {
-        ($name:expr) => {
-            match struct_arr
-                .unmasked_field_by_name($name)
-                .map_err(VortexRdfError::Vortex)
-                .and_then(|c| {
-                    c.clone()
-                        .execute::<PrimitiveArray>(&mut ctx)
-                        .map_err(VortexRdfError::Vortex)
-                }) {
-                Ok(arr) => arr,
-                Err(e) => return vec![Err(e)],
-            }
-        };
-    }
-
-    let s_col = get_u32_col!(COL_S);
-    let p_col = get_u32_col!(COL_P);
-    let o_col = get_u32_col!(COL_O);
-    let g_col = get_u32_col!(COL_G);
-
-    let s_ids = s_col.as_slice::<u32>();
-    let p_ids = p_col.as_slice::<u32>();
-    let o_ids = o_col.as_slice::<u32>();
-    let g_ids = g_col.as_slice::<u32>();
-
-    let term_of = |id: u32| -> Result<&String> {
-        terms.get(&id).ok_or_else(|| {
-            VortexRdfError::Deserialization(format!(
-                "Term code {} missing from the chunk's resolved term map",
-                id
-            ))
-        })
-    };
-
-    (0..n)
-        .map(|i| {
-            decode_spog(
-                term_of(s_ids[i])?,
-                term_of(p_ids[i])?,
-                term_of(o_ids[i])?,
-                term_of(g_ids[i])?,
-            )
-        })
-        .collect()
+    decode_codes(
+        s_col.as_slice::<u32>(),
+        p_col.as_slice::<u32>(),
+        o_col.as_slice::<u32>(),
+        g_col.as_slice::<u32>(),
+        &mut MappedTerms(terms),
+    )
 }

@@ -18,6 +18,68 @@ async fn run_dictionary_roundtrip<B: VortexArrayBuilder>() {
     assert_eq!(quad_strings(&decoded), quad_strings(&quads));
 }
 
+/// Decoding memoizes each role's terms in a fixed-size, direct-mapped table,
+/// so codes that land in the same slot must still decode to their own terms —
+/// a memo that trusted a slot without checking whose code filled it would
+/// hand back a colliding row's term. Wide enough (~4k distinct terms over
+/// 1024 slots) that collisions are certain, with repeated predicates and
+/// graph names alongside them to exercise the hit path in the same pass.
+#[tokio::test]
+async fn test_dictionary_decode_survives_memo_slot_collisions() {
+    let graph = |i: usize| {
+        if i.is_multiple_of(3) {
+            GraphName::DefaultGraph
+        } else {
+            GraphName::NamedNode(
+                NamedNode::new(format!("http://example.org/graph/{}", i % 5)).unwrap(),
+            )
+        }
+    };
+    let quads: Vec<Quad> = (0..2_000)
+        .map(|i| {
+            make_quad(
+                &format!("http://example.org/subject/{i:05}"),
+                &format!("http://example.org/predicate/{}", i % 7),
+                &format!("object value {i:05}"),
+                graph(i),
+            )
+        })
+        .collect();
+
+    let arr = VortexRdfStore::build_vortex_array_with_builder::<SortedStreamBuilder>(
+        quad_stream(quads.clone()),
+        LayoutStrategy::Dictionary,
+        vec![],
+    )
+    .await
+    .unwrap();
+    let store = VortexRdfStore::from_built(arr).unwrap();
+    // ~2000 subjects + 2000 objects + 7 predicates + 4 graphs: far past the
+    // memo's slot count, so distinct codes share slots.
+    assert!(store.dictionary_snapshot().unwrap().0.len() > 1024);
+
+    let decoded = store.quads_vec().await.unwrap();
+    assert_eq!(quad_strings(&decoded), quad_strings(&quads));
+
+    // The same rows reached through a match (a shorter chunk, decoded by the
+    // same path) must agree term for term.
+    let p3 = NamedNode::new("http://example.org/predicate/3").unwrap();
+    let matched = store
+        .match_pattern(None, Some(&p3), None, None)
+        .await
+        .unwrap()
+        .quads_vec()
+        .await
+        .unwrap();
+    let expected: Vec<Quad> = quads
+        .iter()
+        .filter(|q| q.predicate == p3.as_ref())
+        .cloned()
+        .collect();
+    assert!(!expected.is_empty());
+    assert_eq!(quad_strings(&matched), quad_strings(&expected));
+}
+
 #[tokio::test]
 async fn test_dictionary_sorted_in_memory() {
     run_dictionary_roundtrip::<SortedInMemoryBuilder>().await;
