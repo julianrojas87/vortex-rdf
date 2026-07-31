@@ -24,21 +24,13 @@ This library provides both serialization and deserialization capabilities for co
 1. **Zero-copy buffer views**: When you want to access a specific column (e.g., just the `predicates`) or a specific subset of Quads, Vortex creates a [_Layout_](https://docs.vortex.dev/concepts/layouts) either from a Vortex file stored on disk or from Vortex encoded data in memory. Both representations are structured in the same way, which avoids having to convert data before reading it. Bottom line, the Layout is just metadata and pointers to the actual data, it doesn't need to duplicate it.
 2. **Lazy Decompression**: Even when compressed, Vortex is designed to decompress data "_just-in-time_" at the CPU register level, while leveraging [SIMD optimizations](https://en.wikipedia.org/wiki/Single_instruction,_multiple_data) and avoiding the decompression of unnecessary data.
 
-### Vortex File format & IPC
+### Vortex File format
 
-Vortex-RDF leverages the [Vortex File specification](https://docs.vortex.dev/specs/file-format) and the [Vortex IPC (Inter-Process Communication) protocol](https://docs.vortex.dev/developer-guide/internals/serialization#ipc-format) to provide versatile serialization options optimized for both local storage and remote data exchange.
+Vortex-RDF serializes everything as [Vortex files](https://docs.vortex.dev/specs/file-format) — on disk and as the byte-exchange format of the bindings alike.
 
-1. **Vortex Files**: Zero-Copy
-The `.vortex` files are optimized for **local usage** with disk-based storage (Cloud-based alternatives based on blob storage solutions, e.g., Amazon S3 buckets, could be also supported). These files are designed to allow efficient compression and random access, allowing the OS to load only necessary chunks on demand without any parsing overhead. Opening a file (`VortexRdfStore::from_file`) is lazy: no data is read until queried, and `match_pattern` filters are pushed down into the file scan as Vortex filter [expressions](https://docs.vortex.dev/concepts/expressions).
+The `.vortex` files allow efficient compression and random access, letting the OS load only necessary chunks on demand without any parsing overhead. Opening a file (`VortexRdfStore::from_file`) is lazy: no data is read until queried, and `match_pattern` filters are pushed down into the file scan as Vortex filter [expressions](https://docs.vortex.dev/concepts/expressions). The same bytes loaded into memory open through `VortexRdfStore::from_bytes` (the WASM bindings' path), fully materialized. Cloud-based remote reads (e.g. HTTP range requests against blob storage) fit the same reader abstraction and are planned.
 
-2. **IPC Streams**: Remote Exchange
-For exchanging data between different systems or over a network, the library can serialize RDF graphs into a **Vortex IPC Stream**. This format follows the Vortex IPC streaming protocol, making it suitable for pipes, sockets, and network transfers. These streams can be consumed by any Vortex-compatible client (Rust, Python, C++, etc.) to receive the Vortex-RDF data, while avoiding any deserialization and decompression overhead. The WASM bindings use IPC as their byte-exchange format.
-
-Both formats share the same underlying principles:
-- **Self-Describing**: Every file/stream contains a FlatBuffers schema describing the set of [`DType`](https://docs.vortex.dev/concepts/dtypes) (data types).
-- **Unified Encodings**: Specialized encodings are preserved verbatim. This means compressed data **stays compressed** during transfer and is only decompressed lazily when strictly needed by the consumer.
-
-This versatile approach ensures that Vortex-RDF can serve as both a high-performance local database engine and an efficient interchange format for distributed RDF processing.
+Every file is **self-describing**: alongside the FlatBuffers schema of its [`DType`s](https://docs.vortex.dev/concepts/dtypes), a small JSON **manifest** rides in a user metadata segment declaring the layout, its embedded components (the Dictionary layout's term dictionary) and index inventory — validated against the schema on every open. Specialized encodings are preserved verbatim: compressed data **stays compressed** during transfer and is only decompressed lazily when strictly needed by the consumer.
 
 ---
 
@@ -75,12 +67,11 @@ Same as `Default` for `s`, `p`, `g`, but the object column is decomposed into ty
 | `o_lang` | `VarBin<Utf8>` (nullable) | Language tag — non-null when `o_kind = 3` |
 
 #### `Dictionary`
-All four quad fields are stored as `u32` codes into a **single global term dictionary**: the lexicographically sorted set of unique term strings. In memory the dictionary is held beside the code columns in its compact columnar form. Serialized files carry it in one of two placements: **padded** (the default and the IPC form — a nullable `_dict_term` column that is null on quad rows, with the sorted terms appended as trailing dictionary rows, keeping the file a single self-describing artifact) or **sidecar** (bare code columns plus a `<stem>.dict.vortex` companion holding the term column). Because the dictionary rows are a plain scannable `utf8` column, large dictionaries can stay file-backed and be probed by pruned scans instead of being lifted into memory.
+All four quad fields are stored as `u32` codes into a **single global term dictionary**: the lexicographically sorted set of unique term strings. In memory the dictionary is held beside the code columns in its compact (FSST-compressed) columnar form. A serialized file carries it **embedded**: the quad columns stay bare, and the dictionary is a complete Vortex file of its own riding in the quads file's metadata segments — one self-contained artifact whose quads section pays no scan or compression penalty for its self-description. Because the blob is itself a scannable sorted `utf8` column, large dictionaries can stay file-backed and be probed by pruned scans through a bounded reader instead of being lifted into memory (a byte-size threshold decides).
 
 | Column | Type | Content |
 |---|---|---|
 | `s`, `p`, `o`, `g` | `PrimitiveArray<u32>` | code = position of the term in the sorted dictionary |
-| `_dict_term` | `utf8` (nullable; padded serialized form only) | null on quad rows; the sorted unique terms on the trailing dictionary rows |
 
 Because term IDs are **lexicographic ranks**:
 - ID comparisons are order-isomorphic to string comparisons, so sorted builders keep the subject binary-search fast path directly on the `u32` column.
@@ -217,7 +208,7 @@ Vortex compresses the repeated strings internally (FSST, dictionary encodings), 
 
 ### `Dictionary` layout
 
-**Term dictionary** (the `_dict_term` rows): the lexicographically sorted set of unique terms. IDs are implicit — a term's ID is simply its position:
+**Term dictionary** (the embedded blob's `_dict_term` column): the lexicographically sorted set of unique terms. IDs are implicit — a term's ID is simply its position:
 
 | ID* | Term |
 |---|---|
@@ -269,7 +260,7 @@ Declare `vortex-rdf-core` as a dependency as follows:
 vortex-rdf-core = "0.1.0"
 ```
 
-The `file-io` feature (enabled by default) provides Vortex file reading/writing on top of Tokio; disable default features for WASM or IPC-only environments.
+The `file-io` feature (enabled by default) provides path-based Vortex file reading/writing on top of Tokio; disable default features for WASM, where stores are exchanged as in-memory file bytes instead.
 
 Install the CLI with:
 
