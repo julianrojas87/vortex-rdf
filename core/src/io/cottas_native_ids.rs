@@ -1466,6 +1466,30 @@ impl NativeRdfStoreFile {
         }
     }
 
+    /// Resolve several lexical RDF terms concurrently while deduplicating equal terms.
+    ///
+    /// Vortex currently exposes the lexically sorted dictionary through filtered scans.
+    /// Issuing independent point scans concurrently removes their additive wall-clock cost
+    /// without changing the persisted v10 format or introducing an unbounded cache.
+    async fn lookup_term_ids<'a, I>(&self, terms: I) -> Result<HashMap<String, u32>>
+    where
+        I: IntoIterator<Item = &'a str>,
+    {
+        let mut requested = terms.into_iter().map(str::to_owned).collect::<Vec<_>>();
+        requested.sort_unstable();
+        requested.dedup();
+        if requested.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let resolved =
+            future::try_join_all(requested.iter().map(|term| self.lookup_term_id(term))).await?;
+        Ok(requested
+            .into_iter()
+            .zip(resolved)
+            .filter_map(|(term, id)| id.map(|id| (term, id)))
+            .collect())
+    }
+
     /// Resolve IDs through the native ID-ordered dictionary.
     ///
     /// Row selection uses the persisted `row number == ID` invariant and then
@@ -1891,11 +1915,16 @@ impl NativeRdfStoreFile {
             (bound.o.as_deref(), "o"),
             (bound.g.as_deref(), "g"),
         ];
+        let requested_terms = requested
+            .iter()
+            .filter_map(|(term, _column)| *term)
+            .collect::<Vec<_>>();
+        dictionary_lookups = requested_terms.len();
+        let resolved_terms = self.lookup_term_ids(requested_terms).await?;
         let mut resolved = ResolvedNativePattern::default();
         for (term, column) in requested {
             let Some(term) = term else { continue };
-            dictionary_lookups += 1;
-            let Some(id) = self.lookup_term_id(term).await? else {
+            let Some(id) = resolved_terms.get(term).copied() else {
                 if profile {
                     eprintln!(
                         "[vortex-rdf-profile] layer=core operation=match_stages outcome=dictionary-miss column={} rows=0 bound_ms={:.3} dictionary_ms={:.3} dictionary_lookups={} availability_ms=0.000 index_ms=0.000 scan_setup_ms=0.000 scan_read_ms=0.000 reconstruct_lookup_ms=0.000 materialize_ms=0.000 total_ms={:.3}",
