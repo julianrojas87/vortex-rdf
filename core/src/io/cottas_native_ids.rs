@@ -1301,9 +1301,17 @@ pub struct NativeRdfStoreComponentInfo {
 ///
 /// The generic Vortex file scan remains the QuadSource scan. Auxiliary layouts
 /// are addressed explicitly by their stable persisted component names.
+#[derive(Clone, Debug)]
+struct NativeTermFence {
+    first_term: String,
+    last_term: String,
+    row_range: Range<u64>,
+}
+
 #[derive(Clone)]
 pub struct NativeRdfStoreFile {
     file: vortex_file::VortexFile,
+    term_directory: Arc<tokio::sync::OnceCell<Arc<[NativeTermFence]>>>,
 }
 
 impl NativeRdfStoreFile {
@@ -1355,7 +1363,10 @@ impl NativeRdfStoreFile {
             root.child(index).map_err(VortexRdfError::from)?;
         }
         let _ = typed;
-        Ok(Self { file })
+        Ok(Self {
+            file,
+            term_directory: Arc::new(tokio::sync::OnceCell::new()),
+        })
     }
 
     pub fn vortex_file(&self) -> &vortex_file::VortexFile {
@@ -1427,9 +1438,82 @@ impl NativeRdfStoreFile {
         )))
     }
 
-    // VORTEX_RDF_NATIVE_DICTIONARY_LOOKUPS_V1
-    /// Resolve one lexical RDF term through the native lexically sorted dictionary.
+    // VORTEX_RDF_NATIVE_TERM_DIRECTORY_LOOKUP_V1
+    async fn term_directory(&self) -> Result<&Arc<[NativeTermFence]>> {
+        self.term_directory
+            .get_or_try_init(|| async {
+                let directory = self
+                    .component_scan("dictionary.term-directory")?
+                    .ok_or_else(|| {
+                        VortexRdfError::Deserialization(
+                            "native RDF store is missing required dictionary.term-directory component"
+                                .into(),
+                        )
+                    })?
+                    .with_projection(vortex_array::expr::select(
+                        ["first_term", "last_term", "row_start", "row_end"],
+                        vortex_array::expr::root(),
+                    ))
+                    .into_array_stream()
+                    .map_err(VortexRdfError::from)?
+                    .read_all()
+                    .await
+                    .map_err(VortexRdfError::from)?;
+                let first_terms = extract_projected_utf8_column(&directory, "first_term")?;
+                let last_terms = extract_projected_utf8_column(&directory, "last_term")?;
+                let starts = extract_projected_u64_column(&directory, "row_start")?;
+                let ends = extract_projected_u64_column(&directory, "row_end")?;
+                if first_terms.len() != last_terms.len()
+                    || first_terms.len() != starts.len()
+                    || first_terms.len() != ends.len()
+                {
+                    return Err(VortexRdfError::Deserialization(
+                        "native term-directory columns have inconsistent lengths".into(),
+                    ));
+                }
+                let mut fences: Vec<NativeTermFence> = Vec::with_capacity(first_terms.len());
+                for (((first_term, last_term), start), end) in first_terms
+                    .into_iter()
+                    .zip(last_terms)
+                    .zip(starts)
+                    .zip(ends)
+                {
+                    if first_term > last_term || start >= end {
+                        return Err(VortexRdfError::Deserialization(format!(
+                            "invalid native term fence {first_term:?}..={last_term:?} at rows {start}..{end}"
+                        )));
+                    }
+                    if fences.last().is_some_and(|previous| {
+                        previous.last_term.as_str() >= first_term.as_str()
+                    }) {
+                        return Err(VortexRdfError::Deserialization(
+                            "native term-directory fences are not strictly lexical".into(),
+                        ));
+                    }
+                    fences.push(NativeTermFence {
+                        first_term,
+                        last_term,
+                        row_range: start..end,
+                    });
+                }
+                Ok(Arc::from(fences))
+            })
+            .await
+    }
+
+    fn locate_term_window<'a>(fences: &'a [NativeTermFence], term: &str) -> Option<&'a Range<u64>> {
+        let index = fences.partition_point(|fence| fence.last_term.as_str() < term);
+        let fence = fences.get(index)?;
+        (fence.first_term.as_str() <= term).then_some(&fence.row_range)
+    }
+
+    /// Resolve one lexical RDF term by first locating its persisted sparse lexical fence,
+    /// then scanning at most that dictionary window.
     pub async fn lookup_term_id(&self, term: &str) -> Result<Option<u32>> {
+        let directory = self.term_directory().await?;
+        let Some(row_range) = Self::locate_term_window(directory, term) else {
+            return Ok(None);
+        };
         let scan = self
             .component_scan("dictionary.term-to-id")?
             .ok_or_else(|| {
@@ -1438,6 +1522,7 @@ impl NativeRdfStoreFile {
                 )
             })?;
         let result = scan
+            .with_row_range(row_range.clone())
             .with_filter(eq(col("term"), lit(term.to_owned())))
             .with_projection(vortex_array::expr::select(
                 ["id"],
@@ -3025,6 +3110,40 @@ mod native_index_baseline_equivalence_tests {
             .await
             .unwrap();
         assert_eq!(sorted(auto), sorted(disabled));
+    }
+
+    #[test]
+    fn native_term_directory_locates_boundaries_and_misses() {
+        let fences = vec![
+            NativeTermFence {
+                first_term: "a".into(),
+                last_term: "c".into(),
+                row_range: 0..3,
+            },
+            NativeTermFence {
+                first_term: "f".into(),
+                last_term: "z".into(),
+                row_range: 3..8,
+            },
+        ];
+        assert_eq!(
+            NativeRdfStoreFile::locate_term_window(&fences, "a"),
+            Some(&(0..3))
+        );
+        assert_eq!(
+            NativeRdfStoreFile::locate_term_window(&fences, "c"),
+            Some(&(0..3))
+        );
+        assert_eq!(
+            NativeRdfStoreFile::locate_term_window(&fences, "f"),
+            Some(&(3..8))
+        );
+        assert_eq!(
+            NativeRdfStoreFile::locate_term_window(&fences, "z"),
+            Some(&(3..8))
+        );
+        assert_eq!(NativeRdfStoreFile::locate_term_window(&fences, "d"), None);
+        assert_eq!(NativeRdfStoreFile::locate_term_window(&fences, "zz"), None);
     }
 
     #[tokio::test]
