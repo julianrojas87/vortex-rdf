@@ -1878,7 +1878,13 @@ impl NativeRdfStoreFile {
         graph: Option<&GraphName>,
         policy: NativeIndexPolicy,
     ) -> Result<Vec<(String, String, String, String)>> {
+        let profile = std::env::var_os("VORTEX_RDF_PROFILE_MATCH").is_some();
+        let total_started = Instant::now();
+        let bound_started = Instant::now();
         let bound = BoundNativeRdfTerms::from_pattern(subject, predicate, object, graph);
+        let bound_elapsed = bound_started.elapsed();
+        let dictionary_started = Instant::now();
+        let mut dictionary_lookups = 0usize;
         let requested = [
             (bound.s.as_deref(), "s"),
             (bound.p.as_deref(), "p"),
@@ -1888,7 +1894,18 @@ impl NativeRdfStoreFile {
         let mut resolved = ResolvedNativePattern::default();
         for (term, column) in requested {
             let Some(term) = term else { continue };
+            dictionary_lookups += 1;
             let Some(id) = self.lookup_term_id(term).await? else {
+                if profile {
+                    eprintln!(
+                        "[vortex-rdf-profile] layer=core operation=match_stages outcome=dictionary-miss column={} rows=0 bound_ms={:.3} dictionary_ms={:.3} dictionary_lookups={} availability_ms=0.000 index_ms=0.000 scan_setup_ms=0.000 scan_read_ms=0.000 reconstruct_lookup_ms=0.000 materialize_ms=0.000 total_ms={:.3}",
+                        column,
+                        bound_elapsed.as_secs_f64() * 1_000.0,
+                        dictionary_started.elapsed().as_secs_f64() * 1_000.0,
+                        dictionary_lookups,
+                        total_started.elapsed().as_secs_f64() * 1_000.0,
+                    );
+                }
                 return Ok(Vec::new());
             };
             match column {
@@ -1900,6 +1917,8 @@ impl NativeRdfStoreFile {
             }
         }
 
+        let dictionary_elapsed = dictionary_started.elapsed();
+        let availability_started = Instant::now();
         let subject_index_available = self.component_layout("index.subject-ranges")?.is_some();
         let predicate_exact_available = self
             .component_layout("index.predicate.exact-ranges.directory")?
@@ -1925,6 +1944,8 @@ impl NativeRdfStoreFile {
                 .component_layout("index.object.exact-ranges.payload")?
                 .is_some();
         let quad_source_rows = self.file.footer().layout().row_count();
+        let availability_elapsed = availability_started.elapsed();
+        let index_started = Instant::now();
         let mut available_index = "none";
         let mut fallback_reason = "none";
         let (candidate_ranges, access) = if policy == NativeIndexPolicy::Disabled {
@@ -2047,11 +2068,24 @@ impl NativeRdfStoreFile {
             fallback_reason = "no-compatible-bound-column";
             (None, "full-scan")
         };
+        let index_elapsed = index_started.elapsed();
         if candidate_ranges.as_ref().is_some_and(Vec::is_empty)
             || candidate_ranges
                 .as_ref()
                 .is_some_and(|ranges| ranges.len() == 1 && ranges[0].is_empty())
         {
+            if profile {
+                eprintln!(
+                    "[vortex-rdf-profile] layer=core operation=match_stages outcome=index-miss access={} rows=0 bound_ms={:.3} dictionary_ms={:.3} dictionary_lookups={} availability_ms={:.3} index_ms={:.3} scan_setup_ms=0.000 scan_read_ms=0.000 reconstruct_lookup_ms=0.000 materialize_ms=0.000 total_ms={:.3}",
+                    access,
+                    bound_elapsed.as_secs_f64() * 1_000.0,
+                    dictionary_elapsed.as_secs_f64() * 1_000.0,
+                    dictionary_lookups,
+                    availability_elapsed.as_secs_f64() * 1_000.0,
+                    index_elapsed.as_secs_f64() * 1_000.0,
+                    total_started.elapsed().as_secs_f64() * 1_000.0,
+                );
+            }
             return Ok(Vec::new());
         }
 
@@ -2102,22 +2136,42 @@ impl NativeRdfStoreFile {
             ))
             .into_array_stream()
             .map_err(VortexRdfError::from)?;
+        let scan_setup_elapsed = scan_started.elapsed();
         let read_started = Instant::now();
         let (rows, batches, max_batch_rows) =
             read_native_projected_stream_all_with_scan_stats(stream).await?;
+        let scan_read_elapsed = read_started.elapsed();
         log::debug!(
             "[native-rdf-store] match scan rows={} batches={} max_batch_rows={} elapsed={:?}",
             rows.rows,
             batches,
             max_batch_rows,
-            read_started.elapsed()
+            scan_read_elapsed
         );
         if rows.rows == 0 {
+            if profile {
+                eprintln!(
+                    "[vortex-rdf-profile] layer=core operation=match_stages outcome=scan-empty access={} rows=0 bound_ms={:.3} dictionary_ms={:.3} dictionary_lookups={} availability_ms={:.3} index_ms={:.3} scan_setup_ms={:.3} scan_read_ms={:.3} reconstruct_lookup_ms=0.000 materialize_ms=0.000 total_ms={:.3}",
+                    access,
+                    bound_elapsed.as_secs_f64() * 1_000.0,
+                    dictionary_elapsed.as_secs_f64() * 1_000.0,
+                    dictionary_lookups,
+                    availability_elapsed.as_secs_f64() * 1_000.0,
+                    index_elapsed.as_secs_f64() * 1_000.0,
+                    scan_setup_elapsed.as_secs_f64() * 1_000.0,
+                    scan_read_elapsed.as_secs_f64() * 1_000.0,
+                    total_started.elapsed().as_secs_f64() * 1_000.0,
+                );
+            }
             return Ok(Vec::new());
         }
 
+        let reconstruct_started = Instant::now();
         let requested_ids = rows.unique_unbound_ids(&bound);
+        let requested_id_count = requested_ids.len();
         let id_to_term = self.lookup_terms_by_ids(&requested_ids).await?;
+        let reconstruct_lookup_elapsed = reconstruct_started.elapsed();
+        let materialize_started = Instant::now();
         let mut quads = Vec::with_capacity(rows.rows);
         for row in 0..rows.rows {
             let subject_id = rows.id_at(NativeIdColumn::Subject, &bound, row)?;
@@ -2135,6 +2189,25 @@ impl NativeRdfStoreFile {
                 object.to_owned(),
                 graph.to_owned(),
             ));
+        }
+        let materialize_elapsed = materialize_started.elapsed();
+        if profile {
+            eprintln!(
+                "[vortex-rdf-profile] layer=core operation=match_stages outcome=ok access={} rows={} requested_ids={} bound_ms={:.3} dictionary_ms={:.3} dictionary_lookups={} availability_ms={:.3} index_ms={:.3} scan_setup_ms={:.3} scan_read_ms={:.3} reconstruct_lookup_ms={:.3} materialize_ms={:.3} total_ms={:.3}",
+                access,
+                quads.len(),
+                requested_id_count,
+                bound_elapsed.as_secs_f64() * 1_000.0,
+                dictionary_elapsed.as_secs_f64() * 1_000.0,
+                dictionary_lookups,
+                availability_elapsed.as_secs_f64() * 1_000.0,
+                index_elapsed.as_secs_f64() * 1_000.0,
+                scan_setup_elapsed.as_secs_f64() * 1_000.0,
+                scan_read_elapsed.as_secs_f64() * 1_000.0,
+                reconstruct_lookup_elapsed.as_secs_f64() * 1_000.0,
+                materialize_elapsed.as_secs_f64() * 1_000.0,
+                total_started.elapsed().as_secs_f64() * 1_000.0,
+            );
         }
         Ok(quads)
     }
