@@ -59,9 +59,14 @@ fn match_triples(
             .map_err(|e| PyRuntimeError::new_err(e.to_string())),
 
         "cottas-native-ids" | "cottas-native" => {
+            let profile = std::env::var_os("VORTEX_RDF_PROFILE_MATCH").is_some();
+            let total_start = Instant::now();
+            let open_start = Instant::now();
             let store = PY_NATIVE_RUNTIME
                 .block_on(NativeRdfStoreFile::open(Path::new(&path)))
                 .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+            let open_elapsed = open_start.elapsed();
+            let match_start = Instant::now();
             let quads = PY_NATIVE_RUNTIME
                 .block_on(store.match_pattern_with_policy(
                     subject.as_ref(),
@@ -71,10 +76,25 @@ fn match_triples(
                     NativeIndexPolicy::Auto,
                 ))
                 .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
-            Ok(quads
+            let match_elapsed = match_start.elapsed();
+            let rows = quads.len();
+            let convert_start = Instant::now();
+            let triples = quads
                 .into_iter()
                 .map(|(subject, predicate, object, _graph)| (subject, predicate, object))
-                .collect())
+                .collect();
+            let convert_elapsed = convert_start.elapsed();
+            if profile {
+                eprintln!(
+                    "[vortex-rdf-profile] layer=pyo3 operation=match_triples rows={} open_ms={:.3} match_ms={:.3} rust_convert_ms={:.3} total_ms={:.3}",
+                    rows,
+                    open_elapsed.as_secs_f64() * 1_000.0,
+                    match_elapsed.as_secs_f64() * 1_000.0,
+                    convert_elapsed.as_secs_f64() * 1_000.0,
+                    total_start.elapsed().as_secs_f64() * 1_000.0,
+                );
+            }
+            Ok(triples)
         }
 
         other => Err(PyRuntimeError::new_err(format!(

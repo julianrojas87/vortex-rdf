@@ -121,9 +121,13 @@ class VortexStore(Store):
         if self.backend != "native":
             raise ValueError(f"Unsupported Vortex backend: {self.backend}")
 
+        profile = os.environ.get("VORTEX_RDF_PROFILE_MATCH") == "1"
+        profile_started_ns = __import__("time").perf_counter_ns()
+        n3_started_ns = __import__("time").perf_counter_ns()
         s_n3 = self._node_to_n3(s)
         p_n3 = self._node_to_n3(p)
         o_n3 = self._node_to_n3(o)
+        n3_finished_ns = __import__("time").perf_counter_ns()
 
         if trace:
             print(
@@ -139,15 +143,34 @@ class VortexStore(Store):
                 flush=True,
             )
 
+        native_started_ns = __import__("time").perf_counter_ns()
         triples_out = match_triples(
             self.path, s_n3, p_n3, o_n3, self.layout,
         )
-        for ss, pp, oo in triples_out:
-            yield (
+        native_finished_ns = __import__("time").perf_counter_ns()
+        parse_started_ns = native_finished_ns
+        parsed_rows = [
+            (
                 self._from_n3_safe(ss),
                 self._from_n3_safe(pp),
                 self._from_n3_safe(oo),
-            ), None
+            )
+            for ss, pp, oo in triples_out
+        ]
+        parse_finished_ns = __import__("time").perf_counter_ns()
+        if profile:
+            print(
+                "[vortex-rdf-profile] layer=python operation=triples "
+                f"rows={len(parsed_rows)} "
+                f"n3_ms={(n3_finished_ns - n3_started_ns) / 1_000_000:.3f} "
+                f"native_call_ms={(native_finished_ns - native_started_ns) / 1_000_000:.3f} "
+                f"rdflib_parse_ms={(parse_finished_ns - parse_started_ns) / 1_000_000:.3f} "
+                f"total_before_yield_ms={(parse_finished_ns - profile_started_ns) / 1_000_000:.3f}",
+                file=__import__("sys").stderr,
+                flush=True,
+            )
+        for triple in parsed_rows:
+            yield triple, None
 
     def diagnose_triples(self, triple_pattern):
         """Return timings plus raw/unique rows for one native-ID triple pattern."""

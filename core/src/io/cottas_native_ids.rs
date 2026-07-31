@@ -1308,13 +1308,28 @@ pub struct NativeRdfStoreFile {
 
 impl NativeRdfStoreFile {
     pub async fn open(path: impl AsRef<Path>) -> Result<Self> {
+        let profile = std::env::var_os("VORTEX_RDF_PROFILE_MATCH").is_some();
+        let total_start = Instant::now();
+        let open_start = Instant::now();
         let file = NATIVE_FILE_SESSION
             .open_options()
             .open_path(path.as_ref())
             .await
             .map_err(VortexRdfError::from)?
             .with_caching();
-        Self::try_new(file)
+        let open_elapsed = open_start.elapsed();
+        let validate_start = Instant::now();
+        let store = Self::try_new(file)?;
+        if profile {
+            eprintln!(
+                "[vortex-rdf-profile] layer=core operation=open path={} file_open_ms={:.3} validate_ms={:.3} total_ms={:.3}",
+                path.as_ref().display(),
+                open_elapsed.as_secs_f64() * 1_000.0,
+                validate_start.elapsed().as_secs_f64() * 1_000.0,
+                total_start.elapsed().as_secs_f64() * 1_000.0,
+            );
+        }
+        Ok(store)
     }
 
     pub fn try_new(file: vortex_file::VortexFile) -> Result<Self> {
