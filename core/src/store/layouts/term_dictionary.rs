@@ -27,7 +27,7 @@ use vortex_array::expr::{root, select};
 use vortex_array::match_each_integer_ptype;
 #[cfg(feature = "file-io")]
 use vortex_array::stream::ArrayStreamExt as _;
-#[cfg(any(feature = "file-io", target_arch = "wasm32", test))]
+#[cfg(any(feature = "file-io", target_arch = "wasm32"))]
 use vortex_array::validity::Validity;
 use vortex_array::{ArrayRef, IntoArray, VortexSessionExecute};
 use vortex_file::VortexFile;
@@ -498,7 +498,7 @@ impl TermDictionary {
     /// Returns the FSST array itself when the terms are compressed, so writing
     /// a store out carries the compressed form rather than a re-expanded copy;
     /// a multi-chunk store round-trips as a chunked array of its held chunks.
-    #[cfg(any(feature = "file-io", target_arch = "wasm32", test))]
+    #[cfg(any(feature = "file-io", target_arch = "wasm32"))]
     pub(crate) fn terms_array(&self) -> ArrayRef {
         match &self.terms {
             TermStore::Canonical(a) => a.clone().into_array(),
@@ -1337,7 +1337,7 @@ pub(crate) fn validate_blob_file(file: &VortexFile, expected_rows: u64) -> Resul
 /// dictionary is held in (FSST when compressed at the source). Serialized as
 /// a complete Vortex file into the quads file's dictionary metadata segment
 /// (`io::embedded::DICT_SEGMENT_KEY`).
-#[cfg(any(feature = "file-io", target_arch = "wasm32", test))]
+#[cfg(any(feature = "file-io", target_arch = "wasm32"))]
 pub(crate) fn embedded_dict_array(dict: &TermDictionary) -> Result<ArrayRef> {
     StructArray::try_new(
         [TERM_FIELD].into(),
