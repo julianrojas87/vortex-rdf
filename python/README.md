@@ -77,10 +77,10 @@ pushdown.
 `"dictionary"`. Opening auto-detects the layout — `VortexRdfStore` takes no
 layout argument.
 
-For Dictionary-layout files, the term dictionary (embedded in the file as a
-metadata-segment blob) is held in memory when its byte size fits the residency
-budget; pass `VortexRdfStore(path, max_resident_bytes=...)` to change the
-budget (recommended for benchmarking large stores).
+For Dictionary-layout files, the term dictionary (carried in the file as its
+own dictionary component) is held in memory when its byte size fits the
+residency budget; pass `VortexRdfStore(path, max_resident_bytes=...)` to
+change the budget (recommended for benchmarking large stores).
 
 ## File-backed vs in-memory
 

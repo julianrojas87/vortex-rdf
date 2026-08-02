@@ -30,7 +30,7 @@ Vortex-RDF serializes everything as [Vortex files](https://docs.vortex.dev/specs
 
 The `.vortex` files allow efficient compression and random access, letting the OS load only necessary chunks on demand without any parsing overhead. Opening a file (`VortexRdfStore::from_file`) is lazy: no data is read until queried, and `match_pattern` filters are pushed down into the file scan as Vortex filter [expressions](https://docs.vortex.dev/concepts/expressions). The same bytes loaded into memory open through `VortexRdfStore::from_bytes` (the WASM bindings' path), fully materialized. Cloud-based remote reads (e.g. HTTP range requests against blob storage) fit the same reader abstraction and are planned.
 
-Every file is **self-describing**: alongside the FlatBuffers schema of its [`DType`s](https://docs.vortex.dev/concepts/dtypes), a small JSON **manifest** rides in a user metadata segment declaring the layout, its embedded components (the Dictionary layout's term dictionary) and index inventory — validated against the schema on every open. Specialized encodings are preserved verbatim: compressed data **stays compressed** during transfer and is only decompressed lazily when strictly needed by the consumer.
+Every file is **self-describing**: its root is a native Vortex layout (`vortex-rdf.store.v1`) whose first child is the transparent **quad-source** table — a plain scan of the file reads the quads — and whose further children are named **components** (the Dictionary layout's term dictionary, one child per secondary-index family), each with its own row space, all written through one shared segment sink. The component inventory (name, role, implementation slug, version, required flag, column shape) rides in the root layout's metadata and is validated on every open. Specialized encodings are preserved verbatim: compressed data **stays compressed** during transfer and is only decompressed lazily when strictly needed by the consumer.
 
 ---
 
@@ -39,7 +39,7 @@ Every file is **self-describing**: alongside the FlatBuffers schema of its [`DTy
 RDF quads are stored as a Vortex [`StructArray`](https://docs.rs/vortex/latest/vortex/array/arrays/struct_/type.StructArray.html) (or a [`ChunkedArray`](https://docs.rs/vortex/latest/vortex/array/arrays/chunked/type.ChunkedArray.html) of StructArrays for chunked/streamed builds). How that array is shaped and built is controlled by three **orthogonal, build-time choices**:
 
 1. A **column layout** (`LayoutStrategy`) — the columnar schema used for the quad terms.
-2. An optional set of **secondary indexes** (`IndexType`) — extra columns embedded alongside the quads to accelerate pattern matching.
+2. An optional set of **secondary indexes** (`IndexType`) — persisted as their own layout children beside the quads (extra columns of the in-memory array) to accelerate pattern matching.
 3. An **ingestion builder** (`BuilderStrategy`) — how the incoming quad stream is turned into that array (sorting and memory model).
 
 A single store type, `VortexRdfStore`, works over any resulting array: it auto-detects the layout from the schema's field names and routes queries accordingly.
@@ -67,7 +67,7 @@ Same as `Default` for `s`, `p`, `g`, but the object column is decomposed into ty
 | `o_lang` | `VarBin<Utf8>` (nullable) | Language tag — non-null when `o_kind = 3` |
 
 #### `Dictionary`
-All four quad fields are stored as `u32` codes into a **single global term dictionary**: the lexicographically sorted set of unique term strings. In memory the dictionary is held beside the code columns in its compact (FSST-compressed) columnar form. A serialized file carries it **embedded**: the quad columns stay bare, and the dictionary is a complete Vortex file of its own riding in the quads file's metadata segments — one self-contained artifact whose quads section pays no scan or compression penalty for its self-description. Because the blob is itself a scannable sorted `utf8` column, large dictionaries can stay file-backed and be probed by pruned scans through a bounded reader instead of being lifted into memory (a byte-size threshold decides).
+All four quad fields are stored as `u32` codes into a **single global term dictionary**: the lexicographically sorted set of unique term strings. In memory the dictionary is held beside the code columns in its compact (FSST-compressed) columnar form. A serialized file carries it as the store root's **`dictionary` child**: the quad columns stay bare, and the dictionary is a scannable layout child with its own row space — one self-contained artifact whose quads section pays no scan or compression penalty for its self-description. Because the child is itself a scannable sorted `utf8` column, large dictionaries can stay file-backed and be probed by pruned scans of just the splits a probe touches instead of being lifted into memory (a byte-size threshold decides).
 
 | Column | Type | Content |
 |---|---|---|
@@ -208,7 +208,7 @@ Vortex compresses the repeated strings internally (FSST, dictionary encodings), 
 
 ### `Dictionary` layout
 
-**Term dictionary** (the embedded blob's `_dict_term` column): the lexicographically sorted set of unique terms. IDs are implicit — a term's ID is simply its position:
+**Term dictionary** (the `dictionary` child's `_dict_term` column): the lexicographically sorted set of unique terms. IDs are implicit — a term's ID is simply its position:
 
 | ID* | Term |
 |---|---|
