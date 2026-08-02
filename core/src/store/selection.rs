@@ -4,8 +4,9 @@
 //! the base data it was constructed from and narrows a `RowSelection` over
 //! it. Everything a selection names is a *base* row id, so ids stay meaningful
 //! however many times a view is refined — which is what lets secondary indexes
-//! (whose `_idx_*_rid` columns address the base rows) survive `match_pattern`,
-//! and what lets a matched view later be handed back for mutation.
+//! (whose components' `rid` columns address the base rows) survive
+//! `match_pattern`, and what lets a matched view later be handed back for
+//! mutation.
 //!
 //! Both backends select rows in this same currency. The three variants also
 //! encode an invariant the file backend needs: a range and an id list are
@@ -342,7 +343,8 @@ pub(crate) fn split_bounds(selection: &RowSelection, row_count: u64) -> (Selecti
 
 /// The starting mask for one file split: the rows `selection` covers within
 /// `range`, minus any that `deleted` has tombstoned. Returned split-relative
-/// (one bit per row of `range`), ready for [`evaluate_filter_split`].
+/// (one bit per row of `range`), ready for the store's per-split filter
+/// evaluation (`evaluate_filter_split`).
 #[cfg(feature = "file-io")]
 pub(crate) fn split_start_mask(
     selection: &Selection,

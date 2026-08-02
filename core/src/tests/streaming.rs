@@ -143,7 +143,6 @@ async fn test_sorted_streaming_chunk_boundaries() {
 /// produce — otherwise unexercised for the string layouts.
 #[tokio::test]
 async fn test_sorted_streaming_spilled_indexes_match_in_memory() {
-    use crate::store::builders::assemble_chunks;
     use crate::store::builders::sorted_stream::build_sorted_stream_chunk_stream;
 
     let indexes = vec![IndexType::SecondaryByCopy, IndexType::SecondaryByReference];
@@ -161,16 +160,23 @@ async fn test_sorted_streaming_spilled_indexes_match_in_memory() {
         })
         .collect();
 
-    let chunks = build_sorted_stream_chunk_stream(
+    // The quad chunk stream is primary-only (index families stream as native
+    // components beside it); chunk sizes still follow the merge windows.
+    let built = build_sorted_stream_chunk_stream(
         Box::new(quad_stream(quads.clone())),
         LayoutStrategy::Default,
         indexes.clone(),
         3,
     )
     .await
-    .expect("spilled build")
-    .chunks;
-    let chunks: Vec<_> = chunks
+    .expect("spilled build");
+    assert_eq!(
+        built.components.len(),
+        4,
+        "posg/ospg/ref-o/ref-p components"
+    );
+    let chunks: Vec<_> = built
+        .chunks
         .collect::<Vec<_>>()
         .await
         .into_iter()
@@ -182,9 +188,17 @@ async fn test_sorted_streaming_spilled_indexes_match_in_memory() {
         "unexpected chunk sizes"
     );
 
-    let store =
-        VortexRdfStore::new(assemble_chunks(chunks, LayoutStrategy::Default, &indexes).unwrap())
-            .unwrap();
+    // The materializing path re-glues the streamed components into the
+    // in-memory row space, index routing included.
+    let built = crate::store::builders::sorted_stream::build_sorted_stream_array(
+        Box::new(quad_stream(quads.clone())),
+        LayoutStrategy::Default,
+        indexes.clone(),
+        3,
+    )
+    .await
+    .expect("spilled array build");
+    let store = VortexRdfStore::from_built(built).unwrap();
     assert_eq!(store.indexes(), &indexes[..]);
 
     // Every quad survived the spill round-trip, in global subject order.
@@ -376,8 +390,7 @@ async fn test_sorted_builder_stamps_is_sorted() {
 /// chunk-local sorts are not global order — then nothing may be stamped.
 #[tokio::test]
 async fn test_unsorted_exact_chunk_boundary_stamps_index_leads() {
-    use crate::common::array::column_is_sorted;
-    use crate::store::builders::assemble_chunks;
+    use crate::store::array::column_is_sorted;
     use crate::store::builders::unsorted_stream::build_chunk_stream;
     use vortex_array::VortexSessionExecute;
     use vortex_array::arrays::struct_::{StructArray, StructArrayExt};
@@ -434,9 +447,10 @@ async fn test_unsorted_exact_chunk_boundary_stamps_index_leads() {
 
     // And the stamped index routes correctly: identical results to a
     // no-index (mask scan) store over the same data.
-    let store =
-        VortexRdfStore::new(assemble_chunks(chunks, LayoutStrategy::Default, &indexes).unwrap())
-            .unwrap();
+    let store = VortexRdfStore::new(
+        crate::store::builders::assemble_chunks(chunks, LayoutStrategy::Default, &indexes).unwrap(),
+    )
+    .unwrap();
     let baseline = VortexRdfStore::from_built(
         VortexRdfStore::build_vortex_array_with_builder::<UnsortedStreamBuilder>(
             quad_stream(quads),
@@ -574,4 +588,77 @@ async fn test_quads_vec_matches_stream_collection() {
         assert_eq!(collected, streamed, "{tag}");
     }
     std::fs::remove_dir_all(&dir).ok();
+}
+
+/// An unsorted multi-chunk build's index children are per-chunk sorted, not
+/// globally sorted. Reading them back must NOT restore binary-search
+/// routing: the descriptors carry `sorted: false`, in-memory resolution
+/// declines, and the mask scan answers correctly. (Regression: an earlier
+/// `from_bytes` unconditionally re-stamped these columns sorted, making this
+/// match return 5 rows instead of 4.)
+#[cfg(feature = "file-io")]
+#[tokio::test]
+async fn test_unsorted_multichunk_from_bytes_matches_correctly() {
+    use crate::store::builders::unsorted_stream::build_chunk_stream;
+    use crate::store::indexes::IndexType;
+
+    // Predicates interleave across chunks so per-chunk sorted != global.
+    let quads: Vec<Quad> = (0..12)
+        .map(|i| {
+            make_quad(
+                &format!("http://example.org/s/{i:02}"),
+                &format!("http://example.org/p/{}", i % 3),
+                &format!("o{}", i),
+                GraphName::DefaultGraph,
+            )
+        })
+        .collect();
+    let raws: Vec<crate::store::RawQuad> =
+        quads.iter().map(crate::store::RawQuad::from_quad).collect();
+    let built = build_chunk_stream(
+        Box::new(futures::stream::iter(raws.into_iter().map(Ok))),
+        LayoutStrategy::Default,
+        vec![IndexType::SecondaryByCopy],
+        4,
+    )
+    .await
+    .unwrap();
+    let split = crate::store::indexes::tee::split_row_space(
+        built.dtype,
+        built.chunks,
+        built.components_sorted,
+    )
+    .unwrap();
+    let mut components = split.components;
+    components.extend(built.components);
+    let mut bytes: Vec<u8> = Vec::new();
+    crate::io::store_layout::write_store(
+        &crate::io::VORTEX_SESSION,
+        &mut bytes,
+        vortex_array::stream::ArrayStreamAdapter::new(split.quad_dtype, split.quad_chunks),
+        crate::io::store_layout::default_child_strategy(),
+        false,
+        components,
+    )
+    .await
+    .unwrap();
+
+    let store = VortexRdfStore::from_bytes(&bytes).await.unwrap();
+    assert_eq!(store.indexes(), &[IndexType::SecondaryByCopy]);
+    let p = NamedNode::new("http://example.org/p/1").unwrap();
+    let matched: Vec<Quad> = store
+        .match_pattern(None, Some(&p), None, None)
+        .await
+        .unwrap()
+        .quads()
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    // Ground truth: p/1 appears for i = 1, 4, 7, 10 -> 4 quads.
+    assert_eq!(
+        matched.len(),
+        4,
+        "index-routed match after from_bytes is wrong"
+    );
 }

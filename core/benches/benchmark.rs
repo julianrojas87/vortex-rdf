@@ -43,7 +43,7 @@ use std::sync::{Mutex, OnceLock};
 use futures::stream;
 use oxrdf::{GraphName, NamedNode, NamedOrBlankNode, Term};
 
-use vortex_rdf_core::common::testing::generate_rdf_data_stream;
+use support::generate_rdf_data_stream;
 use vortex_rdf_core::{
     LayoutStrategy, SortedInMemoryBuilder, SortedStreamBuilder, UnsortedStreamBuilder,
     VortexRdfError, VortexRdfStore, io,
@@ -413,7 +413,7 @@ fn open_file(bencher: divan::Bencher, layout: &Layout) {
         });
 }
 
-/// Load a store from file bytes (`from_bytes`): manifest validation plus a
+/// Load a store from file bytes (`from_bytes`): root-layout validation plus a
 /// full in-memory materialization off the buffer-backed file.
 #[divan::bench]
 fn from_bytes(bencher: divan::Bencher) {
@@ -437,13 +437,13 @@ fn from_bytes(bencher: divan::Bencher) {
 // ══════════════════════════════════════════════════════════════════════════
 // Group 4 — DICTIONARY RESIDENCY (file-backed vs resident term dictionary)
 //
-// A Dictionary file's embedded term dictionary can be lifted resident at open
-// or left in its metadata-segment blob and reached by scans through the
-// bounded reader (`from_file_with_dict_residency`, byte threshold). The
-// residency axis moves cost between phases: resident pays one contiguous blob
-// read at open and then probes/decodes from memory; file-backed opens on
-// footer metadata alone but pays a pruned blob scan per cold term probe and a
-// row-index scan per decoded chunk.
+// A Dictionary file's term dictionary can be lifted resident at open or left
+// in its dictionary child and reached by scans through the bounded reader
+// (`from_file_with_dict_residency`, byte threshold). The residency axis moves
+// cost between phases: resident pays one contiguous child read at open and
+// then probes/decodes from memory; file-backed opens on footer metadata alone
+// but pays a pruned child scan per cold term probe and a row-index scan per
+// decoded chunk.
 // ══════════════════════════════════════════════════════════════════════════
 
 #[derive(Copy, Clone, PartialEq, Eq, Hash)]
@@ -512,7 +512,7 @@ fn open_dict_store(residency: DictResidency, size: usize) -> VortexRdfStore {
     })
 }
 
-/// Open cost across the residency axis: resident pays the blob read and
+/// Open cost across the residency axis: resident pays the child read and
 /// dictionary lift, file-backed only the footer reads.
 #[divan::bench(args = DICT_CONFIGS)]
 fn dict_open(bencher: divan::Bencher, residency: &DictResidency) {

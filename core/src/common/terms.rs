@@ -18,7 +18,7 @@ use oxrdfio::{RdfFormat, RdfParser};
 /// profiling showed as ~48% of every many-row read (both in-memory and
 /// file-backed). `.vortex` files are likewise trusted to have been checked when
 /// written. The `Result` is kept so the decode call sites (which `?` on genuinely
-/// fallible neighbours like [`buf_as_str`]) stay uniform.
+/// fallible neighbours like `buf_as_str`) stay uniform.
 pub fn parse_named_node(s: &str) -> Result<NamedNode> {
     let s = s.trim_matches(|c| c == '<' || c == '>');
     Ok(NamedNode::new_unchecked(s))

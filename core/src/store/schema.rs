@@ -1,9 +1,11 @@
 //! The column names that define the serialized format.
 //!
 //! These are contract, not policy: a name change here changes what a written
-//! file means, so they live in one place. Index column names (`_idx_*`) are
-//! owned by their index modules ([`secondary_by_copy::Family`],
-//! [`secondary_by_reference`]), which expose them through accessors.
+//! file means, so they live in one place. Column names owned by a single
+//! subsystem live with that subsystem instead: index column names (`_idx_*`)
+//! in their index modules ([`secondary_by_copy::Family`],
+//! [`secondary_by_reference`]), the dictionary child's `_dict_term` in
+//! [`term_dictionary`](crate::store::term_dictionary).
 //!
 //! [`secondary_by_copy::Family`]: crate::store::indexes::secondary_by_copy::Family
 //! [`secondary_by_reference`]: crate::store::indexes::secondary_by_reference
@@ -28,7 +30,3 @@ pub(crate) const COL_O_KIND: &str = "o_kind";
 pub(crate) const COL_O_VALUE: &str = "o_value";
 pub(crate) const COL_O_DATATYPE: &str = "o_datatype";
 pub(crate) const COL_O_LANG: &str = "o_lang";
-
-/// The single column of an embedded dictionary blob: non-nullable utf8, row i
-/// holding the term with code i (sorted, so codes are lexicographic ranks).
-pub(crate) const TERM_FIELD: &str = "_dict_term";

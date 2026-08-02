@@ -4,25 +4,25 @@ use clap::ValueEnum;
 use oxrdf::{GraphName, NamedNode, NamedOrBlankNode, Quad, Term};
 use vortex_array::arrays::struct_::{StructArray, StructArrayExt};
 use vortex_array::arrays::{PrimitiveArray, VarBinViewArray};
-use vortex_array::dtype::{DType, FieldNames, PType};
+use vortex_array::dtype::{DType, PType};
 use vortex_array::scalar::Scalar;
-use vortex_array::validity::Validity;
-use vortex_array::{ArrayRef, IntoArray, VortexSessionExecute};
+use vortex_array::{ArrayRef, VortexSessionExecute};
 
-use crate::common::array::StrColReader;
 use crate::error::{Result, VortexRdfError};
 use crate::io::VORTEX_SESSION;
 use crate::store::RawQuad;
+use crate::store::array::StrColReader;
 
 pub mod default;
+pub(crate) mod dict_access;
 pub mod dictionary;
-pub mod term_dictionary;
 pub mod typed_object;
 
-use self::term_dictionary::DictAccess;
+pub(crate) use self::dict_access::DictAccess;
+#[cfg(feature = "file-io")]
+use crate::store::schema::PRIMARY_COLUMNS;
 use crate::store::schema::{
     COL_G, COL_O, COL_O_DATATYPE, COL_O_KIND, COL_O_LANG, COL_O_VALUE, COL_P, COL_S,
-    PRIMARY_COLUMNS,
 };
 
 /// Determines the columnar schema used to store RDF quads in the Vortex StructArray.
@@ -67,9 +67,10 @@ pub enum LayoutStrategy {
     /// ### `LayoutStrategy::Dictionary` column schema
     /// All four quad fields stored as u32 codes into a single global term
     /// dictionary. In memory the dictionary lives beside the columns (see
-    /// [`term_dictionary`]); a serialized file carries it as a complete
-    /// Vortex-file blob in a user metadata segment (the *embedded* form, see
-    /// [`crate::io::embedded`]), so the quad columns stay bare.
+    /// [`term_dictionary`](crate::store::term_dictionary)); a serialized
+    /// file carries it as the native
+    /// container's `dictionary` child (see `crate::io::store_layout`), so
+    /// the quad columns stay bare.
     ///
     /// | Column        | Type                  | Content                                             |
     /// |---------------|-----------------------|-----------------------------------------------------|
@@ -91,7 +92,7 @@ impl LayoutStrategy {
     pub(crate) fn from_dtype(dtype: &DType) -> LayoutStrategy {
         if let DType::Struct(fields, _) = dtype {
             // u32 code columns mean Dictionary; the dictionary itself rides
-            // outside the schema, as an embedded metadata segment.
+            // outside the schema, as the native container's dictionary child.
             if matches!(fields.field(COL_S), Some(DType::Primitive(ptype, _)) if ptype == PType::U32)
             {
                 return LayoutStrategy::Dictionary;
@@ -121,7 +122,7 @@ impl LayoutStrategy {
     /// [`TermDictionary`], so Dictionary chunks are built by the dedicated
     /// [`dictionary::build_chunk`] pipeline instead.
     ///
-    /// [`TermDictionary`]: crate::store::layouts::term_dictionary::TermDictionary
+    /// [`TermDictionary`]: crate::store::term_dictionary::TermDictionary
     pub(crate) fn build_columns(self, quads: &[RawQuad]) -> Result<Vec<ArrayRef>> {
         match self {
             LayoutStrategy::Default => Ok(default::build_columns(quads)),
@@ -257,7 +258,7 @@ impl TermRef<'_> {
 /// cache for every bound role before the match core runs, so the per-stage
 /// `resolve` calls below it are reads — and the one place a dictionary may
 /// perform I/O to answer them is the prelude (see
-/// [`DictAccess::resolve_pattern`](term_dictionary::DictAccess::resolve_pattern)).
+/// [`DictAccess::resolve_pattern`](dict_access::DictAccess::resolve_pattern)).
 ///
 /// The render goes into `scratch` rather than a fresh `String` per probe: a
 /// term's N-Triples form is only needed long enough to search the dictionary
@@ -325,6 +326,7 @@ impl ResolvedLayout {
     }
 
     /// Field names of the primary (non-index) columns.
+    #[cfg(feature = "file-io")]
     pub(crate) fn primary_column_names(&self) -> Vec<&'static str> {
         match self {
             ResolvedLayout::Default | ResolvedLayout::Dictionary(_) => PRIMARY_COLUMNS.to_vec(),
@@ -340,32 +342,6 @@ impl ResolvedLayout {
                 ]
             }
         }
-    }
-
-    /// Project an array down to this layout's primary (non-index) columns only.
-    pub(crate) fn project_primary(&self, arr: &ArrayRef) -> Result<ArrayRef> {
-        let mut ctx = VORTEX_SESSION.create_execution_ctx();
-        let struct_arr = arr
-            .clone()
-            .execute::<StructArray>(&mut ctx)
-            .map_err(VortexRdfError::Vortex)?;
-
-        let primary = self.primary_column_names();
-        let names: FieldNames = primary.iter().copied().collect();
-        let arrays: Vec<ArrayRef> = primary
-            .iter()
-            .map(|n| {
-                struct_arr
-                    .unmasked_field_by_name(n)
-                    .cloned()
-                    .map_err(VortexRdfError::Vortex)
-            })
-            .collect::<Result<_>>()?;
-
-        let len = arrays.first().map(|a| a.len()).unwrap_or(0);
-        StructArray::try_new(names, arrays, len, Validity::NonNullable)
-            .map_err(VortexRdfError::Vortex)
-            .map(|a| a.into_array())
     }
 
     /// Decode a StructArray chunk into quads. Dictionary chunks are decoded

@@ -113,7 +113,7 @@ impl VortexRdfStore {
     /// pipeline, which is worth ~1 ms per `triples()` call and decides join
     /// performance under rdflib's per-binding probing. `max_resident_bytes`
     /// overrides the Dictionary layout's term-dictionary residency budget
-    /// (the embedded blob's compressed size in bytes).
+    /// (the dictionary child's compressed size in bytes).
     #[new]
     #[pyo3(signature = (path, max_resident_bytes=None, in_memory=false))]
     fn new(
@@ -135,11 +135,12 @@ impl VortexRdfStore {
                         None => CoreStore::from_file(&path).await?,
                     };
                     if in_memory {
-                        // Round-trip through the serializable parts: rows plus
-                        // the dictionary those rows' codes address, exactly
-                        // what `from_built` reconstructs a store from.
+                        // Round-trip through the serializable parts: rows,
+                        // index components, and the dictionary those rows'
+                        // codes address, exactly what `from_parts`
+                        // reconstructs a store from.
                         let parts = store.to_serializable_parts().await?;
-                        CoreStore::from_built(parts)
+                        CoreStore::from_parts(parts)
                     } else {
                         Ok(store)
                     }

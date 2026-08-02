@@ -3,9 +3,9 @@
 //!
 //! Converts RDF quads (parsed from any format [`oxrdfio`] supports) into a
 //! Vortex [`StructArray`](vortex_array::arrays::struct_::StructArray),
-//! storable as a `.vortex` file or streamed over Vortex IPC, and queryable
-//! in place through [`VortexRdfStore`] without decompressing or copying the
-//! underlying data. See the [repository README](https://github.com/vortex-rdf/vortex-rdf)
+//! storable as a native-container `.vortex` file (or the same bytes in
+//! memory), and queryable in place through [`VortexRdfStore`] without
+//! decompressing or copying the underlying data. See the [repository README](https://github.com/vortex-rdf/vortex-rdf)
 //! for the full architecture: column layouts, secondary indexes, and
 //! ingestion builders.
 //!
@@ -50,18 +50,15 @@ pub mod store;
 
 pub use error::VortexRdfError;
 pub use io::deserialize;
-#[cfg(any(feature = "file-io", target_arch = "wasm32"))]
-pub use io::serialize;
 #[cfg(feature = "file-io")]
 pub use io::{
-    quads_stream_to_vortex, quads_stream_to_vortex_writer,
-    quads_stream_to_vortex_writer_with_builder,
+    quads_stream_to_vortex_file_with_builder, quads_stream_to_vortex_writer_with_builder,
 };
 
 pub use store::{
-    BuilderStrategy, BuiltArray, BuiltStream, DictSnapshot, DictionaryQuadSink, IndexType, Indexes,
-    LayoutStrategy, SortedInMemoryBuilder, SortedStreamBuilder, UnsortedStreamBuilder,
-    VortexArrayBuilder, VortexRdfStore,
+    BuilderStrategy, BuiltArray, DictSnapshot, DictionaryQuadSink, IndexType, Indexes,
+    LayoutStrategy, SortedInMemoryBuilder, SortedStreamBuilder, StoreParts, UnsortedStreamBuilder,
+    VortexRdfStore,
 };
 
 #[cfg(all(feature = "mimalloc", not(target_arch = "wasm32")))]

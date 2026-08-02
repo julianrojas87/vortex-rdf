@@ -188,10 +188,11 @@ impl VortexRdfStore {
 
     #[wasm_bindgen(js_name = toBytes, skip_typescript)]
     pub async fn to_bytes(&self) -> Result<Vec<u8>, JsValue> {
-        // Complete Vortex file bytes: the manifest and, under the Dictionary
-        // layout, the FSST-compressed term dictionary ride as metadata
-        // segments, so the bytes are self-describing and `fromBytes` (or a
-        // native `from_file` after writing them to disk) reads them back.
+        // Complete native-container bytes: the quad table is the transparent
+        // root child and, under the Dictionary layout, the FSST-compressed
+        // term dictionary and index copies ride as auxiliary children, so the
+        // bytes are self-describing and `fromBytes` (or a native `from_file`
+        // after writing them to disk) reads them back.
         self.inner
             .to_bytes()
             .await

@@ -52,12 +52,14 @@ impl<'a> StrColReader<'a> {
 ///
 /// Values are copied once, directly into the array's buffer — no intermediate
 /// owned `String` per value.
-pub fn make_string_array(values: impl IntoIterator<Item = impl AsRef<str>>) -> ArrayRef {
+pub(crate) fn make_string_array(values: impl IntoIterator<Item = impl AsRef<str>>) -> ArrayRef {
     VarBinViewArray::from_iter_str(values).into_array()
 }
 
 /// Build a nullable Vortex string array for optional fields (e.g. o_datatype, o_lang).
-pub fn make_nullable_string_array(values: impl IntoIterator<Item = Option<String>>) -> ArrayRef {
+pub(crate) fn make_nullable_string_array(
+    values: impl IntoIterator<Item = Option<String>>,
+) -> ArrayRef {
     VarBinViewArray::from_iter_nullable_str(values).into_array()
 }
 

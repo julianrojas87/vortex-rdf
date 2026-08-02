@@ -37,10 +37,11 @@ thiserror.workspace = true
 uuid = { version = "1", features = ["v4"] }
 rkyv = { version = "0.8.17", features = ["std", "bytecheck"] }
 serde = { version = "1.0", features = ["derive"] }
-# The embedded self-description manifest (io::embedded) is a small JSON stamp.
+# The native container's wire metadata (io::store_layout) is a small JSON stamp.
 serde_json = "1.0"
 
 futures.workspace = true
+async-trait.workspace = true
 log = "0.4.33"
 clap.workspace = true
 web-time = { workspace = true }

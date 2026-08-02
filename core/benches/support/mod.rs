@@ -9,11 +9,11 @@ use std::fmt;
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
-use futures::StreamExt;
-use oxrdf::{GraphName, NamedNode, NamedOrBlankNode, Term};
+use futures::{Stream, StreamExt, stream};
+use oxrdf::{GraphName, NamedNode, NamedOrBlankNode, Quad, Term};
 use tokio::runtime::Runtime;
 
-use vortex_rdf_core::common::testing::generate_rdf_data_stream;
+use vortex_rdf_core::error::Result;
 use vortex_rdf_core::store::RawQuad;
 use vortex_rdf_core::{
     IndexType, LayoutStrategy, SortedInMemoryBuilder, SortedStreamBuilder, UnsortedStreamBuilder,
@@ -306,4 +306,27 @@ pub fn terms_for(
         Pattern::G => (None, None, None, Some(g())),
         Pattern::SPOG => (Some(s()), Some(p()), Some(o()), Some(g())),
     }
+}
+
+/// Generate a stream of mock RDF quads for the bench targets.
+/// Triples are evenly distributed across 10 named graphs.
+pub fn generate_rdf_data_stream(size: usize) -> impl Stream<Item = Result<RawQuad>> {
+    const EX: &str = "http://example.org/";
+    const NUM_GRAPHS: u64 = 10;
+
+    stream::iter((0..size).map(|i| {
+        let subject =
+            NamedOrBlankNode::NamedNode(NamedNode::new_unchecked(format!("{}subject/{}", EX, i)));
+        let predicate = NamedNode::new_unchecked(format!("{}predicate/{}", EX, i % 100));
+        let object = Term::NamedNode(NamedNode::new_unchecked(format!("{}object/{}", EX, i % 50)));
+        let graph = GraphName::NamedNode(NamedNode::new_unchecked(format!(
+            "{}graph/{}",
+            EX,
+            (i as u64) % NUM_GRAPHS
+        )));
+
+        Ok(RawQuad::from_quad(&Quad::new(
+            subject, predicate, object, graph,
+        )))
+    }))
 }

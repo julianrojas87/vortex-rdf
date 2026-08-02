@@ -27,6 +27,15 @@ impl TermDict {
         self.snapshot.decode(code)
     }
 
+    /// Decode a batch of codes in one call, releasing the GIL for the whole
+    /// batch — the bulk companion to [`decode`](Self::decode) for large
+    /// result sets (each FSST-backed decode pays a per-term decompression;
+    /// per-code Python calls additionally pay the FFI round-trip and hold
+    /// the GIL throughout).
+    fn decode_many(&self, py: Python<'_>, codes: Vec<u32>) -> Vec<Option<String>> {
+        py.detach(|| codes.into_iter().map(|c| self.snapshot.decode(c)).collect())
+    }
+
     fn __len__(&self) -> usize {
         self.snapshot.len()
     }

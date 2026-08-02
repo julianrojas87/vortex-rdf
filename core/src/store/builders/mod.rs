@@ -1,10 +1,13 @@
-use crate::common::array::stamp_is_sorted;
 use crate::error::{Result, VortexRdfError};
 use crate::io::VORTEX_SESSION;
 use crate::store::RawQuad;
-use crate::store::indexes::{GlobalIndexes, IndexType, Indexes, unique_indexes};
+use crate::store::array::stamp_is_sorted;
+use crate::store::indexes::{
+    IndexType, Indexes, secondary_by_copy, secondary_by_reference, unique_indexes,
+};
 use crate::store::layouts::LayoutStrategy;
-use crate::store::layouts::term_dictionary::TermDictionary;
+use crate::store::layouts::dictionary::QuadCodes;
+use crate::store::term_dictionary::TermDictionary;
 use futures::{Stream, StreamExt, stream};
 use std::future::Future;
 use std::sync::Arc;
@@ -35,19 +38,35 @@ pub(crate) fn into_vortex_error(e: VortexRdfError) -> vortex_error::VortexError 
 /// A built dataset: the quad array plus whatever layout state cannot be
 /// derived from the array alone — for the Dictionary layout, its term
 /// dictionary (the array holds only u32 code columns; the terms travel
-/// beside it and reach serialized files as an embedded metadata-segment
-/// blob).
+/// beside it and reach serialized files as the native container's
+/// `dictionary` child).
 pub struct BuiltArray {
     pub array: ArrayRef,
     pub(crate) dict: Option<Arc<TermDictionary>>,
 }
 
 /// The streaming counterpart of [`BuiltArray`]: the schema dtype, the lazy
-/// chunk stream, and the dictionary the serializer embeds as a metadata
-/// segment.
+/// chunk stream, the native components riding beside it (index children the
+/// builder streams from its own spill-run mergers — empty when the builder
+/// emits row-space chunks and leaves the split to the serializer), and the
+/// dictionary the serializer writes as the `dictionary` child.
 pub struct BuiltStream {
     pub dtype: DType,
     pub chunks: ChunkStream,
+    pub(crate) components: Vec<crate::io::store_layout::NativeComponentWrite>,
+    /// Whether any `_idx_*` columns riding in the row-space chunks are
+    /// GLOBALLY sorted — the builder's provenance, recorded on the children
+    /// the serializer's tee splits out of them. Per-chunk local sorts must
+    /// leave this false: a reader that binary-searched their concatenation
+    /// would return wrong rows. (Read by the serializer, so dead in builds
+    /// that compile none in.)
+    #[cfg_attr(not(feature = "file-io"), allow(dead_code))]
+    pub(crate) components_sorted: bool,
+    /// Whether the chunks' `s` column is globally sorted — recorded in the
+    /// written root's metadata so a materialized read can restore the
+    /// subject binary-search stamp truthfully.
+    #[cfg_attr(not(feature = "file-io"), allow(dead_code))]
+    pub(crate) quads_sorted: bool,
     pub(crate) dict: Option<Arc<TermDictionary>>,
 }
 
@@ -97,8 +116,12 @@ pub trait VortexArrayBuilder {
             let built = Self::build_vortex_array(quad_stream, layout, indexes).await?;
             let dtype = built.array.dtype().clone();
             let array = built.array;
+            let (quads_sorted, components_sorted) = row_space_sortedness(&array);
             let chunks: ChunkStream = futures::stream::once(async move { Ok(array) }).boxed();
             Ok(BuiltStream {
+                components: Vec::new(),
+                components_sorted,
+                quads_sorted,
                 dtype,
                 chunks,
                 dict: built.dict,
@@ -159,6 +182,78 @@ pub(crate) fn build_struct_array(
         .map(|a| a.into_array())
 }
 
+/// Globally sorted index columns for every requested index type, built once
+/// over the complete in-memory dataset and sliced per chunk — the global
+/// counterpart of the per-chunk `IndexType::append_*` dispatch. Lives with
+/// the builders because it is pure emission machinery: the sorted builders
+/// construct it and slice it into their chunks; nothing on the read side
+/// touches it.
+pub(crate) struct GlobalIndexes {
+    by_copy: Option<secondary_by_copy::GlobalCopyArrays>,
+    by_reference: Option<secondary_by_reference::GlobalIndexArrays>,
+}
+
+impl GlobalIndexes {
+    /// Build from the dataset in final row order (term-string columns).
+    pub(crate) fn from_quads(indexes: &[IndexType], quads: &[RawQuad]) -> Self {
+        let mut by_copy = None;
+        let mut by_reference = None;
+        for idx in unique_indexes(indexes) {
+            match idx {
+                IndexType::SecondaryByCopy => {
+                    by_copy = Some(secondary_by_copy::GlobalCopyArrays::from_quads(quads));
+                }
+                IndexType::SecondaryByReference => {
+                    by_reference =
+                        Some(secondary_by_reference::GlobalIndexArrays::from_quads(quads));
+                }
+            }
+        }
+        Self {
+            by_copy,
+            by_reference,
+        }
+    }
+
+    /// Dictionary-layout variant: build from the dataset's u32 codes.
+    pub(crate) fn from_codes(indexes: &[IndexType], codes: &QuadCodes) -> Self {
+        let mut by_copy = None;
+        let mut by_reference = None;
+        for idx in unique_indexes(indexes) {
+            match idx {
+                IndexType::SecondaryByCopy => {
+                    by_copy = Some(secondary_by_copy::GlobalCopyArrays::from_codes(codes));
+                }
+                IndexType::SecondaryByReference => {
+                    by_reference =
+                        Some(secondary_by_reference::GlobalIndexArrays::from_codes(codes));
+                }
+            }
+        }
+        Self {
+            by_copy,
+            by_reference,
+        }
+    }
+
+    /// Append window `range` of every index's global order as one chunk's
+    /// index columns.
+    pub(crate) fn append_slice(
+        &self,
+        field_names: &mut Vec<Arc<str>>,
+        field_arrays: &mut Vec<ArrayRef>,
+        range: std::ops::Range<usize>,
+    ) -> Result<()> {
+        if let Some(sbc) = &self.by_copy {
+            sbc.append_slice(field_names, field_arrays, range.clone())?;
+        }
+        if let Some(sbr) = &self.by_reference {
+            sbr.append_slice(field_names, field_arrays, range)?;
+        }
+        Ok(())
+    }
+}
+
 /// Build a chunk for rows `range` of an in-memory dataset whose index columns
 /// come pre-sorted from a [`GlobalIndexes`] — the sorted in-memory builder's
 /// chunked emission path. `quads` is the chunk's slice (`dataset[range]`).
@@ -208,6 +303,32 @@ pub(crate) fn canonicalize_sorted(arr: ArrayRef) -> Result<ArrayRef> {
         }
     }
     Ok(struct_arr.into_array())
+}
+
+/// Read a welded row-space array's sortedness provenance off its own stamps:
+/// `(s globally sorted, index sort-key columns globally sorted)`. Only the
+/// global-emission paths stamp these, so a multi-chunk assembly (whose
+/// canonicalization dropped the per-chunk stats) correctly lands on `false`.
+pub(crate) fn row_space_sortedness(array: &ArrayRef) -> (bool, bool) {
+    use crate::store::array::column_is_sorted;
+    let mut ctx = VORTEX_SESSION.create_execution_ctx();
+    let Ok(struct_arr) = array.clone().execute::<StructArray>(&mut ctx) else {
+        return (false, false);
+    };
+    let col_sorted = |name: &str| {
+        struct_arr
+            .unmasked_field_by_name(name)
+            .map(column_is_sorted)
+            .unwrap_or(false)
+    };
+    let quads_sorted = col_sorted(crate::store::schema::COL_S);
+    let index_columns: Vec<&str> = crate::store::indexes::globally_sorted_columns()
+        .into_iter()
+        .filter(|c| struct_arr.names().iter().any(|n| n.as_ref() == *c))
+        .collect();
+    let components_sorted =
+        !index_columns.is_empty() && index_columns.iter().all(|c| col_sorted(c));
+    (quads_sorted, components_sorted)
 }
 
 /// Assemble a list of per-chunk StructArrays into a single ArrayRef.

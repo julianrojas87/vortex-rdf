@@ -46,19 +46,15 @@ use vortex_array::dtype::DType;
 use vortex_array::{ArrayRef, IntoArray};
 
 use super::{IndexResolution, IndexedComponent, sorted_row_ids};
-use crate::common::array::{
-    column_is_sorted, make_string_array, search_sorted_bounds, stamp_is_sorted,
-};
 use crate::error::{Result, VortexRdfError};
 use crate::store::RawQuad;
+use crate::store::array::{make_string_array, search_sorted_bounds, stamp_is_sorted};
 use crate::store::layouts::dictionary::QuadCodes;
 use crate::store::layouts::{PatternCodes, QuadPattern, ResolvedLayout, TermRef};
 
 use super::ServePlan;
 #[cfg(feature = "file-io")]
 use vortex_array::scalar::Scalar;
-#[cfg(feature = "file-io")]
-use vortex_file::VortexFile;
 
 /// One of the two sorted copy families this index maintains, named after its
 /// sort order. Each family owns five columns: the four quad components plus
@@ -71,8 +67,161 @@ pub(crate) enum Family {
     Ospg,
 }
 
+/// Column names inside a copy family's persisted child: the plain primaries
+/// plus the primary row id — no `_idx_*` prefixes; the child's identity
+/// carries the family.
+pub(crate) const CHILD_COLUMNS: [&str; 5] = ["s", "p", "o", "g", "rid"];
+pub(crate) const CHILD_RID_COL: &str = "rid";
+pub(crate) const POSG_IMPLEMENTATION: &str = "secondary-by-copy/posg";
+pub(crate) const OSPG_IMPLEMENTATION: &str = "secondary-by-copy/ospg";
+
+/// The child components this index persists: one differently-sorted quad
+/// table per family, assembled from the row-space `_idx_*` columns.
+#[cfg(feature = "file-io")]
+pub(crate) fn push_component_specs(
+    dtype: &vortex_array::dtype::DType,
+    sorted: bool,
+    out: &mut Vec<super::IndexComponentSpec>,
+) -> crate::error::Result<()> {
+    use crate::io::store_layout::{StoreComponentDescriptor, StoreComponentRole};
+    for family in Family::ALL {
+        let source_columns = family.column_names().to_vec();
+        let target_columns = CHILD_COLUMNS.to_vec();
+        let child_dtype = super::component_child_dtype(dtype, &source_columns, &target_columns)?;
+        out.push(super::IndexComponentSpec {
+            descriptor: StoreComponentDescriptor {
+                name: family.component_name().into(),
+                role: StoreComponentRole::Index,
+                implementation: family.component_slug().into(),
+                version: 1,
+                required: false,
+                sorted,
+                dtype: child_dtype,
+            },
+            source_columns,
+            target_columns,
+        });
+    }
+    Ok(())
+}
+
+/// The persisted child's struct dtype: quad components as strings (or u32
+/// codes under the Dictionary layout) plus the u32 primary row id.
+pub(crate) fn copy_child_dtype(encoded: bool) -> vortex_array::dtype::DType {
+    use vortex_array::dtype::{DType, Nullability, PType, StructFields};
+    let term = if encoded {
+        DType::Primitive(PType::U32, Nullability::NonNullable)
+    } else {
+        DType::Utf8(Nullability::NonNullable)
+    };
+    DType::Struct(
+        StructFields::new(
+            CHILD_COLUMNS
+                .iter()
+                .map(|n| (*n).into())
+                .collect::<Vec<Arc<str>>>()
+                .into(),
+            vec![
+                term.clone(),
+                term.clone(),
+                term.clone(),
+                term,
+                DType::Primitive(PType::U32, Nullability::NonNullable),
+            ],
+        ),
+        Nullability::NonNullable,
+    )
+}
+
+/// One chunk of a copy family's persisted child from a window of its merged
+/// `(sort key, row id)` entries — plain child column names, lead stamped.
+pub(crate) fn copy_child_chunk_strings(
+    family: Family,
+    keys: &[(CopyKey<String>, u32)],
+) -> Result<ArrayRef> {
+    let [s_ix, p_ix, o_ix, g_ix] = family.key_positions();
+    let col = |ix: usize| make_string_array(keys.iter().map(|(key, _)| key.0[ix].as_str()));
+    let columns = vec![
+        col(s_ix),
+        col(p_ix),
+        col(o_ix),
+        col(g_ix),
+        PrimitiveArray::from_iter(keys.iter().map(|(_, rid)| *rid)).into_array(),
+    ];
+    stamp_is_sorted(&columns[family.lead_ix()]);
+    child_struct(columns, keys.len())
+}
+
+/// Code-column variant of [`copy_child_chunk_strings`].
+pub(crate) fn copy_child_chunk_codes(
+    family: Family,
+    keys: &[(CopyKey<u32>, u32)],
+) -> Result<ArrayRef> {
+    let [s_ix, p_ix, o_ix, g_ix] = family.key_positions();
+    let col = |ix: usize| -> ArrayRef {
+        PrimitiveArray::from_iter(keys.iter().map(|(key, _)| key.0[ix])).into_array()
+    };
+    let columns = vec![
+        col(s_ix),
+        col(p_ix),
+        col(o_ix),
+        col(g_ix),
+        PrimitiveArray::from_iter(keys.iter().map(|(_, rid)| *rid)).into_array(),
+    ];
+    stamp_is_sorted(&columns[family.lead_ix()]);
+    child_struct(columns, keys.len())
+}
+
+fn child_struct(columns: Vec<ArrayRef>, len: usize) -> Result<ArrayRef> {
+    use vortex_array::validity::Validity;
+    StructArray::try_new(
+        CHILD_COLUMNS
+            .iter()
+            .map(|n| (*n).into())
+            .collect::<Vec<Arc<str>>>()
+            .into(),
+        columns,
+        len,
+        Validity::NonNullable,
+    )
+    .map(|a| a.into_array())
+    .map_err(VortexRdfError::Vortex)
+}
+
 impl Family {
     pub(crate) const ALL: [Family; 2] = [Family::Posg, Family::Ospg];
+
+    /// The persisted child's component name.
+    pub(crate) fn component_name(self) -> &'static str {
+        match self {
+            Family::Posg => "index:posg",
+            Family::Ospg => "index:ospg",
+        }
+    }
+
+    /// The persisted child's implementation slug.
+    pub(crate) fn component_slug(self) -> &'static str {
+        match self {
+            Family::Posg => POSG_IMPLEMENTATION,
+            Family::Ospg => OSPG_IMPLEMENTATION,
+        }
+    }
+
+    /// The leading sort-key column inside the persisted child (plain names).
+    pub(crate) fn child_lead_col(self) -> &'static str {
+        match self {
+            Family::Posg => "p",
+            Family::Ospg => "o",
+        }
+    }
+
+    /// The second sort-key column inside the persisted child.
+    pub(crate) fn child_second_col(self) -> &'static str {
+        match self {
+            Family::Posg => "o",
+            Family::Ospg => "s",
+        }
+    }
 
     pub(crate) fn s_col(self) -> &'static str {
         match self {
@@ -121,27 +270,12 @@ impl Family {
         ]
     }
 
-    /// This family's four quad-component columns, in primary `(s, p, o, g)`
-    /// order — the columns a serve reads and relabels as the primaries.
-    fn primary_columns(self) -> [&'static str; 4] {
-        [self.s_col(), self.p_col(), self.o_col(), self.g_col()]
-    }
-
     /// The column holding this family's leading sort key — the one binary
     /// searches probe and builders stamp `IsSorted`.
     pub(crate) fn lead_col(self) -> &'static str {
         match self {
             Family::Posg => self.p_col(),
             Family::Ospg => self.o_col(),
-        }
-    }
-
-    /// The column holding the second sort key, sorted within each lead run —
-    /// what a prefix search probes after bounding the lead.
-    fn second_col(self) -> &'static str {
-        match self {
-            Family::Posg => self.o_col(),
-            Family::Ospg => self.s_col(),
         }
     }
 
@@ -247,19 +381,39 @@ fn choose<'a>(pattern: QuadPattern<'a>) -> Option<CopyProbe<'a>> {
     }
 }
 
-/// Resolve a pattern against this index's copy columns in an in-memory base
-/// array.
+/// The in-memory components this index assembles from a welded row space:
+/// one per family whose `_idx_*` columns are all present.
+pub(crate) fn components_from_row_space(
+    struct_arr: &StructArray,
+    out: &mut Vec<super::IndexComponent>,
+) -> crate::error::Result<()> {
+    for family in Family::ALL {
+        if let Some(component) = super::component_from_columns(
+            struct_arr,
+            family.component_name(),
+            family.component_slug(),
+            &family.column_names(),
+            &CHILD_COLUMNS,
+            family.lead_col(),
+        )? {
+            out.push(component);
+        }
+    }
+    Ok(())
+}
+
+/// Resolve a pattern against this index's in-memory component.
 ///
 /// Binary-searches the chosen family's lead column for the probe term — and,
 /// for a (p, o) prefix probe, the object column within the resulting run — and
 /// slices out the paired row ids. Declines (so the store falls back to a mask
-/// scan) when a needed column is absent, probe-incompatible, or the lead
-/// column isn't stamped `IsSorted`: a per-chunk copy over a multi-chunk array
-/// is not globally binary-searchable. The stamp is only ever set by builds
-/// that sorted the family by its full comparator, which is also what makes the
-/// second column sorted within each lead run and the prefix search valid.
+/// scan) when the family's component is absent, probe-incompatible, or not
+/// globally sorted (`IndexComponent::sorted` — per-chunk sorted data is not
+/// binary-searchable). Global sortedness by the family's full comparator is
+/// also what makes the second column sorted within each lead run and the
+/// prefix search valid.
 pub(crate) fn resolve_in_memory(
-    struct_arr: &StructArray,
+    components: &[super::IndexComponent],
     layout: &ResolvedLayout,
     pattern: QuadPattern<'_>,
     codes: &mut PatternCodes,
@@ -268,6 +422,16 @@ pub(crate) fn resolve_in_memory(
     let Some(probe) = choose(pattern) else {
         return Ok(IndexResolution::Declined);
     };
+    // Route through the index only when the family's component exists and its
+    // sort keys are globally sorted — the writer's provenance, not a stamp
+    // inspection.
+    let Some(component) = super::IndexComponent::find(components, probe.family.component_name())
+    else {
+        return Ok(IndexResolution::Declined);
+    };
+    if !component.sorted {
+        return Ok(IndexResolution::Declined);
+    }
     // Translate the term to the value columns' native probe value (a string,
     // or a dictionary code). Absent from the dictionary ⇒ nothing can match.
     // The probe terms are the pattern's own predicate/object, so this shares
@@ -275,17 +439,13 @@ pub(crate) fn resolve_in_memory(
     let Some(lead_native) = layout.probe_scalar_cached(probe.lead, codes) else {
         return Ok(IndexResolution::Empty);
     };
-    // Route through the index only when its lead column is actually usable:
-    // present, probe-castable, and stamped sorted for binary search.
-    let Ok(lead_col) = struct_arr.unmasked_field_by_name(probe.family.lead_col()) else {
+    let rows = &component.array;
+    let Ok(lead_col) = rows.unmasked_field_by_name(probe.family.child_lead_col()) else {
         return Ok(IndexResolution::Declined);
     };
     let Ok(lead_scalar) = lead_native.cast(lead_col.dtype()) else {
         return Ok(IndexResolution::Declined);
     };
-    if !column_is_sorted(lead_col) {
-        return Ok(IndexResolution::Declined);
-    }
     // Left/right binary search bounds the [lo, hi) run of rows whose lead
     // component equals the probe.
     let (mut lo, mut hi) = search_sorted_bounds(lead_col, &lead_scalar)?;
@@ -298,7 +458,7 @@ pub(crate) fn resolve_in_memory(
         let Some(second_native) = layout.probe_scalar_cached(second_term, codes) else {
             return Ok(IndexResolution::Empty);
         };
-        let Ok(second_col) = struct_arr.unmasked_field_by_name(probe.family.second_col()) else {
+        let Ok(second_col) = rows.unmasked_field_by_name(probe.family.child_second_col()) else {
             return Ok(IndexResolution::Declined);
         };
         let Ok(second_scalar) = second_native.cast(second_col.dtype()) else {
@@ -314,8 +474,7 @@ pub(crate) fn resolve_in_memory(
     // Row ids of every quad in the matched run. They come out in the family's
     // order, so `sorted_row_ids` puts them back in base row order.
     let row_ids = sorted_row_ids(
-        struct_arr
-            .unmasked_field_by_name(probe.family.rid_col())
+        rows.unmasked_field_by_name(CHILD_RID_COL)
             .map_err(VortexRdfError::Vortex)?
             .slice(lo..hi)
             .map_err(VortexRdfError::Vortex)?,
@@ -324,12 +483,13 @@ pub(crate) fn resolve_in_memory(
         row_ids,
         resolves: probe.resolves,
         // The matched quads are the contiguous `[lo, hi)` run of this family's
-        // copy columns, so a read can slice them straight from the base instead
-        // of gathering the primary columns at the row ids (see `ServePlan`).
+        // component, so a read can slice them straight from it instead of
+        // gathering the primary columns at the row ids (see `ServePlan`).
         serve: Some(ServePlan::in_memory(
-            probe.family.primary_columns(),
-            probe.family.rid_col(),
+            ["s", "p", "o", "g"],
+            CHILD_RID_COL,
             copy_decode_layout(layout),
+            component.as_array(),
             lo..hi,
         )),
     })
@@ -352,7 +512,7 @@ fn copy_decode_layout(layout: &ResolvedLayout) -> ResolvedLayout {
 /// probe simply becomes two value constraints on the same scan.
 #[cfg(feature = "file-io")]
 pub(crate) async fn resolve_file(
-    file: &VortexFile,
+    file: &crate::io::native_file::NativeStoreFile,
     layout: &ResolvedLayout,
     pattern: QuadPattern<'_>,
     codes: &mut PatternCodes,
@@ -360,18 +520,27 @@ pub(crate) async fn resolve_file(
     let Some(probe) = choose(pattern) else {
         return Ok(IndexResolution::Declined);
     };
+    // The store's index set says this index exists, but be graceful when the
+    // family's child is absent (a foreign writer could omit one family).
+    let Some((_, reader)) = file
+        .component_reader(probe.family.component_name())
+        .map_err(VortexRdfError::Vortex)?
+    else {
+        return Ok(IndexResolution::Declined);
+    };
     // Term absent from the dictionary ⇒ the pattern provably matches nothing.
     let Some(lead_native) = layout.probe_scalar_cached(probe.lead, codes) else {
         return Ok(IndexResolution::Empty);
     };
-    let mut constraints: Vec<(&'static str, Scalar)> = vec![(probe.family.lead_col(), lead_native)];
+    let mut constraints: Vec<(&'static str, Scalar)> =
+        vec![(probe.family.child_lead_col(), lead_native)];
     if let Some(second_term) = probe.second {
         let Some(second_native) = layout.probe_scalar_cached(second_term, codes) else {
             return Ok(IndexResolution::Empty);
         };
-        constraints.push((probe.family.second_col(), second_native));
+        constraints.push((probe.family.child_second_col(), second_native));
     }
-    let row_ids = super::scan_index_row_ids(file, &constraints, probe.family.rid_col()).await?;
+    let row_ids = super::scan_index_row_ids(reader.clone(), &constraints, CHILD_RID_COL).await?;
     if row_ids.is_empty() {
         return Ok(IndexResolution::Empty);
     }
@@ -380,7 +549,7 @@ pub(crate) async fn resolve_file(
         resolves: probe.resolves,
         // The copies hold the whole quad in family order, so the matched rows
         // are a contiguous run the store can stream directly (see `ServePlan`).
-        serve: build_serve_plan(probe.family, layout, pattern, codes),
+        serve: build_serve_plan(reader, layout, pattern, codes),
     })
 }
 
@@ -397,24 +566,25 @@ pub(crate) async fn resolve_file(
 /// subject-bound patterns, so the subject never appears here.
 #[cfg(feature = "file-io")]
 fn build_serve_plan(
-    family: Family,
+    reader: vortex_layout::LayoutReaderRef,
     layout: &ResolvedLayout,
     pattern: QuadPattern<'_>,
     codes: &mut PatternCodes,
 ) -> Option<ServePlan> {
     let mut constraints: Vec<(&'static str, Scalar)> = Vec::new();
     for (column, term) in [
-        (family.p_col(), pattern.predicate.map(TermRef::Predicate)),
-        (family.o_col(), pattern.object.map(TermRef::Object)),
-        (family.g_col(), pattern.graph.map(TermRef::Graph)),
+        ("p", pattern.predicate.map(TermRef::Predicate)),
+        ("o", pattern.object.map(TermRef::Object)),
+        ("g", pattern.graph.map(TermRef::Graph)),
     ] {
         let Some(term) = term else { continue };
         constraints.push((column, layout.probe_scalar_cached(term, codes)?));
     }
     Some(ServePlan::file(
-        family.primary_columns(),
-        family.rid_col(),
+        ["s", "p", "o", "g"],
+        CHILD_RID_COL,
         copy_decode_layout(layout),
+        reader,
         constraints,
     ))
 }
@@ -563,43 +733,8 @@ impl<V: Clone> CopyKey<V> {
     }
 }
 
-/// Append the ten copy columns from already-sorted `(key, row ID)` pairs.
-/// Out-of-core builders call this directly with keys merged from disk runs in
-/// global family order (`stamp_sorted = true`).
-pub(crate) fn append_sorted_string_keys(
-    field_names: &mut Vec<Arc<str>>,
-    field_arrays: &mut Vec<ArrayRef>,
-    posg: &[(CopyKey<String>, u32)],
-    ospg: &[(CopyKey<String>, u32)],
-    stamp_sorted: bool,
-) {
-    append_family_string_keys(field_names, field_arrays, Family::Posg, posg, stamp_sorted);
-    append_family_string_keys(field_names, field_arrays, Family::Ospg, ospg, stamp_sorted);
-}
-
-fn append_family_string_keys(
-    field_names: &mut Vec<Arc<str>>,
-    field_arrays: &mut Vec<ArrayRef>,
-    family: Family,
-    keys: &[(CopyKey<String>, u32)],
-    stamp_sorted: bool,
-) {
-    let [s_ix, p_ix, o_ix, g_ix] = family.key_positions();
-    let col = |ix: usize| make_string_array(keys.iter().map(|(key, _)| key.0[ix].as_str()));
-    let columns = [
-        col(s_ix),
-        col(p_ix),
-        col(o_ix),
-        col(g_ix),
-        PrimitiveArray::from_iter(keys.iter().map(|(_, rid)| *rid)).into_array(),
-    ];
-    if stamp_sorted {
-        stamp_is_sorted(&columns[family.lead_ix()]);
-    }
-    push_family(field_names, field_arrays, family, columns);
-}
-
-/// Code-column variant of [`append_sorted_string_keys`].
+/// Append both families' globally sorted code-key windows as row-space
+/// `_idx_*` columns (the in-memory builders' emission path).
 pub(crate) fn append_sorted_code_keys(
     field_names: &mut Vec<Arc<str>>,
     field_arrays: &mut Vec<ArrayRef>,

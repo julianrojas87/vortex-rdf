@@ -1,17 +1,17 @@
+use std::sync::Arc;
+
 use vortex_array::ArrayRef;
 use vortex_mask::Mask;
 
-use crate::store::indexes::ServePlan;
+use crate::store::indexes::{IndexComponent, ServePlan};
 use crate::store::selection::RowSelection;
 
 #[cfg(feature = "file-io")]
+use crate::io::native_file::NativeStoreFile;
+#[cfg(feature = "file-io")]
 use std::path::PathBuf;
 #[cfg(feature = "file-io")]
-use std::sync::Arc;
-#[cfg(feature = "file-io")]
 use vortex_array::expr::Expression;
-#[cfg(feature = "file-io")]
-use vortex_file::VortexFile;
 
 /// A lazily-decoded view onto quad data: the base the store was constructed
 /// from, plus which of its rows this view covers.
@@ -19,8 +19,8 @@ use vortex_file::VortexFile;
 /// Both variants keep their base intact and narrow a [`RowSelection`] over it
 /// rather than rewriting rows, so base row ids stay meaningful for as long as
 /// the view lives — that is what keeps secondary indexes usable across
-/// `match_pattern` (their `_idx_*_rid` columns address base rows) and what
-/// leaves the unselected data reachable for later mutation.
+/// `match_pattern` (their components' `rid` columns address base rows) and
+/// what leaves the unselected data reachable for later mutation.
 #[derive(Clone)]
 pub(crate) enum QuadsSource {
     /// Quad data that is already loaded into a Vortex array.
@@ -31,6 +31,18 @@ pub(crate) enum QuadsSource {
         /// The base row ids visible through this particular store or derived
         /// view; narrowing a view changes this without rewriting `base`.
         selection: RowSelection,
+        /// The secondary-index components held beside `base` — the in-memory
+        /// twins of a native file's index children, in the same child schema.
+        /// Empty for stores built without indexes. Views share them (`Arc`):
+        /// their `rid` columns address base rows, which a `RowSelection`
+        /// never renumbers — only a physical gather invalidates them, and a
+        /// gather constructs a fresh source, forcing that decision here.
+        ///
+        /// Living on this variant (not the store) makes the invariant
+        /// structural: a file-backed store cannot carry in-memory components —
+        /// its index data stays on disk as index children and resolves
+        /// through pushed-down scans.
+        components: Arc<[IndexComponent]>,
         /// Base rows deleted since construction, one bit per base row (`None`
         /// until something is deleted).
         ///
@@ -54,17 +66,23 @@ pub(crate) enum QuadsSource {
     #[cfg(feature = "file-io")]
     /// Quad data read lazily from a Vortex file when a query is executed.
     File {
-        /// The path the file was opened from. Kept so compaction can rewrite
-        /// the store's rows back over their own source file (atomically) and
-        /// reopen it, rather than degrading a file-backed store to an in-memory
-        /// one. Carried across every derived view so a compaction of a match
-        /// result still knows which file to overwrite.
+        /// The path the file was opened from. Kept so an OWNER's compaction
+        /// can rewrite the store's rows back over their own source file
+        /// (atomically) and reopen it, rather than degrading a file-backed
+        /// store to an in-memory one. (A derived view's compaction never
+        /// touches the file — its rows are a subset of data other readers
+        /// share.)
         path: PathBuf,
+        /// The dictionary-residency budget this store was opened with, so a
+        /// compaction's reopen keeps the caller's pinned residency mode
+        /// instead of silently reverting to the default.
+        dict_max_resident_bytes: u64,
         /// The shared file handle, including its cached schema, metadata, and
-        /// layout reader used by scans and pruning. Every file row is a quad
-        /// row (the embedded dictionary rides in a metadata segment, not the
-        /// row space), so `file.row_count()` is the store's row space.
-        file: Arc<VortexFile>,
+        /// layout reader used by scans and pruning. Every root row is a quad
+        /// row (the dictionary and index copies ride as auxiliary children
+        /// with their own row spaces), so `file.row_count()` is the store's
+        /// row space.
+        file: Arc<NativeStoreFile>,
         /// Pattern components not resolved to row ids, pushed down to the scan.
         filter: Option<Expression>,
         /// The file row ids visible through this store or derived view,

@@ -8,8 +8,8 @@ use crate::store::RawQuad;
 use crate::store::indexes::Indexes;
 use crate::store::layouts::default::DirectChunkBuilder;
 use crate::store::layouts::dictionary::ingest_interning;
-use crate::store::layouts::term_dictionary::TermDictionaryBuilder;
 use crate::store::layouts::{LayoutStrategy, dictionary};
+use crate::store::term_dictionary::TermDictionaryBuilder;
 
 use futures::{Stream, StreamExt, TryStreamExt, stream};
 use std::sync::Arc;
@@ -109,12 +109,19 @@ pub(crate) async fn build_chunk_stream(
     // Fast path: with the Default layout and no index columns, terms are
     // formatted straight into the column builders — no intermediate RawQuad
     // strings are allocated.
-    let (dtype, chunks) = if layout == LayoutStrategy::Default && indexes.is_empty() {
-        build_direct_chunk_stream(quads, chunk_size).await?
-    } else {
-        build_buffered_chunk_stream(quads, layout, indexes, chunk_size).await?
-    };
+    let (dtype, chunks, components_sorted) =
+        if layout == LayoutStrategy::Default && indexes.is_empty() {
+            let (dtype, chunks) = build_direct_chunk_stream(quads, chunk_size).await?;
+            (dtype, chunks, false)
+        } else {
+            build_buffered_chunk_stream(quads, layout, indexes, chunk_size).await?
+        };
     Ok(BuiltStream {
+        components: Vec::new(),
+        // A single whole-dataset chunk carries globally sorted, stamped
+        // index columns; anything longer is per-chunk local sorts.
+        components_sorted,
+        quads_sorted: false,
         dtype,
         chunks,
         dict: None,
@@ -215,6 +222,9 @@ async fn build_dict_chunk_stream(
 
     let chunks: ChunkStream = stream::once(async move { Ok(first) }).chain(rest).boxed();
     Ok(BuiltStream {
+        components: Vec::new(),
+        components_sorted: total <= chunk_size,
+        quads_sorted: false,
         dtype,
         chunks,
         dict: Some(dict),
@@ -228,7 +238,7 @@ async fn build_buffered_chunk_stream(
     layout: LayoutStrategy,
     indexes: Indexes,
     chunk_size: usize,
-) -> Result<(DType, ChunkStream)> {
+) -> Result<(DType, ChunkStream, bool)> {
     let mut buf: Vec<RawQuad> = Vec::with_capacity(chunk_size.min(4096));
     while buf.len() < chunk_size {
         match quads.next().await {
@@ -244,6 +254,7 @@ async fn build_buffered_chunk_stream(
     } else {
         None
     };
+    let whole_dataset = pending.is_none();
 
     let first = if buf.is_empty() {
         make_empty_struct(layout, &indexes)?
@@ -251,15 +262,7 @@ async fn build_buffered_chunk_stream(
         // Nothing follows the first chunk: it is the whole dataset and its
         // index columns are globally sorted (stamped for binary-search
         // routing).
-        build_struct_array(
-            &buf,
-            layout,
-            &indexes,
-            buf.len(),
-            0,
-            false,
-            pending.is_none(),
-        )?
+        build_struct_array(&buf, layout, &indexes, buf.len(), 0, false, whole_dataset)?
     };
     let dtype = first.dtype().clone();
     let next_row = buf.len() as u32;
@@ -303,7 +306,7 @@ async fn build_buffered_chunk_stream(
     );
 
     let chunks: ChunkStream = stream::once(async move { Ok(first) }).chain(rest).boxed();
-    Ok((dtype, chunks))
+    Ok((dtype, chunks, whole_dataset))
 }
 
 /// Fast chunk-stream path for the Default layout without indexes: appends

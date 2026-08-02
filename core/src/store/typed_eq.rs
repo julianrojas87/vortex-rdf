@@ -11,6 +11,7 @@ use vortex_array::scalar::Scalar;
 use vortex_array::{ArrayRef, VortexSessionExecute};
 
 use crate::io::VORTEX_SESSION;
+use crate::store::selection::RowSelection;
 
 /// A residual equality constraint's probe value, extracted from its `Scalar`
 /// once per scan — not per chunk, the string extraction allocates.
@@ -116,7 +117,7 @@ impl<'a> TypedEq<'a> {
                 // boolean AND — no per-row short-circuit). Decoding once to
                 // canonical views here lets `StrEq` run the length-first,
                 // conjunction-short-circuiting loop instead. Only reached with ≥2
-                // constraints (see `VortexRdfStore::typed_residual_ids`), where
+                // constraints (see `typed_residual_ids`), where
                 // the short-circuit repays the decode.
                 let arr = match col.clone().try_downcast::<VarBinView>() {
                     Ok(a) => a,
@@ -173,9 +174,89 @@ impl<'a> TypedEq<'a> {
     }
 }
 
+/// Selection size below which a *single* residual equality is better served by
+/// the typed row-at-a-time loop than the vectorized mask pipeline (see
+/// [`typed_residual_ids`]).
+///
+/// Above it the mask scan's SIMD comparison outruns the typed loop by enough to
+/// repay slicing and canonicalizing the base; below it the query is nothing but
+/// that fixed cost. The exact crossover depends on how many columns the store
+/// carries — a `SecondaryByCopy` store pays it over 14 — so this sits an order
+/// of magnitude under the narrowest measured crossover rather than at it.
+const TYPED_SINGLE_EQ_MAX_ROWS: usize = 4_096;
+
+/// Typed residual filter over a store's base: when every residual equality
+/// constraint targets a typed-comparable canonical column (see [`TypedEq`]),
+/// test just the rows the selection covers with direct loads and return the
+/// surviving base row ids. Returns `None` when any constraint cannot take the
+/// typed path — the caller then falls back to the general mask scan, whose
+/// per-call pipeline (slice through the optimizer, ConstantArray compares,
+/// BoolArray canonicalization) profiling showed dominating residual-bound
+/// patterns. The base counterpart of [`typed_positions`].
+pub(crate) fn typed_residual_ids(
+    struct_arr: &StructArray,
+    selection: &RowSelection,
+    base_len: usize,
+    eqs: &[(&'static str, Scalar)],
+) -> Option<vortex_buffer::Buffer<u64>> {
+    // With ≥2 columns the typed residual wins outright: it short-circuits
+    // the conjunction per row, which the vectorized pipeline cannot.
+    //
+    // With a lone constraint there is nothing to short-circuit, and the
+    // row-at-a-time `views()` access (an erased-array deref per row) loses
+    // to SIMD `compare_views_constant` — profiling showed a single-column
+    // `[S]` scan running ~3× slower typed. But that holds only while the
+    // scan is what dominates. The mask pipeline's arguments cost the same
+    // whatever the selection: `selection.apply` pushes a slice through the
+    // array optimizer and `mask_for` canonicalizes the struct, over *every*
+    // column the base carries. Once a fast path has already narrowed the
+    // view to a handful of rows — a bound subject's binary search leaving
+    // one residual term, the `SP` shape — that fixed cost is the entire
+    // query, and it scales with the store's width: on a `SecondaryByCopy`
+    // store (14 columns) `SP` cost 106 µs against `SPO`'s 8 µs, purely
+    // because the second constraint let it take this path instead.
+    //
+    // So the single-constraint rule is about selection size, not column
+    // count: keep the mask scan while there are enough rows for SIMD to pay
+    // for the setup, and take the typed loop below that.
+    if eqs.len() < 2 && selection.len(base_len) > TYPED_SINGLE_EQ_MAX_ROWS {
+        return None;
+    }
+    let needles = Needle::extract(eqs)?;
+    let mut ctx = VORTEX_SESSION.create_execution_ctx();
+    let cols = TypedEq::bind(struct_arr, eqs, &needles, &mut ctx)?;
+    fn collect_ids(
+        selection: &RowSelection,
+        base_len: usize,
+        matches_row: impl Fn(usize) -> bool,
+    ) -> Vec<u64> {
+        match selection {
+            RowSelection::All => (0..base_len as u64)
+                .filter(|&i| matches_row(i as usize))
+                .collect(),
+            RowSelection::Range(r) => (r.start..r.end)
+                .filter(|&i| matches_row(i as usize))
+                .collect(),
+            RowSelection::Ids(ids) => ids
+                .iter()
+                .copied()
+                .filter(|&i| matches_row(i as usize))
+                .collect(),
+        }
+    }
+    let ids: Vec<u64> = if let Some(codes) = TypedEq::code_views(&cols) {
+        collect_ids(selection, base_len, |i| {
+            codes.iter().all(|(s, c)| s[i] == *c)
+        })
+    } else {
+        collect_ids(selection, base_len, |i| cols.iter().all(|c| c.matches(i)))
+    };
+    Some(vortex_buffer::Buffer::from_iter(ids))
+}
+
 /// The positions (in `applied`'s own row order) matching every constraint,
 /// via the typed comparisons of [`TypedEq`] — the tail counterpart of
-/// `VortexRdfStore::typed_residual_ids`. Accepts a flat canonical struct or
+/// [`typed_residual_ids`]. Accepts a flat canonical struct or
 /// a chunked accretion of them (the shape `VortexRdfStore::add_quads`
 /// builds); `None` on any other shape, falling back to the mask pipeline.
 pub(crate) fn typed_positions(

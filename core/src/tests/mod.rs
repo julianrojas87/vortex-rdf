@@ -2,6 +2,9 @@
 //! here; each submodule covers one section of behavior.
 
 use super::*;
+#[cfg(feature = "file-io")]
+use crate::io::quads_stream_to_vortex;
+use crate::store::VortexArrayBuilder;
 use futures::{StreamExt, TryStreamExt, stream};
 use oxrdf::{GraphName, Literal, NamedNode, NamedOrBlankNode, Quad, Term};
 

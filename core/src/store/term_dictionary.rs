@@ -12,7 +12,7 @@
 use std::collections::{HashMap, HashSet};
 #[cfg(feature = "file-io")]
 use std::ops::Range;
-#[cfg(any(feature = "file-io", target_arch = "wasm32"))]
+#[cfg(feature = "file-io")]
 use std::sync::OnceLock;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -30,17 +30,20 @@ use vortex_array::stream::ArrayStreamExt as _;
 #[cfg(any(feature = "file-io", target_arch = "wasm32"))]
 use vortex_array::validity::Validity;
 use vortex_array::{ArrayRef, IntoArray, VortexSessionExecute};
-use vortex_file::VortexFile;
 use vortex_fsst::{FSST, FSSTArray, FSSTArraySlotsExt as _, fsst_compress, fsst_train_compressor};
 #[cfg(feature = "file-io")]
 use vortex_mask::{AllOr, Mask};
 
-use crate::common::array::{StrColReader, buf_as_str};
 use crate::error::{Result, VortexRdfError};
 use crate::io::VORTEX_SESSION;
 use crate::store::RawQuad;
-use crate::store::layouts::dictionary::QuadCodes;
-use crate::store::schema::TERM_FIELD;
+use crate::store::array::{StrColReader, buf_as_str};
+
+/// The single column of the native container's `dictionary` child: non-nullable
+/// utf8, row i holding the term with code i (sorted, so codes are lexicographic
+/// ranks). Part of the wire contract, owned here — the module that builds and
+/// reads the child — per the ownership rule in [`crate::store::schema`].
+pub(crate) const TERM_FIELD: &str = "_dict_term";
 
 /// Build-only term-to-ID lookup table, keyed by owned terms. It is deliberately
 /// kept separate from [`TermDictionary`] so stores retain only the compact
@@ -102,129 +105,13 @@ impl TermDictionaryBuilder {
     }
 }
 
-/// Ingest-time interner producing the dictionary and the coded quads in one
-/// pass: quads are consumed as they arrive, each unique term is held once, and
-/// each quad is kept as four u32 ids.
-///
-/// This replaces buffering the whole stream as a `Vec<RawQuad>` — four owned
-/// `String`s per quad, held live until the dictionary and codes were derived
-/// from them — which was the measured wasm ingest high-water mark (~377 B/row).
-/// The per-quad Strings still exist transiently (the stream hands them over),
-/// but they die inside [`push`](Self::push); what accumulates is one copy of
-/// each distinct term plus 16 bytes per quad.
-///
-/// Ids handed out during ingest are provisional (insertion order).
-/// [`finish`](Self::finish) sorts the unique terms, freezes them into the
-/// [`TermDictionary`], and remaps every quad id to its term's sorted rank —
-/// which *is* the dictionary code, since codes are lexicographic ranks. For
-/// sorted builders it then sorts the coded quads directly: `[u32; 4]`
-/// lexicographic order equals (s, p, o, g) term order (order-isomorphism
-/// again), and sorting 16-byte rows is far cheaper than sorting four-String
-/// structs.
-pub(crate) struct InterningQuadBuilder {
-    /// term → provisional id, owning each distinct term exactly once.
-    ids: HashMap<Box<str>, u32>,
-    /// One `[s, p, o, g]` of provisional ids per quad, in arrival order.
-    quads: Vec<[u32; 4]>,
-}
-
-impl InterningQuadBuilder {
-    pub(crate) fn new() -> Self {
-        Self {
-            ids: HashMap::new(),
-            quads: Vec::new(),
-        }
-    }
-
-    fn intern(&mut self, term: String) -> u32 {
-        let next = self.ids.len() as u32;
-        // `into_boxed_str` is free for exact-capacity Strings (the common
-        // case from `RawQuad::from_quad`) and shrinks the rest.
-        *self.ids.entry(term.into_boxed_str()).or_insert(next)
-    }
-
-    /// Consume one quad: intern its four terms, keep only their ids.
-    pub(crate) fn push(&mut self, q: RawQuad) {
-        let quad = [
-            self.intern(q.s),
-            self.intern(q.p),
-            self.intern(q.o),
-            self.intern(q.g),
-        ];
-        self.quads.push(quad);
-    }
-
-    /// Freeze the dictionary and produce the dataset's codes, sorted by
-    /// (s, p, o, g) when `sort` is set.
-    pub(crate) fn finish(mut self, sort: bool) -> Result<(TermDictionary, QuadCodes)> {
-        let total_start = Instant::now();
-        let n = self.quads.len();
-
-        let sort_start = Instant::now();
-        // Unique terms, so the tuple Ord never reaches the id.
-        let mut entries: Vec<(Box<str>, u32)> = self.ids.into_iter().collect();
-        entries.sort_unstable();
-        let sort_terms_elapsed = sort_start.elapsed();
-
-        // provisional id → sorted rank == dictionary code.
-        let mut rank_of = vec![0u32; entries.len()];
-        for (rank, (_, pid)) in entries.iter().enumerate() {
-            rank_of[*pid as usize] = rank as u32;
-        }
-
-        // Freeze by *consuming* the boxes: each term is freed as it is copied
-        // into the plain column, so the boxes and the column never coexist in
-        // full — that stacking was the finish-phase memory peak.
-        let freeze_start = Instant::now();
-        // List offsets are i32, so the term count must fit in one (the same
-        // guard as `from_sorted`).
-        if entries.len() > i32::MAX as usize {
-            return Err(VortexRdfError::Serialization(format!(
-                "Dictionary of {} unique terms exceeds the supported maximum ({})",
-                entries.len(),
-                i32::MAX
-            )));
-        }
-        let plain = VarBinViewArray::from_iter_str(entries.into_iter().map(|(t, _)| t));
-        let dict = TermDictionary::compress(plain)?;
-        let freeze_elapsed = freeze_start.elapsed();
-
-        let remap_start = Instant::now();
-        for quad in &mut self.quads {
-            for id in quad.iter_mut() {
-                *id = rank_of[*id as usize];
-            }
-        }
-        if sort {
-            self.quads.sort_unstable();
-        }
-        let remap_elapsed = remap_start.elapsed();
-
-        let mut codes = QuadCodes {
-            s: Vec::with_capacity(n),
-            p: Vec::with_capacity(n),
-            o: Vec::with_capacity(n),
-            g: Vec::with_capacity(n),
-        };
-        for [s, p, o, g] in self.quads {
-            codes.s.push(s);
-            codes.p.push(p);
-            codes.o.push(o);
-            codes.g.push(g);
-        }
-
-        log::debug!(
-            "[Dictionary] Interned {} quads ({} unique terms): sort terms {:?}, freeze {:?}, remap+sort quads {:?}, total {:?}",
-            n,
-            dict.len(),
-            sort_terms_elapsed,
-            freeze_elapsed,
-            remap_elapsed,
-            total_start.elapsed()
-        );
-        Ok((dict, codes))
-    }
-}
+/// Terms per FSST window when compressing at the source (see
+/// [`TermDictionary::compress`]): the granularity at which a large
+/// dictionary's serialized child can be read back, fenced, and lifted
+/// chunk-by-chunk. Small enough that a file-backed probe scans one window in
+/// tens of microseconds; large enough that the per-window symbol-table copy
+/// (~2 KiB) stays noise.
+const DICT_CHUNK_ROWS: usize = 64 * 1024;
 
 /// How a dictionary's sorted terms are held in memory.
 ///
@@ -241,10 +128,10 @@ enum TermStore {
     Canonical(VarBinViewArray),
     /// FSST-compressed terms: ~4x smaller, and every read decodes.
     Fsst(FsstTerms),
-    /// A multi-chunk term column read back from a serialized blob, each chunk
-    /// kept in the encoding it was written in. Holding the chunks (instead of
-    /// canonicalizing them into one array) is what keeps a large dictionary
-    /// FSST-compressed through the resident lift.
+    /// A multi-chunk term column read back from a serialized dictionary
+    /// child, each chunk kept in the encoding it was written in. Holding the
+    /// chunks (instead of canonicalizing them into one array) is what keeps a
+    /// large dictionary FSST-compressed through the resident lift.
     Chunked(ChunkedTerms),
 }
 
@@ -281,14 +168,6 @@ pub(crate) struct TermDictionary {
     terms: TermStore,
     /// Memo for [`get_id`](Self::get_id); see [`ProbeCache`].
     probes: ProbeCache,
-    /// Memo for the serialized embedded-blob form (see `io::ser`'s
-    /// `dict_blob_bytes`): the dictionary is frozen, so its blob never
-    /// changes, and repeated serializations of the same store (the wasm
-    /// bindings' `toBytes`) reuse it instead of re-running the nested file
-    /// write. Costs the blob's compressed size in memory once a dictionary
-    /// has been serialized, for as long as the dictionary lives.
-    #[cfg(any(feature = "file-io", target_arch = "wasm32"))]
-    blob: OnceLock<vortex_buffer::ByteBuffer>,
 }
 
 /// Cloning shares nothing: the memo starts empty rather than being copied.
@@ -302,8 +181,6 @@ impl Clone for TermDictionary {
         Self {
             terms: self.terms.clone(),
             probes: ProbeCache::new(),
-            #[cfg(any(feature = "file-io", target_arch = "wasm32"))]
-            blob: OnceLock::new(),
         }
     }
 }
@@ -314,15 +191,7 @@ impl TermDictionary {
         Self {
             terms,
             probes: ProbeCache::new(),
-            #[cfg(any(feature = "file-io", target_arch = "wasm32"))]
-            blob: OnceLock::new(),
         }
-    }
-
-    /// The serialized-blob memo cell; owned here, filled by `io::ser`.
-    #[cfg(any(feature = "file-io", target_arch = "wasm32"))]
-    pub(crate) fn blob_cache(&self) -> &OnceLock<vortex_buffer::ByteBuffer> {
-        &self.blob
     }
 
     pub(crate) fn empty() -> Self {
@@ -351,11 +220,6 @@ impl TermDictionary {
         Self::compress(plain)
     }
 
-    /// FSST-compress a plaintext term column.
-    ///
-    /// An empty dictionary is left canonical: there is nothing to train a
-    /// symbol table on, and `fsst_train_compressor` has no non-null rows to
-    /// sample.
     /// Adopt a term column as read back from a file or IPC stream.
     ///
     /// Already-FSST terms are kept compressed — decoding them here would undo
@@ -367,11 +231,11 @@ impl TermDictionary {
         elements: ArrayRef,
         ctx: &mut vortex_array::ExecutionCtx,
     ) -> Result<Self> {
-        // Flatten `Chunked` containers into their chunks: the blob's writer
-        // splits large dictionaries into several chunks, each independently
-        // FSST-compressed, and canonicalizing them into one array would
-        // decompress the dictionary on open — exactly the copy holding it
-        // compressed exists to avoid.
+        // Flatten `Chunked` containers into their chunks: the dictionary
+        // child's writer splits large dictionaries into several chunks, each
+        // independently FSST-compressed, and canonicalizing them into one
+        // array would decompress the dictionary on open — exactly the copy
+        // holding it compressed exists to avoid.
         use vortex_array::arrays::chunked::ChunkedArrayExt as _;
         let mut queue = vec![elements];
         let mut flat = Vec::new();
@@ -433,22 +297,78 @@ impl TermDictionary {
         Ok(Self::new(store))
     }
 
-    fn compress(plain: VarBinViewArray) -> Result<Self> {
+    /// FSST-compress a plaintext term column.
+    ///
+    /// An empty dictionary is left canonical: there is nothing to train a
+    /// symbol table on, and `fsst_train_compressor` has no non-null rows to
+    /// sample.
+    ///
+    /// A dictionary larger than [`DICT_CHUNK_ROWS`] is compressed in
+    /// independent windows (one symbol table trained on the whole column,
+    /// each window compressed with it): every window is a self-contained
+    /// FSST array, so the serializer can write the chunks verbatim — no
+    /// re-encoding, no slicing a parent array whose buffers every written
+    /// chunk would then drag along — and the chunk boundaries become the
+    /// file child's splits (the `FileBackedDict` fence granularity).
+    pub(crate) fn compress(plain: VarBinViewArray) -> Result<Self> {
+        Self::compress_windowed(plain, DICT_CHUNK_ROWS)
+    }
+
+    /// [`compress`](Self::compress) with an explicit window, so tests can
+    /// exercise the multi-window path without building 64 Ki terms.
+    fn compress_windowed(plain: VarBinViewArray, window: usize) -> Result<Self> {
         if plain.is_empty() {
             return Ok(Self::new(TermStore::Canonical(plain)));
         }
         let start = Instant::now();
+        let len = plain.len();
         let array = plain.into_array();
         let mut ctx = VORTEX_SESSION.create_execution_ctx();
         let compressor = fsst_train_compressor(&array, &mut ctx).map_err(VortexRdfError::Vortex)?;
-        let fsst = fsst_compress(&array, &compressor, &mut ctx).map_err(VortexRdfError::Vortex)?;
-        let terms = FsstTerms::new(fsst)?;
+        if len <= window {
+            let fsst =
+                fsst_compress(&array, &compressor, &mut ctx).map_err(VortexRdfError::Vortex)?;
+            let terms = FsstTerms::new(fsst)?;
+            log::debug!(
+                "[Dictionary] FSST-compressed {} terms in {:?}",
+                terms.len(),
+                start.elapsed()
+            );
+            return Ok(Self::new(TermStore::Fsst(terms)));
+        }
+        let windows = len.div_ceil(window);
+        let mut chunks = Vec::with_capacity(windows);
+        let mut starts = Vec::with_capacity(windows);
+        let mut at = 0usize;
+        while at < len {
+            let end = (at + window).min(len);
+            // Canonicalize the window before compressing: `fsst_compress`
+            // requires a VarBinView, not the lazy wrapper `slice` returns.
+            // The view copies share the parent's data buffers, so this is
+            // per-window view headers, not a copy of the terms.
+            let piece = array
+                .slice(at..end)
+                .map_err(VortexRdfError::Vortex)?
+                .execute::<VarBinViewArray>(&mut ctx)
+                .map_err(VortexRdfError::Vortex)?
+                .into_array();
+            let fsst =
+                fsst_compress(&piece, &compressor, &mut ctx).map_err(VortexRdfError::Vortex)?;
+            starts.push(at);
+            chunks.push(TermChunk::Fsst(FsstTerms::new(fsst)?));
+            at = end;
+        }
         log::debug!(
-            "[Dictionary] FSST-compressed {} terms in {:?}",
-            terms.len(),
+            "[Dictionary] FSST-compressed {} terms into {} windows in {:?}",
+            len,
+            chunks.len(),
             start.elapsed()
         );
-        Ok(Self::new(TermStore::Fsst(terms)))
+        Ok(Self::new(TermStore::Chunked(ChunkedTerms {
+            chunks,
+            starts,
+            len,
+        })))
     }
 
     /// The dataset's unique terms, sorted — the raw material of
@@ -511,33 +431,6 @@ impl TermDictionary {
         }
     }
 
-    /// The sorted term column as it is held, for serialization.
-    ///
-    /// Returns the FSST array itself when the terms are compressed, so writing
-    /// a store out carries the compressed form rather than a re-expanded copy;
-    /// a multi-chunk store round-trips as a chunked array of its held chunks.
-    #[cfg(any(feature = "file-io", target_arch = "wasm32"))]
-    pub(crate) fn terms_array(&self) -> ArrayRef {
-        match &self.terms {
-            TermStore::Canonical(a) => a.clone().into_array(),
-            TermStore::Fsst(f) => f.array.clone().into_array(),
-            TermStore::Chunked(c) => {
-                let chunks: Vec<ArrayRef> = c
-                    .chunks
-                    .iter()
-                    .map(|chunk| match chunk {
-                        TermChunk::Canonical(a) => a.clone().into_array(),
-                        TermChunk::Fsst(f) => f.array.clone().into_array(),
-                    })
-                    .collect();
-                let dtype = chunks[0].dtype().clone();
-                ChunkedArray::try_new(chunks, dtype)
-                    .expect("term chunks share one dtype")
-                    .into_array()
-            }
-        }
-    }
-
     /// A cursor over the terms. Holds the scratch buffer an FSST read decodes
     /// into, so callers needing several terms at once (a quad's four roles)
     /// must take one reader per role.
@@ -555,9 +448,12 @@ impl TermDictionary {
                     .iter()
                     .map(|chunk| match chunk {
                         TermChunk::Canonical(a) => ChunkCursor::Canonical(StrColReader::new(a)),
+                        // Scratch is allocated lazily inside `bytes_at`: one
+                        // eager allocation per window would tax every
+                        // single-term decode with O(windows) mallocs.
                         TermChunk::Fsst(f) => ChunkCursor::Fsst {
                             terms: f,
-                            scratch: f.new_scratch(),
+                            scratch: Vec::new(),
                         },
                     })
                     .collect(),
@@ -856,6 +752,12 @@ impl ChunkCursor<'_> {
         match self {
             ChunkCursor::Canonical(r) => r.bytes_at(local),
             ChunkCursor::Fsst { terms, scratch } => {
+                // Allocated on first use: a windowed dictionary builds one
+                // cursor per chunk, and most reads (binary-search probes,
+                // single-term decodes) only ever touch a few of them.
+                if scratch.capacity() == 0 {
+                    *scratch = terms.new_scratch();
+                }
                 scratch.clear();
                 terms.decode_into(local, scratch)
             }
@@ -886,7 +788,7 @@ impl DictReader<'_> {
 }
 
 /// An immutable handle on a Dictionary-layout store's term dictionary, taken
-/// with [`VortexRdfStore::dictionary_snapshot`].
+/// with [`VortexRdfStore::dictionary_snapshot`](crate::store::VortexRdfStore::dictionary_snapshot).
 ///
 /// Cloning is an `Arc` bump, and the snapshot retains only the dictionary — not
 /// the store or its quad columns.
@@ -918,168 +820,6 @@ impl DictSnapshot {
     }
 }
 
-/// How a resolved Dictionary layout reaches its term dictionary: the
-/// *residency* axis, sitting above [`TermStore`]'s encoding axis.
-///
-/// `Resident` holds the whole dictionary in memory — today's only variant. A
-/// planned file-backed variant will leave the terms in a scannable Vortex
-/// column and read them on demand, which makes term↔code translation
-/// asynchronous. The seam is drawn now so that variant lands as a new arm in
-/// these methods rather than a rework of their callers:
-///
-/// - [`resolve_pattern`](Self::resolve_pattern) is the **async prelude**: the
-///   one place a dictionary is allowed to perform I/O during a match. It runs
-///   before the synchronous match core and pre-resolves every bound term of
-///   the pattern into the match's [`PatternCodes`], so everything downstream
-///   resolves from that cache without touching the dictionary again.
-/// - The sync accessors ([`get_id`](Self::get_id), [`term_at`](Self::term_at))
-///   are total for `Resident`; a file-backed arm must answer them from
-///   memoized state filled by the prelude, or its caller must move to an
-///   async path.
-/// - [`resident`](Self::resident) hands out the in-memory dictionary itself,
-///   for the paths that genuinely need the whole column (reconstruction,
-///   serialization, snapshots). It is total today; the file-backed variant
-///   will change its signature, and the compile errors that causes are the
-///   audit of exactly those paths.
-#[derive(Clone)]
-pub(crate) enum DictAccess {
-    /// The whole dictionary in memory (FSST-compressed or canonical).
-    Resident(Arc<TermDictionary>),
-    /// The dictionary left in its file, probed and decoded by scans on
-    /// demand — chosen at open when the term count exceeds the residency
-    /// threshold (see `VortexRdfStore::from_file`).
-    #[cfg(feature = "file-io")]
-    FileBacked(FileBackedDict),
-}
-
-impl DictAccess {
-    /// Pre-resolve every bound term of `pattern` into `codes` — the async
-    /// prelude run before the synchronous match core.
-    ///
-    /// For `Resident` the lookups are in-memory binary searches, resolved
-    /// eagerly rather than lazily at each use site: what this buys is the
-    /// invariant the match core is written against — *after the prelude,
-    /// every bound role is in `codes`* — which is what lets a file-backed
-    /// dictionary do its I/O here and nowhere else.
-    pub(crate) async fn resolve_pattern(
-        &self,
-        pattern: super::QuadPattern<'_>,
-        codes: &mut super::PatternCodes,
-    ) -> Result<()> {
-        use super::TermRef;
-        match self {
-            DictAccess::Resident(dict) => {
-                if let Some(s) = pattern.subject {
-                    codes.resolve(TermRef::Subject(s), |t| dict.get_id(t));
-                }
-                if let Some(p) = pattern.predicate {
-                    codes.resolve(TermRef::Predicate(p), |t| dict.get_id(t));
-                }
-                if let Some(o) = pattern.object {
-                    codes.resolve(TermRef::Object(o), |t| dict.get_id(t));
-                }
-                if let Some(g) = pattern.graph {
-                    codes.resolve(TermRef::Graph(g), |t| dict.get_id(t));
-                }
-                Ok(())
-            }
-            // Each bound role costs one filtered probe of the term column
-            // (memoized in the probe cache); the resolved code is then seeded
-            // into `codes` so the sync match core never reaches back here.
-            #[cfg(feature = "file-io")]
-            DictAccess::FileBacked(fb) => {
-                if let Some(s) = pattern.subject {
-                    let id = fb.get_id(codes.render(TermRef::Subject(s))).await?;
-                    codes.resolve(TermRef::Subject(s), |_| id);
-                }
-                if let Some(p) = pattern.predicate {
-                    let id = fb.get_id(codes.render(TermRef::Predicate(p))).await?;
-                    codes.resolve(TermRef::Predicate(p), |_| id);
-                }
-                if let Some(o) = pattern.object {
-                    let id = fb.get_id(codes.render(TermRef::Object(o))).await?;
-                    codes.resolve(TermRef::Object(o), |_| id);
-                }
-                if let Some(g) = pattern.graph {
-                    let id = fb.get_id(codes.render(TermRef::Graph(g))).await?;
-                    codes.resolve(TermRef::Graph(g), |_| id);
-                }
-                Ok(())
-            }
-        }
-    }
-
-    /// Look up a term's code through the *synchronous* surface
-    /// (`VortexRdfStore::encode_code`). A file-backed dictionary cannot probe
-    /// its file without I/O, so it answers `None` — callers needing
-    /// file-backed lookups go through the async prelude instead.
-    pub(crate) fn get_id(&self, term: &str) -> Option<u32> {
-        match self {
-            DictAccess::Resident(dict) => dict.get_id(term),
-            #[cfg(feature = "file-io")]
-            DictAccess::FileBacked(_) => None,
-        }
-    }
-
-    /// [`get_id`](Self::get_id) for the match core's probe closures, which run
-    /// strictly after [`resolve_pattern`](Self::resolve_pattern) has seeded
-    /// every bound role into the pattern's code cache — so a call ever
-    /// reaching a file-backed dictionary is a broken prelude, not a miss.
-    pub(crate) fn get_id_resolved(&self, term: &str) -> Option<u32> {
-        match self {
-            DictAccess::Resident(dict) => dict.get_id(term),
-            #[cfg(feature = "file-io")]
-            DictAccess::FileBacked(_) => unreachable!(
-                "the async prelude resolves every bound role before the sync match core runs"
-            ),
-        }
-    }
-
-    /// Decode a code back to its term string through the *synchronous*
-    /// surface (`VortexRdfStore::decode_code`), or `None` when out of range —
-    /// or when the dictionary is file-backed (same contract as
-    /// [`get_id`](Self::get_id)).
-    pub(crate) fn term_at(&self, code: u32) -> Option<String> {
-        match self {
-            DictAccess::Resident(dict) => dict.term_at(code),
-            #[cfg(feature = "file-io")]
-            DictAccess::FileBacked(_) => None,
-        }
-    }
-
-    /// The in-memory dictionary, or `None` when it is file-backed — sync
-    /// callers (snapshots, in-memory chunk decode) treat `None` as "not
-    /// available here"; paths that genuinely need the whole column go through
-    /// [`ensure_resident`](Self::ensure_resident).
-    pub(crate) fn resident(&self) -> Option<&Arc<TermDictionary>> {
-        match self {
-            DictAccess::Resident(dict) => Some(dict),
-            #[cfg(feature = "file-io")]
-            DictAccess::FileBacked(_) => None,
-        }
-    }
-
-    /// The whole dictionary in memory, lifting a file-backed one with a single
-    /// term-column scan — for the operations that need the full column
-    /// (serialization, compaction, tail-merge re-encoding). The lift is
-    /// transient: it is not cached back into the access, so a store's steady
-    /// state keeps the file-backed footprint.
-    pub(crate) async fn ensure_resident(&self) -> Result<Arc<TermDictionary>> {
-        match self {
-            DictAccess::Resident(dict) => Ok(Arc::clone(dict)),
-            #[cfg(feature = "file-io")]
-            DictAccess::FileBacked(fb) => Ok(Arc::new(fb.load_resident().await?)),
-        }
-    }
-
-    /// Whether reconstruction must decode through the file (async) rather
-    /// than the resident dictionary.
-    #[cfg(feature = "file-io")]
-    pub(crate) fn is_file_backed(&self) -> bool {
-        matches!(self, DictAccess::FileBacked(_))
-    }
-}
-
 /// The in-memory fence over a file-backed dictionary's splits: the first
 /// term of every dictionary-bearing split, in file order. The term column is
 /// sorted, so a probed term can only live in the last split whose first term
@@ -1098,21 +838,20 @@ struct Fence {
     splits: Vec<Range<u64>>,
 }
 
-/// A term dictionary left in its blob: term→ID probes and ID→term decodes
-/// scan the sorted `_dict_term` column on demand instead of holding all terms
-/// resident.
+/// A term dictionary left in its layout child: term→ID probes and ID→term
+/// decodes scan the sorted `_dict_term` column on demand instead of holding
+/// all terms resident.
 ///
-/// `file` is the embedded dictionary blob opened as its own [`VortexFile`]
-/// (through the bounded reader — see `io::embedded`), so a term's code is its
-/// file row. A term probe binary-searches the in-memory [`Fence`] for the one
-/// split that can hold the term, evaluates an equality filter over just that
-/// split, and memoizes the answer in a [`ProbeCache`]. ID→term reads are
-/// row-index scans.
+/// `reader` is the dictionary child's layout reader (the native store root's
+/// `dictionary` component), so a term's code is its child row. A term probe
+/// binary-searches the in-memory [`Fence`] for the one split that can hold
+/// the term, evaluates an equality filter over just that split, and memoizes
+/// the answer in a [`ProbeCache`]. ID→term reads are row-index scans.
 #[cfg(feature = "file-io")]
 #[derive(Clone)]
 pub(crate) struct FileBackedDict {
-    /// The dictionary blob as its own file.
-    file: Arc<VortexFile>,
+    /// The dictionary child's layout reader (child-local row coordinates).
+    reader: vortex_layout::LayoutReaderRef,
     /// Number of terms.
     len: u64,
     /// term → code memo, shared across clones (every derived view of a store
@@ -1124,13 +863,22 @@ pub(crate) struct FileBackedDict {
 
 #[cfg(feature = "file-io")]
 impl FileBackedDict {
-    pub(crate) fn new(file: Arc<VortexFile>, len: u64) -> Self {
+    pub(crate) fn new(reader: vortex_layout::LayoutReaderRef, len: u64) -> Self {
         Self {
-            file,
+            reader,
             len,
             probes: Arc::new(ProbeCache::new()),
             fence: Arc::new(OnceLock::new()),
         }
+    }
+
+    /// A scan over the dictionary child — the reader-level equivalent of
+    /// `file.scan()`.
+    fn scan(&self) -> vortex_layout::scan::scan_builder::ScanBuilder<ArrayRef> {
+        vortex_layout::scan::scan_builder::ScanBuilder::new(
+            VORTEX_SESSION.clone(),
+            self.reader.clone(),
+        )
     }
 
     /// The fence, building it on first use. Concurrent first probes may race
@@ -1150,11 +898,21 @@ impl FileBackedDict {
     /// Collect the dictionary's splits (clamped to its rows, defensively) and
     /// resolve each one's first term with a single row-index scan.
     async fn build_fence(&self) -> Result<Fence> {
+        use itertools::Itertools as _;
+        use vortex_array::dtype::FieldMask;
+        use vortex_layout::scan::split_by::SplitBy;
+        let bounds = SplitBy::Layout
+            .splits(
+                self.reader.as_ref(),
+                &(0..self.reader.row_count()),
+                &[FieldMask::All],
+            )
+            .map_err(VortexRdfError::Vortex)?;
         let mut splits = Vec::new();
-        for split in self.file.splits().map_err(VortexRdfError::Vortex)? {
-            let stop = split.end.min(self.len);
-            if split.start < stop {
-                splits.push(split.start..stop);
+        for (start, end) in bounds.into_iter().tuple_windows() {
+            let stop = end.min(self.len);
+            if start < stop {
+                splits.push(start..stop);
             }
         }
         let codes: Vec<u32> = splits.iter().map(|range| range.start as u32).collect();
@@ -1181,9 +939,8 @@ impl FileBackedDict {
             None => None,
             Some(range) => {
                 let filter = [eq(get_item(TERM_FIELD, root()), lit(term))];
-                let reader = self.file.layout_reader().map_err(VortexRdfError::Vortex)?;
-                let mask = crate::store::vortex_rdf_store::evaluate_filter_split(
-                    reader,
+                let mask = crate::store::file_scan::evaluate_filter_split(
+                    self.reader.clone(),
                     &filter,
                     &range,
                     Mask::new_true((range.end - range.start) as usize),
@@ -1217,9 +974,7 @@ impl FileBackedDict {
         }
         let rows: vortex_buffer::Buffer<u64> = codes.iter().map(|&code| code as u64).collect();
         let arr = self
-            .file
             .scan()
-            .map_err(VortexRdfError::Vortex)?
             .with_row_indices(rows)
             .with_projection(select([TERM_FIELD], root()))
             .into_array_stream()
@@ -1253,7 +1008,7 @@ impl FileBackedDict {
     /// The terms a chunk of code columns needs, as a code→term map: gather the
     /// chunk's distinct codes, resolve them in one scan.
     pub(crate) async fn chunk_term_map(&self, chunk: &ArrayRef) -> Result<HashMap<u32, String>> {
-        let codes = super::dictionary::unique_codes(chunk)?;
+        let codes = crate::store::layouts::dictionary::unique_codes(chunk)?;
         let terms = self.resolve_terms(&codes).await?;
         Ok(codes.into_iter().zip(terms).collect())
     }
@@ -1261,24 +1016,24 @@ impl FileBackedDict {
     /// Lift the whole dictionary resident — the transient full-column read
     /// behind [`DictAccess::ensure_resident`].
     pub(crate) async fn load_resident(&self) -> Result<TermDictionary> {
-        dict_from_blob_file(&self.file).await
+        dict_from_reader(self.reader.clone()).await
     }
 }
 
-/// Read a dictionary blob file's whole term column into a resident
+/// Read a dictionary child's whole term column into a resident
 /// [`TermDictionary`], keeping each chunk's stored encoding (FSST where the
 /// writer compressed).
 ///
 /// Drives the scan's per-split futures inline (no runtime handle), so it
-/// serves the native bounded-shim open, the buffered `open_buffer` open, and
-/// the wasm read path alike.
-pub(crate) async fn dict_from_blob_file(file: &VortexFile) -> Result<TermDictionary> {
-    if file.row_count() == 0 {
+/// serves the file-backed open, the buffered `open_buffer` open, and the
+/// wasm read path alike.
+pub(crate) async fn dict_from_reader(
+    reader: vortex_layout::LayoutReaderRef,
+) -> Result<TermDictionary> {
+    if reader.row_count() == 0 {
         return Ok(TermDictionary::empty());
     }
-    let scan = file
-        .scan()
-        .map_err(VortexRdfError::Vortex)?
+    let scan = vortex_layout::scan::scan_builder::ScanBuilder::new(VORTEX_SESSION.clone(), reader)
         .with_projection(select([TERM_FIELD], root()));
     let mut ctx = VORTEX_SESSION.create_execution_ctx();
     let mut chunks = Vec::new();
@@ -1309,62 +1064,41 @@ pub(crate) async fn dict_from_blob_file(file: &VortexFile) -> Result<TermDiction
     )
 }
 
-/// Open a dictionary blob from its bytes (an embedded metadata segment),
-/// validate it against its manifest descriptor, and lift it resident.
-/// Synchronous segment resolution end to end — the resident tier and the
-/// wasm/`from_bytes` path.
-pub(crate) async fn dict_from_blob_bytes(
-    bytes: vortex_buffer::ByteBuffer,
-    expected_rows: u64,
-) -> Result<TermDictionary> {
-    use vortex_file::OpenOptionsSessionExt as _;
-    let file = VORTEX_SESSION
-        .open_options()
-        .open_buffer(bytes)
-        .map_err(VortexRdfError::Vortex)?;
-    validate_blob_file(&file, expected_rows)?;
-    dict_from_blob_file(&file).await
-}
-
-/// Validate an opened dictionary blob against its manifest descriptor: the
-/// expected one-column schema and the declared row count.
-pub(crate) fn validate_blob_file(file: &VortexFile, expected_rows: u64) -> Result<()> {
-    let ok_schema = matches!(file.dtype(), DType::Struct(fields, _)
-        if fields.names().len() == 1
-            && fields.names()[0].as_ref() == TERM_FIELD
-            && matches!(fields.field(TERM_FIELD), Some(DType::Utf8(vortex_array::dtype::Nullability::NonNullable))));
-    if !ok_schema {
-        return Err(VortexRdfError::Deserialization(format!(
-            "embedded dictionary blob has schema {}, expected a single \
-             non-nullable `{TERM_FIELD}: utf8` column",
-            file.dtype()
-        )));
-    }
-    if file.row_count() != expected_rows {
-        return Err(VortexRdfError::Deserialization(format!(
-            "embedded dictionary blob holds {} terms but the manifest declares {}",
-            file.row_count(),
-            expected_rows
-        )));
-    }
-    Ok(())
-}
-
-/// The embedded dictionary blob's body: a one-column `{_dict_term: utf8}`
-/// array, row i = the term with code i. Terms keep the encoding the
-/// dictionary is held in (FSST when compressed at the source). Serialized as
-/// a complete Vortex file into the quads file's dictionary metadata segment
-/// (`io::embedded::DICT_SEGMENT_KEY`).
+/// The dictionary component's body, one `{_dict_term: utf8}` struct per held
+/// term chunk — row i of the concatenation = the term with code i, in the
+/// encoding the dictionary is held in (FSST when compressed at the source).
+/// Chunk-granular because each chunk is a self-contained array (independent
+/// FSST windows, see [`TermDictionary::compress`]) written verbatim as one
+/// flat leaf, so its boundary survives as a split of the serialized child.
+/// Always at least one chunk, possibly empty — the child strategy needs a
+/// chunk to write a schema-complete component.
 #[cfg(any(feature = "file-io", target_arch = "wasm32"))]
-pub(crate) fn embedded_dict_array(dict: &TermDictionary) -> Result<ArrayRef> {
-    StructArray::try_new(
-        [TERM_FIELD].into(),
-        vec![dict.terms_array()],
-        dict.len(),
-        Validity::NonNullable,
-    )
-    .map_err(VortexRdfError::Vortex)
-    .map(|a| a.into_array())
+pub(crate) fn dict_child_chunks(dict: &TermDictionary) -> Result<Vec<ArrayRef>> {
+    let wrap = |terms: ArrayRef| -> Result<ArrayRef> {
+        let rows = terms.len();
+        StructArray::try_new(
+            [TERM_FIELD].into(),
+            vec![terms],
+            rows,
+            Validity::NonNullable,
+        )
+        .map_err(VortexRdfError::Vortex)
+        .map(|a| a.into_array())
+    };
+    match &dict.terms {
+        TermStore::Canonical(a) => Ok(vec![wrap(a.clone().into_array())?]),
+        TermStore::Fsst(f) => Ok(vec![wrap(f.array.clone().into_array())?]),
+        TermStore::Chunked(c) => c
+            .chunks
+            .iter()
+            .map(|chunk| {
+                wrap(match chunk {
+                    TermChunk::Canonical(a) => a.clone().into_array(),
+                    TermChunk::Fsst(f) => f.array.clone().into_array(),
+                })
+            })
+            .collect(),
+    }
 }
 
 #[cfg(test)]
@@ -1431,5 +1165,114 @@ mod tests {
         let copy = d.clone();
         assert_eq!(copy.get_id("<http://b>"), Some(1));
         assert_eq!(copy.get_id("<http://zz>"), None);
+    }
+
+    /// Multi-window compression is invisible to lookups: a dictionary
+    /// compressed in many small windows holds independent FSST chunks and
+    /// answers exactly like the single-window form — every term, both
+    /// directions, across window boundaries, and absent probes alike.
+    #[test]
+    fn windowed_compress_probe_parity() {
+        let terms: Vec<String> = (0..1_000)
+            .map(|i| format!("<http://example.org/term/{i:05}>"))
+            .collect();
+        let plain = VarBinViewArray::from_iter_str(terms.iter().map(String::as_str));
+        let windowed = TermDictionary::compress_windowed(plain.clone(), 64).unwrap();
+        match &windowed.terms {
+            TermStore::Chunked(c) => {
+                assert_eq!(c.chunks.len(), 1_000usize.div_ceil(64));
+                assert_eq!(c.len, 1_000);
+                assert!(c.chunks.iter().all(|ch| matches!(ch, TermChunk::Fsst(_))));
+            }
+            _ => panic!("a dictionary above the window size must be chunked"),
+        }
+        let single = TermDictionary::compress_windowed(plain, usize::MAX).unwrap();
+        assert!(matches!(single.terms, TermStore::Fsst(_)));
+        for (i, term) in terms.iter().enumerate() {
+            assert_eq!(windowed.get_id(term), Some(i as u32), "{term}");
+            assert_eq!(windowed.term_at(i as u32).as_deref(), Some(term.as_str()));
+            assert_eq!(single.get_id(term), Some(i as u32));
+        }
+        assert_eq!(windowed.get_id("<http://absent>"), None);
+        assert_eq!(windowed.term_at(1_000), None);
+    }
+
+    /// The compression windows survive serialization as the child's splits:
+    /// a `FileBackedDict` over a windowed dictionary's written child fences
+    /// one split per window and probes correctly across all of them.
+    #[cfg(feature = "file-io")]
+    #[tokio::test]
+    async fn windowed_dict_child_fence_splits() {
+        use crate::io::store_layout;
+        use vortex_array::stream::ArrayStreamAdapter;
+        use vortex_buffer::ByteBuffer;
+        use vortex_file::OpenOptionsSessionExt as _;
+
+        let terms: Vec<String> = (0..600)
+            .map(|i| format!("<http://example.org/fence/{i:04}>"))
+            .collect();
+        let plain = VarBinViewArray::from_iter_str(terms.iter().map(String::as_str));
+        let d = TermDictionary::compress_windowed(plain, 100).unwrap();
+        let len = d.len() as u64;
+
+        // A minimal native file: a one-row quad child plus the dictionary.
+        let quads = StructArray::try_new(
+            ["s", "p", "o", "g"].into(),
+            (0..4)
+                .map(|_| vortex_buffer::Buffer::from_iter([0u32]).into_array())
+                .collect::<Vec<_>>(),
+            1,
+            Validity::NonNullable,
+        )
+        .unwrap()
+        .into_array();
+        let dtype = quads.dtype().clone();
+        let stream = ArrayStreamAdapter::new(
+            dtype,
+            Box::pin(futures::stream::once(async move { Ok(quads) })),
+        );
+        let mut bytes: Vec<u8> = Vec::new();
+        store_layout::write_store(
+            &VORTEX_SESSION,
+            &mut bytes,
+            stream,
+            store_layout::default_child_strategy(),
+            false,
+            vec![crate::io::ser::dict_component(&d).unwrap()],
+        )
+        .await
+        .unwrap();
+
+        let file = VORTEX_SESSION
+            .open_options()
+            .open_buffer(ByteBuffer::from(bytes))
+            .unwrap();
+        let native = crate::io::native_file::NativeStoreFile::try_new(file).unwrap();
+        let (_, reader) = native
+            .component_reader(store_layout::DICT_COMPONENT_NAME)
+            .unwrap()
+            .expect("the dictionary child must be present");
+        let fbd = FileBackedDict::new(reader, len);
+
+        // One split per compression window, none merged, none re-cut.
+        let fence = fbd.fence().await.unwrap();
+        assert_eq!(fence.splits.len(), 6);
+
+        // Probes across every window: interior, first-of-window,
+        // last-of-window, and absent.
+        for (i, term) in terms.iter().enumerate().step_by(97) {
+            assert_eq!(fbd.get_id(term).await.unwrap(), Some(i as u32), "{term}");
+        }
+        for boundary in (0..600).step_by(100) {
+            assert_eq!(
+                fbd.get_id(&terms[boundary]).await.unwrap(),
+                Some(boundary as u32)
+            );
+            assert_eq!(
+                fbd.get_id(&terms[boundary + 99]).await.unwrap(),
+                Some((boundary + 99) as u32)
+            );
+        }
+        assert_eq!(fbd.get_id("<http://zzz>").await.unwrap(), None);
     }
 }

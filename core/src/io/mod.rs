@@ -1,6 +1,7 @@
-pub mod de;
-pub mod embedded;
-pub mod ser;
+pub(crate) mod export;
+pub(crate) mod native_file;
+pub(crate) mod ser;
+pub(crate) mod store_layout;
 
 use std::sync::LazyLock;
 use vortex_array::scalar_fn::session::ScalarFnSession;
@@ -35,15 +36,14 @@ pub static VORTEX_SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
     #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
     let session = session.with_handle(vortex_io::runtime::wasm::WasmRuntime::handle());
     vortex_file::register_default_encodings(&session);
+    store_layout::register(&session);
     session
 });
 
-pub use de::deserialize;
+pub use export::deserialize;
 #[cfg(feature = "file-io")]
-pub use de::open_vortex_file;
+pub use native_file::open_vortex_file;
 
-#[cfg(any(feature = "file-io", target_arch = "wasm32"))]
-pub use ser::serialize;
 #[cfg(feature = "file-io")]
 pub use ser::{
     quads_stream_to_vortex, quads_stream_to_vortex_file_with_builder,

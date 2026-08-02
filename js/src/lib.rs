@@ -39,9 +39,9 @@ pub async fn rdf_to_vortex(
     let config = parse_build_options(options)?;
     let quads_stream = parse_quads_from_reader(Cursor::new(input), format);
     let built = build_array(quads_stream, config).await?;
-    // Route through the store so the written bytes are a complete Vortex
-    // file whose metadata segments carry the manifest and, under the
-    // Dictionary layout, the FSST-compressed term dictionary.
+    // Route through the store so the written bytes are a complete native
+    // container whose auxiliary children carry, under the Dictionary layout,
+    // the FSST-compressed term dictionary and index copies.
     let store = CoreStore::from_built(built).map_err(|e| JsValue::from_str(&e.to_string()))?;
     store
         .to_bytes()

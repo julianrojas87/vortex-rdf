@@ -4,10 +4,11 @@ use super::{
 };
 use crate::error::Result;
 use crate::store::RawQuad;
-use crate::store::indexes::{GlobalIndexes, Indexes};
+use crate::store::builders::GlobalIndexes;
+use crate::store::indexes::Indexes;
 use crate::store::layouts::dictionary::{QuadCodes, ingest_interning};
-use crate::store::layouts::term_dictionary::TermDictionary;
 use crate::store::layouts::{LayoutStrategy, dictionary};
+use crate::store::term_dictionary::TermDictionary;
 
 use futures::{Stream, StreamExt, stream};
 use std::sync::Arc;
@@ -150,6 +151,11 @@ pub(crate) async fn build_sorted_chunk_stream(
 
     let chunks: ChunkStream = stream::once(async move { Ok(first) }).chain(rest).boxed();
     Ok(BuiltStream {
+        components: Vec::new(),
+        // Chunks slice one global emission: both the quads and the index
+        // columns concatenate back to their global sort orders.
+        components_sorted: true,
+        quads_sorted: true,
         dtype,
         chunks,
         dict: None,
@@ -191,6 +197,9 @@ fn emit_dict_chunks(
 
     let chunks: ChunkStream = stream::once(async move { Ok(first) }).chain(rest).boxed();
     Ok(BuiltStream {
+        components: Vec::new(),
+        components_sorted: true,
+        quads_sorted: true,
         dtype,
         chunks,
         dict: Some(dict),
