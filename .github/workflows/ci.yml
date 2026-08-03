@@ -39,6 +39,11 @@ jobs:
         run: cargo fmt --check
       - name: Run clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+      # The no-default-features build has its own dead-code surface (items only
+      # reachable through the file-io feature), which the default clippy run
+      # cannot see.
+      - name: Run clippy (core, no default features)
+        run: cargo clippy -p vortex-rdf-core --no-default-features --all-targets -- -D warnings
 
   rust-tests:
     name: Rust Tests (${{ matrix.label }})
@@ -71,10 +76,13 @@ jobs:
           enable-cache: true
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+      # Both js and python are members of the root workspace, so maturin and
+      # wasm-pack write to <root>/target; the cache covers that default path and
+      # `key` keeps each job's entry separate.
       - name: Cache Rust artifacts
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: python
+          key: python
       - name: Build bindings and install environment
         working-directory: python
         run: uv sync --locked
@@ -98,7 +106,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v7
         with:
-          node-version: 24
+          node-version-file: .nvmrc
           cache: npm
           cache-dependency-path: js/package-lock.json
       - name: Setup Rust toolchain
@@ -108,15 +116,20 @@ jobs:
       - name: Cache Rust artifacts
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: js
-      - name: Install wasm-pack
-        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+          key: js
+      # wasm-pack is a pinned npm devDependency; `npm ci` installs it and npm
+      # run puts node_modules/.bin ahead of anything on PATH.
       - name: Install dependencies
         working-directory: js
         run: npm ci
       - name: Build WASM package
         working-directory: js
         run: npm run build
+      # Typechecks after the build: the tsconfigs resolve against the generated
+      # pkg/web/vortex_rdf.d.ts.
+      - name: Run typecheck
+        working-directory: js
+        run: npm run typecheck
       - name: Run tests
         working-directory: js
         run: npm test

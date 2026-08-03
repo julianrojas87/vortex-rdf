@@ -55,12 +55,59 @@ jobs:
     name: CI
     uses: ./.github/workflows/ci.yml
 
+  # The three registries carry independently declared versions. This job fails
+  # before any of them is touched when they disagree with the tag being pushed
+  # (or, on workflow_dispatch, with each other).
+  verify-versions:
+    name: Verify versions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Compare declared versions
+        run: |
+          set -euo pipefail
+
+          cargo_version="$(cargo metadata --format-version 1 --no-deps \
+            | jq -r '.packages[] | select(.name == "vortex-rdf-core") | .version')"
+          npm_version="$(node -p "require('./js/package.json').version")"
+          # [project].version is optional: with maturin's dynamic versioning the
+          # PyPI version is inherited from the workspace Cargo.toml, so the cargo
+          # check below already covers it.
+          pypi_version="$(python3 -c "import tomllib; print(tomllib.load(open('python/pyproject.toml','rb'))['project'].get('version', ''))")"
+
+          if [ "${{ github.event_name }}" = "push" ]; then
+            expected="${GITHUB_REF_NAME#v}"
+          else
+            expected="$cargo_version"
+          fi
+          echo "Expected version: $expected"
+
+          fail=0
+          check() {
+            if [ "$2" != "$expected" ]; then
+              echo "::error::$1 declares version '$2', expected '$expected'"
+              fail=1
+            else
+              echo "  $1: $2"
+            fi
+          }
+          check "Cargo.toml (workspace)" "$cargo_version"
+          check "js/package.json" "$npm_version"
+          if [ -n "$pypi_version" ]; then
+            check "python/pyproject.toml" "$pypi_version"
+          else
+            echo "  python/pyproject.toml: inherited from Cargo.toml"
+          fi
+          exit "$fail"
+
   # A tag push publishes everywhere: the inputs.* context is empty on push
   # events (falsy toggles, and !inputs.dry_run is true), so each publish
   # gate ORs in the event check.
   crates:
     name: crates.io
-    needs: ci
+    needs: [ci, verify-versions]
     if: ${{ github.event_name == 'push' || inputs.crates }}
     runs-on: ubuntu-latest
     environment: release
@@ -81,7 +128,7 @@ jobs:
 
   npm:
     name: npm
-    needs: ci
+    needs: [ci, verify-versions]
     if: ${{ github.event_name == 'push' || inputs.npm }}
     runs-on: ubuntu-latest
     environment: release
@@ -97,14 +144,14 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v7
         with:
-          node-version: 24
+          node-version-file: .nvmrc
           registry-url: "https://registry.npmjs.org"
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
-      - name: Install wasm-pack
-        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+      # wasm-pack is a pinned npm devDependency; `npm ci` installs it and npm
+      # run puts node_modules/.bin ahead of anything on PATH.
       - name: Install dependencies
         working-directory: js
         run: npm ci
@@ -114,7 +161,7 @@ jobs:
 
   pypi-wheels:
     name: PyPI wheel (${{ matrix.platform.name }})
-    needs: ci
+    needs: [ci, verify-versions]
     if: ${{ github.event_name == 'push' || inputs.pypi }}
     runs-on: ${{ matrix.platform.runner }}
     strategy:
@@ -156,7 +203,7 @@ jobs:
 
   pypi-sdist:
     name: PyPI sdist
-    needs: ci
+    needs: [ci, verify-versions]
     if: ${{ github.event_name == 'push' || inputs.pypi }}
     runs-on: ubuntu-latest
     steps:

@@ -44,7 +44,9 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@v7
         with:
-          node-version: 25
+          node-version-file: .nvmrc
+          cache: npm
+          cache-dependency-path: js/package-lock.json
 
       # Build the wasm bindings and run the JavaScript comparative benchmark
       # (VortexRdfStore variants vs rdf-stores.js vs oxigraph). Wall-clock via

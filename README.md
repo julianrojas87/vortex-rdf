@@ -399,17 +399,27 @@ RUST_LOG=vortex_rdf_cli=debug,vortex_rdf_core=debug vortex-rdf-cli serialize --i
 ## Development
 
 Run `./scripts/install-git-hooks.sh` once per clone to enable the git hooks. The
-`pre-push` hook mirrors the Rust jobs in [`.github/workflows/ci.yml`](.github/workflows/ci.yml) —
-`cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
-and both `cargo test` variants. You can also run it manually with
-`./scripts/ci-check.sh`. Skip it for one push with `git push --no-verify`.
+`pre-push` hook mirrors the `lint`, `rust-tests` and `python-tests` jobs in
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) — `cargo fmt --check`,
+both `cargo clippy` runs (workspace, and core with `--no-default-features`),
+both `cargo test` variants, and `uv sync --locked && uv run pytest tests -q`
+in `python/`. You can also run it manually with `./scripts/ci-check.sh`. Skip
+it for one push with `git push --no-verify`.
 
-The `js-tests` CI job (wasm-pack build + `npm test`) is *not* mirrored locally —
-the wasm32 build needs the memory tuning `ci.yml` applies (`CARGO_BUILD_JOBS=1`,
-low codegen units/opt-level) even to run reliably, and was killed under memory
-pressure locally without it. Before pushing JS/wasm changes, run it by hand
-with `(cd js && npm run build && npm test)`; otherwise rely on GitHub CI for
-that job.
+The python block is a soft skip when `uv` is not installed: the script warns and
+continues, so CI remains the source of truth for that job on a clone without
+`uv`.
+
+The `js-tests` CI job (wasm-pack build + `npm run typecheck` + `npm test`) is
+*not* mirrored locally — the wasm32 build needs the memory tuning `ci.yml`
+applies (`CARGO_BUILD_JOBS=1`, low codegen units/opt-level) even to run
+reliably, and was killed under memory pressure locally without it. Before
+pushing JS/wasm changes, run it by hand with
+`(cd js && npm run build && npm run typecheck && npm test)`; otherwise rely on
+GitHub CI for that job.
+
+Node's version is pinned once in [`.nvmrc`](.nvmrc); every workflow reads it via
+`node-version-file`, so `nvm use` locally matches CI.
 
 ### Changelog
 
