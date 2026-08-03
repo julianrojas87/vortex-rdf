@@ -86,7 +86,6 @@ wheels = [
 
 [[package]]
 name = "vortex-rdf"
-version = "0.5.0"
 source = { editable = "." }
 
 [package.dev-dependencies]

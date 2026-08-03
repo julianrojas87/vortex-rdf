@@ -1,14 +1,20 @@
 """Type stubs for the private native extension module."""
 
-from typing import List, Optional, Tuple
+import os
+from typing import List, Optional, Tuple, Union
 
 __version__: str
+
+# `serialize_rdf`'s path arguments are `PathBuf` on the Rust side, so any
+# `os.PathLike[str]` is accepted alongside `str`.
+StrPath = Union[str, "os.PathLike[str]"]
 
 class VortexRdfError(Exception):
     """Raised when a Vortex-RDF store operation fails."""
 
 class TermDict:
     def decode(self, code: int) -> Optional[str]: ...
+    def decode_many(self, codes: List[int]) -> List[Optional[str]]: ...
     def __len__(self) -> int: ...
 
 class U32Column:
@@ -22,7 +28,7 @@ class VortexRdfStore:
     def __init__(
         self,
         path: str,
-        max_resident_terms: Optional[int] = None,
+        max_resident_bytes: Optional[int] = None,
         in_memory: bool = False,
     ) -> None: ...
     def layout(self) -> str: ...
@@ -51,10 +57,9 @@ class VortexRdfStore:
     ) -> Tuple[List[str], List[Tuple[int, int, int]]]: ...
 
 def serialize_rdf(
-    input_path: str,
-    output_path: str,
+    input_path: StrPath,
+    output_path: StrPath,
     layout: str = "default",
-    dictionary_placement: str = "padded",
     format: Optional[str] = None,
     builder: str = "unsorted-stream",
 ) -> None: ...
