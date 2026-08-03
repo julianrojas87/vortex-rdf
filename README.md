@@ -418,8 +418,10 @@ pushing JS/wasm changes, run it by hand with
 `(cd js && npm run build && npm run typecheck && npm test)`; otherwise rely on
 GitHub CI for that job.
 
-Node's version is pinned once in [`.nvmrc`](.nvmrc); every workflow reads it via
-`node-version-file`, so `nvm use` locally matches CI.
+Node's version is pinned once in [`.tool-versions`](.tool-versions); every
+workflow reads it via `node-version-file`, and mise and asdf pick it up natively,
+so a local shell matches CI. Keep the version the last token on its line —
+`actions/setup-node` does not accept a trailing comment there.
 
 ### Changelog
 
