@@ -15,5 +15,3 @@ __pycache__/
 *.pyc
 python/.venv/
 *.so
-scripts/DBBench/data/
-scripts/DBBench/dbbench_runs/
