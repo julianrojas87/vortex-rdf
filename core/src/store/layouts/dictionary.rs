@@ -128,7 +128,7 @@ impl DictionaryQuadSink {
 /// `get(term)` lookup identical for either.
 ///
 /// [`BorrowedTermIdMap`]: crate::store::term_dictionary::BorrowedTermIdMap
-pub(crate) fn encode_quads<K>(
+fn encode_quads<K>(
     quads: &[RawQuad],
     dict: &TermDictionary,
     id_map: &HashMap<K, u32>,
@@ -176,7 +176,7 @@ where
 /// `s_sorted` stamps the `IsSorted` statistic on the `s` column; valid
 /// because sorted-dictionary codes preserve lexicographic order.
 ///
-/// [`DictAccess`]: crate::store::term_dictionary::DictAccess
+/// [`DictAccess`]: crate::store::layouts::dict_access::DictAccess
 fn chunk_parts(
     codes: &QuadCodes,
     range: Range<usize>,
@@ -262,7 +262,7 @@ where
 /// (s, p, o, g) order, the unsorted builder in arrival order. Index columns
 /// are globally sorted either way (`GlobalIndexes::from_codes` sorts pairs).
 ///
-/// [`InterningQuadBuilder`]: crate::store::term_dictionary::InterningQuadBuilder
+/// [`InterningQuadBuilder`]: self::InterningQuadBuilder
 pub(crate) fn build_array(
     codes: &QuadCodes,
     indexes: &[IndexType],
@@ -657,17 +657,8 @@ impl InterningQuadBuilder {
         // into the plain column, so the boxes and the column never coexist in
         // full — that stacking was the finish-phase memory peak.
         let freeze_start = Instant::now();
-        // List offsets are i32, so the term count must fit in one (the same
-        // guard as `from_sorted`).
-        if entries.len() > i32::MAX as usize {
-            return Err(VortexRdfError::Serialization(format!(
-                "Dictionary of {} unique terms exceeds the supported maximum ({})",
-                entries.len(),
-                i32::MAX
-            )));
-        }
         let plain = VarBinViewArray::from_iter_str(entries.into_iter().map(|(t, _)| t));
-        let dict = TermDictionary::compress(plain)?;
+        let dict = TermDictionary::from_sorted_column(plain)?;
         let freeze_elapsed = freeze_start.elapsed();
 
         let remap_start = Instant::now();

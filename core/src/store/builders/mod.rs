@@ -1,3 +1,23 @@
+//! Emission orchestration: turning a quad stream into the row space a store
+//! is built or serialized from.
+//!
+//! This hub owns everything the three strategies share — the
+//! [`VortexArrayBuilder`] contract and its two products ([`BuiltArray`],
+//! [`BuiltStream`]), chunk assembly, the sortedness stamps a build is allowed
+//! to claim, and the globally-sorted index emission the sorted strategies
+//! slice their chunks out of. A strategy leaf
+//! (`sorted_in_memory`, `sorted_stream`, `unsorted_stream`) contributes only
+//! its ordering discipline and memory profile; `spill` backs the out-of-core
+//! one.
+//!
+//! Builders emit the *welded* row space — primary columns plus every
+//! requested index's `_idx_*` columns in one struct. Splitting that into a
+//! store's model or a file's children is the reader/serializer's job (see
+//! `indexes::components`), never a
+//! builder's. What a builder does own is sortedness *provenance*: only the
+//! globally-sorted paths may stamp `IsSorted`, because a reader binary-
+//! searches on that stamp alone.
+
 use crate::error::{Result, VortexRdfError};
 use crate::io::VORTEX_SESSION;
 use crate::store::RawQuad;
@@ -17,10 +37,8 @@ use vortex_array::dtype::DType;
 use vortex_array::validity::Validity;
 use vortex_array::{ArrayRef, IntoArray, VortexSessionExecute};
 
-use clap::ValueEnum;
-
 /// Number of quads per StructArray chunk in streaming/chunked builders.
-pub const DEFAULT_CHUNK_SIZE: usize = 100_000;
+pub(crate) const DEFAULT_CHUNK_SIZE: usize = 100_000;
 
 /// A stream of StructArray chunks ready for consumption by the Vortex file
 /// writer. Items use `VortexResult` because the writer polls the stream
@@ -70,7 +88,8 @@ pub struct BuiltStream {
     pub(crate) dict: Option<Arc<TermDictionary>>,
 }
 
-#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum, Debug)]
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
+#[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
 pub enum BuilderStrategy {
     /// Natural insertion order, no sorting. Chunks stream directly to the
     /// writer during serialization, bounding memory by the chunk size.
@@ -81,10 +100,10 @@ pub enum BuilderStrategy {
     SortedStream,
 }
 
-pub mod sorted_in_memory;
-pub mod sorted_stream;
+pub(crate) mod sorted_in_memory;
+pub(crate) mod sorted_stream;
 pub(crate) mod spill;
-pub mod unsorted_stream;
+pub(crate) mod unsorted_stream;
 
 pub use sorted_in_memory::SortedInMemoryBuilder;
 pub use sorted_stream::SortedStreamBuilder;
@@ -333,7 +352,7 @@ pub(crate) fn row_space_sortedness(array: &ArrayRef) -> (bool, bool) {
 
 /// Assemble a list of per-chunk StructArrays into a single ArrayRef.
 /// Returns an empty StructArray with the correct schema when `chunks` is empty.
-pub fn assemble_chunks(
+pub(crate) fn assemble_chunks(
     mut chunks: Vec<ArrayRef>,
     layout: LayoutStrategy,
     indexes: &Indexes,

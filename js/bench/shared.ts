@@ -1,8 +1,16 @@
-// Shared definitions between the orchestrator (compare.bench.ts) and the per-adapter
-// worker (compare.worker.ts). Each adapter's full lifecycle runs in its own child
-// process (see compare.bench.ts) — this file is imported independently by both, so
-// it must be pure/deterministic given the same env vars (no shared in-memory state
-// crosses the process boundary).
+// Shared infrastructure for every multi-process bench instrument here: the
+// comparative orchestrator (compare.bench.ts), its per-adapter worker
+// (compare.worker.ts), and the dictionary-memory worker (dict-memory.worker.ts,
+// which takes the dataset generator, the Vortex adapters and the memory probes).
+//
+// PURITY CONTRACT: each of those runs in its own child process and imports this
+// file independently, so it must be pure/deterministic given the same env vars —
+// no shared in-memory state crosses the process boundary, and every knob is an
+// env var read here rather than a value passed between processes.
+//
+// codspeed.bench.ts deliberately does NOT import this file: the store libraries
+// loaded below would put a foreign multi-MB wasm module into its Valgrind-
+// instrumented process. The helpers both need live in ./util.ts instead.
 
 import type { BenchOptions, Bench } from 'tinybench';
 import { DataFactory } from 'rdf-data-factory';
@@ -10,6 +18,7 @@ import type { Quad, Term } from '@rdfjs/types';
 import { readFileSync } from 'node:fs';
 
 import { VortexRdfStore, type BuildOptions } from '../entry/node.js';
+import { fmtNs, freeWasm } from './util.js';
 import {
     RdfStore,
     RdfStoreIndexNestedMapQuoted,
@@ -259,15 +268,6 @@ export interface StoreAdapter<H = unknown> {
     dispose?(h: H): void;
 }
 
-// Both Vortex's and oxigraph's public `.d.ts` are hand-curated (typescript_custom_section
-// / equivalent) and deliberately omit the wasm-bindgen `free()` method from the normal
-// consumer-facing API — ordinary callers are meant to lean on the FinalizationRegistry.
-// This benchmark is not an ordinary caller: it needs deterministic disposal, so it reaches
-// past the curated type rather than widening what real consumers see.
-function freeWasm(h: unknown): void {
-    (h as { free(): void }).free();
-}
-
 // Disposal alone isn't enough for the pure-JS adapters (rdf-stores): a 2M-quad store
 // there is a large, long-lived Map-of-Maps graph, and merely dropping the reference
 // only makes it *eligible* for GC — V8's generational collector has no obligation to
@@ -378,13 +378,6 @@ export interface Row {
     fastest: string; slowest: string; median: string; mean: string;
     fastest_ns: number; slowest_ns: number; median_ns: number; mean_ns: number;
     samples: string;
-}
-
-export function fmtNs(ns: number): string {
-    if (ns < 1e3) return ns.toFixed(0) + ' ns';
-    if (ns < 1e6) return (ns / 1e3).toPrecision(3) + ' µs';
-    if (ns < 1e9) return (ns / 1e6).toPrecision(3) + ' ms';
-    return (ns / 1e9).toPrecision(3) + ' s';
 }
 
 export function collect(bench: Bench, results: Row[]): void {

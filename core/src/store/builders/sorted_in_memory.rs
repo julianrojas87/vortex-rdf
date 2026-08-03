@@ -1,3 +1,15 @@
+//! The [`SortedInMemoryBuilder`] strategy: hold the whole dataset, sort it
+//! once by (s, p, o, g), and emit chunks as windows of that single order.
+//!
+//! Holding everything at once is what earns the global sortedness stamps on
+//! `s` and on the index value columns (built through
+//! [`GlobalIndexes`] over the sorted dataset), the
+//! stamps a reader binary-searches on. The cost is O(dataset) memory; the
+//! out-of-core strategy with the same guarantee is
+//! [`sorted_stream`](super::sorted_stream). Only this file's ordering
+//! discipline lives here — the emission machinery it drives belongs to
+//! [`builders`](super).
+
 use super::{
     BuiltArray, BuiltStream, ChunkStream, DEFAULT_CHUNK_SIZE, VortexArrayBuilder,
     build_struct_array, build_struct_array_global, into_vortex_error, make_empty_struct,

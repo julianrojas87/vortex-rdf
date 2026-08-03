@@ -126,18 +126,15 @@ pub(crate) fn push_component_specs(
     out: &mut Vec<super::IndexComponentSpec>,
 ) -> crate::error::Result<()> {
     use crate::io::store_layout::{StoreComponentDescriptor, StoreComponentRole};
-    for (name, slug, val_col, rid_col) in [
-        (REF_O_COMPONENT, O_IMPLEMENTATION, O_VAL_COL, O_RID_COL),
-        (REF_P_COMPONENT, P_IMPLEMENTATION, P_VAL_COL, P_RID_COL),
-    ] {
-        let source_columns = vec![val_col, rid_col];
+    for role in RefRole::ALL {
+        let source_columns = vec![role.val_col(), role.rid_col()];
         let target_columns = CHILD_COLUMNS.to_vec();
         let child_dtype = super::component_child_dtype(dtype, &source_columns, &target_columns)?;
         out.push(super::IndexComponentSpec {
             descriptor: StoreComponentDescriptor {
-                name: name.into(),
+                name: role.component_name().into(),
                 role: StoreComponentRole::Index,
-                implementation: slug.into(),
+                implementation: role.component_slug().into(),
                 version: 1,
                 required: false,
                 sorted,
@@ -157,6 +154,54 @@ pub(crate) const O_RID_COL: &str = "_idx_o_rid";
 pub(crate) const P_VAL_COL: &str = "_idx_p_val";
 pub(crate) const P_RID_COL: &str = "_idx_p_rid";
 
+/// One of the two quad components this index covers, named after it. Each
+/// role owns one `{val, rid}` component — its name, implementation slug, and
+/// the row-space column pair it is assembled from — so the association is
+/// stated once here instead of at every roster site.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum RefRole {
+    /// Object values.
+    O,
+    /// Predicate values.
+    P,
+}
+
+impl RefRole {
+    pub(crate) const ALL: [RefRole; 2] = [RefRole::O, RefRole::P];
+
+    /// The persisted child's component name.
+    pub(crate) fn component_name(self) -> &'static str {
+        match self {
+            RefRole::O => REF_O_COMPONENT,
+            RefRole::P => REF_P_COMPONENT,
+        }
+    }
+
+    /// The persisted child's implementation slug.
+    pub(crate) fn component_slug(self) -> &'static str {
+        match self {
+            RefRole::O => O_IMPLEMENTATION,
+            RefRole::P => P_IMPLEMENTATION,
+        }
+    }
+
+    /// The row-space column holding this role's sorted values.
+    pub(crate) fn val_col(self) -> &'static str {
+        match self {
+            RefRole::O => O_VAL_COL,
+            RefRole::P => P_VAL_COL,
+        }
+    }
+
+    /// The row-space column holding the primary row id paired with each value.
+    pub(crate) fn rid_col(self) -> &'static str {
+        match self {
+            RefRole::O => O_RID_COL,
+            RefRole::P => P_RID_COL,
+        }
+    }
+}
+
 /// Whether a struct dtype carries this index's four columns — how stores
 /// detect the index in an array or file schema without reading any data.
 pub(crate) fn is_present(dtype: &DType) -> bool {
@@ -169,11 +214,10 @@ pub(crate) fn is_present(dtype: &DType) -> bool {
     }
 }
 
-/// The sorted value column to probe (which selects the covered role's
-/// component), the term to probe for, and which pattern component a hit
-/// resolves.
+/// The covered role to probe (which names its component and columns), the
+/// term to probe for, and which pattern component a hit resolves.
 struct ColumnProbe<'a> {
-    value_column: &'static str,
+    role: RefRole,
     probe_term: TermRef<'a>,
     resolves: IndexedComponent,
 }
@@ -192,14 +236,14 @@ fn choose<'a>(pattern: QuadPattern<'a>) -> Option<ColumnProbe<'a>> {
     }
     if let Some(object) = pattern.object {
         return Some(ColumnProbe {
-            value_column: O_VAL_COL,
+            role: RefRole::O,
             probe_term: TermRef::Object(object),
             resolves: IndexedComponent::Object,
         });
     }
     if let Some(predicate) = pattern.predicate {
         return Some(ColumnProbe {
-            value_column: P_VAL_COL,
+            role: RefRole::P,
             probe_term: TermRef::Predicate(predicate),
             resolves: IndexedComponent::Predicate,
         });
@@ -213,17 +257,14 @@ pub(crate) fn components_from_row_space(
     struct_arr: &StructArray,
     out: &mut Vec<super::IndexComponent>,
 ) -> crate::error::Result<()> {
-    for (name, slug, val_col, rid_col) in [
-        (REF_O_COMPONENT, O_IMPLEMENTATION, O_VAL_COL, O_RID_COL),
-        (REF_P_COMPONENT, P_IMPLEMENTATION, P_VAL_COL, P_RID_COL),
-    ] {
+    for role in RefRole::ALL {
         if let Some(component) = super::component_from_columns(
             struct_arr,
-            name,
-            slug,
-            &[val_col, rid_col],
+            role.component_name(),
+            role.component_slug(),
+            &[role.val_col(), role.rid_col()],
             &CHILD_COLUMNS,
-            val_col,
+            role.val_col(),
         )? {
             out.push(component);
         }
@@ -249,14 +290,10 @@ pub(crate) fn resolve_in_memory(
     let Some(probe) = choose(pattern) else {
         return Ok(IndexResolution::Declined);
     };
-    let component_name = if probe.value_column == O_VAL_COL {
-        REF_O_COMPONENT
-    } else {
-        REF_P_COMPONENT
-    };
     // Route through the index only when the role's component exists and is
     // globally sorted — the writer's provenance, not a stamp inspection.
-    let Some(component) = super::IndexComponent::find(components, component_name) else {
+    let Some(component) = super::IndexComponent::find(components, probe.role.component_name())
+    else {
         return Ok(IndexResolution::Declined);
     };
     if !component.sorted {
@@ -315,13 +352,8 @@ pub(crate) async fn resolve_file(
     };
     // Map the probed role onto its persisted child; be graceful when the
     // child is absent (a foreign writer could omit one role).
-    let component = if probe.value_column == O_VAL_COL {
-        REF_O_COMPONENT
-    } else {
-        REF_P_COMPONENT
-    };
     let Some((_, reader)) = file
-        .component_reader(component)
+        .component_reader(probe.role.component_name())
         .map_err(VortexRdfError::Vortex)?
     else {
         return Ok(IndexResolution::Declined);
@@ -330,7 +362,8 @@ pub(crate) async fn resolve_file(
     let Some(native) = layout.probe_scalar_cached(probe.probe_term, codes) else {
         return Ok(IndexResolution::Empty);
     };
-    let row_ids = super::scan_index_row_ids(reader, &[("val", native)], "rid").await?;
+    let row_ids =
+        super::scan_index_row_ids(reader, &[(CHILD_VAL_COL, native)], CHILD_RID_COL).await?;
     if row_ids.is_empty() {
         return Ok(IndexResolution::Empty);
     }
@@ -573,13 +606,13 @@ mod tests {
         // Object preferred over predicate when both are bound.
         let probe = choose(QuadPattern::new(None, Some(&p), Some(&o), None)).unwrap();
         assert_eq!(probe.resolves, IndexedComponent::Object);
-        assert_eq!(probe.value_column, "_idx_o_val");
+        assert_eq!(probe.role.val_col(), "_idx_o_val");
         assert_eq!(probe.probe_term.to_string(), o.to_string());
 
         // Predicate-only patterns use the predicate side.
         let probe = choose(QuadPattern::new(None, Some(&p), None, None)).unwrap();
         assert_eq!(probe.resolves, IndexedComponent::Predicate);
-        assert_eq!(probe.value_column, "_idx_p_val");
+        assert_eq!(probe.role.val_col(), "_idx_p_val");
         assert_eq!(probe.probe_term.to_string(), p.to_string());
 
         // Nothing this index covers is bound: declines.

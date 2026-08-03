@@ -1,4 +1,4 @@
-import { Quad, Term, NamedNode, BlankNode, Literal, Quad_Subject, Quad_Predicate, Quad_Object, Quad_Graph, Stream } from '@rdfjs/types';
+import { Quad, Term, Stream } from '@rdfjs/types';
 
 /**
  * How quads are ordered while the columnar array is built.
@@ -95,10 +95,13 @@ export class VortexRdfStore {
      */
     getQuads(subject?: Term | null, predicate?: Term | null, object?: Term | null, graph?: Term | null): Promise<Quad[]>;
     /**
-     * Low-level (Dictionary layout only). Resolve a pattern to the matched rows'
-     * raw u32 term codes — four columnar `Uint32Array`s — without materializing
-     * any term strings. Returns `null` if the store is not Dictionary layout.
-     * Resolve codes to terms with `decodeTerm`. `match`/`getQuads` build on this.
+     * Low-level prototype: an alternative read path to `match`/`getQuads`,
+     * which build their own columnar payload rather than going through this.
+     * Resolves a pattern to the matched rows' raw u32 term codes — four
+     * columnar `Uint32Array`s — without materializing any term strings;
+     * resolve codes to terms with `decodeTerm`. Returns `null` unless the
+     * store is Dictionary layout with no pending appends (appended quads are
+     * encoded against a fresh dictionary, so their codes would not decode).
      */
     matchCodes(subject?: Term | null, predicate?: Term | null, object?: Term | null, graph?: Term | null): Promise<{ s: Uint32Array; p: Uint32Array; o: Uint32Array; g: Uint32Array; length: number } | null>;
     /** Low-level. Decode a Dictionary-layout term code to its N-Triples term string. */

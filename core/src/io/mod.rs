@@ -1,5 +1,9 @@
 pub(crate) mod export;
 pub(crate) mod native_file;
+/// Every item in `ser` is write-side native-container machinery, compiled only
+/// where a store can be written: natively behind `file-io`, and on wasm (whose
+/// bindings exchange file bytes).
+#[cfg(any(feature = "file-io", target_arch = "wasm32"))]
 pub(crate) mod ser;
 pub(crate) mod store_layout;
 
@@ -25,7 +29,7 @@ use vortex_io::session::RuntimeSessionExt;
 /// natively, the microtask-queue `WasmRuntime` on wasm (required by the file
 /// writer's task spawning), and none for native no-file-io builds, whose code
 /// paths are all handle-free.
-pub static VORTEX_SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
+pub(crate) static VORTEX_SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
     let session = VortexSession::empty()
         .with::<ArraySession>()
         .with::<LayoutSession>()
@@ -41,11 +45,13 @@ pub static VORTEX_SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
 });
 
 pub use export::deserialize;
-#[cfg(feature = "file-io")]
-pub use native_file::open_vortex_file;
 
 #[cfg(feature = "file-io")]
 pub use ser::{
-    quads_stream_to_vortex, quads_stream_to_vortex_file_with_builder,
-    quads_stream_to_vortex_writer, quads_stream_to_vortex_writer_with_builder,
+    quads_stream_to_vortex_file_with_builder, quads_stream_to_vortex_writer_with_builder,
 };
+
+/// The value-level [`BuilderStrategy`](crate::store::BuilderStrategy) twins of
+/// the `*_with_builder` entry points above.
+#[cfg(feature = "file-io")]
+pub use ser::{quads_stream_to_vortex_file, quads_stream_to_vortex_writer_with_strategy};

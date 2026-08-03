@@ -1,13 +1,26 @@
-use std::ops::Range;
+//! Secondary-index vocabulary and the store's dispatch into it.
+//!
+//! This hub owns what is common to every index: the [`IndexType`] enum and
+//! its exhaustive dispatch into the per-index modules (column emission,
+//! schema detection, resolution), the resolution currency
+//! (`IndexResolution`, `IndexedComponent`) both backends answer in, the
+//! planners that try a store's whole index set in preference order, and the
+//! row-space helpers shared across index families.
+//!
+//! What belongs in a leaf instead: an index's column-name scheme, its sort
+//! orders, and how it probes them (`secondary_by_copy`,
+//! `secondary_by_reference`) — the hub never hardcodes a column name.
+//! Two further clusters live beside it: `serve` (reading matched quads out of
+//! an index's own columns) and `components` (the persisted-child model), both
+//! re-exported here so callers see one `indexes::` surface.
+
 use std::sync::Arc;
 
-use clap::ValueEnum;
-use oxrdf::Quad;
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::struct_::{StructArray, StructArrayExt};
-use vortex_array::dtype::{DType, FieldName, FieldNames};
+use vortex_array::dtype::{DType, FieldName};
 #[cfg(feature = "file-io")]
-use vortex_array::expr::{Expression, and, eq, get_item, gt_eq, lit, lt_eq, root, select};
+use vortex_array::expr::{Expression, and, get_item, gt_eq, lit, lt_eq, root, select};
 #[cfg(feature = "file-io")]
 use vortex_array::scalar::Scalar;
 #[cfg(feature = "file-io")]
@@ -15,7 +28,6 @@ use vortex_array::stream::ArrayStreamExt;
 use vortex_array::validity::Validity;
 use vortex_array::{ArrayRef, IntoArray, VortexSessionExecute};
 use vortex_buffer::Buffer;
-use vortex_mask::Mask;
 
 use crate::error::{Result, VortexRdfError};
 use crate::io::VORTEX_SESSION;
@@ -23,17 +35,28 @@ use crate::store::RawQuad;
 use crate::store::layouts::dictionary::QuadCodes;
 use crate::store::layouts::{PatternCodes, QuadPattern, ResolvedLayout};
 
-pub mod secondary_by_copy;
-pub mod secondary_by_reference;
+pub(crate) mod components;
+pub(crate) mod secondary_by_copy;
+pub(crate) mod secondary_by_reference;
+pub(crate) mod serve;
 #[cfg(feature = "file-io")]
 pub(crate) mod tee;
+
+pub(crate) use components::{
+    IndexComponent, component_from_columns, component_identity_for_slug, indexes_from_components,
+    row_space_columns_for_slug, split_built_row_space,
+};
+#[cfg(feature = "file-io")]
+pub(crate) use components::{IndexComponentSpec, component_child_dtype, index_component_specs};
+pub(crate) use serve::ServePlan;
 
 /// A secondary index that can be embedded alongside the primary quad columns.
 ///
 /// Variant declaration order is the resolution preference order: pattern
 /// matching tries each detected index in this order and takes the first that
 /// doesn't decline (see `resolve_indexes_in_memory`).
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, ValueEnum)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
 pub enum IndexType {
     /// Appends two complete extra copies of the quad columns, each in its own
     /// sort order and each paired with the primary row IDs it permutes — the
@@ -78,13 +101,44 @@ pub enum IndexType {
     SecondaryByReference,
 }
 
+/// Every [`IndexType`], in declaration = preference order — what
+/// [`detect_indexes`] scans and what [`IndexType::preference_rank`] indexes
+/// into. Adding a variant fails to compile at that exhaustive match until the
+/// variant is listed here too.
+pub(crate) const ALL_INDEX_TYPES: [IndexType; 2] =
+    [IndexType::SecondaryByCopy, IndexType::SecondaryByReference];
+
 impl IndexType {
+    /// This variant's position in [`ALL_INDEX_TYPES`] — the resolution
+    /// preference order, as a sort key.
+    pub(crate) const fn preference_rank(self) -> usize {
+        match self {
+            IndexType::SecondaryByCopy => 0,
+            IndexType::SecondaryByReference => 1,
+        }
+    }
+
     /// Whether this index needs the sorted builders' global two-pass
     /// emission path so its value columns are globally sorted.
     pub(crate) fn needs_global_sorted_emission(self) -> bool {
         match self {
             IndexType::SecondaryByCopy => true,
             IndexType::SecondaryByReference => true,
+        }
+    }
+
+    /// The index type owning a persisted component, by implementation slug —
+    /// how the open path (and [`indexes_from_components`]) maps a component
+    /// roster back onto the index set.
+    pub(crate) fn from_component_slug(implementation: &str) -> Option<IndexType> {
+        match implementation {
+            secondary_by_copy::POSG_IMPLEMENTATION | secondary_by_copy::OSPG_IMPLEMENTATION => {
+                Some(IndexType::SecondaryByCopy)
+            }
+            secondary_by_reference::O_IMPLEMENTATION | secondary_by_reference::P_IMPLEMENTATION => {
+                Some(IndexType::SecondaryByReference)
+            }
+            _ => None,
         }
     }
 
@@ -296,248 +350,6 @@ pub(crate) enum IndexResolution {
     },
 }
 
-/// An alternative physical read path an index offers for serving a resolved
-/// view's quads: read them straight from the index's own columns — where the
-/// index already clusters the matched rows into a contiguous run — instead of
-/// gathering the primary columns by scattered row id.
-///
-/// This is the generic form of what a permutation index (whole quads in a
-/// query-friendly order, e.g. [`IndexType::SecondaryByCopy`]) can provide and a
-/// back-reference index (only `(value, row-id)` pairs, e.g.
-/// [`IndexType::SecondaryByReference`]) cannot. An index builds a plan during
-/// resolution; the store executes it without knowing which index produced it,
-/// so serving stays a uniform capability rather than one index's special case.
-///
-/// Only the *acquisition* of the matched columns differs by backend (see
-/// [`ServeSource`]): a file scan filtered to the rows, or a plain slice of an
-/// in-memory base. Both then decode through the same shared tail.
-///
-/// Correctness never depends on the plan: it reproduces exactly the rows the
-/// resolution's `row_ids` name, so any operation that can't honor it (chained
-/// matches, counting, materializing) simply ignores it and reads through the
-/// row ids. The store keeps a plan only while the resolution is a view's sole
-/// restriction — see `QuadsSource::File` / `QuadsSource::InMemory`.
-#[derive(Clone)]
-pub(crate) struct ServePlan {
-    /// The source column for each primary `(s, p, o, g)` component, in that
-    /// order — the index's own columns holding the whole quad.
-    primary_columns: [&'static str; 4],
-    /// The column giving each served row's primary row id, used to drop rows
-    /// tombstoned since construction.
-    rid_column: &'static str,
-    /// The layout the projected source columns decode through (an index that
-    /// stores whole terms decodes them as strings, or dictionary codes under
-    /// the Dictionary layout).
-    decode_layout: ResolvedLayout,
-    /// How to reach the matched rows within the index's columns — the one
-    /// backend-specific part of a serve.
-    source: ServeSource,
-}
-
-/// Where a [`ServePlan`]'s matched rows sit within the index's columns, and how
-/// to reach them.
-#[derive(Clone)]
-enum ServeSource {
-    /// In-memory component: the matched rows are the contiguous `[start, end)`
-    /// run of the index component's own array — the run a binary search over
-    /// its sorted lead column bounded. The plan carries the component array
-    /// (an `Arc` bump) and slices it directly, with no row-id gather.
-    InMemory {
-        /// The index component's rows, in child schema.
-        array: ArrayRef,
-        range: Range<usize>,
-    },
-    /// File-backed: the matched rows are those where every `(column, value)`
-    /// term equality holds, read by a pushed-down scan of the index child
-    /// (whose sort order clusters them into a contiguous, zone-prunable run).
-    #[cfg(feature = "file-io")]
-    File {
-        /// The index component child's cached layout reader.
-        reader: vortex_layout::LayoutReaderRef,
-        constraints: Vec<(&'static str, Scalar)>,
-    },
-}
-
-impl ServePlan {
-    /// A plan serving the contiguous `range` of an in-memory index
-    /// component's rows.
-    pub(crate) fn in_memory(
-        primary_columns: [&'static str; 4],
-        rid_column: &'static str,
-        decode_layout: ResolvedLayout,
-        array: ArrayRef,
-        range: Range<usize>,
-    ) -> Self {
-        Self {
-            primary_columns,
-            rid_column,
-            decode_layout,
-            source: ServeSource::InMemory { array, range },
-        }
-    }
-
-    /// A plan serving a file's index columns by a pushed-down scan filtered to
-    /// the rows where every `constraints` equality holds.
-    #[cfg(feature = "file-io")]
-    pub(crate) fn file(
-        primary_columns: [&'static str; 4],
-        rid_column: &'static str,
-        decode_layout: ResolvedLayout,
-        reader: vortex_layout::LayoutReaderRef,
-        constraints: Vec<(&'static str, Scalar)>,
-    ) -> Self {
-        Self {
-            primary_columns,
-            rid_column,
-            decode_layout,
-            source: ServeSource::File {
-                reader,
-                constraints,
-            },
-        }
-    }
-
-    /// Decode the matched quads straight from the index component's rows:
-    /// slice the component to this plan's row run, then decode those columns
-    /// as the primary `(s, p, o, g)` — replacing the row-id gather over the
-    /// primaries.
-    pub(crate) fn decode_in_memory(&self, deleted: Option<&Mask>) -> Vec<Result<Quad>> {
-        let (array, range) = match &self.source {
-            ServeSource::InMemory { array, range } => (array, range.clone()),
-            #[cfg(feature = "file-io")]
-            ServeSource::File { .. } => {
-                unreachable!("an in-memory view only ever carries an in-memory serve plan")
-            }
-        };
-        match array.slice(range) {
-            Ok(rows) => self.decode_columns(&rows, deleted),
-            Err(e) => vec![Err(VortexRdfError::Vortex(e))],
-        }
-    }
-
-    /// Decode the `(s, p, o, g)` quads out of a chunk of this plan's projected
-    /// index columns, dropping rows tombstoned in `deleted` via the row-id
-    /// column — the shared tail of both backends' serving.
-    pub(crate) fn decode_columns(
-        &self,
-        chunk: &ArrayRef,
-        deleted: Option<&Mask>,
-    ) -> Vec<Result<Quad>> {
-        match self.chunk_rows(chunk, deleted) {
-            Ok(rows) => self.decode_layout.decode_chunk(&rows),
-            Err(e) => vec![Err(e)],
-        }
-    }
-
-    /// [`decode_columns`](Self::decode_columns) through the layout's async
-    /// decode — for serving a store whose term dictionary is file-backed,
-    /// where each chunk's codes are resolved with a dictionary scan.
-    #[cfg(feature = "file-io")]
-    pub(crate) async fn decode_columns_async(
-        &self,
-        chunk: &ArrayRef,
-        deleted: Option<&Mask>,
-    ) -> Vec<Result<Quad>> {
-        match self.chunk_rows(chunk, deleted) {
-            Ok(rows) => self.decode_layout.decode_chunk_async(&rows).await,
-            Err(e) => vec![Err(e)],
-        }
-    }
-
-    /// A chunk's live rows as a primary-named `(s, p, o, g)` struct: relabel the
-    /// source columns, then drop any whose primary row id is tombstoned.
-    fn chunk_rows(&self, chunk: &ArrayRef, deleted: Option<&Mask>) -> Result<ArrayRef> {
-        let mut ctx = VORTEX_SESSION.create_execution_ctx();
-        let struct_arr = chunk
-            .clone()
-            .execute::<StructArray>(&mut ctx)
-            .map_err(VortexRdfError::Vortex)?;
-        let col = |name: &'static str| {
-            struct_arr
-                .unmasked_field_by_name(name)
-                .cloned()
-                .map_err(VortexRdfError::Vortex)
-        };
-        let [s, p, o, g] = self.primary_columns;
-        let len = struct_arr.len();
-        let rows = StructArray::try_new(
-            FieldNames::from(crate::store::schema::PRIMARY_COLUMNS),
-            vec![col(s)?, col(p)?, col(o)?, col(g)?],
-            len,
-            Validity::NonNullable,
-        )
-        .map_err(VortexRdfError::Vortex)?
-        .into_array();
-
-        let Some(deleted) = deleted else {
-            return Ok(rows);
-        };
-        // Tombstones are defined over primary row ids; the rid column says which
-        // primary row each served row mirrors.
-        let rid_col = col(self.rid_column)?
-            .execute::<PrimitiveArray>(&mut ctx)
-            .map_err(VortexRdfError::Vortex)?;
-        let live = Mask::from_indices(
-            len,
-            rid_col
-                .as_slice::<u32>()
-                .iter()
-                .enumerate()
-                .filter(|&(_, &rid)| !deleted.value(rid as usize))
-                .map(|(position, _)| position),
-        );
-        if live.all_true() {
-            return Ok(rows);
-        }
-        rows.filter(live).map_err(VortexRdfError::Vortex)
-    }
-}
-
-/// File-backed serving: turning the plan's constraints into a scan.
-#[cfg(feature = "file-io")]
-impl ServePlan {
-    /// The columns to project from the file to serve these rows: the four
-    /// component sources plus the row-id column (for tombstones).
-    pub(crate) fn projection(&self) -> [&'static str; 5] {
-        let [s, p, o, g] = self.primary_columns;
-        [s, p, o, g, self.rid_column]
-    }
-
-    /// A scan over the serving index child — where [`Self::projection`] and
-    /// [`Self::filter`] apply.
-    pub(crate) fn file_scan(&self) -> vortex_layout::scan::scan_builder::ScanBuilder<ArrayRef> {
-        let reader = match &self.source {
-            ServeSource::File { reader, .. } => reader.clone(),
-            ServeSource::InMemory { .. } => {
-                unreachable!("a file view only ever carries a file serve plan")
-            }
-        };
-        vortex_layout::scan::scan_builder::ScanBuilder::new(VORTEX_SESSION.clone(), reader)
-    }
-
-    /// The filter selecting exactly the served rows within the index's columns
-    /// — the conjunction of this plan's term equalities.
-    pub(crate) fn filter(&self) -> Expression {
-        let constraints = match &self.source {
-            ServeSource::File { constraints, .. } => constraints,
-            ServeSource::InMemory { .. } => {
-                unreachable!("a file view only ever carries a file serve plan")
-            }
-        };
-        let mut filter: Option<Expression> = None;
-        for (column, value) in constraints {
-            let expr = eq(get_item(*column, root()), lit(value.clone()));
-            filter = Some(match filter.take() {
-                Some(f) => and(f, expr),
-                None => expr,
-            });
-        }
-        // A serve plan always carries at least one constraint (the resolved
-        // lead component), so the conjunction is never empty.
-        filter.expect("a serve plan constrains at least one column")
-    }
-}
-
 /// Decode a row-id column into the ascending, unique `Buffer<u64>` every index
 /// resolution answers in.
 ///
@@ -629,287 +441,15 @@ pub(crate) async fn scan_index_row_ids(
 /// Index types whose columns are present in `dtype` — how a store discovers
 /// its queryable indexes from an array or file schema at construction.
 ///
-/// Iterates every `IndexType` variant via clap's derived
-/// `ValueEnum::value_variants`, so a new variant flows in here (and into the
-/// resolvers) with no store changes once its `is_present`/`resolve_*` arms
-/// exist.
+/// Iterates [`ALL_INDEX_TYPES`], so a new variant flows in here (and into the
+/// resolvers) with no store changes once it is listed there and its
+/// `is_present`/`resolve_*` arms exist.
 pub(crate) fn detect_indexes(dtype: &DType) -> Indexes {
-    IndexType::value_variants()
+    ALL_INDEX_TYPES
         .iter()
         .copied()
         .filter(|index| index.is_present(dtype))
         .collect()
-}
-
-/// One secondary-index component held in memory beside the store's primary
-/// base: the in-memory twin of a native store file's index child, carrying
-/// the same rows under the same child schema (plain column names — `s`, `p`,
-/// `o`, `g`, `rid` for a copy family; `val`, `rid` for a reference role).
-///
-/// `rid` values address rows of the base the component was built against;
-/// that is what keeps components valid across derived views (a
-/// `RowSelection` narrows without renumbering) and what invalidates them on
-/// any physical gather.
-#[derive(Clone)]
-pub(crate) struct IndexComponent {
-    /// The component name (`index:posg`, `index:ref-o`, …) — the same
-    /// identity the persisted child carries.
-    pub(crate) name: &'static str,
-    /// The implementation slug (`secondary-by-copy/posg`, …).
-    pub(crate) implementation: &'static str,
-    /// The component's rows, canonicalized to one struct in child schema.
-    pub(crate) array: StructArray,
-    /// Whether the sort-key columns are GLOBALLY sorted — the writer's
-    /// provenance, not an inspection: binary-search resolution is gated on
-    /// this, and per-chunk-sorted data must never claim it (a false stamp
-    /// corrupts query results; see the `sorted` field on the wire
-    /// descriptor).
-    pub(crate) sorted: bool,
-}
-
-impl IndexComponent {
-    /// The component's rows as an `ArrayRef` (an `Arc` bump).
-    pub(crate) fn as_array(&self) -> ArrayRef {
-        self.array.clone().into_array()
-    }
-
-    /// Look a component up by name.
-    pub(crate) fn find<'a>(
-        components: &'a [IndexComponent],
-        name: &str,
-    ) -> Option<&'a IndexComponent> {
-        components.iter().find(|c| c.name == name)
-    }
-}
-
-/// The index set a component roster implies, in declaration (preference)
-/// order — the in-memory counterpart of reading a file's child roster.
-pub(crate) fn indexes_from_components(components: &[IndexComponent]) -> Indexes {
-    let mut indexes: Indexes = Vec::new();
-    for component in components {
-        if let Some(index) = IndexType::from_component_slug(component.implementation)
-            && !indexes.contains(&index)
-        {
-            indexes.push(index);
-        }
-    }
-    indexes.sort_by_key(|index| *index as usize);
-    indexes
-}
-
-/// Split a builder's welded row space into the store's model: the primary
-/// quad array (index columns projected away) plus one [`IndexComponent`] per
-/// persisted-child role the `_idx_*` columns assemble.
-///
-/// The builders keep emitting the welded form — it is also the streaming
-/// write path's wire shape — and the store splits once at construction.
-/// Sortedness is read off the welded columns' own `IsSorted` stamps, which
-/// only the globally-sorted emission paths set (multi-chunk arrays lose
-/// per-chunk stamps in canonicalization, correctly landing on `false`: a
-/// concatenation of per-chunk sorts is not binary-searchable).
-pub(crate) fn split_built_row_space(array: ArrayRef) -> Result<(ArrayRef, Vec<IndexComponent>)> {
-    let detected = detect_indexes(array.dtype());
-    if detected.is_empty() {
-        return Ok((array, Vec::new()));
-    }
-    let mut ctx = VORTEX_SESSION.create_execution_ctx();
-    let struct_arr = array
-        .execute::<StructArray>(&mut ctx)
-        .map_err(VortexRdfError::Vortex)?;
-    let mut components = Vec::new();
-    for index in &detected {
-        match index {
-            IndexType::SecondaryByCopy => {
-                secondary_by_copy::components_from_row_space(&struct_arr, &mut components)?
-            }
-            IndexType::SecondaryByReference => {
-                secondary_by_reference::components_from_row_space(&struct_arr, &mut components)?
-            }
-        }
-    }
-    let primary = strip_index_columns(struct_arr.into_array())?;
-    Ok((primary, components))
-}
-
-/// Rebuild a component from row-space column arrays: relabel
-/// `source_columns[i]` (shared, stats and all) to the child's
-/// `target_columns[i]` names. `sorted` provenance comes from the lead
-/// column's own stamp — set only by globally-sorted emission.
-fn component_from_columns(
-    struct_arr: &StructArray,
-    name: &'static str,
-    implementation: &'static str,
-    source_columns: &[&'static str],
-    target_columns: &[&'static str],
-    lead_source: &'static str,
-) -> Result<Option<IndexComponent>> {
-    let mut arrays = Vec::with_capacity(source_columns.len());
-    for column in source_columns {
-        match struct_arr.unmasked_field_by_name(column) {
-            Ok(a) => arrays.push(a.clone()),
-            // A partial column set means this component was never built.
-            Err(_) => return Ok(None),
-        }
-    }
-    let sorted = source_columns
-        .iter()
-        .position(|c| c == &lead_source)
-        .map(|i| crate::store::array::column_is_sorted(&arrays[i]))
-        .unwrap_or(false);
-    let len = struct_arr.len();
-    let array = StructArray::try_new(
-        target_columns
-            .iter()
-            .map(|n| FieldName::from(*n))
-            .collect::<Vec<_>>()
-            .into(),
-        arrays,
-        len,
-        Validity::NonNullable,
-    )
-    .map_err(VortexRdfError::Vortex)?;
-    Ok(Some(IndexComponent {
-        name,
-        implementation,
-        array,
-        sorted,
-    }))
-}
-
-/// One persisted child component of an index type: the descriptor written
-/// into the native store root plus the row-space columns the component is
-/// assembled from (`source_columns[i]` becomes the child's
-/// `target_columns[i]`).
-#[cfg(feature = "file-io")]
-pub(crate) struct IndexComponentSpec {
-    pub(crate) descriptor: crate::io::store_layout::StoreComponentDescriptor,
-    pub(crate) source_columns: Vec<&'static str>,
-    pub(crate) target_columns: Vec<&'static str>,
-}
-
-/// The index components a row-space dtype implies, over every detected index
-/// type — what the serializer turns into auxiliary children. `sorted` is the
-/// writer's promise that the emitted columns are globally (not per-chunk)
-/// sorted; it travels to the descriptors so a reader lifting the components
-/// back into memory knows whether they are binary-searchable.
-#[cfg(feature = "file-io")]
-pub(crate) fn index_component_specs(
-    dtype: &DType,
-    sorted: bool,
-) -> Result<Vec<IndexComponentSpec>> {
-    let mut specs = Vec::new();
-    for index in detect_indexes(dtype) {
-        match index {
-            IndexType::SecondaryByCopy => {
-                secondary_by_copy::push_component_specs(dtype, sorted, &mut specs)?
-            }
-            IndexType::SecondaryByReference => {
-                secondary_by_reference::push_component_specs(dtype, sorted, &mut specs)?
-            }
-        }
-    }
-    Ok(specs)
-}
-
-/// The child struct dtype a component assembles: the row-space columns'
-/// dtypes under the child's own names.
-#[cfg(feature = "file-io")]
-pub(crate) fn component_child_dtype(
-    dtype: &DType,
-    source_columns: &[&'static str],
-    target_columns: &[&'static str],
-) -> Result<DType> {
-    use vortex_array::dtype::{Nullability, StructFields};
-    let DType::Struct(fields, _) = dtype else {
-        return Err(VortexRdfError::Serialization(format!(
-            "index components need a struct row space, got {dtype}"
-        )));
-    };
-    let field_dtypes = source_columns
-        .iter()
-        .map(|n| {
-            fields.field(n).ok_or_else(|| {
-                VortexRdfError::Serialization(format!("row space misses index column {n}"))
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
-    Ok(DType::Struct(
-        StructFields::new(
-            target_columns
-                .iter()
-                .map(|n| (*n).into())
-                .collect::<Vec<std::sync::Arc<str>>>()
-                .into(),
-            field_dtypes,
-        ),
-        Nullability::NonNullable,
-    ))
-}
-
-/// The canonical (name, implementation) identity of a known index component,
-/// by implementation slug — how a reader adopts a persisted child as an
-/// in-memory [`IndexComponent`]. `None` for foreign slugs (skippable when
-/// optional).
-pub(crate) fn component_identity_for_slug(
-    implementation: &str,
-) -> Option<(&'static str, &'static str)> {
-    use secondary_by_copy::Family;
-    match implementation {
-        x if x == secondary_by_copy::POSG_IMPLEMENTATION => Some((
-            Family::Posg.component_name(),
-            secondary_by_copy::POSG_IMPLEMENTATION,
-        )),
-        x if x == secondary_by_copy::OSPG_IMPLEMENTATION => Some((
-            Family::Ospg.component_name(),
-            secondary_by_copy::OSPG_IMPLEMENTATION,
-        )),
-        x if x == secondary_by_reference::O_IMPLEMENTATION => Some((
-            secondary_by_reference::REF_O_COMPONENT,
-            secondary_by_reference::O_IMPLEMENTATION,
-        )),
-        x if x == secondary_by_reference::P_IMPLEMENTATION => Some((
-            secondary_by_reference::REF_P_COMPONENT,
-            secondary_by_reference::P_IMPLEMENTATION,
-        )),
-        _ => None,
-    }
-}
-
-/// The in-memory row-space column names a persisted index component's
-/// columns re-glue into (positionally matching the child's column order) —
-/// the read-side inverse of [`index_component_specs`].
-pub(crate) fn row_space_columns_for_slug(implementation: &str) -> Option<Vec<&'static str>> {
-    use secondary_by_copy::Family;
-    match implementation {
-        secondary_by_copy::POSG_IMPLEMENTATION => Some(Family::Posg.column_names().to_vec()),
-        secondary_by_copy::OSPG_IMPLEMENTATION => Some(Family::Ospg.column_names().to_vec()),
-        secondary_by_reference::O_IMPLEMENTATION => Some(vec![
-            secondary_by_reference::O_VAL_COL,
-            secondary_by_reference::O_RID_COL,
-        ]),
-        secondary_by_reference::P_IMPLEMENTATION => Some(vec![
-            secondary_by_reference::P_VAL_COL,
-            secondary_by_reference::P_RID_COL,
-        ]),
-        _ => None,
-    }
-}
-
-impl IndexType {
-    /// The index type owning a persisted component, by implementation slug —
-    /// how the open path (and [`indexes_from_components`]) maps a component
-    /// roster back onto the index set.
-    pub(crate) fn from_component_slug(implementation: &str) -> Option<IndexType> {
-        match implementation {
-            secondary_by_copy::POSG_IMPLEMENTATION | secondary_by_copy::OSPG_IMPLEMENTATION => {
-                Some(IndexType::SecondaryByCopy)
-            }
-            secondary_by_reference::O_IMPLEMENTATION | secondary_by_reference::P_IMPLEMENTATION => {
-                Some(IndexType::SecondaryByReference)
-            }
-            _ => None,
-        }
-    }
 }
 
 /// Resolve the pattern against the configured indexes over an in-memory array,

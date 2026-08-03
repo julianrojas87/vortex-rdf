@@ -2,7 +2,6 @@ use super::*;
 
 // ─── 6) File-backed edge behavior ──────────────────────────────────────
 
-#[cfg(feature = "file-io")]
 #[tokio::test]
 async fn test_file_backed_filtered_size() {
     // 20 quads alternating between two predicates (10 each).
@@ -39,7 +38,6 @@ async fn test_file_backed_filtered_size() {
     let _ = std::fs::remove_file(&path);
 }
 
-#[cfg(feature = "file-io")]
 #[tokio::test]
 async fn test_file_backed_secondary_index_object_predicate() {
     let quads: Vec<Quad> = (0..30)
@@ -98,7 +96,6 @@ async fn test_file_backed_secondary_index_object_predicate() {
 /// (clusters at both ends of an s-sorted file, with a middle zone whose
 /// stats exclude the predicate) must all survive the metadata row-range
 /// pre-pass. A first-gap cutoff would silently drop the trailing cluster.
-#[cfg(feature = "file-io")]
 #[tokio::test]
 async fn test_file_backed_non_contiguous_predicate_matches() {
     // Three 8192-row zones. The rare predicate appears only in the first
@@ -167,7 +164,6 @@ async fn test_file_backed_non_contiguous_predicate_matches() {
 /// to a row range from the zone maps; a subsequent indexed object match
 /// must restrict its index row ids to that range (not discard the index),
 /// and index-to-index chaining must intersect the two id lists.
-#[cfg(feature = "file-io")]
 #[tokio::test]
 async fn test_file_backed_chained_subject_then_object_index() {
     const N: usize = 3 * 8192;
@@ -256,6 +252,145 @@ async fn test_file_backed_chained_subject_then_object_index() {
         results.iter().all(|q| {
             q.predicate == "http://example.org/p2" && q.object.to_string() == "\"o1\""
         })
+    );
+
+    let _ = std::fs::remove_file(&path);
+}
+
+/// An unrefined file-backed store's `to_bytes` reads its index children
+/// wholesale, so the byte round-trip keeps the index set (previously they
+/// were silently dropped on the file→bytes path).
+#[tokio::test]
+async fn test_file_backed_to_bytes_keeps_indexes() {
+    let quads: Vec<Quad> = (0..12)
+        .map(|i| {
+            make_quad(
+                &format!("http://example.org/s{:02}", i),
+                &format!("http://example.org/p{}", i % 3),
+                &format!("object {}", i % 4),
+                GraphName::DefaultGraph,
+            )
+        })
+        .collect();
+    let dir = std::env::temp_dir().join(format!("vortex_rdf_f2b_{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("indexed.vortex");
+    crate::io::ser::quads_stream_to_vortex_file_with_builder::<
+        crate::store::builders::SortedStreamBuilder,
+        _,
+    >(
+        quad_stream(quads.clone()),
+        &path,
+        LayoutStrategy::Default,
+        vec![IndexType::SecondaryByCopy],
+    )
+    .await
+    .unwrap();
+
+    let store = VortexRdfStore::from_file(&path).await.unwrap();
+    assert_eq!(store.indexes(), &[IndexType::SecondaryByCopy]);
+    let bytes = store.to_bytes().await.unwrap();
+    let reread = VortexRdfStore::from_bytes(&bytes).await.unwrap();
+    assert_eq!(
+        reread.indexes(),
+        &[IndexType::SecondaryByCopy],
+        "file → bytes must carry the index children across"
+    );
+    // And they route with correct results after the round-trip.
+    let p1 = NamedNode::new("http://example.org/p1").unwrap();
+    assert_eq!(
+        reread
+            .match_pattern(None, Some(&p1), None, None)
+            .await
+            .unwrap()
+            .size()
+            .await
+            .unwrap(),
+        4
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A sorted store's `quads_sorted` provenance survives the file → bytes
+/// round-trip: the file arm of serialization re-stamps from the root
+/// metadata, never from stats a multi-chunk scan lost.
+#[tokio::test]
+async fn test_file_backed_to_bytes_keeps_quads_sorted() {
+    let quads: Vec<Quad> = (0..500)
+        .map(|i| {
+            make_quad(
+                &format!("http://example.org/s{:05}", i),
+                "http://example.org/p",
+                &format!("o{}", i),
+                GraphName::DefaultGraph,
+            )
+        })
+        .collect();
+    let dir = std::env::temp_dir().join(format!("vortex_rdf_qs_{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("sorted.vortex");
+    crate::io::ser::quads_stream_to_vortex_file_with_builder::<
+        crate::store::builders::SortedStreamBuilder,
+        _,
+    >(
+        quad_stream(quads.clone()),
+        &path,
+        LayoutStrategy::Default,
+        vec![],
+    )
+    .await
+    .unwrap();
+    let store = VortexRdfStore::from_file(&path).await.unwrap();
+    let bytes = store.to_bytes().await.unwrap();
+    assert!(
+        String::from_utf8_lossy(&bytes).contains("\"quads_sorted\":true"),
+        "file-backed to_bytes must carry the sorted provenance across"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn test_file_backed_subject_metadata_range_for_missing_subject() {
+    let quads: Vec<Quad> = (0..25)
+        .rev()
+        .map(|i| {
+            make_quad(
+                &format!("http://example.org/s{:02}", i),
+                "http://example.org/p",
+                "o",
+                GraphName::DefaultGraph,
+            )
+        })
+        .collect();
+
+    let path = std::env::temp_dir().join(format!(
+        "vortex_rdf_subject_range_{}.vortex",
+        uuid::Uuid::new_v4()
+    ));
+    let mut buffer = Vec::new();
+    quads_stream_to_vortex_writer_with_builder::<SortedInMemoryBuilder, _, _>(
+        quad_stream(quads),
+        &mut buffer,
+        LayoutStrategy::Default,
+        vec![],
+    )
+    .await
+    .unwrap();
+    std::fs::write(&path, &buffer).unwrap();
+
+    let store = VortexRdfStore::from_file(&path).await.unwrap();
+    let missing = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/s99").unwrap());
+    let row_range = store.debug_subject_row_range(&missing).await.unwrap();
+    assert_eq!(row_range, Some(0..0));
+    assert_eq!(
+        store
+            .match_pattern(Some(&missing), None, None, None)
+            .await
+            .unwrap()
+            .size()
+            .await
+            .unwrap(),
+        0
     );
 
     let _ = std::fs::remove_file(&path);

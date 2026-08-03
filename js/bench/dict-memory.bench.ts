@@ -48,15 +48,14 @@
 // Every config runs in its own process because wasm memory never shrinks; see
 // dict-memory.worker.ts.
 
-import { spawnSync } from 'node:child_process';
-import { tmpdir } from 'node:os';
-import { writeFileSync, readFileSync, rmSync } from 'node:fs';
+import { writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { dirname, resolve, join } from 'node:path';
+import { dirname, resolve } from 'node:path';
+
+import { runWorkerProcess } from './util.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const workerPath = resolve(here, 'dict-memory.worker.ts');
-const tsxBin = resolve(here, '..', 'node_modules', '.bin', 'tsx');
 const OUT = resolve(here, process.env.DICT_MEM_OUT ?? 'dict-memory.json');
 
 /** Rows held fixed across the sweep — only term cardinality varies.
@@ -114,26 +113,15 @@ function retainedPerStore(p: Point): number | null {
     return fit(xs, ys).slope;
 }
 
+/** One cardinality point, in its own process — wasm memory never shrinks, so a
+ *  sweep sharing a process would report every point at the high-water mark of
+ *  the largest one before it. */
 function runPoint(slug: string, subjRatio: number, objRatio: number): Point | null {
-    const outFile = join(tmpdir(), `vortex-dictmem-${slug}-${subjRatio}-${process.pid}.json`);
-    const res = spawnSync(
-        tsxBin,
-        ['--expose-gc', '--max-old-space-size=8192', workerPath,
-            slug, String(N), String(subjRatio), String(objRatio), outFile],
-        { stdio: 'inherit', env: process.env },
+    return runWorkerProcess<Point>(
+        workerPath,
+        [slug, String(N), String(subjRatio), String(objRatio)],
+        `${slug} @ ratio ${subjRatio}`,
     );
-    try {
-        if (res.status !== 0) {
-            console.error(`\n[${slug} @ ratio ${subjRatio}] worker exited ${res.status} — skipping.`);
-            return null;
-        }
-        return JSON.parse(readFileSync(outFile, 'utf8')) as Point;
-    } catch (e) {
-        console.error(`[${slug} @ ratio ${subjRatio}] failed to read output:`, e);
-        return null;
-    } finally {
-        rmSync(outFile, { force: true });
-    }
 }
 
 /** True when this run is the exact config REFERENCE was measured at, and so is

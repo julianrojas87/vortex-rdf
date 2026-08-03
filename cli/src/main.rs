@@ -9,12 +9,12 @@ use std::time::Instant;
 
 use vortex_rdf_core::common::formats::detect_format;
 use vortex_rdf_core::common::terms::{
-    parse_graph_name, parse_named_node, parse_quads_from_reader, parse_subject, parse_term,
+    parse_graph_name_checked, parse_named_node_checked, parse_quads_from_reader,
+    parse_subject_checked, parse_term_checked,
 };
 use vortex_rdf_core::{
-    BuilderStrategy, IndexType, LayoutStrategy, SortedInMemoryBuilder, SortedStreamBuilder,
-    UnsortedStreamBuilder, VortexRdfStore,
-    io::{deserialize, quads_stream_to_vortex_file_with_builder},
+    BuilderStrategy, IndexType, LayoutStrategy, VortexRdfStore,
+    io::{deserialize, quads_stream_to_vortex_file},
 };
 
 #[derive(Parser)]
@@ -132,36 +132,9 @@ async fn main() -> Result<()> {
 
             // Chunks are streamed into the Vortex writer as they are built;
             // streaming-capable builders never materialize the full dataset.
-            match builder_strategy {
-                BuilderStrategy::UnsortedStream => {
-                    quads_stream_to_vortex_file_with_builder::<UnsortedStreamBuilder, _>(
-                        quads_stream,
-                        &output,
-                        layout,
-                        indexes,
-                    )
-                    .await
-                }
-                BuilderStrategy::SortedInMemory => {
-                    quads_stream_to_vortex_file_with_builder::<SortedInMemoryBuilder, _>(
-                        quads_stream,
-                        &output,
-                        layout,
-                        indexes,
-                    )
-                    .await
-                }
-                BuilderStrategy::SortedStream => {
-                    quads_stream_to_vortex_file_with_builder::<SortedStreamBuilder, _>(
-                        quads_stream,
-                        &output,
-                        layout,
-                        indexes,
-                    )
-                    .await
-                }
-            }
-            .context("Failed to serialize to Vortex")?;
+            quads_stream_to_vortex_file(quads_stream, &output, layout, indexes, builder_strategy)
+                .await
+                .context("Failed to serialize to Vortex")?;
             info!("Fully serialized to Vortex-RDF in {:?}", start.elapsed());
         }
 
@@ -217,10 +190,31 @@ async fn main() -> Result<()> {
         } => {
             let start = Instant::now();
 
-            let subject_node = subject.as_deref().map(parse_subject).transpose()?;
-            let predicate_node = predicate.as_deref().map(parse_named_node).transpose()?;
-            let object_node = object.as_deref().map(parse_term).transpose()?;
-            let graph_node = graph.as_deref().map(parse_graph_name).transpose()?;
+            // Pattern arguments are user-typed, so they take the validating
+            // parse family rather than the store's trusted decode path.
+            let subject_node = subject
+                .as_deref()
+                .map(parse_subject_checked)
+                .transpose()
+                .context("Invalid --subject pattern (expected <iri>, an IRI, or _:blank)")?;
+            let predicate_node = predicate
+                .as_deref()
+                .map(parse_named_node_checked)
+                .transpose()
+                .context("Invalid --predicate pattern (expected <iri> or an IRI)")?;
+            let object_node = object
+                .as_deref()
+                .map(parse_term_checked)
+                .transpose()
+                .context(
+                    "Invalid --object pattern (expected <iri>, _:blank, \"literal\", \
+                     \"literal\"@lang, or \"literal\"^^<datatype>)",
+                )?;
+            let graph_node = graph
+                .as_deref()
+                .map(parse_graph_name_checked)
+                .transpose()
+                .context("Invalid --graph pattern (expected <iri>, _:blank, or default)")?;
 
             let output_format = format
                 .map(RdfFormat::from)
@@ -234,30 +228,14 @@ async fn main() -> Result<()> {
 
             let is_vortex = input.extension().map(|e| e == "vortex").unwrap_or(false);
 
-            if is_vortex {
-                let load_start = Instant::now();
+            let load_start = Instant::now();
+            let store = if is_vortex {
                 let store = VortexRdfStore::from_file(&input)
                     .await
                     .map_err(|e| anyhow::anyhow!(e))?;
                 debug!("Opened Vortex file in {:?}", load_start.elapsed());
-
-                let match_start = Instant::now();
-                let filtered = store
-                    .match_pattern(
-                        subject_node.as_ref(),
-                        predicate_node.as_ref(),
-                        object_node.as_ref(),
-                        graph_node.as_ref(),
-                    )
-                    .await
-                    .context("Failed to match pattern")?;
-                debug!("Applying match pattern took {:?}", match_start.elapsed());
-
-                deserialize(filtered, writer, output_format)
-                    .await
-                    .context("Failed to deserialize filtered results")?;
+                store
             } else {
-                let load_start = Instant::now();
                 let input_format = format
                     .map(RdfFormat::from)
                     .or_else(|| detect_format(&Some(input.clone())))
@@ -271,23 +249,24 @@ async fn main() -> Result<()> {
                 let arr = VortexRdfStore::build_vortex_array(quads_stream).await?;
                 let store = VortexRdfStore::new(arr).map_err(|e| anyhow::anyhow!(e))?;
                 debug!("Vortex store built in {:?}", load_start.elapsed());
+                store
+            };
 
-                let match_start = Instant::now();
-                let filtered = store
-                    .match_pattern(
-                        subject_node.as_ref(),
-                        predicate_node.as_ref(),
-                        object_node.as_ref(),
-                        graph_node.as_ref(),
-                    )
-                    .await
-                    .context("Failed to match pattern")?;
-                debug!("Applying match pattern took {:?}", match_start.elapsed());
+            let match_start = Instant::now();
+            let filtered = store
+                .match_pattern(
+                    subject_node.as_ref(),
+                    predicate_node.as_ref(),
+                    object_node.as_ref(),
+                    graph_node.as_ref(),
+                )
+                .await
+                .context("Failed to match pattern")?;
+            debug!("Applying match pattern took {:?}", match_start.elapsed());
 
-                deserialize(filtered, writer, output_format)
-                    .await
-                    .context("Failed to deserialize filtered results")?;
-            }
+            deserialize(filtered, writer, output_format)
+                .await
+                .context("Failed to deserialize filtered results")?;
 
             info!("Full matching operation took {:?}", start.elapsed());
         }

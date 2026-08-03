@@ -30,6 +30,10 @@ import { DataFactory } from 'rdf-data-factory';
 import type { Quad, Term } from '@rdfjs/types';
 
 import { VortexRdfStore, type BuildOptions } from '../entry/node.js';
+// Only ./util.js is importable here — it is the one bench module with no store
+// library behind it (see its purity contract); shared.ts loads oxigraph and
+// rdf-stores at module scope, which this instrumented process must never do.
+import { decodeAll, fmtNs, freeWasm } from './util.js';
 
 const df = new DataFactory();
 const EX = 'http://example.org/#';
@@ -122,34 +126,10 @@ const QUERY_VARIANTS: Variant[] = [
     { slug: 'sorted_dict_bycopy', options: { builder: 'Sorted', layout: 'Dictionary', indexes: ['SecondaryByCopy'] } },
 ];
 
-// ─── WASM disposal ───────────────────────────────────────────────────────────
-// The curated .d.ts hides wasm-bindgen's `free()` from ordinary consumers (they
-// lean on the FinalizationRegistry); this bench disposes deterministically so a
-// store never lingers past its measurement. Reaches past the curated type.
-function free(store: VortexRdfStore): void {
-    (store as unknown as { free(): void }).free();
-}
-
 async function drain(stream: unknown): Promise<number> {
     let n = 0;
     for await (const _ of stream as AsyncIterable<Quad>) n++;
     return n;
-}
-
-/** Force every term of every quad to be materialized.
- *
- * Every other read benchmark here discards the result, and for the Dictionary
- * layout that never decodes a single term — the lazy read model hands back term
- * *codes* and only resolves them when `.value` is read. So without this, the
- * whole term-decoding path (and the per-distinct-term boundary crossing the
- * on-demand dictionary makes) is invisible to CodSpeed. */
-function decodeAll(quads: Quad[]): number {
-    let chars = 0;
-    for (const q of quads) {
-        chars += q.subject.value.length + q.predicate.value.length
-            + q.object.value.length + q.graph.value.length;
-    }
-    return chars;
 }
 
 // tinybench options (ignored under CodSpeed instrumentation, which measures each
@@ -157,13 +137,6 @@ function decodeAll(quads: Quad[]): number {
 // the costly build/mutation phases get a low fixed iteration count.
 const READ_OPTS: BenchOptions = { time: 200, iterations: 10, warmup: true, warmupIterations: 3, throws: true };
 const HEAVY_OPTS: BenchOptions = { time: 0, iterations: 3, warmup: false, warmupIterations: 0, throws: true };
-
-function fmtNs(ns: number): string {
-    if (ns < 1e3) return ns.toFixed(0) + ' ns';
-    if (ns < 1e6) return (ns / 1e3).toPrecision(3) + ' µs';
-    if (ns < 1e9) return (ns / 1e6).toPrecision(3) + ' ms';
-    return (ns / 1e9).toPrecision(3) + ' s';
-}
 
 async function runGroup(opts: BenchOptions, add: (b: Bench) => void): Promise<void> {
     const bench = withCodSpeed(new Bench(opts));
@@ -192,13 +165,13 @@ async function benchBuild(triples: Quad[]): Promise<void> {
         for (const v of BUILD_VARIANTS) {
             let h: VortexRdfStore | undefined;
             b.add(`build::${v.slug}`, async () => { h = await VortexRdfStore.fromQuads(triples, v.options); }, {
-                afterEach: () => { if (h) free(h); h = undefined; },
+                afterEach: () => { if (h) freeWasm(h); h = undefined; },
             });
         }
         let hs: VortexRdfStore | undefined;
         b.add('build::fromString_nquads', async () => {
             hs = await VortexRdfStore.fromString(nquads, 'nquads', { builder: 'Sorted', layout: 'Dictionary' });
-        }, { afterEach: () => { if (hs) free(hs); hs = undefined; } });
+        }, { afterEach: () => { if (hs) freeWasm(hs); hs = undefined; } });
     });
 }
 
@@ -214,14 +187,14 @@ async function benchQuery(triples: Quad[], quads: Quad[]): Promise<void> {
                 await th.getQuads(FULL_SCAN_PATTERN.s, FULL_SCAN_PATTERN.p, FULL_SCAN_PATTERN.o, FULL_SCAN_PATTERN.g);
             });
         });
-        free(th);
+        freeWasm(th);
 
         const qh = await VortexRdfStore.fromQuads(quads, v.options);
         await runGroup(READ_OPTS, (b) => {
             for (const p of QUAD_PATTERNS)
                 b.add(`query_${v.slug}::${p.name}`, async () => { await qh.getQuads(p.s, p.p, p.o, p.g); });
         });
-        free(qh);
+        freeWasm(qh);
     }
 }
 
@@ -250,7 +223,7 @@ async function benchReadPath(triples: Quad[]): Promise<void> {
             decodeAll(await store.getQuads(f.s, f.p, f.o, f.g));
         });
     });
-    free(store);
+    freeWasm(store);
 }
 
 /** readback::<op> — serialize/deserialize the store across the boundary:
@@ -263,10 +236,10 @@ async function benchReadback(triples: Quad[]): Promise<void> {
         b.add('readback::toRdf_nquads', async () => { await store.toRdf('nquads'); });
         let h: VortexRdfStore | undefined;
         b.add('readback::fromBytes', async () => { h = await VortexRdfStore.fromBytes(bytes); }, {
-            afterEach: () => { if (h) free(h); h = undefined; },
+            afterEach: () => { if (h) freeWasm(h); h = undefined; },
         });
     });
-    free(store);
+    freeWasm(store);
 }
 
 /** mutate::<op> — the mutation paths on the JS-default store: per-quad addQuad
@@ -281,20 +254,20 @@ async function benchMutate(): Promise<void> {
         b.add('mutate::addQuad_loop', async () => {
             h = VortexRdfStore.empty();
             for (const q of fresh) await h.addQuad(q);
-        }, { afterEach: () => { if (h) free(h); h = undefined; } });
+        }, { afterEach: () => { if (h) freeWasm(h); h = undefined; } });
 
         let hb: VortexRdfStore | undefined;
         b.add('mutate::addQuads_batch', async () => {
             hb = VortexRdfStore.empty();
             await hb.addQuads(fresh);
-        }, { afterEach: () => { if (hb) free(hb); hb = undefined; } });
+        }, { afterEach: () => { if (hb) freeWasm(hb); hb = undefined; } });
 
         let hd: VortexRdfStore | undefined;
         b.add('mutate::deleteQuad_loop', async () => {
             for (const q of delSlice) await hd!.deleteQuad(q);
         }, {
             beforeEach: async () => { hd = await VortexRdfStore.fromQuads(delSlice, opts); },
-            afterEach: () => { if (hd) free(hd); hd = undefined; },
+            afterEach: () => { if (hd) freeWasm(hd); hd = undefined; },
         });
     });
 }

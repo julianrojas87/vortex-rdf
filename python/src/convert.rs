@@ -4,21 +4,16 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use vortex_rdf_core::common::formats::{detect_format, format_from_name};
 use vortex_rdf_core::common::terms::parse_quads_from_reader;
-use vortex_rdf_core::io::quads_stream_to_vortex_file_with_builder;
-use vortex_rdf_core::{
-    BuilderStrategy, LayoutStrategy, SortedInMemoryBuilder, SortedStreamBuilder,
-    UnsortedStreamBuilder, VortexRdfError,
-};
+use vortex_rdf_core::io::quads_stream_to_vortex_file;
+use vortex_rdf_core::{BuilderStrategy, LayoutStrategy, VortexRdfError};
 
 use crate::{RUNTIME, store_err};
 
-/// Accepts the cottas-bench branch's layout names as aliases so its
-/// benchmark scripts keep working against these bindings.
 fn parse_layout(name: &str) -> PyResult<LayoutStrategy> {
     match name.to_ascii_lowercase().as_str() {
-        "default" | "cottas-native-strings" => Ok(LayoutStrategy::Default),
+        "default" => Ok(LayoutStrategy::Default),
         "typed-object" | "typed_object" => Ok(LayoutStrategy::TypedObject),
-        "dictionary" | "cottas-native-ids" | "cottas-native" => Ok(LayoutStrategy::Dictionary),
+        "dictionary" => Ok(LayoutStrategy::Dictionary),
         other => Err(PyValueError::new_err(format!(
             "unknown layout {other:?}; expected \"default\", \"typed-object\" or \"dictionary\""
         ))),
@@ -71,37 +66,13 @@ pub fn serialize_rdf(
     py.detach(|| -> Result<(), VortexRdfError> {
         let file = std::fs::File::open(&input_path)?;
         let quads = parse_quads_from_reader(file, format);
-        RUNTIME.block_on(async {
-            match builder {
-                BuilderStrategy::UnsortedStream => {
-                    quads_stream_to_vortex_file_with_builder::<UnsortedStreamBuilder, _>(
-                        quads,
-                        &output_path,
-                        layout,
-                        Vec::new(),
-                    )
-                    .await
-                }
-                BuilderStrategy::SortedInMemory => {
-                    quads_stream_to_vortex_file_with_builder::<SortedInMemoryBuilder, _>(
-                        quads,
-                        &output_path,
-                        layout,
-                        Vec::new(),
-                    )
-                    .await
-                }
-                BuilderStrategy::SortedStream => {
-                    quads_stream_to_vortex_file_with_builder::<SortedStreamBuilder, _>(
-                        quads,
-                        &output_path,
-                        layout,
-                        Vec::new(),
-                    )
-                    .await
-                }
-            }
-        })
+        RUNTIME.block_on(quads_stream_to_vortex_file(
+            quads,
+            &output_path,
+            layout,
+            Vec::new(),
+            builder,
+        ))
     })
     .map_err(store_err)
 }

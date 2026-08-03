@@ -44,10 +44,7 @@ use futures::stream;
 use oxrdf::{GraphName, NamedNode, NamedOrBlankNode, Term};
 
 use support::generate_rdf_data_stream;
-use vortex_rdf_core::{
-    LayoutStrategy, SortedInMemoryBuilder, SortedStreamBuilder, UnsortedStreamBuilder,
-    VortexRdfError, VortexRdfStore, io,
-};
+use vortex_rdf_core::{LayoutStrategy, SortedStreamBuilder, VortexRdfError, VortexRdfStore, io};
 
 mod support;
 use support::*;
@@ -160,39 +157,14 @@ fn serialize(bencher: divan::Bencher, cfg: &SerCfg) {
             rt().block_on(async move {
                 let mut buf = Vec::new();
                 let stream = stream::iter(quads.into_iter().map(Ok::<_, VortexRdfError>));
-                match cfg.builder {
-                    Builder::Unsorted => io::quads_stream_to_vortex_writer_with_builder::<
-                        UnsortedStreamBuilder,
-                        _,
-                        _,
-                    >(
-                        stream,
-                        &mut buf,
-                        cfg.layout.strategy(),
-                        cfg.index.types(),
-                    )
-                    .await,
-                    Builder::SortedInMemory => io::quads_stream_to_vortex_writer_with_builder::<
-                        SortedInMemoryBuilder,
-                        _,
-                        _,
-                    >(
-                        stream,
-                        &mut buf,
-                        cfg.layout.strategy(),
-                        cfg.index.types(),
-                    )
-                    .await,
-                    Builder::SortedStream => {
-                        io::quads_stream_to_vortex_writer_with_builder::<SortedStreamBuilder, _, _>(
-                            stream,
-                            &mut buf,
-                            cfg.layout.strategy(),
-                            cfg.index.types(),
-                        )
-                        .await
-                    }
-                }
+                io::quads_stream_to_vortex_writer_with_strategy(
+                    stream,
+                    &mut buf,
+                    cfg.layout.strategy(),
+                    cfg.index.types(),
+                    cfg.builder.strategy(),
+                )
+                .await
                 .expect("serialize failed");
                 black_box(buf.len())
             })

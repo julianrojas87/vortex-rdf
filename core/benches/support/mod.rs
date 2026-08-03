@@ -15,10 +15,7 @@ use tokio::runtime::Runtime;
 
 use vortex_rdf_core::error::Result;
 use vortex_rdf_core::store::RawQuad;
-use vortex_rdf_core::{
-    IndexType, LayoutStrategy, SortedInMemoryBuilder, SortedStreamBuilder, UnsortedStreamBuilder,
-    VortexRdfStore,
-};
+use vortex_rdf_core::{BuilderStrategy, IndexType, LayoutStrategy, VortexRdfStore};
 
 /// Single dataset size for the whole suite. In simulation mode CodSpeed counts
 /// instructions deterministically, so one representative size catches
@@ -60,6 +57,14 @@ impl Builder {
             Self::Unsorted => "unsorted",
             Self::SortedInMemory => "sorted_in_memory",
             Self::SortedStream => "sorted_stream",
+        }
+    }
+
+    pub fn strategy(self) -> BuilderStrategy {
+        match self {
+            Self::Unsorted => BuilderStrategy::UnsortedStream,
+            Self::SortedInMemory => BuilderStrategy::SortedInMemory,
+            Self::SortedStream => BuilderStrategy::SortedStream,
         }
     }
 }
@@ -154,36 +159,19 @@ pub fn materialize_quads(size: usize) -> Vec<RawQuad> {
     })
 }
 
-/// Build the in-memory store for a config, dispatching the generic builder on
-/// the runtime `Builder` enum. A store rather than a bare array: under the
-/// Dictionary layout the array holds only u32 codes, and the term dictionary
-/// travels beside it in the builder's `BuiltArray` — `from_built` is the one
-/// constructor that accepts that pair.
+/// Build the in-memory store for a config. A store rather than a bare array:
+/// under the Dictionary layout the array holds only u32 codes, and the term
+/// dictionary travels beside it in the builder's `BuiltArray` — `from_built`
+/// is the one constructor that accepts that pair.
 pub fn build_store(builder: Builder, layout: Layout, index: Index, size: usize) -> VortexRdfStore {
     rt().block_on(async move {
-        let stream = generate_rdf_data_stream(size);
-        let strategy = layout.strategy();
-        let indexes = index.types();
-        match builder {
-            Builder::Unsorted => {
-                VortexRdfStore::build_vortex_array_with_builder::<UnsortedStreamBuilder>(
-                    stream, strategy, indexes,
-                )
-                .await
-            }
-            Builder::SortedInMemory => {
-                VortexRdfStore::build_vortex_array_with_builder::<SortedInMemoryBuilder>(
-                    stream, strategy, indexes,
-                )
-                .await
-            }
-            Builder::SortedStream => {
-                VortexRdfStore::build_vortex_array_with_builder::<SortedStreamBuilder>(
-                    stream, strategy, indexes,
-                )
-                .await
-            }
-        }
+        VortexRdfStore::build_vortex_array_with_strategy(
+            generate_rdf_data_stream(size),
+            layout.strategy(),
+            index.types(),
+            builder.strategy(),
+        )
+        .await
         .and_then(VortexRdfStore::from_built)
         .expect("failed to build vortex store")
     })

@@ -1,5 +1,6 @@
-//! Low-level helpers over Vortex arrays: canonical string-column access,
-//! sortedness statistics, sorted-column binary search, and mask conversion.
+//! Low-level helpers over Vortex arrays: string-array construction, canonical
+//! string-column access, sortedness statistics, sorted-column binary search,
+//! and mask conversion.
 
 use crate::error::{Result, VortexRdfError};
 use crate::io::VORTEX_SESSION;
@@ -137,7 +138,8 @@ pub(crate) fn bool_array_to_mask(arr: ArrayRef) -> Result<Mask> {
 
 /// Borrow the bytes of a UTF-8 string column value as `&str` without copying.
 ///
-/// **Trusted-input decode path**, the same argument as [`parse_named_node`]:
+/// **Trusted-input decode path**, the same argument as
+/// [`parse_named_node`](crate::common::terms::parse_named_node):
 /// every caller reads a column whose dtype is `Utf8`, and vortex validates that
 /// invariant when the array is constructed — `VarBinViewData::validate` runs a
 /// `from_utf8` over every view on IPC decode, and the file reader validates on

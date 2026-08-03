@@ -6,7 +6,7 @@ pub mod indexes;
 pub mod layouts;
 pub mod quad;
 pub(crate) mod schema;
-pub mod selection;
+pub(crate) mod selection;
 pub(crate) mod source;
 pub mod term_dictionary;
 pub(crate) mod typed_eq;

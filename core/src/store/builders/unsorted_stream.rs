@@ -1,3 +1,17 @@
+//! The build strategy that keeps quads in arrival order, emitting each chunk
+//! as it fills.
+//!
+//! It is the cheapest path to a store and the one that promises the least:
+//! the quad columns are never globally sorted, so this module must never
+//! stamp `IsSorted` on `s`. Index columns are sorted per chunk, and may claim
+//! global sortedness only when the build is a single whole-dataset chunk.
+//!
+//! Memory is O(chunk), with one exception the Dictionary layout forces: no
+//! chunk can be encoded before the term dictionary is complete, so that
+//! layout runs a two-pass pipeline over a [`spill`](super::spill) run
+//! (streaming builds) or interns into one materialized chunk (in-memory
+//! builds).
+
 use super::spill::{RunReader, RunWriter, TempRunsGuard, make_temp_dir};
 use super::{
     BuiltArray, BuiltStream, ChunkStream, DEFAULT_CHUNK_SIZE, VortexArrayBuilder, assemble_chunks,

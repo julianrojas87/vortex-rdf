@@ -49,11 +49,6 @@ pub mod io;
 pub mod store;
 
 pub use error::VortexRdfError;
-pub use io::deserialize;
-#[cfg(feature = "file-io")]
-pub use io::{
-    quads_stream_to_vortex_file_with_builder, quads_stream_to_vortex_writer_with_builder,
-};
 
 pub use store::{
     BuilderStrategy, BuiltArray, DictSnapshot, DictionaryQuadSink, IndexType, Indexes,

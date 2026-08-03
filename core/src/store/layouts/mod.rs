@@ -1,6 +1,24 @@
+//! How quads become columns, and how a pattern becomes column constraints.
+//!
+//! This hub owns the vocabulary every layout is named through: the
+//! [`LayoutStrategy`] a build requests, the `ResolvedLayout` a store actually
+//! reads through (the strategy plus the state it cannot carry alone — a
+//! Dictionary layout's term access), the `QuadPattern`/`PatternCodes` pattern
+//! form, and the dispatch that turns either into per-layout column building,
+//! chunk decoding, and constraint lowering.
+//!
+//! A leaf owns exactly one layout's physical schema — its column names, its
+//! encode/decode loops (`default`, `typed_object`, `dictionary`) — and never
+//! names another's. `dict_access` is the one non-layout leaf: the residency
+//! seam between the Dictionary layout and the term dictionary.
+//!
+//! Secondary-index columns are *not* part of a layout. Every layout carries
+//! whichever `_idx_*` columns the requested
+//! [`IndexType`](crate::store::indexes::IndexType)s append, in that index's
+//! own encoding for the layout; the index modules own those names.
+
 use std::sync::Arc;
 
-use clap::ValueEnum;
 use oxrdf::{GraphName, NamedNode, NamedOrBlankNode, Quad, Term};
 use vortex_array::arrays::struct_::{StructArray, StructArrayExt};
 use vortex_array::arrays::{PrimitiveArray, VarBinViewArray};
@@ -13,20 +31,20 @@ use crate::io::VORTEX_SESSION;
 use crate::store::RawQuad;
 use crate::store::array::StrColReader;
 
-pub mod default;
+pub(crate) mod default;
 pub(crate) mod dict_access;
-pub mod dictionary;
-pub mod typed_object;
+pub(crate) mod dictionary;
+pub(crate) mod typed_object;
 
 pub(crate) use self::dict_access::DictAccess;
+use self::typed_object::{COL_O_DATATYPE, COL_O_KIND, COL_O_LANG, COL_O_VALUE};
 #[cfg(feature = "file-io")]
 use crate::store::schema::PRIMARY_COLUMNS;
-use crate::store::schema::{
-    COL_G, COL_O, COL_O_DATATYPE, COL_O_KIND, COL_O_LANG, COL_O_VALUE, COL_P, COL_S,
-};
+use crate::store::schema::{COL_G, COL_O, COL_P, COL_S};
 
 /// Determines the columnar schema used to store RDF quads in the Vortex StructArray.
-#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum, Debug)]
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
+#[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
 pub enum LayoutStrategy {
     /// ### `LayoutStrategy::Default` column schema
     ///
@@ -41,8 +59,11 @@ pub enum LayoutStrategy {
     /// | `o`    | `VarBin<Utf8>`    | Object: `<IRI>`, `_:blank`, `"lit"`, `"lit"@lang`, `"lit"^^<dt>` |
     /// | `g`    | `VarBin<Utf8>`    | Graph: `<IRI>`, `_:blank`, or `""` for DefaultGraph        |
     ///
-    /// When `Indexes` contains `IndexType::SecondaryByReference`, four additional
-    /// columns are appended: `_idx_o_val`, `_idx_o_rid`, `_idx_p_val`, `_idx_p_rid`.
+    /// Each requested [`IndexType`] appends its own columns on top of these;
+    /// see that enum's variant docs for the per-index column tables (they
+    /// hold term strings here, as under `TypedObject`).
+    ///
+    /// [`IndexType`]: crate::store::indexes::IndexType
     Default,
 
     /// ### `LayoutStrategy::TypedObject` column schema
@@ -60,8 +81,11 @@ pub enum LayoutStrategy {
     /// | `o_lang`     | `VarBin<Utf8>` (nullable) | Language tag — non-null when `o_kind = 3`  |
     /// | `g`          | `VarBin<Utf8>`        | (same as Default)                           |
     ///
-    /// When `Indexes` contains `IndexType::SecondaryByReference`, `_idx_o_val`
-    /// sorts the full object terms in N-Triples form (same as the other layouts).
+    /// Index columns are unaffected by the object split: every requested
+    /// [`IndexType`] appends the same term-string columns it would under
+    /// `Default`, sorting whole object terms in N-Triples form.
+    ///
+    /// [`IndexType`]: crate::store::indexes::IndexType
     TypedObject,
 
     /// ### `LayoutStrategy::Dictionary` column schema
@@ -80,9 +104,12 @@ pub enum LayoutStrategy {
     /// order-isomorphic to string comparisons (sorted builders keep the
     /// subject binary-search fast path on the u32 column).
     ///
-    /// When `Indexes` contains `IndexType::SecondaryByReference`, the
-    /// `_idx_o_val`/`_idx_p_val` columns hold u32 codes instead of strings
-    /// (see `IndexType::append_dictionary_columns`).
+    /// Every requested [`IndexType`] appends its usual columns, except that
+    /// the term-valued ones hold u32 codes instead of strings (see
+    /// `IndexType::append_dictionary_columns`); the `_idx_*_rid` row-id
+    /// columns are `u32` under every layout.
+    ///
+    /// [`IndexType`]: crate::store::indexes::IndexType
     Dictionary,
 }
 

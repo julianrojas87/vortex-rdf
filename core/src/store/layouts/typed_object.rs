@@ -16,9 +16,16 @@ use crate::error::{Result, VortexRdfError};
 use crate::io::VORTEX_SESSION;
 use crate::store::RawQuad;
 use crate::store::array::{StrColReader, make_nullable_string_array, make_string_array};
-use crate::store::schema::{
-    COL_G, COL_O_DATATYPE, COL_O_KIND, COL_O_LANG, COL_O_VALUE, COL_P, COL_S,
-};
+use crate::store::schema::{COL_G, COL_P, COL_S};
+
+/// The term kind tag — its presence in a schema is what marks the layout.
+pub(crate) const COL_O_KIND: &str = "o_kind";
+/// The object's lexical value: IRI string, blank node id, or literal value.
+pub(crate) const COL_O_VALUE: &str = "o_value";
+/// The literal datatype IRI — null unless the object is a typed literal.
+pub(crate) const COL_O_DATATYPE: &str = "o_datatype";
+/// The literal language tag — null unless the object is a language literal.
+pub(crate) const COL_O_LANG: &str = "o_lang";
 
 /// Field names of the primary columns:
 /// `s`, `p`, `o_kind`, `o_value`, `o_datatype`, `o_lang`, `g`.

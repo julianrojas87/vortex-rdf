@@ -5,7 +5,8 @@ use crate::io::store_layout;
 use crate::store::RawQuad;
 use crate::store::array::{bool_array_to_mask, column_is_sorted, search_sorted_bounds};
 use crate::store::builders::{
-    BuiltArray, DEFAULT_CHUNK_SIZE, UnsortedStreamBuilder, VortexArrayBuilder, build_struct_array,
+    BuilderStrategy, BuiltArray, DEFAULT_CHUNK_SIZE, SortedInMemoryBuilder, SortedStreamBuilder,
+    UnsortedStreamBuilder, VortexArrayBuilder, build_struct_array,
 };
 #[cfg(feature = "file-io")]
 use crate::store::file_scan;
@@ -104,19 +105,92 @@ pub struct StoreParts {
     pub(crate) dict: Option<Arc<TermDictionary>>,
 }
 
+/// What one entry of a store's component roster means to this version.
+enum ComponentKind {
+    /// The required `dictionary` child (the Dictionary layout's terms).
+    Dict,
+    /// A known index child, with the identity an in-memory
+    /// [`IndexComponent`](crate::store::indexes::IndexComponent) adopts and
+    /// the index type it makes queryable.
+    Index {
+        name: &'static str,
+        implementation: &'static str,
+        /// Read by the file open path, which only compiles with `file-io`.
+        #[cfg_attr(not(feature = "file-io"), allow(dead_code))]
+        index: IndexType,
+    },
+    /// An optional component this version does not interpret — ignoring it
+    /// cannot change query results.
+    Skip,
+}
+
+/// Interpret one component descriptor for every open path (`from_file`,
+/// `from_bytes`, `file_components`), owning the rejection of an
+/// *uninterpretable required* component: skipping one — a future change set,
+/// say — would silently change query results.
+fn classify_component(
+    descriptor: &crate::io::store_layout::StoreComponentDescriptor,
+) -> Result<ComponentKind> {
+    use crate::io::store_layout;
+    if descriptor.name == store_layout::DICT_COMPONENT_NAME {
+        return Ok(ComponentKind::Dict);
+    }
+    if let Some((name, implementation)) =
+        crate::store::indexes::component_identity_for_slug(&descriptor.implementation)
+        && let Some(index) = IndexType::from_component_slug(&descriptor.implementation)
+    {
+        return Ok(ComponentKind::Index {
+            name,
+            implementation,
+            index,
+        });
+    }
+    if descriptor.required {
+        return Err(VortexRdfError::Deserialization(format!(
+            "this store carries a required component this version cannot \
+             interpret: {} ({} v{})",
+            descriptor.name, descriptor.implementation, descriptor.version
+        )));
+    }
+    Ok(ComponentKind::Skip)
+}
+
+/// Every known index child holds exactly one row per quad; a mismatched child
+/// means a corrupt or foreign file, and routing through it would return
+/// silently wrong matches.
+fn check_component_rows(name: &str, component_rows: u64, quad_rows: u64) -> Result<()> {
+    if component_rows != quad_rows {
+        return Err(VortexRdfError::Deserialization(format!(
+            "index component {} holds {} rows against {} quad rows",
+            name, component_rows, quad_rows
+        )));
+    }
+    Ok(())
+}
+
+/// The layout an in-memory construction resolves to: a dictionary held beside
+/// the rows makes it Dictionary-resident, otherwise the array's own dtype
+/// decides.
+fn resolved_layout(
+    dict: Option<Arc<TermDictionary>>,
+    dtype: &vortex_array::dtype::DType,
+) -> ResolvedLayout {
+    match dict {
+        Some(dict) => ResolvedLayout::Dictionary(DictAccess::Resident(dict)),
+        None => match LayoutStrategy::from_dtype(dtype) {
+            LayoutStrategy::TypedObject => ResolvedLayout::TypedObject,
+            _ => ResolvedLayout::Default,
+        },
+    }
+}
+
 impl VortexRdfStore {
     // ── constructors ─────────────────────────────────────────────────────────
 
     /// Rebuild a store from [`StoreParts`] — the inverse of
     /// [`to_serializable_parts`](Self::to_serializable_parts).
     pub fn from_parts(parts: StoreParts) -> Result<Self> {
-        let layout = match parts.dict {
-            Some(dict) => ResolvedLayout::Dictionary(DictAccess::Resident(dict)),
-            None => match LayoutStrategy::from_dtype(parts.array.dtype()) {
-                LayoutStrategy::TypedObject => ResolvedLayout::TypedObject,
-                _ => ResolvedLayout::Default,
-            },
-        };
+        let layout = resolved_layout(parts.dict, parts.array.dtype());
         Self::from_parts_internal(parts.array, parts.components, layout)
     }
 
@@ -156,13 +230,7 @@ impl VortexRdfStore {
     /// [`IndexComponent`]: crate::store::indexes::IndexComponent
     fn from_row_space(array: ArrayRef, dict: Option<Arc<TermDictionary>>) -> Result<Self> {
         let (base, components) = crate::store::indexes::split_built_row_space(array)?;
-        let layout = match dict {
-            Some(dict) => ResolvedLayout::Dictionary(DictAccess::Resident(dict)),
-            None => match LayoutStrategy::from_dtype(base.dtype()) {
-                LayoutStrategy::TypedObject => ResolvedLayout::TypedObject,
-                _ => ResolvedLayout::Default,
-            },
-        };
+        let layout = resolved_layout(dict, base.dtype());
         Self::from_parts_internal(base, components, layout)
     }
 
@@ -270,33 +338,15 @@ impl VortexRdfStore {
             .layout()
             .as_::<store_layout::RdfStoreLayoutVTable>();
         for descriptor in file.components() {
-            if descriptor.name == store_layout::DICT_COMPONENT_NAME {
-                continue;
-            }
-            if let Some(index) = IndexType::from_component_slug(&descriptor.implementation) {
-                // Every known index child holds exactly one row per quad; a
-                // mismatched child means a corrupt or foreign file, and
-                // routing through it would return silently wrong matches.
+            if let ComponentKind::Index { index, .. } = classify_component(descriptor)? {
                 if let Some((_, child)) = store_layout::store_component(typed, &descriptor.name)
                     .map_err(VortexRdfError::Vortex)?
-                    && child.row_count() != file.row_count()
                 {
-                    return Err(VortexRdfError::Deserialization(format!(
-                        "index component {} holds {} rows against {} quad rows",
-                        descriptor.name,
-                        child.row_count(),
-                        file.row_count()
-                    )));
+                    check_component_rows(&descriptor.name, child.row_count(), file.row_count())?;
                 }
                 if !indexes.contains(&index) {
                     indexes.push(index);
                 }
-            } else if descriptor.required {
-                return Err(VortexRdfError::Deserialization(format!(
-                    "this store carries a required component this version cannot \
-                     interpret: {} ({} v{})",
-                    descriptor.name, descriptor.implementation, descriptor.version
-                )));
             }
         }
         let layout = match LayoutStrategy::from_dtype(file.dtype()) {
@@ -408,6 +458,7 @@ impl VortexRdfStore {
             else {
                 continue;
             };
+            let kind = classify_component(descriptor)?;
             let reader = child
                 .new_reader(
                     descriptor.name.as_str().into(),
@@ -416,40 +467,34 @@ impl VortexRdfStore {
                     &Default::default(),
                 )
                 .map_err(VortexRdfError::Vortex)?;
-            if descriptor.name == store_layout::DICT_COMPONENT_NAME {
-                if descriptor.implementation != store_layout::DICT_IMPLEMENTATION {
-                    return Err(VortexRdfError::Deserialization(format!(
-                        "unsupported dictionary implementation: {} v{}",
-                        descriptor.implementation, descriptor.version
-                    )));
+            match kind {
+                ComponentKind::Dict => {
+                    if descriptor.implementation != store_layout::DICT_IMPLEMENTATION {
+                        return Err(VortexRdfError::Deserialization(format!(
+                            "unsupported dictionary implementation: {} v{}",
+                            descriptor.implementation, descriptor.version
+                        )));
+                    }
+                    dict = Some(Arc::new(term_dictionary::dict_from_reader(reader).await?));
                 }
-                dict = Some(Arc::new(term_dictionary::dict_from_reader(reader).await?));
-            } else if let Some((name, implementation)) =
-                crate::store::indexes::component_identity_for_slug(&descriptor.implementation)
-            {
-                let array = native_file::scan_all_reader(reader)
-                    .await?
-                    .execute::<StructArray>(&mut ctx)
-                    .map_err(VortexRdfError::Vortex)?;
-                if array.len() != quads.len() {
-                    return Err(VortexRdfError::Deserialization(format!(
-                        "index component holds {} rows against {} quad rows",
-                        array.len(),
-                        quads.len()
-                    )));
-                }
-                components.push(crate::store::indexes::IndexComponent {
+                ComponentKind::Index {
                     name,
                     implementation,
-                    array,
-                    sorted: descriptor.sorted,
-                });
-            } else if descriptor.required {
-                return Err(VortexRdfError::Deserialization(format!(
-                    "this store carries a required component this version cannot \
-                     interpret: {} ({} v{})",
-                    descriptor.name, descriptor.implementation, descriptor.version
-                )));
+                    ..
+                } => {
+                    let array = native_file::scan_all_reader(reader)
+                        .await?
+                        .execute::<StructArray>(&mut ctx)
+                        .map_err(VortexRdfError::Vortex)?;
+                    check_component_rows(&descriptor.name, array.len() as u64, quads.len() as u64)?;
+                    components.push(crate::store::indexes::IndexComponent {
+                        name,
+                        implementation,
+                        array,
+                        sorted: descriptor.sorted,
+                    });
+                }
+                ComponentKind::Skip => {}
             }
         }
         let layout = match (dict, LayoutStrategy::from_dtype(quads.dtype())) {
@@ -700,8 +745,6 @@ impl VortexRdfStore {
         Self::from_parts_internal(base, components, layout)
     }
 
-    /// Every live quad this view covers, decoded to raw N-Triples term strings
-    /// — base rows first (in view order), then tail rows.
     /// The base rows decoded to raw quads, through the async path when the
     /// dictionary is file-backed (only possible on a file-io build).
     async fn base_raw_quads(&self, rows: &ArrayRef) -> Result<Vec<RawQuad>> {
@@ -715,6 +758,8 @@ impl VortexRdfStore {
         }
     }
 
+    /// Every live quad this view covers, decoded to raw N-Triples term strings
+    /// — base rows first (in view order), then tail rows.
     async fn live_raw_quads(&self) -> Result<Vec<RawQuad>> {
         let mut raws = self
             .base_raw_quads(&self.base_selected_rows().await?)
@@ -866,6 +911,45 @@ impl VortexRdfStore {
         // stream and produces the final columnar array according to `layout`
         // and `indexes` (the builder strategies live under `store::builders`).
         B::build_vortex_array(Box::new(quad_stream), layout, indexes).await
+    }
+
+    /// [`build_vortex_array_with_builder`](Self::build_vortex_array_with_builder)
+    /// driven by a *value* [`BuilderStrategy`] instead of a builder type
+    /// parameter — the one place the enum is interpreted, so callers choosing
+    /// a builder at runtime (the bindings, the benches) do not each re-write
+    /// the dispatch.
+    pub async fn build_vortex_array_with_strategy(
+        quad_stream: impl Stream<Item = Result<RawQuad>> + Unpin + Send + 'static,
+        layout: LayoutStrategy,
+        indexes: Indexes,
+        strategy: BuilderStrategy,
+    ) -> Result<BuiltArray> {
+        match strategy {
+            BuilderStrategy::UnsortedStream => {
+                Self::build_vortex_array_with_builder::<UnsortedStreamBuilder>(
+                    quad_stream,
+                    layout,
+                    indexes,
+                )
+                .await
+            }
+            BuilderStrategy::SortedInMemory => {
+                Self::build_vortex_array_with_builder::<SortedInMemoryBuilder>(
+                    quad_stream,
+                    layout,
+                    indexes,
+                )
+                .await
+            }
+            BuilderStrategy::SortedStream => {
+                Self::build_vortex_array_with_builder::<SortedStreamBuilder>(
+                    quad_stream,
+                    layout,
+                    indexes,
+                )
+                .await
+            }
+        }
     }
 
     // ── accessors ─────────────────────────────────────────────────────────────
@@ -1104,6 +1188,53 @@ impl VortexRdfStore {
         ])
     }
 
+    /// The rows this view selects as four `u32` term-code columns, gathering
+    /// them when [`code_columns`](Self::code_columns)' zero-copy fast path
+    /// does not apply.
+    ///
+    /// The fallback is the full read pipeline —
+    /// [`get_quads_array`](Self::get_quads_array), canonicalize, then one
+    /// primitive column per role — so a file-backed store, a narrowed view
+    /// whose base columns are chunked, or any other non-canonical shape still
+    /// answers codes. Only the cases where codes are not the store's
+    /// vocabulary at all yield `None`: a non-Dictionary layout, or a non-empty
+    /// append tail (whose terms are absent from the cached dictionary, so its
+    /// codes would address a different one).
+    ///
+    /// This is the payload path behind the bindings' code-column reads; they
+    /// call it instead of re-implementing the gather.
+    pub async fn code_columns_gathered(&self) -> Result<Option<[vortex_buffer::Buffer<u32>; 4]>> {
+        use vortex_array::arrays::PrimitiveArray;
+        use vortex_buffer::Buffer;
+        if let Some(columns) = self.code_columns() {
+            return Ok(Some(columns));
+        }
+        if self.layout.strategy() != LayoutStrategy::Dictionary || self.tail_len() != 0 {
+            return Ok(None);
+        }
+        let rows = self.get_quads_array().await?;
+        let mut ctx = VORTEX_SESSION.create_execution_ctx();
+        let struct_arr = rows
+            .execute::<StructArray>(&mut ctx)
+            .map_err(VortexRdfError::Vortex)?;
+        let column = |name: &str, ctx: &mut vortex_array::ExecutionCtx| -> Result<Buffer<u32>> {
+            let col = struct_arr
+                .unmasked_field_by_name(name)
+                .map_err(VortexRdfError::Vortex)?;
+            let prim = col
+                .clone()
+                .execute::<PrimitiveArray>(ctx)
+                .map_err(VortexRdfError::Vortex)?;
+            Ok(prim.into_buffer::<u32>())
+        };
+        Ok(Some([
+            column(schema::COL_S, &mut ctx)?,
+            column(schema::COL_P, &mut ctx)?,
+            column(schema::COL_O, &mut ctx)?,
+            column(schema::COL_G, &mut ctx)?,
+        ]))
+    }
+
     /// The rows this view covers, base and tail combined, as one array of
     /// primary columns — plus the index components describing them and, when
     /// a tailed Dictionary view re-encoded them, the *fresh* term dictionary
@@ -1237,8 +1368,11 @@ impl VortexRdfStore {
         let mut ctx = VORTEX_SESSION.create_execution_ctx();
         let mut components = Vec::new();
         for descriptor in file.components() {
-            let Some((name, implementation)) =
-                crate::store::indexes::component_identity_for_slug(&descriptor.implementation)
+            let ComponentKind::Index {
+                name,
+                implementation,
+                ..
+            } = classify_component(descriptor)?
             else {
                 continue;
             };
@@ -2078,10 +2212,11 @@ impl VortexRdfStore {
     /// Test-only hook: whether this view carries an index serving plan for
     /// `quads()`, so tests can assert the plan actually attaches (and drops)
     /// where intended instead of only observing results.
-    #[cfg(all(test, feature = "file-io"))]
+    #[cfg(test)]
     pub(crate) fn debug_has_serve_plan(&self) -> bool {
         match &self.quads {
             QuadsSource::InMemory { serve, .. } => serve.is_some(),
+            #[cfg(feature = "file-io")]
             QuadsSource::File { serve, .. } => serve.is_some(),
         }
     }

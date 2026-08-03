@@ -82,7 +82,7 @@ pub(crate) fn decode_chunk(chunk: &ArrayRef) -> Vec<Result<Quad>> {
         .collect()
 }
 
-pub(crate) fn decode_spog(s: &str, p: &str, o: &str, g: &str) -> Result<Quad> {
+fn decode_spog(s: &str, p: &str, o: &str, g: &str) -> Result<Quad> {
     let subject = parse_subject(s)?;
     let predicate = parse_named_node(p)?;
     let object = get_as_term(o)

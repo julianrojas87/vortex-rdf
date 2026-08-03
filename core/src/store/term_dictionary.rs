@@ -208,7 +208,14 @@ impl TermDictionary {
     /// source is what makes "the dictionary is FSST" an invariant this code
     /// owns instead of an assumption about somebody else's heuristic.
     fn from_sorted<'a>(terms: impl Iterator<Item = &'a str> + Clone) -> Result<Self> {
-        let plain = VarBinViewArray::from_iter_str(terms);
+        Self::from_sorted_column(VarBinViewArray::from_iter_str(terms))
+    }
+
+    /// Build from an already-assembled column of sorted unique terms — the
+    /// construction entry for callers that hold the plaintext column (the
+    /// interning builder freezes one directly), and the single owner of the
+    /// term-count guard and of the compression step.
+    pub(crate) fn from_sorted_column(plain: VarBinViewArray) -> Result<Self> {
         // List offsets are i32, so the term count must fit in one.
         if plain.len() > i32::MAX as usize {
             return Err(VortexRdfError::Serialization(format!(
@@ -227,10 +234,7 @@ impl TermDictionary {
     /// cost a full plaintext copy of its dictionary. Any other encoding is
     /// canonicalized: the write path compresses, but nothing in the format
     /// obliges a producer to have done so.
-    pub(crate) fn from_terms_array(
-        elements: ArrayRef,
-        ctx: &mut vortex_array::ExecutionCtx,
-    ) -> Result<Self> {
+    fn from_terms_array(elements: ArrayRef, ctx: &mut vortex_array::ExecutionCtx) -> Result<Self> {
         // Flatten `Chunked` containers into their chunks: the dictionary
         // child's writer splits large dictionaries into several chunks, each
         // independently FSST-compressed, and canonicalizing them into one
@@ -252,7 +256,7 @@ impl TermDictionary {
     /// Adopt a term column's chunks, each kept FSST when it arrived FSST and
     /// canonicalized otherwise (the write path compresses, but nothing in the
     /// format obliges a producer to have done so).
-    pub(crate) fn from_term_chunks(
+    fn from_term_chunks(
         chunks: Vec<ArrayRef>,
         ctx: &mut vortex_array::ExecutionCtx,
     ) -> Result<Self> {
@@ -310,7 +314,7 @@ impl TermDictionary {
     /// re-encoding, no slicing a parent array whose buffers every written
     /// chunk would then drag along — and the chunk boundaries become the
     /// file child's splits (the `FileBackedDict` fence granularity).
-    pub(crate) fn compress(plain: VarBinViewArray) -> Result<Self> {
+    fn compress(plain: VarBinViewArray) -> Result<Self> {
         Self::compress_windowed(plain, DICT_CHUNK_ROWS)
     }
 
@@ -511,7 +515,7 @@ impl TermDictionary {
     /// real query workloads have — the same predicate walked over many
     /// patterns, the same subject chained through several matches.
     ///
-    /// [`PatternCodes`]: super::PatternCodes
+    /// [`PatternCodes`]: crate::store::layouts::PatternCodes
     pub(crate) fn get_id(&self, term: &str) -> Option<u32> {
         if let Some(memoized) = self.probes.get(term) {
             return memoized;
@@ -960,7 +964,7 @@ impl FileBackedDict {
 
     /// ID→terms for reconstruction: resolve `codes` (ascending, unique) to
     /// their term strings with a single row-index scan.
-    pub(crate) async fn resolve_terms(&self, codes: &[u32]) -> Result<Vec<String>> {
+    async fn resolve_terms(&self, codes: &[u32]) -> Result<Vec<String>> {
         if codes.is_empty() {
             return Ok(Vec::new());
         }
@@ -1015,6 +1019,8 @@ impl FileBackedDict {
 
     /// Lift the whole dictionary resident — the transient full-column read
     /// behind [`DictAccess::ensure_resident`].
+    ///
+    /// [`DictAccess::ensure_resident`]: crate::store::layouts::dict_access::DictAccess::ensure_resident
     pub(crate) async fn load_resident(&self) -> Result<TermDictionary> {
         dict_from_reader(self.reader.clone()).await
     }

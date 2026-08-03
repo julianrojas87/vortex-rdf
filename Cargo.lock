@@ -3444,12 +3444,9 @@ dependencies = [
  "js-sys",
  "oxrdf",
  "oxrdfio",
- "vortex",
- "vortex-array",
  "vortex-rdf-core",
  "wasm-bindgen",
  "wasm-bindgen-futures",
- "web-sys",
 ]
 
 [[package]]
@@ -3459,15 +3456,10 @@ dependencies = [
  "anyhow",
  "clap",
  "env_logger",
- "futures",
  "log",
- "oxrdf",
  "oxrdfio",
  "tokio",
- "vortex",
- "vortex-array",
  "vortex-rdf-core",
- "vortex-session",
 ]
 
 [[package]]
@@ -3510,7 +3502,7 @@ dependencies = [
  "oxrdf",
  "pyo3",
  "tokio",
- "vortex-array",
+ "vortex-buffer",
  "vortex-rdf-core",
 ]
 
@@ -3685,16 +3677,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dc1b4cb0cc549fcf58d7dfc081778139b3d283a081644e833e84682ad71cea24"
 dependencies = [
  "unicode-ident",
-]
-
-[[package]]
-name = "web-sys"
-version = "0.3.103"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8622dcb61c0bcc9fffa6938bed81210af2da9a7e4a1a834b2e37a59b6dfb6141"
-dependencies = [
- "js-sys",
- "wasm-bindgen",
 ]
 
 [[package]]

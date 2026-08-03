@@ -13,7 +13,7 @@ use crate::store::term_dictionary::FileBackedDict;
 use crate::store::term_dictionary::TermDictionary;
 
 /// How a resolved Dictionary layout reaches its term dictionary: the
-/// *residency* axis, sitting above [`TermStore`]'s encoding axis.
+/// *residency* axis, sitting above `TermStore`'s encoding axis.
 ///
 /// `Resident` holds the whole dictionary in memory; `FileBacked` leaves the
 /// terms in the file's scannable dictionary child and reads them on demand,
@@ -23,7 +23,7 @@ use crate::store::term_dictionary::TermDictionary;
 /// - [`resolve_pattern`](Self::resolve_pattern) is the **async prelude**: the
 ///   one place a dictionary is allowed to perform I/O during a match. It runs
 ///   before the synchronous match core and pre-resolves every bound term of
-///   the pattern into the match's [`PatternCodes`], so everything downstream
+///   the pattern into the match's [`PatternCodes`](crate::store::layouts::PatternCodes), so everything downstream
 ///   resolves from that cache without touching the dictionary again — which
 ///   is what confines a file-backed dictionary's I/O to this method.
 /// - The sync accessors ([`get_id`](Self::get_id), [`term_at`](Self::term_at))

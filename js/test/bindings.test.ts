@@ -584,3 +584,76 @@ describe('adding quads', () => {
         expect(await store.has(fresh)).toBe(true);
     });
 });
+
+describe('empty store + delete', () => {
+    test('empty() builds a store of size 0', async () => {
+        const store = VortexRdfStore.empty();
+        expect(await store.size()).toBe(0);
+    });
+
+    test('deleteQuad drops a quad added to an empty store', async () => {
+        const store = VortexRdfStore.empty();
+        const quad = df.quad(
+            df.namedNode('http://example.org/s'),
+            df.namedNode('http://example.org/p'),
+            df.literal('hello'),
+        );
+
+        await store.addQuad(quad);
+        expect(await store.size()).toBe(1);
+        expect(await store.has(quad)).toBe(true);
+
+        await store.deleteQuad(quad);
+        expect(await store.size()).toBe(0);
+    });
+});
+
+describe('duck-typed quads', () => {
+    // Deliberately not a real Quad instance (no `.equals`): the store accepts any
+    // structurally-shaped value, reading only the four term fields.
+    const structural = {
+        subject: { termType: 'NamedNode' as const, value: 'http://example.org/s' },
+        predicate: { termType: 'NamedNode' as const, value: 'http://example.org/p' },
+        object: { termType: 'Literal' as const, value: 'hello' },
+        graph: { termType: 'DefaultGraph' as const, value: '' },
+    } as unknown as Quad;
+
+    test('addQuad / has / deleteQuad accept a non-Quad with the right fields', async () => {
+        const store = VortexRdfStore.empty();
+
+        await store.addQuad(structural);
+        expect(await store.size()).toBe(1);
+        expect(await store.has(structural)).toBe(true);
+
+        await store.deleteQuad(structural);
+        expect(await store.size()).toBe(0);
+    });
+});
+
+describe('getQuads without a pattern', () => {
+    test('zero arguments returns every quad', async () => {
+        const store = await VortexRdfStore.fromString(NQUADS, 'nquads');
+        expect((await store.getQuads()).length).toBe(6);
+    });
+});
+
+describe('BuildOptionsInput string shorthand', () => {
+    // A bare builder name stands in for the whole options object.
+    for (const strategy of ['Unsorted', 'Sorted'] as const) {
+        test(`fromString accepts the bare '${strategy}' builder name`, async () => {
+            const store = await VortexRdfStore.fromString(NQUADS, 'nquads', strategy);
+            expect(await store.size()).toBe(6);
+
+            const p1 = await store.getQuads(null, df.namedNode('http://example.org/p1'), null, null);
+            expect(p1.length).toBe(3);
+        });
+
+        test(`rdf_to_vortex accepts the bare '${strategy}' builder name`, async () => {
+            const bytes = await rdf_to_vortex(NQUADS, 'nquads', strategy);
+            expect(bytes).toBeInstanceOf(Uint8Array);
+
+            const nq = await vortex_to_rdf(bytes, 'nquads');
+            expect(nq.trim().split('\n').filter(Boolean).length).toBe(6);
+        });
+    }
+});

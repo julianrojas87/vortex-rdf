@@ -1,14 +1,12 @@
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 
-use oxrdf::{BlankNode, GraphName, NamedNode, NamedOrBlankNode, Term};
-use pyo3::exceptions::{PyFileNotFoundError, PyValueError};
+use oxrdf::{GraphName, NamedNode, NamedOrBlankNode, Term};
+use pyo3::exceptions::PyFileNotFoundError;
 use pyo3::prelude::*;
-use vortex_array::VortexSessionExecute;
-use vortex_array::arrays::PrimitiveArray;
-use vortex_array::arrays::struct_::{StructArray, StructArrayExt};
-use vortex_rdf_core::common::terms::{get_as_term, parse_graph_name};
-use vortex_rdf_core::io::VORTEX_SESSION;
+use vortex_rdf_core::common::terms::{
+    parse_graph_name_checked, parse_named_node_checked, parse_subject_checked, parse_term_checked,
+};
 use vortex_rdf_core::{LayoutStrategy, VortexRdfError, VortexRdfStore as CoreStore};
 
 use crate::codes::{TermDict, U32Column};
@@ -40,33 +38,12 @@ pub struct VortexRdfStore {
     path: String,
 }
 
-// Pattern terms arrive from Python callers, so unlike core's trusted decode
-// paths (`new_unchecked`) they are validated — the cost is per match call,
-// not per row. Objects go through `get_as_term`, which handles all literal
-// forms (language-tagged, typed); core's `parse_term` does not.
-
-fn py_parse_named_node(s: &str) -> PyResult<NamedNode> {
-    let iri = s
-        .strip_prefix('<')
-        .and_then(|rest| rest.strip_suffix('>'))
-        .unwrap_or(s);
-    NamedNode::new(iri).map_err(|e| PyValueError::new_err(format!("invalid IRI {s:?}: {e}")))
-}
-
-fn py_parse_subject(s: &str) -> PyResult<NamedOrBlankNode> {
-    if let Some(id) = s.strip_prefix("_:") {
-        BlankNode::new(id)
-            .map(NamedOrBlankNode::BlankNode)
-            .map_err(|e| PyValueError::new_err(format!("invalid blank node {s:?}: {e}")))
-    } else {
-        py_parse_named_node(s).map(NamedOrBlankNode::NamedNode)
-    }
-}
-
-fn py_parse_object(s: &str) -> PyResult<Term> {
-    get_as_term(s).ok_or_else(|| PyValueError::new_err(format!("could not parse RDF term {s:?}")))
-}
-
+// Pattern terms are caller-supplied, so all four slots go through core's
+// checked parse family (validating oxrdf constructors) rather than the
+// trusted `new_unchecked` decode path core uses for terms it serialized
+// itself: an invalid IRI, blank-node id or language tag in any of s/p/o/g
+// raises `ValueError` instead of silently matching nothing. Validation costs
+// one call per match, not per row; this crate adds only the `PyErr` shaping.
 fn parse_pattern(
     s: Option<&str>,
     p: Option<&str>,
@@ -74,10 +51,16 @@ fn parse_pattern(
     g: Option<&str>,
 ) -> PyResult<Pattern> {
     Ok((
-        s.map(py_parse_subject).transpose()?,
-        p.map(py_parse_named_node).transpose()?,
-        o.map(py_parse_object).transpose()?,
-        g.map(parse_graph_name).transpose().map_err(parse_err)?,
+        s.map(parse_subject_checked)
+            .transpose()
+            .map_err(parse_err)?,
+        p.map(parse_named_node_checked)
+            .transpose()
+            .map_err(parse_err)?,
+        o.map(parse_term_checked).transpose().map_err(parse_err)?,
+        g.map(parse_graph_name_checked)
+            .transpose()
+            .map_err(parse_err)?,
     ))
 }
 
@@ -236,37 +219,26 @@ impl VortexRdfStore {
             return Ok(None);
         }
         let pattern = parse_pattern(s, p, o, g)?;
-        let [s, p, o, g] = py
+        let columns = py
             .detach(|| -> Result<_, VortexRdfError> {
                 RUNTIME.block_on(async {
                     let (s, p, o, g) = &pattern;
-                    let matched = self
-                        .store
+                    self.store
                         .match_pattern(s.as_ref(), p.as_ref(), o.as_ref(), g.as_ref())
-                        .await?;
-                    let arr = matched.get_quads_array().await?;
-                    let mut ctx = VORTEX_SESSION.create_execution_ctx();
-                    let struct_arr = arr.execute::<StructArray>(&mut ctx)?;
-                    let mut cols = Vec::with_capacity(4);
-                    for name in ["s", "p", "o", "g"] {
-                        let col = struct_arr.unmasked_field_by_name(name)?;
-                        cols.push(col.clone().execute::<PrimitiveArray>(&mut ctx)?);
-                    }
-                    Ok([
-                        cols.remove(0),
-                        cols.remove(0),
-                        cols.remove(0),
-                        cols.remove(0),
-                    ])
+                        .await?
+                        .code_columns_gathered()
+                        .await
                 })
             })
             .map_err(store_err)?;
-        Ok(Some((
-            U32Column { prim: s },
-            U32Column { prim: p },
-            U32Column { prim: o },
-            U32Column { prim: g },
-        )))
+        Ok(columns.map(|[s, p, o, g]| {
+            (
+                U32Column { codes: s },
+                U32Column { codes: p },
+                U32Column { codes: o },
+                U32Column { codes: g },
+            )
+        }))
     }
 
     /// Match a triple pattern and return `(term_table, rows)`: a de-duplicated

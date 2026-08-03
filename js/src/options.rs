@@ -9,14 +9,15 @@ use vortex_rdf_core::common::formats::format_from_name;
 use vortex_rdf_core::error::Result as CoreResult;
 use vortex_rdf_core::store::{BuiltArray, RawQuad};
 use vortex_rdf_core::{
-    BuilderStrategy, IndexType, Indexes, LayoutStrategy, SortedInMemoryBuilder,
-    UnsortedStreamBuilder, VortexRdfStore as CoreStore,
+    BuilderStrategy, IndexType, Indexes, LayoutStrategy, VortexRdfStore as CoreStore,
 };
 use wasm_bindgen::prelude::*;
 
+use crate::error::{js_err, js_err_ctx};
+
 pub(crate) fn parse_format(format_name: &str) -> Result<RdfFormat, JsValue> {
     format_from_name(format_name).ok_or_else(|| {
-        JsValue::from_str(&format!(
+        js_err(format!(
             "Unsupported format: {}. Supported formats are 'ntriples', 'nquads', 'turtle', \
              'trig', 'n3', 'rdfxml' and 'jsonld'.",
             format_name
@@ -45,8 +46,9 @@ impl Default for BuildConfig {
 
 /// Run the quad stream through the builder named by `config`.
 ///
-/// This is the single place that monomorphizes the builders, so every entry
-/// point (`fromString`, `fromQuads`, `rdf_to_vortex`) offers the same choices.
+/// Every entry point (`fromString`, `fromQuads`, `rdf_to_vortex`) builds
+/// through here, so they offer the same choices and share the one strategy
+/// WebAssembly cannot honour.
 pub(crate) async fn build_array(
     quads: impl Stream<Item = CoreResult<RawQuad>> + Unpin + Send + 'static,
     config: BuildConfig,
@@ -56,27 +58,15 @@ pub(crate) async fn build_array(
         layout,
         indexes,
     } = config;
-    match builder {
-        BuilderStrategy::UnsortedStream => {
-            CoreStore::build_vortex_array_with_builder::<UnsortedStreamBuilder>(
-                quads, layout, indexes,
-            )
-            .await
-        }
-        BuilderStrategy::SortedInMemory => {
-            CoreStore::build_vortex_array_with_builder::<SortedInMemoryBuilder>(
-                quads, layout, indexes,
-            )
-            .await
-        }
-        // Defensive: `parse_builder` never yields SortedStream, which spills to disk.
-        BuilderStrategy::SortedStream => {
-            return Err(JsValue::from_str(
-                "The sorted-stream builder strategy is not available in WebAssembly.",
-            ));
-        }
+    // Defensive: `parse_builder` never yields SortedStream, which spills to disk.
+    if builder == BuilderStrategy::SortedStream {
+        return Err(js_err(
+            "The sorted-stream builder strategy is not available in WebAssembly.",
+        ));
     }
-    .map_err(|e| JsValue::from_str(&format!("Vortex build error: {}", e)))
+    CoreStore::build_vortex_array_with_strategy(quads, layout, indexes, builder)
+        .await
+        .map_err(|e| js_err_ctx("Vortex build error", e))
 }
 
 /// Resolve the optional JS build options. Accepts `undefined`/`null` (all
@@ -100,16 +90,16 @@ pub(crate) fn parse_build_options(options: JsValue) -> Result<BuildConfig, JsVal
         config.layout = parse_layout(&name)?;
     }
     let indexes = Reflect::get(&options, &"indexes".into())
-        .map_err(|_| JsValue::from_str("Could not read the 'indexes' option"))?;
+        .map_err(|_| js_err("Could not read the 'indexes' option"))?;
     if !indexes.is_null() && !indexes.is_undefined() {
         if !js_sys::Array::is_array(&indexes) {
-            return Err(JsValue::from_str("Option 'indexes' must be an array"));
+            return Err(js_err("Option 'indexes' must be an array"));
         }
         config.indexes = js_sys::Array::from(&indexes)
             .iter()
             .map(|value| match value.as_string() {
                 Some(name) => parse_index(&name),
-                None => Err(JsValue::from_str("Option 'indexes' must contain strings")),
+                None => Err(js_err("Option 'indexes' must contain strings")),
             })
             .collect::<Result<Indexes, JsValue>>()?;
     }
@@ -119,16 +109,13 @@ pub(crate) fn parse_build_options(options: JsValue) -> Result<BuildConfig, JsVal
 /// Read an optional string field, erroring if present but not a string.
 fn get_string_option(options: &JsValue, key: &str) -> Result<Option<String>, JsValue> {
     let value = Reflect::get(options, &key.into())
-        .map_err(|_| JsValue::from_str(&format!("Could not read the '{}' option", key)))?;
+        .map_err(|_| js_err(format!("Could not read the '{}' option", key)))?;
     if value.is_null() || value.is_undefined() {
         return Ok(None);
     }
     match value.as_string() {
         Some(name) => Ok(Some(name)),
-        None => Err(JsValue::from_str(&format!(
-            "Option '{}' must be a string",
-            key
-        ))),
+        None => Err(js_err(format!("Option '{}' must be a string", key))),
     }
 }
 
@@ -136,7 +123,7 @@ fn parse_builder(name: &str) -> Result<BuilderStrategy, JsValue> {
     match name {
         "Unsorted" => Ok(BuilderStrategy::UnsortedStream),
         "Sorted" => Ok(BuilderStrategy::SortedInMemory),
-        other => Err(JsValue::from_str(&format!(
+        other => Err(js_err(format!(
             "Unknown builder strategy: {}. Supported strategies are 'Unsorted' and 'Sorted'.",
             other
         ))),
@@ -148,7 +135,7 @@ fn parse_layout(name: &str) -> Result<LayoutStrategy, JsValue> {
         "Default" => Ok(LayoutStrategy::Default),
         "TypedObject" => Ok(LayoutStrategy::TypedObject),
         "Dictionary" => Ok(LayoutStrategy::Dictionary),
-        other => Err(JsValue::from_str(&format!(
+        other => Err(js_err(format!(
             "Unknown layout strategy: {}. Supported layouts are 'Default', 'TypedObject' \
              and 'Dictionary'.",
             other
@@ -160,7 +147,7 @@ fn parse_index(name: &str) -> Result<IndexType, JsValue> {
     match name {
         "SecondaryByReference" => Ok(IndexType::SecondaryByReference),
         "SecondaryByCopy" => Ok(IndexType::SecondaryByCopy),
-        other => Err(JsValue::from_str(&format!(
+        other => Err(js_err(format!(
             "Unknown index type: {}. Supported indexes are 'SecondaryByReference' \
              and 'SecondaryByCopy'.",
             other

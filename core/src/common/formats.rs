@@ -1,5 +1,13 @@
+//! Resolving an [`RdfFormat`] from what a user supplies: a file path or a
+//! format name. The two entry points below are the only places a format is
+//! named rather than passed, so every binding's format argument funnels
+//! through them and accepts the same spellings.
+
 use oxrdfio::RdfFormat;
 
+/// Infer the RDF format from a path's extension. `None` when there is no
+/// path, no extension, or the extension names no format oxrdfio knows — the
+/// caller then needs an explicit format.
 pub fn detect_format(path: &Option<std::path::PathBuf>) -> Option<RdfFormat> {
     let path = path.as_ref()?;
     let ext = path.extension()?.to_str()?;

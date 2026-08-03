@@ -118,10 +118,18 @@ def test_blank_node_round_trip(vortex_files):
 
 def test_bad_term_raises_value_error(vortex_files):
     store = VortexRdfStore(str(vortex_files["default"]))
+    # All four pattern slots validate: a malformed term raises rather than
+    # silently matching nothing.
     with pytest.raises(ValueError):
         store.match_triples(s="not a term")
     with pytest.raises(ValueError):
         store.match_triples(p='"literals-cannot-be-predicates"')
+    with pytest.raises(ValueError):
+        store.match_triples(o="<http://ex.org/not a valid iri>")
+    with pytest.raises(ValueError):
+        store.match_triples(o='"Bob"@not a language tag')
+    with pytest.raises(ValueError):
+        store.match_triples(g="<http://ex.org/not a valid iri>")
 
 
 def test_missing_file_raises_oserror(tmp_path):
@@ -137,13 +145,6 @@ def test_serialize_rejects_unknown_options(fixture_nt_path, tmp_path):
         serialize_rdf(str(fixture_nt_path), out, builder="nope")
     with pytest.raises(ValueError):
         serialize_rdf(str(fixture_nt_path), out, format="nope")
-
-
-def test_serialize_layout_aliases(fixture_nt_path, tmp_path):
-    # cottas-bench branch names remain accepted.
-    out = tmp_path / "alias.vortex"
-    serialize_rdf(str(fixture_nt_path), str(out), layout="cottas-native-ids")
-    assert VortexRdfStore(str(out)).layout() == "dictionary"
 
 
 def test_dictionary_file_is_self_contained(fixture_nt_path, tmp_path):

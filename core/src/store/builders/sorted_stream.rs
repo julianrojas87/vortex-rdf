@@ -1,3 +1,15 @@
+//! The [`SortedStreamBuilder`] strategy: spill sorted runs to temporary
+//! files, then K-way merge them back into one global (s, p, o, g) order.
+//!
+//! It offers the same sortedness guarantee as
+//! [`sorted_in_memory`](super::sorted_in_memory) — globally sorted `s` and
+//! index value columns, both binary-searchable — without holding the dataset,
+//! paying for it in temp-file I/O. Requested indexes are merged from their
+//! own spilled `(value, row id)` runs and handed over as native components
+//! rather than riding along as `_idx_*` row-space columns. The run file
+//! format itself belongs to [`spill`](super::spill), the emission machinery
+//! to [`builders`](super); what lives here is the merge.
+
 use super::spill::{
     PairMerger, PairRunSpiller, Run, RunWriter, TempRunsGuard, make_temp_dir, write_run,
 };

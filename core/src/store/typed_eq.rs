@@ -15,7 +15,7 @@ use crate::store::selection::RowSelection;
 
 /// A residual equality constraint's probe value, extracted from its `Scalar`
 /// once per scan — not per chunk, the string extraction allocates.
-pub(crate) enum Needle {
+enum Needle {
     Code(u32),
     Str(String),
 }
@@ -30,7 +30,7 @@ impl Needle {
 
     /// Extract every constraint's probe once; `None` if any is neither a u32
     /// code nor a utf8 string.
-    pub(crate) fn extract(eqs: &[(&'static str, Scalar)]) -> Option<Vec<Needle>> {
+    fn extract(eqs: &[(&'static str, Scalar)]) -> Option<Vec<Needle>> {
         if eqs.is_empty() {
             return None;
         }
@@ -45,7 +45,7 @@ impl Needle {
 /// TypedObject / tail string columns, compared at the view level). Anything
 /// else — nullable, compressed, or chunked — declines, and the caller falls
 /// back to the general mask-scan pipeline.
-pub(crate) enum TypedEq<'a> {
+enum TypedEq<'a> {
     Code(PrimitiveArray, u32),
     Str(StrEq<'a>),
 }
@@ -55,7 +55,7 @@ pub(crate) enum TypedEq<'a> {
 /// which alone rejects almost every row), then the inline bytes or the
 /// referenced buffer range. No per-row `ByteBuffer` is materialized —
 /// profiling showed `bytes_at`'s slice/refcount traffic dominating tail scans.
-pub(crate) struct StrEq<'a> {
+struct StrEq<'a> {
     arr: VarBinViewArray,
     needle: &'a [u8],
 }
@@ -132,7 +132,7 @@ impl<'a> TypedEq<'a> {
     }
 
     /// Bind every constraint to its typed column, or `None` if any declines.
-    pub(crate) fn bind(
+    fn bind(
         struct_arr: &StructArray,
         eqs: &[(&'static str, Scalar)],
         needles: &'a [Needle],
@@ -151,7 +151,7 @@ impl<'a> TypedEq<'a> {
     /// (Dictionary bases are all-code, tails and Default bases all-string),
     /// and the hot all-code case takes [`TypedEq::code_views`] instead.
     #[inline]
-    pub(crate) fn matches(&self, i: usize) -> bool {
+    fn matches(&self, i: usize) -> bool {
         match self {
             TypedEq::Code(prim, code) => prim.as_slice::<u32>()[i] == *code,
             TypedEq::Str(s) => s.matches(i),
@@ -164,7 +164,7 @@ impl<'a> TypedEq<'a> {
     /// constraints — is branch-free per constraint and vectorizes;
     /// benchmarking showed a mixed-enum loop costing ~2× on full-column
     /// scans. `None` when any constraint is a string compare.
-    pub(crate) fn code_views<'b>(cols: &'b [TypedEq<'a>]) -> Option<Vec<(&'b [u32], u32)>> {
+    fn code_views<'b>(cols: &'b [TypedEq<'a>]) -> Option<Vec<(&'b [u32], u32)>> {
         cols.iter()
             .map(|c| match c {
                 TypedEq::Code(prim, code) => Some((prim.as_slice::<u32>(), *code)),

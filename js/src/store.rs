@@ -7,15 +7,13 @@ use std::io::Cursor;
 use futures::StreamExt;
 use js_sys::{Object, Reflect};
 use oxrdf::{GraphName, NamedNode, NamedOrBlankNode, Term};
-use vortex_array::VortexSessionExecute;
-use vortex_array::arrays::PrimitiveArray;
-use vortex_array::arrays::struct_::{StructArray, StructArrayExt};
 use vortex_rdf_core::common::terms::parse_quads_from_reader;
-use vortex_rdf_core::io::{VORTEX_SESSION, deserialize};
+use vortex_rdf_core::io::deserialize;
 use vortex_rdf_core::{BuilderStrategy, DictSnapshot, LayoutStrategy, VortexRdfStore as CoreStore};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::future_to_promise;
 
+use crate::error::{js_err, js_err_ctx};
 use crate::ingest::{js_array_to_dictionary_array, js_array_to_quads, js_to_quad_stream};
 use crate::options::{build_array, layout_name, parse_build_options, parse_format};
 use crate::terms::{js_to_graph, js_to_named_node, js_to_quad, js_to_subject, js_to_term};
@@ -45,8 +43,7 @@ extern "C" {
 
 #[wasm_bindgen(skip_typescript)]
 pub struct VortexRdfStore {
-    #[wasm_bindgen(skip)]
-    pub inner: CoreStore,
+    inner: CoreStore,
     // The store's term dictionary as a JS `LazyDict`, built once on the first
     // Dictionary-layout read and shared by every LazyTerm this store produces
     // (their `.equals` fast path keys on its identity). Not exposed to JS.
@@ -116,12 +113,6 @@ impl TermDict {
     pub fn decode(&self, code: u32) -> Option<String> {
         self.snapshot.decode(code)
     }
-
-    /// Number of terms in the dictionary.
-    #[wasm_bindgen(getter)]
-    pub fn size(&self) -> usize {
-        self.snapshot.len()
-    }
 }
 
 #[wasm_bindgen]
@@ -133,9 +124,7 @@ impl VortexRdfStore {
 
     #[wasm_bindgen(js_name = fromBytes, skip_typescript)]
     pub async fn from_bytes(bytes: &[u8]) -> Result<VortexRdfStore, JsValue> {
-        let inner = CoreStore::from_bytes(bytes)
-            .await
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        let inner = CoreStore::from_bytes(bytes).await.map_err(js_err)?;
         Ok(VortexRdfStore::wrap(inner))
     }
 
@@ -150,7 +139,7 @@ impl VortexRdfStore {
         let quads_stream = parse_quads_from_reader(Cursor::new(input), format);
         let built = build_array(quads_stream, config).await?;
 
-        let inner = CoreStore::from_built(built).map_err(|e| JsValue::from_str(&e.to_string()))?;
+        let inner = CoreStore::from_built(built).map_err(js_err)?;
         Ok(VortexRdfStore::wrap(inner))
     }
 
@@ -169,15 +158,14 @@ impl VortexRdfStore {
             let sorted = config.builder == BuilderStrategy::SortedInMemory;
             let built =
                 js_array_to_dictionary_array(js_sys::Array::from(&quads), sorted, config.indexes)?;
-            let inner =
-                CoreStore::from_built(built).map_err(|e| JsValue::from_str(&e.to_string()))?;
+            let inner = CoreStore::from_built(built).map_err(js_err)?;
             return Ok(VortexRdfStore::wrap(inner));
         }
 
         let quad_stream = js_to_quad_stream(quads)?;
         let built = build_array(quad_stream, config).await?;
 
-        let inner = CoreStore::from_built(built).map_err(|e| JsValue::from_str(&e.to_string()))?;
+        let inner = CoreStore::from_built(built).map_err(js_err)?;
         Ok(VortexRdfStore::wrap(inner))
     }
 
@@ -196,7 +184,7 @@ impl VortexRdfStore {
         self.inner
             .to_bytes()
             .await
-            .map_err(|e| JsValue::from_str(&format!("Vortex serialization error: {}", e)))
+            .map_err(|e| js_err_ctx("Vortex serialization error", e))
     }
 
     #[wasm_bindgen(js_name = toRdf, skip_typescript)]
@@ -207,16 +195,13 @@ impl VortexRdfStore {
         // from `match` still decodes against the term dictionary it carries.
         deserialize(self.inner.clone(), &mut buffer, format)
             .await
-            .map_err(|e| JsValue::from_str(&format!("Deserialize error: {}", e)))?;
-        String::from_utf8(buffer).map_err(|e| JsValue::from_str(&format!("UTF-8 error: {}", e)))
+            .map_err(|e| js_err_ctx("Deserialize error", e))?;
+        String::from_utf8(buffer).map_err(|e| js_err_ctx("UTF-8 error", e))
     }
 
     #[wasm_bindgen(skip_typescript)]
     pub async fn size(&self) -> Result<usize, JsValue> {
-        self.inner
-            .size()
-            .await
-            .map_err(|e| JsValue::from_str(&e.to_string()))
+        self.inner.size().await.map_err(js_err)
     }
 
     #[wasm_bindgen(skip_typescript)]
@@ -239,21 +224,13 @@ impl VortexRdfStore {
     /// materializes it into an owning copy, rebuilding its indexes so the copy
     /// stays query-accelerated. Either way the source is never touched.
     async fn owned(&self) -> Result<CoreStore, JsValue> {
-        self.inner
-            .owned()
-            .await
-            .map_err(|e| JsValue::from_str(&e.to_string()))
+        self.inner.owned().await.map_err(js_err)
     }
 
     #[wasm_bindgen(js_name = addQuad, skip_typescript)]
     pub async fn add_quad(&mut self, quad_js: JsValue) -> Result<(), JsValue> {
-        let quad = js_to_quad(quad_js).ok_or_else(|| JsValue::from_str("Invalid quad object"))?;
-        self.inner = self
-            .owned()
-            .await?
-            .add_quad(quad)
-            .await
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        let quad = js_to_quad(quad_js).ok_or_else(|| js_err("Invalid quad object"))?;
+        self.inner = self.owned().await?.add_quad(quad).await.map_err(js_err)?;
         // The dictionary may have changed (auto-compaction re-encodes); drop the
         // cached view so the next read takes a snapshot of the new one. Rebuilding
         // is O(1), and any `LazyQuad` already handed out keeps the snapshot its
@@ -265,25 +242,20 @@ impl VortexRdfStore {
     #[wasm_bindgen(js_name = addQuads, skip_typescript)]
     pub async fn add_quads(&mut self, quads_js: js_sys::Array) -> Result<(), JsValue> {
         let quads = js_array_to_quads(quads_js)?;
-        self.inner = self
-            .owned()
-            .await?
-            .add_quads(quads)
-            .await
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        self.inner = self.owned().await?.add_quads(quads).await.map_err(js_err)?;
         self.dict_view.replace(None);
         Ok(())
     }
 
     #[wasm_bindgen(js_name = deleteQuad, skip_typescript)]
     pub async fn delete_quad(&mut self, quad_js: JsValue) -> Result<(), JsValue> {
-        let quad = js_to_quad(quad_js).ok_or_else(|| JsValue::from_str("Invalid quad object"))?;
+        let quad = js_to_quad(quad_js).ok_or_else(|| js_err("Invalid quad object"))?;
         self.inner = self
             .owned()
             .await?
             .delete_quad(&quad)
             .await
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+            .map_err(js_err)?;
         self.dict_view.replace(None);
         Ok(())
     }
@@ -340,10 +312,11 @@ impl VortexRdfStore {
 
     /// **Prototype (Dictionary layout only).** Resolve a pattern and hand back
     /// the matched rows as raw `u32` term codes — four `Uint32Array` columns
-    /// `{ s, p, o, g, length }`, or `null` if this store is not Dictionary
-    /// layout. No term strings are materialized; the caller resolves codes to
-    /// terms lazily via [`decodeTerm`](Self::decode_term). This is the
-    /// zero-copy-until-observed read path being evaluated against `getQuads`.
+    /// `{ s, p, o, g, length }`, or `null` unless this store is Dictionary
+    /// layout with no append tail. No term strings are materialized; the caller
+    /// resolves codes to terms lazily via [`decodeTerm`](Self::decode_term).
+    /// This is the zero-copy-until-observed read path being evaluated against
+    /// `getQuads`, which builds its own columnar payload rather than this one.
     #[wasm_bindgen(js_name = matchCodes, skip_typescript)]
     pub async fn match_codes(
         &self,
@@ -366,45 +339,13 @@ impl VortexRdfStore {
             .inner
             .match_pattern(s.as_ref(), p.as_ref(), o.as_ref(), g.as_ref())
             .await
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        let arr = matched
-            .get_quads_array()
-            .await
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-        let mut ctx = VORTEX_SESSION.create_execution_ctx();
-        let struct_arr = arr
-            .execute::<StructArray>(&mut ctx)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-        macro_rules! u32_col {
-            ($name:expr) => {{
-                let col = struct_arr
-                    .unmasked_field_by_name($name)
-                    .map_err(|e| JsValue::from_str(&e.to_string()))?;
-                let prim = col
-                    .clone()
-                    .execute::<PrimitiveArray>(&mut ctx)
-                    .map_err(|e| JsValue::from_str(&e.to_string()))?;
-                let slice = prim.as_slice::<u32>();
-                // Copy into a JS-owned Uint32Array (safe against wasm memory
-                // growth, which would detach a zero-copy view).
-                let ta = js_sys::Uint32Array::new_with_length(slice.len() as u32);
-                ta.copy_from(slice);
-                JsValue::from(ta)
-            }};
-        }
+            .map_err(js_err)?;
 
         let result = Object::new();
-        Reflect::set(&result, &"s".into(), &u32_col!("s"))?;
-        Reflect::set(&result, &"p".into(), &u32_col!("p"))?;
-        Reflect::set(&result, &"o".into(), &u32_col!("o"))?;
-        Reflect::set(&result, &"g".into(), &u32_col!("g"))?;
-        Reflect::set(
-            &result,
-            &"length".into(),
-            &JsValue::from_f64(struct_arr.len() as f64),
-        )?;
+        let Some(n) = set_code_columns(&result, &matched).await? else {
+            return Ok(JsValue::NULL);
+        };
+        Reflect::set(&result, &"length".into(), &JsValue::from_f64(n as f64))?;
         Ok(result.into())
     }
 
@@ -447,96 +388,72 @@ async fn match_columns(
             graph.as_ref(),
         )
         .await
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        .map_err(js_err)?;
     let payload = Object::new();
 
-    if let Some(dict) = dict {
-        // Code payload: u32 columns + the shared dictionary.
-        if let Some(cols) = matched.code_columns() {
-            // Fast path: codes gathered straight off the base's canonical
-            // slices — no per-call gather-and-canonicalize pipeline.
-            let n = cols[0].len();
-            for (name, col) in ["s", "p", "o", "g"].iter().zip(cols.iter()) {
-                let ta = js_sys::Uint32Array::new_with_length(col.len() as u32);
-                ta.copy_from(col);
-                Reflect::set(&payload, &(*name).into(), &ta)?;
-            }
-            Reflect::set(&payload, &"kind".into(), &"code".into())?;
-            Reflect::set(&payload, &"dict".into(), &dict)?;
-            Reflect::set(&payload, &"length".into(), &JsValue::from_f64(n as f64))?;
-            return Ok(payload.into());
-        }
-        let arr = matched
-            .get_quads_array()
-            .await
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        let mut ctx = VORTEX_SESSION.create_execution_ctx();
-        let struct_arr = arr
-            .execute::<StructArray>(&mut ctx)
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        macro_rules! u32_col {
-            ($name:expr) => {{
-                let col = struct_arr
-                    .unmasked_field_by_name($name)
-                    .map_err(|e| JsValue::from_str(&e.to_string()))?;
-                let prim = col
-                    .clone()
-                    .execute::<PrimitiveArray>(&mut ctx)
-                    .map_err(|e| JsValue::from_str(&e.to_string()))?;
-                let slice = prim.as_slice::<u32>();
-                let ta = js_sys::Uint32Array::new_with_length(slice.len() as u32);
-                ta.copy_from(slice);
-                JsValue::from(ta)
-            }};
-        }
+    // Code payload: u32 columns + the shared dictionary.
+    if let Some(dict) = dict
+        && let Some(n) = set_code_columns(&payload, &matched).await?
+    {
         Reflect::set(&payload, &"kind".into(), &"code".into())?;
-        Reflect::set(&payload, &"s".into(), &u32_col!("s"))?;
-        Reflect::set(&payload, &"p".into(), &u32_col!("p"))?;
-        Reflect::set(&payload, &"o".into(), &u32_col!("o"))?;
-        Reflect::set(&payload, &"g".into(), &u32_col!("g"))?;
         Reflect::set(&payload, &"dict".into(), &dict)?;
-        Reflect::set(
-            &payload,
-            &"length".into(),
-            &JsValue::from_f64(struct_arr.len() as f64),
-        )?;
-    } else {
-        // Term payload: packed N-Triples term columns for non-Dictionary layouts.
-        let mut quads_stream = matched
-            .quads()
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
-        // (offsets seeded with a leading 0, bytes) per s/p/o/g column.
-        let mut cols: [(Vec<u32>, Vec<u8>); 4] = [
-            (vec![0], Vec::new()),
-            (vec![0], Vec::new()),
-            (vec![0], Vec::new()),
-            (vec![0], Vec::new()),
-        ];
-        let mut n = 0u32;
-        while let Some(q_res) = quads_stream.next().await {
-            let q = q_res.map_err(|e| JsValue::from_str(&e.to_string()))?;
-            let terms = [
-                q.subject.to_string(),
-                q.predicate.to_string(),
-                q.object.to_string(),
-                match &q.graph_name {
-                    GraphName::DefaultGraph => String::new(),
-                    other => other.to_string(),
-                },
-            ];
-            for (col, term) in cols.iter_mut().zip(terms.iter()) {
-                col.1.extend_from_slice(term.as_bytes());
-                col.0.push(col.1.len() as u32);
-            }
-            n += 1;
-        }
-        Reflect::set(&payload, &"kind".into(), &"term".into())?;
-        for (name, (offsets, bytes)) in ["s", "p", "o", "g"].iter().zip(cols.iter()) {
-            Reflect::set(&payload, &(*name).into(), &term_column(offsets, bytes))?;
-        }
         Reflect::set(&payload, &"length".into(), &JsValue::from_f64(n as f64))?;
+        return Ok(payload.into());
     }
+
+    // Term payload: packed N-Triples term columns — the always-correct path,
+    // taken whenever the rows cannot be described as codes against the store's
+    // cached dictionary.
+    let mut quads_stream = matched.quads().map_err(js_err)?;
+    // (offsets seeded with a leading 0, bytes) per s/p/o/g column.
+    let mut cols: [(Vec<u32>, Vec<u8>); 4] = [
+        (vec![0], Vec::new()),
+        (vec![0], Vec::new()),
+        (vec![0], Vec::new()),
+        (vec![0], Vec::new()),
+    ];
+    let mut n = 0u32;
+    while let Some(q_res) = quads_stream.next().await {
+        let q = q_res.map_err(js_err)?;
+        let terms = [
+            q.subject.to_string(),
+            q.predicate.to_string(),
+            q.object.to_string(),
+            match &q.graph_name {
+                GraphName::DefaultGraph => String::new(),
+                other => other.to_string(),
+            },
+        ];
+        for (col, term) in cols.iter_mut().zip(terms.iter()) {
+            col.1.extend_from_slice(term.as_bytes());
+            col.0.push(col.1.len() as u32);
+        }
+        n += 1;
+    }
+    Reflect::set(&payload, &"kind".into(), &"term".into())?;
+    for (name, (offsets, bytes)) in ["s", "p", "o", "g"].iter().zip(cols.iter()) {
+        Reflect::set(&payload, &(*name).into(), &term_column(offsets, bytes))?;
+    }
+    Reflect::set(&payload, &"length".into(), &JsValue::from_f64(n as f64))?;
     Ok(payload.into())
+}
+
+/// Set a matched view's four `u32` code columns on `payload` under `s`/`p`/`o`/
+/// `g`, returning the row count — or `None` when codes are not that view's
+/// vocabulary at all, in which case nothing is set and the caller falls back to
+/// the term path.
+async fn set_code_columns(payload: &Object, matched: &CoreStore) -> Result<Option<usize>, JsValue> {
+    let Some(cols) = matched.code_columns_gathered().await.map_err(js_err)? else {
+        return Ok(None);
+    };
+    for (name, col) in ["s", "p", "o", "g"].iter().zip(cols.iter()) {
+        // Copy into a JS-owned Uint32Array (safe against wasm memory growth,
+        // which would detach a zero-copy view).
+        let ta = js_sys::Uint32Array::new_with_length(col.len() as u32);
+        ta.copy_from(col);
+        Reflect::set(payload, &(*name).into(), &ta)?;
+    }
+    Ok(Some(cols[0].len()))
 }
 
 /// Pack one term column's offsets/bytes into a `{offsets, bytes}` JS object.

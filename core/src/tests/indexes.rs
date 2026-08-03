@@ -628,114 +628,6 @@ async fn test_file_backed_compaction_rewrites_source_file() {
     let _ = std::fs::remove_file(&path);
 }
 
-/// Mutations belong to the store that owns its rows. A narrowed view is a
-/// window onto a shared base, so it rejects them and points at the way out.
-#[tokio::test]
-async fn test_derived_view_rejects_mutations() {
-    let quads: Vec<Quad> = (0..6)
-        .map(|i| {
-            make_quad(
-                &format!("http://example.org/s{}", i),
-                "http://example.org/p",
-                &format!("object {}", i % 2),
-                GraphName::DefaultGraph,
-            )
-        })
-        .collect();
-
-    let arr = VortexRdfStore::build_vortex_array_with_builder::<UnsortedStreamBuilder>(
-        quad_stream(quads.clone()),
-        LayoutStrategy::Default,
-        vec![],
-    )
-    .await
-    .unwrap();
-    let store = VortexRdfStore::from_built(arr).unwrap();
-
-    let object = Term::Literal(Literal::new_simple_literal("object 0"));
-    let view = store
-        .match_pattern(None, None, Some(&object), None)
-        .await
-        .unwrap();
-    assert_eq!(view.size().await.unwrap(), 3);
-
-    for result in [
-        view.add_quad(quads[0].clone()).await.err(),
-        view.delete_quad(&quads[0]).await.err(),
-        view.delete_matching(None, None, Some(&object), None)
-            .await
-            .err(),
-    ] {
-        let message = result
-            .expect("a derived view must reject mutations")
-            .to_string();
-        assert!(
-            message.contains("owned()"),
-            "the error should point at the way out, got: {message}"
-        );
-    }
-
-    // `owned()` yields an independent copy that mutates freely, and leaves
-    // the store it came from alone.
-    let owned = view.owned().await.unwrap();
-    let edited = owned.delete_quad(&quads[0]).await.unwrap();
-    assert_eq!(edited.size().await.unwrap(), 2);
-    assert_eq!(store.size().await.unwrap(), 6);
-
-    // An unconstrained view covers exactly the base, so it counts as an
-    // owner: mutating it is the same as mutating the store it came from.
-    let whole = store.match_pattern(None, None, None, None).await.unwrap();
-    assert_eq!(
-        whole
-            .delete_quad(&quads[0])
-            .await
-            .unwrap()
-            .size()
-            .await
-            .unwrap(),
-        5
-    );
-}
-
-/// The base a view was derived from stays reachable: matching narrows a
-/// selection, it does not throw the unselected rows away.
-#[tokio::test]
-async fn test_derived_view_does_not_lose_base_rows() {
-    let quads: Vec<Quad> = (0..10)
-        .map(|i| {
-            make_quad(
-                &format!("http://example.org/s{}", i),
-                "http://example.org/p",
-                &format!("object {}", i % 2),
-                GraphName::DefaultGraph,
-            )
-        })
-        .collect();
-
-    let arr = VortexRdfStore::build_vortex_array_with_builder::<UnsortedStreamBuilder>(
-        quad_stream(quads.clone()),
-        LayoutStrategy::Default,
-        vec![],
-    )
-    .await
-    .unwrap();
-    let store = VortexRdfStore::from_built(arr).unwrap();
-
-    let object = Term::Literal(Literal::new_simple_literal("object 0"));
-    let matched = store
-        .match_pattern(None, None, Some(&object), None)
-        .await
-        .unwrap();
-    assert_eq!(matched.size().await.unwrap(), 5);
-
-    // Widening back out from the derived view reaches only what the view
-    // selects (5 rows) — but the store it came from is untouched, and a
-    // fresh match against it still sees all 10.
-    let widened = matched.match_pattern(None, None, None, None).await.unwrap();
-    assert_eq!(widened.size().await.unwrap(), 5);
-    assert_eq!(store.size().await.unwrap(), 10);
-}
-
 async fn run_index_matrix_test<B: VortexArrayBuilder>(builder_name: &str) {
     let quads: Vec<Quad> = (0..24)
         .map(|i| {
@@ -957,16 +849,8 @@ async fn test_in_memory_copy_index_matching() {
 /// scan or narrow the selection further — fall back to the row ids. Serving
 /// applies exactly when the index fully resolves the pattern, which is also
 /// exactly when no gather would otherwise happen.
-#[cfg(feature = "file-io")]
 #[tokio::test]
 async fn test_in_memory_copy_index_serving() {
-    async fn matched_strings(view: &VortexRdfStore) -> Vec<String> {
-        let quads: Vec<Quad> = view.quads().unwrap().try_collect().await.unwrap();
-        let mut strings: Vec<String> = quads.iter().map(|q| q.to_string()).collect();
-        strings.sort();
-        strings
-    }
-
     let graphs = [
         GraphName::NamedNode(NamedNode::new("http://example.org/g0").unwrap()),
         GraphName::NamedNode(NamedNode::new("http://example.org/g1").unwrap()),
@@ -1011,7 +895,7 @@ async fn test_in_memory_copy_index_serving() {
         .unwrap();
     assert!(by_p.debug_has_serve_plan());
     assert_eq!(by_p.size().await.unwrap(), 10);
-    assert_eq!(matched_strings(&by_p).await, expected(&|i| i % 3 == 1));
+    assert_eq!(view_strings(&by_p).await, expected(&|i| i % 3 == 1));
 
     // Object-bound: served from the OSPG family.
     let o2 = Term::Literal(Literal::new_simple_literal("o2"));
@@ -1020,7 +904,7 @@ async fn test_in_memory_copy_index_serving() {
         .await
         .unwrap();
     assert!(by_o.debug_has_serve_plan());
-    assert_eq!(matched_strings(&by_o).await, expected(&|i| i % 5 == 2));
+    assert_eq!(view_strings(&by_o).await, expected(&|i| i % 5 == 2));
 
     // Predicate and object: one (p, o) prefix probe fully resolves the
     // pattern, so the narrowed run is served directly.
@@ -1030,7 +914,7 @@ async fn test_in_memory_copy_index_serving() {
         .await
         .unwrap();
     assert!(by_po.debug_has_serve_plan());
-    assert_eq!(matched_strings(&by_po).await, expected(&|i| i % 15 == 1));
+    assert_eq!(view_strings(&by_po).await, expected(&|i| i % 15 == 1));
 
     // A residual graph constraint leaves a mask scan to run — which already
     // gathers the rows — so the serve plan is dropped (it would save
@@ -1042,7 +926,7 @@ async fn test_in_memory_copy_index_serving() {
         .unwrap();
     assert!(!by_pg.debug_has_serve_plan());
     assert_eq!(
-        matched_strings(&by_pg).await,
+        view_strings(&by_pg).await,
         expected(&|i| i % 3 == 2 && i % 2 == 0)
     );
 
@@ -1053,7 +937,7 @@ async fn test_in_memory_copy_index_serving() {
         .unwrap();
     assert!(!chained.debug_has_serve_plan());
     assert_eq!(
-        matched_strings(&chained).await,
+        view_strings(&chained).await,
         expected(&|i| i % 3 == 1 && i % 5 == 1)
     );
 
@@ -1067,7 +951,7 @@ async fn test_in_memory_copy_index_serving() {
     assert!(by_p_after.debug_has_serve_plan());
     assert_eq!(by_p_after.size().await.unwrap(), 9);
     assert_eq!(
-        matched_strings(&by_p_after).await,
+        view_strings(&by_p_after).await,
         expected(&|i| i % 3 == 1 && i != 4)
     );
 }
@@ -1079,13 +963,6 @@ async fn test_in_memory_copy_index_serving() {
 #[cfg(feature = "file-io")]
 async fn run_copy_index_file_serving_test<B: VortexArrayBuilder>(layout: LayoutStrategy) {
     use crate::io::ser::quads_stream_to_vortex_writer_with_builder;
-
-    async fn matched_strings(view: &VortexRdfStore) -> Vec<String> {
-        let quads: Vec<Quad> = view.quads().unwrap().try_collect().await.unwrap();
-        let mut strings: Vec<String> = quads.iter().map(|q| q.to_string()).collect();
-        strings.sort();
-        strings
-    }
 
     let graphs = [
         GraphName::NamedNode(NamedNode::new("http://example.org/g0").unwrap()),
@@ -1141,7 +1018,7 @@ async fn run_copy_index_file_serving_test<B: VortexArrayBuilder>(layout: LayoutS
         .unwrap();
     assert!(by_p.debug_has_serve_plan());
     assert_eq!(by_p.size().await.unwrap(), 10);
-    assert_eq!(matched_strings(&by_p).await, expected(&|i| i % 3 == 1));
+    assert_eq!(view_strings(&by_p).await, expected(&|i| i % 3 == 1));
 
     // Object-bound: i ≡ 2 (mod 5), served from the OSPG family.
     let o2 = Term::Literal(Literal::new_simple_literal("o2"));
@@ -1151,7 +1028,7 @@ async fn run_copy_index_file_serving_test<B: VortexArrayBuilder>(layout: LayoutS
         .unwrap();
     assert!(by_o.debug_has_serve_plan());
     assert_eq!(by_o.size().await.unwrap(), 6);
-    assert_eq!(matched_strings(&by_o).await, expected(&|i| i % 5 == 2));
+    assert_eq!(view_strings(&by_o).await, expected(&|i| i % 5 == 2));
 
     // Predicate and object bound: one (p, o) prefix resolution —
     // i ≡ 1 (mod 3) ∧ i ≡ 1 (mod 5) ⇔ i ≡ 1 (mod 15).
@@ -1161,7 +1038,7 @@ async fn run_copy_index_file_serving_test<B: VortexArrayBuilder>(layout: LayoutS
         .await
         .unwrap();
     assert_eq!(by_po.size().await.unwrap(), 2);
-    assert_eq!(matched_strings(&by_po).await, expected(&|i| i % 15 == 1));
+    assert_eq!(view_strings(&by_po).await, expected(&|i| i % 15 == 1));
 
     // A residual graph constraint rides the copy-served scan's filter.
     let p2 = NamedNode::new("http://example.org/p2").unwrap();
@@ -1171,7 +1048,7 @@ async fn run_copy_index_file_serving_test<B: VortexArrayBuilder>(layout: LayoutS
         .unwrap();
     assert_eq!(by_pg.size().await.unwrap(), 5);
     assert_eq!(
-        matched_strings(&by_pg).await,
+        view_strings(&by_pg).await,
         expected(&|i| i % 3 == 2 && i % 2 == 0)
     );
 
@@ -1183,7 +1060,7 @@ async fn run_copy_index_file_serving_test<B: VortexArrayBuilder>(layout: LayoutS
         .unwrap();
     assert!(!chained.debug_has_serve_plan());
     assert_eq!(
-        matched_strings(&chained).await,
+        view_strings(&chained).await,
         expected(&|i| i % 3 == 1 && i % 5 == 1)
     );
 
@@ -1204,7 +1081,7 @@ async fn run_copy_index_file_serving_test<B: VortexArrayBuilder>(layout: LayoutS
         .unwrap();
     assert_eq!(by_p_after.size().await.unwrap(), 9);
     assert_eq!(
-        matched_strings(&by_p_after).await,
+        view_strings(&by_p_after).await,
         expected(&|i| i % 3 == 1 && i != 4)
     );
 

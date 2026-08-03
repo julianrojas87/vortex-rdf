@@ -8,7 +8,7 @@ use std::os::raw::{c_int, c_void};
 use pyo3::exceptions::PySystemError;
 use pyo3::ffi;
 use pyo3::prelude::*;
-use vortex_array::arrays::PrimitiveArray;
+use vortex_buffer::Buffer;
 use vortex_rdf_core::DictSnapshot;
 
 /// An immutable handle on a store's term dictionary. Decodes term codes to
@@ -47,20 +47,20 @@ impl TermDict {
 
 /// One matched term-code column, exposed to Python zero-copy through the
 /// buffer protocol: `memoryview(col).cast("I")` views the Rust memory
-/// directly. The column is read-only and owns (refcounts) its backing array.
+/// directly. The column is read-only and owns (refcounts) its backing buffer.
 #[pyclass(frozen, module = "vortex_rdf._native")]
 pub struct U32Column {
-    pub(crate) prim: PrimitiveArray,
+    pub(crate) codes: Buffer<u32>,
 }
 
 #[pymethods]
 impl U32Column {
     fn __len__(&self) -> usize {
-        self.prim.len()
+        self.codes.len()
     }
 
     fn __repr__(&self) -> String {
-        format!("U32Column(len={})", self.prim.len())
+        format!("U32Column(len={})", self.codes.len())
     }
 
     /// Fills `view` over the raw u32 data; the exported buffer holds a
@@ -70,7 +70,7 @@ impl U32Column {
         view: *mut ffi::Py_buffer,
         flags: c_int,
     ) -> PyResult<()> {
-        let data = slf.get().prim.as_slice::<u32>();
+        let data = slf.get().codes.as_slice();
         let ret = unsafe {
             ffi::PyBuffer_FillInfo(
                 view,

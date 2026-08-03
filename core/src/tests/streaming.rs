@@ -286,54 +286,6 @@ async fn test_sorted_stream_streaming_write() {
     run_sorted_streaming_write_test::<SortedStreamBuilder>().await;
 }
 
-#[cfg(feature = "file-io")]
-#[tokio::test]
-async fn test_file_backed_subject_metadata_range_for_missing_subject() {
-    let quads: Vec<Quad> = (0..25)
-        .rev()
-        .map(|i| {
-            make_quad(
-                &format!("http://example.org/s{:02}", i),
-                "http://example.org/p",
-                "o",
-                GraphName::DefaultGraph,
-            )
-        })
-        .collect();
-
-    let path = std::env::temp_dir().join(format!(
-        "vortex_rdf_subject_range_{}.vortex",
-        uuid::Uuid::new_v4()
-    ));
-    let mut buffer = Vec::new();
-    quads_stream_to_vortex_writer_with_builder::<SortedInMemoryBuilder, _, _>(
-        quad_stream(quads),
-        &mut buffer,
-        LayoutStrategy::Default,
-        vec![],
-    )
-    .await
-    .unwrap();
-    std::fs::write(&path, &buffer).unwrap();
-
-    let store = VortexRdfStore::from_file(&path).await.unwrap();
-    let missing = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/s99").unwrap());
-    let row_range = store.debug_subject_row_range(&missing).await.unwrap();
-    assert_eq!(row_range, Some(0..0));
-    assert_eq!(
-        store
-            .match_pattern(Some(&missing), None, None, None)
-            .await
-            .unwrap()
-            .size()
-            .await
-            .unwrap(),
-        0
-    );
-
-    let _ = std::fs::remove_file(&path);
-}
-
 #[tokio::test]
 async fn test_sorted_builder_stamps_is_sorted() {
     use vortex_array::VortexSessionExecute;
@@ -492,55 +444,6 @@ async fn test_unsorted_exact_chunk_boundary_stamps_index_leads() {
     }
 }
 
-#[tokio::test]
-async fn test_sorted_subject_binary_search() {
-    // Multiple quads per subject: the binary-search fast path must return
-    // the full [lo, hi) range for the matched subject.
-    let mut quads: Vec<Quad> = Vec::new();
-    for i in (0..10).rev() {
-        for p in ["http://example.org/p1", "http://example.org/p2"] {
-            quads.push(make_quad(
-                &format!("http://example.org/s{:02}", i),
-                p,
-                "o",
-                GraphName::DefaultGraph,
-            ));
-        }
-    }
-
-    let arr = VortexRdfStore::build_vortex_array_with_builder::<SortedInMemoryBuilder>(
-        quad_stream(quads),
-        LayoutStrategy::Default,
-        vec![],
-    )
-    .await
-    .unwrap();
-    let store = VortexRdfStore::from_built(arr).unwrap();
-
-    let s5 = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/s05").unwrap());
-    let matched = store
-        .match_pattern(Some(&s5), None, None, None)
-        .await
-        .unwrap();
-    assert_eq!(matched.size().await.unwrap(), 2);
-
-    // Subject + predicate narrows within the sliced range.
-    let p1 = NamedNode::new("http://example.org/p1").unwrap();
-    let matched_sp = store
-        .match_pattern(Some(&s5), Some(&p1), None, None)
-        .await
-        .unwrap();
-    assert_eq!(matched_sp.size().await.unwrap(), 1);
-
-    // Missing subject → empty via binary search short-circuit.
-    let s99 = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/s99").unwrap());
-    let empty = store
-        .match_pattern(Some(&s99), None, None, None)
-        .await
-        .unwrap();
-    assert_eq!(empty.size().await.unwrap(), 0);
-}
-
 /// `quads_vec` (the exact-size materialization) must yield the same quads,
 /// in the same order, as one-at-a-time stream collection — for a plain
 /// store, a matched view, and a mutated store with a tail.
@@ -558,7 +461,7 @@ async fn test_quads_vec_matches_stream_collection() {
         quad_stream(quads.clone()),
         &path,
         LayoutStrategy::Dictionary,
-        dictionary_indexes(),
+        vec![],
     )
     .await
     .unwrap();

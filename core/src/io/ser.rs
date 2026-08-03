@@ -1,30 +1,38 @@
-#[cfg(any(feature = "file-io", target_arch = "wasm32"))]
+//! The write side of the native store container.
+//!
+//! Assembles a store's parts — the primary quad table, the in-memory index
+//! components, and the term dictionary — into
+//! [`NativeComponentWrite`](crate::io::store_layout::NativeComponentWrite)s
+//! and drives [`write_store`](crate::io::store_layout::write_store) over
+//! them, carrying each part's sortedness provenance onto the descriptors a
+//! reader will trust. Also owns the `quads_stream_to_*` entry points, which
+//! run a builder's chunk stream straight into that writer.
+//!
+//! Reading these bytes back is [`native_file`](crate::io::native_file)'s job,
+//! and the container's own on-disk grammar is
+//! [`store_layout`](crate::io::store_layout)'s.
+
 use crate::error::{Result, VortexRdfError};
-#[cfg(any(feature = "file-io", target_arch = "wasm32"))]
 use vortex_array::ArrayRef;
 
-#[cfg(any(feature = "file-io", target_arch = "wasm32"))]
 use crate::io::store_layout::{
     self, DICT_COMPONENT_NAME, NativeComponentWrite, ReplayableArraySource,
     StoreComponentDescriptor, StoreComponentRole, default_child_strategy,
 };
-#[cfg(any(feature = "file-io", target_arch = "wasm32"))]
 use crate::store::LayoutStrategy;
-#[cfg(any(feature = "file-io", target_arch = "wasm32"))]
 use crate::store::term_dictionary::{self, TermDictionary};
-#[cfg(any(feature = "file-io", target_arch = "wasm32"))]
 use std::sync::Arc;
-#[cfg(any(feature = "file-io", target_arch = "wasm32"))]
 use vortex_array::stream::ArrayStreamAdapter;
-#[cfg(any(feature = "file-io", target_arch = "wasm32"))]
 use vortex_io::VortexWrite;
-#[cfg(any(feature = "file-io", target_arch = "wasm32"))]
 use web_time::Instant;
 
 #[cfg(feature = "file-io")]
 use crate::error;
 #[cfg(feature = "file-io")]
-use crate::store::builders::{UnsortedStreamBuilder, VortexArrayBuilder};
+use crate::store::builders::{
+    BuilderStrategy, SortedInMemoryBuilder, SortedStreamBuilder, UnsortedStreamBuilder,
+    VortexArrayBuilder,
+};
 #[cfg(feature = "file-io")]
 use crate::store::{Indexes, RawQuad};
 #[cfg(feature = "file-io")]
@@ -34,7 +42,6 @@ use futures::Stream;
 /// one chunk per held FSST window, written verbatim through the pass-through
 /// strategy as the root's required `dictionary` child (see
 /// [`store_layout::dict_child_strategy`]).
-#[cfg(any(feature = "file-io", target_arch = "wasm32"))]
 pub(crate) fn dict_component(dict: &TermDictionary) -> Result<NativeComponentWrite> {
     let chunks = term_dictionary::dict_child_chunks(dict)?;
     let dtype = chunks[0].dtype().clone();
@@ -59,7 +66,6 @@ pub(crate) fn dict_component(dict: &TermDictionary) -> Result<NativeComponentWri
 /// as a native store file. Sortedness provenance is carried faithfully: the
 /// root records whether `s` is globally sorted (off the primary's own
 /// stamp), and each index child records its component's `sorted` flag.
-#[cfg(any(feature = "file-io", target_arch = "wasm32"))]
 pub(crate) async fn serialize_parts<W: VortexWrite + Unpin + Send>(
     primary: ArrayRef,
     components: &[crate::store::indexes::IndexComponent],
@@ -117,7 +123,6 @@ pub(crate) async fn serialize_parts<W: VortexWrite + Unpin + Send>(
 /// descriptor carrying the component's own sortedness provenance.
 ///
 /// [`IndexComponent`]: crate::store::indexes::IndexComponent
-#[cfg(any(feature = "file-io", target_arch = "wasm32"))]
 fn component_write(
     component: &crate::store::indexes::IndexComponent,
 ) -> Result<NativeComponentWrite> {
@@ -222,30 +227,76 @@ where
     quads_stream_to_vortex_writer_with_builder::<B, _, _>(quads, writer, layout, indexes).await
 }
 
-/// Serialize a stream of quads directly to a Vortex file writer using the
-/// default configuration (UnsortedStream builder, Default layout, no indexes).
+/// [`quads_stream_to_vortex_writer_with_builder`] driven by a *value*
+/// [`BuilderStrategy`] instead of a builder type parameter — the one place
+/// the enum is interpreted, so callers choosing a builder at runtime (the
+/// CLI, the bindings, the benches) do not each re-write the dispatch.
 #[cfg(feature = "file-io")]
-pub async fn quads_stream_to_vortex_writer<S, W>(quads: S, writer: W) -> error::Result<()>
+pub async fn quads_stream_to_vortex_writer_with_strategy<S, W>(
+    quads: S,
+    writer: W,
+    layout: LayoutStrategy,
+    indexes: Indexes,
+    strategy: BuilderStrategy,
+) -> Result<()>
 where
     S: Stream<Item = error::Result<RawQuad>> + Unpin + Send + 'static,
     W: VortexWrite + Unpin + Send,
 {
-    quads_stream_to_vortex_writer_with_builder::<UnsortedStreamBuilder, _, _>(
-        quads,
-        writer,
-        LayoutStrategy::Default,
-        Vec::new(),
-    )
-    .await
+    match strategy {
+        BuilderStrategy::UnsortedStream => {
+            quads_stream_to_vortex_writer_with_builder::<UnsortedStreamBuilder, _, _>(
+                quads, writer, layout, indexes,
+            )
+            .await
+        }
+        BuilderStrategy::SortedInMemory => {
+            quads_stream_to_vortex_writer_with_builder::<SortedInMemoryBuilder, _, _>(
+                quads, writer, layout, indexes,
+            )
+            .await
+        }
+        BuilderStrategy::SortedStream => {
+            quads_stream_to_vortex_writer_with_builder::<SortedStreamBuilder, _, _>(
+                quads, writer, layout, indexes,
+            )
+            .await
+        }
+    }
 }
 
-/// Serialize a stream of quads to an in-memory Vortex file byte buffer.
+/// The path-based twin of [`quads_stream_to_vortex_writer_with_strategy`] —
+/// [`quads_stream_to_vortex_file_with_builder`] over a value
+/// [`BuilderStrategy`].
 #[cfg(feature = "file-io")]
-pub async fn quads_stream_to_vortex<S>(quads: S) -> error::Result<Vec<u8>>
+pub async fn quads_stream_to_vortex_file<S>(
+    quads: S,
+    path: &std::path::Path,
+    layout: LayoutStrategy,
+    indexes: Indexes,
+    strategy: BuilderStrategy,
+) -> Result<()>
 where
     S: Stream<Item = error::Result<RawQuad>> + Unpin + Send + 'static,
 {
-    let mut buffer = Vec::new();
-    quads_stream_to_vortex_writer(quads, &mut buffer).await?;
-    Ok(buffer)
+    match strategy {
+        BuilderStrategy::UnsortedStream => {
+            quads_stream_to_vortex_file_with_builder::<UnsortedStreamBuilder, _>(
+                quads, path, layout, indexes,
+            )
+            .await
+        }
+        BuilderStrategy::SortedInMemory => {
+            quads_stream_to_vortex_file_with_builder::<SortedInMemoryBuilder, _>(
+                quads, path, layout, indexes,
+            )
+            .await
+        }
+        BuilderStrategy::SortedStream => {
+            quads_stream_to_vortex_file_with_builder::<SortedStreamBuilder, _>(
+                quads, path, layout, indexes,
+            )
+            .await
+        }
+    }
 }

@@ -3,12 +3,15 @@
 
 use super::*;
 #[cfg(feature = "file-io")]
-use crate::io::quads_stream_to_vortex;
+use crate::io::quads_stream_to_vortex_writer_with_builder;
 use crate::store::VortexArrayBuilder;
 use futures::{StreamExt, TryStreamExt, stream};
 use oxrdf::{GraphName, Literal, NamedNode, NamedOrBlankNode, Quad, Term};
 
 mod dictionary;
+#[cfg(feature = "file-io")]
+mod dictionary_file_backed;
+mod escaping;
 #[cfg(feature = "file-io")]
 mod file_backed;
 mod indexes;
@@ -38,6 +41,24 @@ fn quad_stream(
     )
 }
 
+/// A quad stream serialized to native store bytes with the suite's default
+/// configuration (UnsortedStream builder, Default layout, no indexes).
+#[cfg(feature = "file-io")]
+async fn quads_stream_to_vortex<S>(quads: S) -> crate::error::Result<Vec<u8>>
+where
+    S: futures::Stream<Item = crate::error::Result<crate::store::RawQuad>> + Unpin + Send + 'static,
+{
+    let mut buffer = Vec::new();
+    quads_stream_to_vortex_writer_with_builder::<crate::store::UnsortedStreamBuilder, _, _>(
+        quads,
+        &mut buffer,
+        LayoutStrategy::Default,
+        Vec::new(),
+    )
+    .await?;
+    Ok(buffer)
+}
+
 /// Sorted subject strings of every quad a store exposes.
 async fn subjects_of(store: &VortexRdfStore) -> Vec<String> {
     let mut got: Vec<String> = store
@@ -50,8 +71,9 @@ async fn subjects_of(store: &VortexRdfStore) -> Vec<String> {
     got
 }
 
-fn dictionary_indexes() -> Indexes {
-    vec![]
+/// Sorted string forms of every quad a store view exposes.
+async fn view_strings(view: &VortexRdfStore) -> Vec<String> {
+    quad_strings(&view.quads_vec().await.unwrap())
 }
 
 /// Quads with shared terms across positions, a named graph, and the
