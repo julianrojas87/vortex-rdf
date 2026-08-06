@@ -21,6 +21,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use vortex_array::RawMetadata;
 use vortex_array::dtype::{DType, Nullability, PType, StructFields};
+use vortex_array::stream::{ArrayStreamAdapter, ArrayStreamExt};
 use vortex_error::{VortexResult, vortex_bail, vortex_ensure_eq};
 use vortex_layout::segments::SegmentSource;
 use vortex_layout::{
@@ -560,7 +561,6 @@ impl NativeComponentSource for ReplayableArraySource {
     }
 
     fn open(&self) -> VortexResult<vortex_array::stream::SendableArrayStream> {
-        use vortex_array::stream::{ArrayStreamAdapter, ArrayStreamExt};
         let chunks = Arc::clone(&self.chunks);
         let stream = futures::stream::unfold((chunks, 0usize), |(chunks, index)| async move {
             let chunk = chunks.get(index)?.clone();
@@ -606,7 +606,6 @@ impl NativeComponentSource for PullComponentSource {
     }
 
     fn open(&self) -> VortexResult<vortex_array::stream::SendableArrayStream> {
-        use vortex_array::stream::{ArrayStreamAdapter, ArrayStreamExt};
         let pull = self
             .pull
             .lock()
@@ -846,8 +845,6 @@ mod tests {
     use crate::io::VORTEX_SESSION;
     use vortex_array::IntoArray;
     use vortex_array::arrays::{StructArray, VarBinViewArray};
-    #[cfg(any(feature = "file-io", target_arch = "wasm32"))]
-    use vortex_array::stream::{ArrayStreamAdapter, ArrayStreamExt as _};
     use vortex_buffer::Buffer;
     #[cfg(any(feature = "file-io", target_arch = "wasm32"))]
     use vortex_buffer::ByteBuffer;

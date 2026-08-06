@@ -7,6 +7,7 @@ use crate::io::VORTEX_SESSION;
 
 use vortex_array::arrays::varbinview::BinaryView;
 use vortex_array::arrays::{BoolArray, VarBinViewArray};
+use vortex_array::expr::stats::{Precision, Stat, StatsProvider};
 use vortex_array::{ArrayRef, IntoArray, VortexSessionExecute};
 use vortex_mask::Mask;
 
@@ -70,7 +71,6 @@ pub(crate) fn make_nullable_string_array(
 /// this stat to binary-search the column, so a false stamp corrupts query
 /// results.
 pub(crate) fn stamp_is_sorted(arr: &ArrayRef) {
-    use vortex_array::expr::stats::{Precision, Stat};
     arr.statistics()
         .set(Stat::IsSorted, Precision::Exact(true.into()));
 }
@@ -79,7 +79,6 @@ pub(crate) fn stamp_is_sorted(arr: &ArrayRef) {
 /// absent stat counts as unsorted — order is never assumed, only trusted
 /// when explicitly recorded.
 pub(crate) fn column_is_sorted(arr: &ArrayRef) -> bool {
-    use vortex_array::expr::stats::{Precision, Stat, StatsProvider};
     match arr.statistics().get(Stat::IsSorted) {
         Precision::Exact(sc) | Precision::Inexact(sc) => bool::try_from(&sc).unwrap_or(false),
         Precision::Absent => false,

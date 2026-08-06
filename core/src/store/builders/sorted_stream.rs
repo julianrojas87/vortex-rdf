@@ -650,8 +650,7 @@ where
     <CopyKey<V> as Archive>::Archived: RkyvDeserialize<CopyKey<V>, HighDeserializer<RkyvError>>,
 {
     use crate::io::store_layout::{
-        NativeComponentWrite, PullComponentSource, StoreComponentDescriptor, StoreComponentRole,
-        default_child_strategy,
+        PullComponentSource, StoreComponentDescriptor, StoreComponentRole, default_child_strategy,
     };
     use crate::store::indexes::secondary_by_copy::Family;
     use crate::store::indexes::secondary_by_reference::{REF_O_COMPONENT, REF_P_COMPONENT};

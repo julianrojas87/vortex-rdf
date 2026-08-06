@@ -51,8 +51,8 @@ pub(crate) const REF_P_COMPONENT: &str = "index:ref-p";
 
 /// The persisted child's struct dtype: sorted values (strings, or u32 codes
 /// under the Dictionary layout) plus the u32 primary row id.
-pub(crate) fn ref_child_dtype(encoded: bool) -> vortex_array::dtype::DType {
-    use vortex_array::dtype::{DType, Nullability, PType, StructFields};
+pub(crate) fn ref_child_dtype(encoded: bool) -> DType {
+    use vortex_array::dtype::{Nullability, PType, StructFields};
     let val = if encoded {
         DType::Primitive(PType::U32, Nullability::NonNullable)
     } else {

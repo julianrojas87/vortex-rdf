@@ -1,11 +1,13 @@
 use super::*;
+use crate::store::builders::sorted_stream::build_sorted_stream_chunk_stream;
+use crate::store::builders::unsorted_stream::build_chunk_stream;
+use vortex_array::VortexSessionExecute;
+use vortex_array::arrays::struct_::{StructArray, StructArrayExt};
 
 // ─── 3) Streaming/chunking behavior ─────────────────────────────────────
 
 #[tokio::test]
 async fn test_streaming_chunk_boundaries() {
-    use crate::store::builders::unsorted_stream::build_chunk_stream;
-
     let quads: Vec<Quad> = (0..10)
         .map(|i| {
             make_quad(
@@ -74,7 +76,6 @@ async fn test_streaming_write_read_roundtrip() {
 #[tokio::test]
 async fn test_sorted_streaming_chunk_boundaries() {
     use crate::store::builders::sorted_in_memory::build_sorted_chunk_stream;
-    use crate::store::builders::sorted_stream::build_sorted_stream_chunk_stream;
 
     // Quads fed in REVERSE subject order; both sorted builders must emit
     // globally sorted output across chunk boundaries.
@@ -143,8 +144,6 @@ async fn test_sorted_streaming_chunk_boundaries() {
 /// produce — otherwise unexercised for the string layouts.
 #[tokio::test]
 async fn test_sorted_streaming_spilled_indexes_match_in_memory() {
-    use crate::store::builders::sorted_stream::build_sorted_stream_chunk_stream;
-
     let indexes = vec![IndexType::SecondaryByCopy, IndexType::SecondaryByReference];
     // Fed in reverse so nothing is accidentally in order, and wide enough
     // (24 quads over a chunk size of 3) to force 8 runs.
@@ -288,8 +287,6 @@ async fn test_sorted_stream_streaming_write() {
 
 #[tokio::test]
 async fn test_sorted_builder_stamps_is_sorted() {
-    use vortex_array::VortexSessionExecute;
-    use vortex_array::arrays::struct_::{StructArray, StructArrayExt};
     use vortex_array::expr::stats::{Precision, Stat, StatsProvider};
 
     let quads: Vec<Quad> = (0..10)
@@ -343,9 +340,6 @@ async fn test_sorted_builder_stamps_is_sorted() {
 #[tokio::test]
 async fn test_unsorted_exact_chunk_boundary_stamps_index_leads() {
     use crate::store::array::column_is_sorted;
-    use crate::store::builders::unsorted_stream::build_chunk_stream;
-    use vortex_array::VortexSessionExecute;
-    use vortex_array::arrays::struct_::{StructArray, StructArrayExt};
 
     let indexes = vec![IndexType::SecondaryByCopy];
     let make = |n: usize| -> Vec<Quad> {
@@ -502,7 +496,6 @@ async fn test_quads_vec_matches_stream_collection() {
 #[cfg(feature = "file-io")]
 #[tokio::test]
 async fn test_unsorted_multichunk_from_bytes_matches_correctly() {
-    use crate::store::builders::unsorted_stream::build_chunk_stream;
     use crate::store::indexes::IndexType;
 
     // Predicates interleave across chunks so per-chunk sorted != global.

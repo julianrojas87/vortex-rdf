@@ -26,6 +26,8 @@ use vortex_array::{ArrayRef, IntoArray, VortexSessionExecute};
 use crate::error::{Result, VortexRdfError};
 use crate::io::VORTEX_SESSION;
 
+use super::secondary_by_copy::Family;
+use super::secondary_by_reference::RefRole;
 use super::{
     IndexType, Indexes, detect_indexes, secondary_by_copy, secondary_by_reference,
     strip_index_columns,
@@ -243,8 +245,6 @@ pub(crate) fn component_child_dtype(
 pub(crate) fn component_identity_for_slug(
     implementation: &str,
 ) -> Option<(&'static str, &'static str)> {
-    use secondary_by_copy::Family;
-    use secondary_by_reference::RefRole;
     match implementation {
         x if x == secondary_by_copy::POSG_IMPLEMENTATION => Some((
             Family::Posg.component_name(),
@@ -268,8 +268,6 @@ pub(crate) fn component_identity_for_slug(
 /// columns re-glue into (positionally matching the child's column order) —
 /// the read-side inverse of [`index_component_specs`].
 pub(crate) fn row_space_columns_for_slug(implementation: &str) -> Option<Vec<&'static str>> {
-    use secondary_by_copy::Family;
-    use secondary_by_reference::RefRole;
     match implementation {
         secondary_by_copy::POSG_IMPLEMENTATION => Some(Family::Posg.column_names().to_vec()),
         secondary_by_copy::OSPG_IMPLEMENTATION => Some(Family::Ospg.column_names().to_vec()),

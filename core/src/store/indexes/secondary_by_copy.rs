@@ -107,8 +107,8 @@ pub(crate) fn push_component_specs(
 
 /// The persisted child's struct dtype: quad components as strings (or u32
 /// codes under the Dictionary layout) plus the u32 primary row id.
-pub(crate) fn copy_child_dtype(encoded: bool) -> vortex_array::dtype::DType {
-    use vortex_array::dtype::{DType, Nullability, PType, StructFields};
+pub(crate) fn copy_child_dtype(encoded: bool) -> DType {
+    use vortex_array::dtype::{Nullability, PType, StructFields};
     let term = if encoded {
         DType::Primitive(PType::U32, Nullability::NonNullable)
     } else {

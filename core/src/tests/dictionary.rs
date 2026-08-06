@@ -1,4 +1,14 @@
 use super::*;
+#[cfg(feature = "file-io")]
+use crate::io::store_layout;
+#[cfg(feature = "file-io")]
+use crate::store::term_dictionary;
+use vortex_array::IntoArray as _;
+use vortex_array::arrays::struct_::StructArray;
+#[cfg(feature = "file-io")]
+use vortex_array::stream::ArrayStreamAdapter;
+use vortex_array::validity::Validity;
+use vortex_buffer::Buffer;
 
 // ─── 7) Dictionary layout ──────────────────────────────────────────────
 async fn run_dictionary_roundtrip<B: VortexArrayBuilder>() {
@@ -413,7 +423,7 @@ async fn test_dictionary_empty_dataset() {
 #[cfg(feature = "file-io")]
 fn term_chunk_of(chunk: &vortex_array::ArrayRef) -> vortex_array::ArrayRef {
     use vortex_array::VortexSessionExecute as _;
-    use vortex_array::arrays::struct_::{StructArray, StructArrayExt as _};
+    use vortex_array::arrays::struct_::StructArrayExt as _;
     let mut ctx = crate::io::VORTEX_SESSION.create_execution_ctx();
     chunk
         .clone()
@@ -433,7 +443,6 @@ fn term_chunk_of(chunk: &vortex_array::ArrayRef) -> vortex_array::ArrayRef {
 #[cfg(feature = "file-io")]
 #[tokio::test]
 async fn test_dictionary_terms_are_fsst_through_bytes() {
-    use crate::store::term_dictionary;
     let quads: Vec<Quad> = (0..2_000)
         .map(|i| {
             make_quad(
@@ -545,8 +554,6 @@ async fn test_dictionary_file_roundtrip() {
 #[cfg(feature = "file-io")]
 #[tokio::test]
 async fn test_dictionary_native_file_roundtrip() {
-    use crate::io::store_layout;
-
     let quads = dictionary_test_quads();
     let dir = std::env::temp_dir().join(format!(
         "vortex_rdf_dict_child_test_{}",
@@ -622,11 +629,6 @@ async fn test_dictionary_empty_store_roundtrip() {
 #[cfg(feature = "file-io")]
 #[tokio::test]
 async fn test_foreign_vortex_file_is_rejected() {
-    use vortex_array::IntoArray as _;
-    use vortex_array::arrays::struct_::StructArray;
-    use vortex_array::stream::ArrayStreamAdapter;
-    use vortex_array::validity::Validity;
-    use vortex_buffer::Buffer;
     use vortex_file::WriteOptionsSessionExt as _;
 
     // A bare u32 code schema, written by the raw Vortex writer under a
@@ -669,11 +671,6 @@ async fn test_foreign_vortex_file_is_rejected() {
 /// A bare Dictionary-layout array cannot self-describe, and `new` says so.
 #[test]
 fn test_new_rejects_bare_dictionary_array() {
-    use vortex_array::IntoArray as _;
-    use vortex_array::arrays::struct_::StructArray;
-    use vortex_array::validity::Validity;
-    use vortex_buffer::Buffer;
-
     let col = || Buffer::from_iter([1u32, 2, 3]).into_array();
     let array = StructArray::try_new(
         ["s", "p", "o", "g"].into(),
@@ -696,10 +693,9 @@ fn test_new_rejects_bare_dictionary_array() {
 #[cfg(feature = "file-io")]
 #[tokio::test]
 async fn test_large_dictionary_child_lift_keeps_fsst() {
-    use crate::io::store_layout::{self, default_child_strategy};
+    use crate::io::store_layout::default_child_strategy;
     use crate::store::RawQuad;
-    use crate::store::term_dictionary::{self, TermDictionaryBuilder};
-    use vortex_array::stream::ArrayStreamAdapter;
+    use crate::store::term_dictionary::TermDictionaryBuilder;
     use vortex_buffer::ByteBuffer;
     use vortex_file::OpenOptionsSessionExt as _;
 
@@ -719,7 +715,6 @@ async fn test_large_dictionary_child_lift_keeps_fsst() {
     let len = dict.len() as u64;
 
     // A minimal native file: a one-row quad child plus the dictionary child.
-    use vortex_array::IntoArray as _;
     let quads = vortex_array::arrays::StructArray::try_new(
         ["s", "p", "o", "g"].into(),
         (0..4)

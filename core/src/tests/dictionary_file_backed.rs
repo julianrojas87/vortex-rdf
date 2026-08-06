@@ -1,4 +1,7 @@
 use super::*;
+use crate::io::native_file::NativeStoreFile;
+use crate::io::store_layout::DICT_COMPONENT_NAME;
+use crate::store::term_dictionary::FileBackedDict;
 
 // ─── 7b) File-backed dictionary ─────────────────────────────────────────
 
@@ -142,9 +145,6 @@ async fn test_file_backed_dictionary_serves_from_copy_index() {
 /// below it stays file-backed.
 #[tokio::test]
 async fn test_file_backed_dictionary_threshold_boundary() {
-    use crate::io::native_file::NativeStoreFile;
-    use crate::io::store_layout::DICT_COMPONENT_NAME;
-
     let quads = dictionary_test_quads();
     let dir = std::env::temp_dir().join(format!("vortex_rdf_fbdict_thr_{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -241,10 +241,6 @@ async fn test_file_backed_dictionary_serializes_and_mutates() {
 /// resident dictionary, and mutated absent terms must come back `None`.
 #[tokio::test]
 async fn test_file_backed_dictionary_fence_probe_parity() {
-    use crate::io::native_file::NativeStoreFile;
-    use crate::io::store_layout::DICT_COMPONENT_NAME;
-    use crate::store::term_dictionary::FileBackedDict;
-
     // Enough unique terms to spread the dictionary across several splits, so
     // the fence's binary search genuinely selects between candidates.
     let quads: Vec<Quad> = (0..20_000)
@@ -318,10 +314,6 @@ async fn test_file_backed_dictionary_fence_probe_parity() {
 /// term is a literal (`"…`) probed with `!`, which sorts before `"`.
 #[tokio::test]
 async fn test_file_backed_dictionary_fence_rejects_below_first_term() {
-    use crate::io::native_file::NativeStoreFile;
-    use crate::io::store_layout::DICT_COMPONENT_NAME;
-    use crate::store::term_dictionary::FileBackedDict;
-
     let g = GraphName::NamedNode(NamedNode::new("http://example.org/g").unwrap());
     let quads: Vec<Quad> = (0..3)
         .map(|i| {

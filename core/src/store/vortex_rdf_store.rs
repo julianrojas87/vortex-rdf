@@ -1,6 +1,5 @@
 use crate::error::{Result, VortexRdfError};
 use crate::io::VORTEX_SESSION;
-#[cfg(feature = "file-io")]
 use crate::io::store_layout;
 use crate::store::RawQuad;
 use crate::store::array::{bool_array_to_mask, column_is_sorted, search_sorted_bounds};
@@ -40,13 +39,14 @@ use web_time::Instant;
 
 use vortex_array::arrays::constant::ConstantArray;
 use vortex_array::arrays::struct_::StructArrayExt;
-use vortex_array::arrays::{ChunkedArray, StructArray, VarBinViewArray};
+use vortex_array::arrays::{ChunkedArray, PrimitiveArray, StructArray, VarBinViewArray};
 use vortex_array::builtins::ArrayBuiltins;
 use vortex_array::dtype::FieldNames;
 use vortex_array::scalar::Scalar;
 use vortex_array::scalar_fn::fns::operators::Operator;
 use vortex_array::validity::Validity;
 use vortex_array::{ArrayRef, IntoArray, RecursiveCanonical, VortexSessionExecute};
+use vortex_buffer::Buffer;
 use vortex_mask::Mask;
 
 #[cfg(feature = "file-io")]
@@ -129,9 +129,8 @@ enum ComponentKind {
 /// *uninterpretable required* component: skipping one — a future change set,
 /// say — would silently change query results.
 fn classify_component(
-    descriptor: &crate::io::store_layout::StoreComponentDescriptor,
+    descriptor: &store_layout::StoreComponentDescriptor,
 ) -> Result<ComponentKind> {
-    use crate::io::store_layout;
     if descriptor.name == store_layout::DICT_COMPONENT_NAME {
         return Ok(ComponentKind::Dict);
     }
@@ -422,7 +421,6 @@ impl VortexRdfStore {
     /// Runs handle-free end to end (buffer-backed segment reads resolve
     /// synchronously), so this is the wasm bindings' load path.
     pub async fn from_bytes(bytes: &[u8]) -> Result<Self> {
-        use crate::io::store_layout;
         use vortex_buffer::ByteBuffer;
         // The one unavoidable copy: the caller lends a slice, and the file
         // machinery hands out refcounted slices of a buffer it keeps alive.
@@ -677,7 +675,6 @@ impl VortexRdfStore {
         path: &std::path::Path,
         dict_max_resident_bytes: u64,
     ) -> Result<Self> {
-        use crate::store::builders::SortedStreamBuilder;
         // A sibling temp file keeps the rename on one filesystem (so it is
         // atomic); the uuid suffix avoids colliding with a temp left behind by
         // an earlier interrupted compaction.
@@ -1117,9 +1114,8 @@ impl VortexRdfStore {
     /// This is the payload path behind the JS bindings' `match`/`getQuads`:
     /// serving codes off the base's buffers skips the per-call
     /// slice-gather-canonicalize pipeline those calls otherwise pay.
-    pub fn code_columns(&self) -> Option<[vortex_buffer::Buffer<u32>; 4]> {
-        use vortex_array::arrays::{Primitive, PrimitiveArray, Struct};
-        use vortex_buffer::Buffer;
+    pub fn code_columns(&self) -> Option<[Buffer<u32>; 4]> {
+        use vortex_array::arrays::{Primitive, Struct};
         if self.layout.strategy() != LayoutStrategy::Dictionary || self.tail_len() != 0 {
             return None;
         }
@@ -1203,9 +1199,7 @@ impl VortexRdfStore {
     ///
     /// This is the payload path behind the bindings' code-column reads; they
     /// call it instead of re-implementing the gather.
-    pub async fn code_columns_gathered(&self) -> Result<Option<[vortex_buffer::Buffer<u32>; 4]>> {
-        use vortex_array::arrays::PrimitiveArray;
-        use vortex_buffer::Buffer;
+    pub async fn code_columns_gathered(&self) -> Result<Option<[Buffer<u32>; 4]>> {
         if let Some(columns) = self.code_columns() {
             return Ok(Some(columns));
         }

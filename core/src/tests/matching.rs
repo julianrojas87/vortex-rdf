@@ -201,8 +201,6 @@ async fn test_derived_view_does_not_lose_base_rows() {
 
 #[cfg(feature = "file-io")]
 async fn run_match_pattern_file_test<B: VortexArrayBuilder>(layout: LayoutStrategy) {
-    use crate::io::ser::quads_stream_to_vortex_writer_with_builder;
-
     let q1 = make_quad(
         "http://example.org/s1",
         "http://example.org/p1",
@@ -257,8 +255,6 @@ async fn run_match_pattern_file_test<B: VortexArrayBuilder>(layout: LayoutStrate
 
 #[cfg(feature = "file-io")]
 async fn run_match_pattern_file_typed_object_test<B: VortexArrayBuilder>() {
-    use crate::io::ser::quads_stream_to_vortex_writer_with_builder;
-
     let q1 = make_quad(
         "http://example.org/s1",
         "http://example.org/p1",
@@ -313,8 +309,6 @@ async fn run_match_pattern_file_typed_object_test<B: VortexArrayBuilder>() {
 
 #[cfg(feature = "file-io")]
 async fn run_match_pattern_file_dictionary_test<B: VortexArrayBuilder>() {
-    use crate::io::ser::quads_stream_to_vortex_writer_with_builder;
-
     let quads = dictionary_test_quads();
 
     let mut bytes: Vec<u8> = Vec::new();
