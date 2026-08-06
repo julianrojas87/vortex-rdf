@@ -83,5 +83,11 @@ jobs:
         uses: CodSpeedHQ/action@v5
         with:
           mode: simulation
-          run: node --import tsx --expose-gc bench/codspeed.bench.ts
+          # --no-liftoff: the plugin measures a single invocation per task, and
+          # V8's background wasm tier-up raced it — the measured run
+          # nondeterministically executed Liftoff or TurboFan code, a ~2x
+          # instruction-count swing on the build tasks at identical code.
+          # Top-tier-only compilation is deterministic; its one-time lazy
+          # compile cost is absorbed by the plugin's untimed warmup calls.
+          run: node --import tsx --expose-gc --no-liftoff bench/codspeed.bench.ts
           working-directory: js

@@ -66,6 +66,29 @@ function genQuads(d: number): Quad[] {
     return out;
 }
 
+/** DIM³ triples whose objects are literals — plain, language-tagged, typed,
+ * and escape-bearing (quotes, backslashes, newlines, and `"@`/`^^` lookalikes
+ * inside the value). Every other dataset in this file is named-node-only, so
+ * the tasks over this one are the only coverage of literal escaping on ingest
+ * and the unescape path on decode/export. */
+function genLiteralTriples(d: number): Quad[] {
+    const dt = df.namedNode('http://www.w3.org/2001/XMLSchema#integer');
+    const out: Quad[] = [];
+    let i = 0;
+    for (let s = 0; s < d; s++)
+        for (let p = 0; p < d; p++)
+            for (let o = 0; o < d; o++) {
+                const object =
+                    i % 4 === 0 ? df.literal(`plain value ${o}`)
+                    : i % 4 === 1 ? df.literal(`tagged value ${o}`, 'en')
+                    : i % 4 === 2 ? df.literal(String(o), dt)
+                    : df.literal(`say "hi"@home ^^ line\nbreak back\\slash ${o}`);
+                out.push(df.quad(nn(s), nn(p), object));
+                i++;
+            }
+    return out;
+}
+
 /** A batch of fresh quads (disjoint namespace) for the add phase. */
 function genFresh(n: number): Quad[] {
     const out: Quad[] = [];
@@ -132,11 +155,17 @@ async function drain(stream: unknown): Promise<number> {
     return n;
 }
 
-// tinybench options (ignored under CodSpeed instrumentation, which measures each
-// task once; they only shape the local wall-clock run). Reads get a time budget;
-// the costly build/mutation phases get a low fixed iteration count.
+// tinybench options shape only the LOCAL wall-clock run. Under CodSpeed
+// instrumentation the plugin ignores them: each task runs seven untimed warmup
+// invocations (core.optimizeFunction), then global.gc(), then exactly ONE
+// measured invocation. That single-shot model is why the runner passes
+// --no-liftoff (codspeed.yml, package.json): with background wasm tier-up
+// enabled, the measured invocation nondeterministically executed Liftoff or
+// TurboFan code — a ~2x instruction-count swing on the build tasks at
+// identical code. Reads get a time budget; the costly build/mutation phases
+// get warmup plus a fixed iteration count so local numbers are stable too.
 const READ_OPTS: BenchOptions = { time: 200, iterations: 10, warmup: true, warmupIterations: 3, throws: true };
-const HEAVY_OPTS: BenchOptions = { time: 0, iterations: 3, warmup: false, warmupIterations: 0, throws: true };
+const HEAVY_OPTS: BenchOptions = { time: 0, iterations: 7, warmup: true, warmupIterations: 2, throws: true };
 
 async function runGroup(opts: BenchOptions, add: (b: Bench) => void): Promise<void> {
     const bench = withCodSpeed(new Bench(opts));
@@ -155,8 +184,9 @@ async function runGroup(opts: BenchOptions, add: (b: Bench) => void): Promise<vo
 // ─── Groups ──────────────────────────────────────────────────────────────────
 
 /** build::<config> — VortexRdfStore.fromQuads over each star variant, plus a
- * fromString (parse + build) task to cover the RDF-text entry point. */
-async function benchBuild(triples: Quad[]): Promise<void> {
+ * fromString (parse + build) task to cover the RDF-text entry point and a
+ * literal-bearing build covering term escaping on ingest. */
+async function benchBuild(triples: Quad[], literals: Quad[]): Promise<void> {
     // All generated terms are named nodes, so N-Triples serialization is trivial.
     const nquads = triples
         .map((q) => `<${q.subject.value}> <${q.predicate.value}> <${q.object.value}> .`)
@@ -172,7 +202,25 @@ async function benchBuild(triples: Quad[]): Promise<void> {
         b.add('build::fromString_nquads', async () => {
             hs = await VortexRdfStore.fromString(nquads, 'nquads', { builder: 'Sorted', layout: 'Dictionary' });
         }, { afterEach: () => { if (hs) freeWasm(hs); hs = undefined; } });
+        let hl: VortexRdfStore | undefined;
+        b.add('build::sorted_dict_literals', async () => {
+            hl = await VortexRdfStore.fromQuads(literals, { builder: 'Sorted', layout: 'Dictionary' });
+        }, { afterEach: () => { if (hl) freeWasm(hl); hl = undefined; } });
     });
+}
+
+/** Literal-bearing read paths on a Sorted/Dictionary store over
+ * genLiteralTriples' dataset: toRdf re-escapes every literal on export, and
+ * the decoded read parses every literal's serialized form on the JS side. */
+async function benchLiterals(literals: Quad[]): Promise<void> {
+    const store = await VortexRdfStore.fromQuads(literals, { builder: 'Sorted', layout: 'Dictionary' });
+    await runGroup(READ_OPTS, (b) => {
+        b.add('readback::toRdf_nquads_literals', async () => { await store.toRdf('nquads'); });
+        b.add('readpath::full_decoded_literals', async () => {
+            decodeAll(await store.getQuads(null, null, null, null));
+        });
+    });
+    freeWasm(store);
 }
 
 /** query_<config>::<pattern> — getQuads across every routing class, on each
@@ -279,11 +327,13 @@ async function main(): Promise<void> {
     );
     const triples = genTriples(DIM);
     const quads = genQuads(DIM_QUADS);
+    const literals = genLiteralTriples(DIM);
 
-    await benchBuild(triples);
+    await benchBuild(triples, literals);
     await benchQuery(triples, quads);
     await benchReadPath(triples);
     await benchReadback(triples);
+    await benchLiterals(literals);
     await benchMutate();
 }
 

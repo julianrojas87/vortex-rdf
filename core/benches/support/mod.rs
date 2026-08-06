@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
 use futures::{Stream, StreamExt, stream};
-use oxrdf::{GraphName, NamedNode, NamedOrBlankNode, Quad, Term};
+use oxrdf::{GraphName, Literal, NamedNode, NamedOrBlankNode, Quad, Term};
 use tokio::runtime::Runtime;
 
 use vortex_rdf_core::error::Result;
@@ -317,4 +317,65 @@ pub fn generate_rdf_data_stream(size: usize) -> impl Stream<Item = Result<RawQua
             subject, predicate, object, graph,
         )))
     }))
+}
+
+/// Like [`generate_rdf_data_stream`], but with literal objects — plain,
+/// language-tagged, typed, and escape-bearing (quotes, backslashes, newlines,
+/// and `"@`/`^^` lookalikes inside the value). The star dataset above is
+/// named-node-only, so this is what lets a benchmark reach the literal
+/// escape/unescape paths at all.
+pub fn generate_literal_rdf_data_stream(size: usize) -> impl Stream<Item = Result<RawQuad>> {
+    const EX: &str = "http://example.org/";
+
+    stream::iter((0..size).map(|i| {
+        let subject =
+            NamedOrBlankNode::NamedNode(NamedNode::new_unchecked(format!("{}subject/{}", EX, i)));
+        let predicate = NamedNode::new_unchecked(format!("{}predicate/{}", EX, i % 100));
+        let object = Term::Literal(match i % 4 {
+            0 => Literal::new_simple_literal(format!("plain value {}", i % 50)),
+            1 => Literal::new_language_tagged_literal_unchecked(
+                format!("tagged value {}", i % 50),
+                "en",
+            ),
+            2 => Literal::new_typed_literal(
+                format!("{}", i % 50),
+                NamedNode::new_unchecked("http://www.w3.org/2001/XMLSchema#integer"),
+            ),
+            _ => Literal::new_simple_literal(format!(
+                "say \"hi\"@home ^^ line\nbreak back\\slash {}",
+                i % 50
+            )),
+        });
+
+        Ok(RawQuad::from_quad(&Quad::new(
+            subject,
+            predicate,
+            object,
+            GraphName::DefaultGraph,
+        )))
+    }))
+}
+
+/// The literal-bearing store for `decode_all_literals`, cached like the star
+/// stores: SortedStream builder, Dictionary layout, no index — the config
+/// whose full decode term-decodes every row.
+pub fn cached_literal_store(size: usize) -> VortexRdfStore {
+    static CACHE: OnceLock<Mutex<HashMap<usize, VortexRdfStore>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(store) = cache.lock().unwrap().get(&size) {
+        return store.clone();
+    }
+    let store = rt().block_on(async move {
+        VortexRdfStore::build_vortex_array_with_strategy(
+            generate_literal_rdf_data_stream(size),
+            LayoutStrategy::Dictionary,
+            Vec::new(),
+            BuilderStrategy::SortedStream,
+        )
+        .await
+        .and_then(VortexRdfStore::from_built)
+        .expect("failed to build literal store")
+    });
+    cache.lock().unwrap().insert(size, store.clone());
+    store
 }

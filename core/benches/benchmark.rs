@@ -369,6 +369,22 @@ fn decode_all(bencher: divan::Bencher, cfg: &DecodeCfg) {
         });
 }
 
+/// [`decode_all`] over a literal-bearing dataset (plain, language-tagged,
+/// typed, and escape-carrying values — see the generator's doc): the star
+/// dataset is named-node-only, so this is the one benchmark whose decode
+/// reaches the literal unescape path.
+#[divan::bench]
+fn decode_all_literals(bencher: divan::Bencher) {
+    bencher
+        .with_inputs(|| cached_literal_store(bench_size()))
+        .bench_refs(|store| {
+            rt().block_on(async {
+                let quads = store.quads_vec().await.expect("decode literals");
+                black_box(quads.len())
+            })
+        });
+}
+
 /// Open a file-backed store. Default and TypedObject read the footer only;
 /// Dictionary also reads its term dictionary up front (an extra single-column
 /// scan), so the layouts are worth distinguishing.
