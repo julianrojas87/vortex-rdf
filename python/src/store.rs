@@ -1,23 +1,14 @@
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 
-use oxrdf::{GraphName, NamedNode, NamedOrBlankNode, Term};
 use pyo3::exceptions::PyFileNotFoundError;
 use pyo3::prelude::*;
-use vortex_rdf_core::common::terms::{
-    parse_graph_name_checked, parse_named_node_checked, parse_subject_checked, parse_term_checked,
-};
-use vortex_rdf_core::{LayoutStrategy, VortexRdfError, VortexRdfStore as CoreStore};
+use pyo3::types::PyBytes;
+use vortex_rdf_core::common::terms::{Pattern, parse_pattern_checked};
+use vortex_rdf_core::{VortexRdfError, VortexRdfStore as CoreStore};
 
 use crate::codes::{TermDict, U32Column};
 use crate::{RUNTIME, parse_err, store_err};
-
-type Pattern = (
-    Option<NamedOrBlankNode>,
-    Option<NamedNode>,
-    Option<Term>,
-    Option<GraphName>,
-);
 
 /// `(term_table, rows)` as returned by [`VortexRdfStore::match_compact`].
 type CompactTriples = (Vec<String>, Vec<(u32, u32, u32)>);
@@ -35,43 +26,21 @@ type CodeColumns = (U32Column, U32Column, U32Column, U32Column);
 #[pyclass(frozen, module = "vortex_rdf._native")]
 pub struct VortexRdfStore {
     store: CoreStore,
-    path: String,
+    /// `None` for stores opened from bytes rather than a file.
+    path: Option<String>,
 }
 
-// Pattern terms are caller-supplied, so all four slots go through core's
-// checked parse family (validating oxrdf constructors) rather than the
-// trusted `new_unchecked` decode path core uses for terms it serialized
-// itself: an invalid IRI, blank-node id or language tag in any of s/p/o/g
-// raises `ValueError` instead of silently matching nothing. Validation costs
-// one call per match, not per row; this crate adds only the `PyErr` shaping.
-fn parse_pattern(
-    s: Option<&str>,
-    p: Option<&str>,
-    o: Option<&str>,
-    g: Option<&str>,
-) -> PyResult<Pattern> {
-    Ok((
-        s.map(parse_subject_checked)
-            .transpose()
-            .map_err(parse_err)?,
-        p.map(parse_named_node_checked)
-            .transpose()
-            .map_err(parse_err)?,
-        o.map(parse_term_checked).transpose().map_err(parse_err)?,
-        g.map(parse_graph_name_checked)
-            .transpose()
-            .map_err(parse_err)?,
-    ))
-}
-
-fn intern(ids: &mut HashMap<String, u32>, table: &mut Vec<String>, term: String) -> u32 {
+/// Interns `term`, storing each distinct term exactly once (as the map key —
+/// no cloned side table). Ids are assigned in first-appearance order;
+/// [`VortexRdfStore::match_compact`] rebuilds the id-ordered term table by
+/// moving the keys out of the map after the match loop.
+fn intern(ids: &mut HashMap<String, u32>, term: String) -> u32 {
+    let next = ids.len() as u32;
     match ids.entry(term) {
         Entry::Occupied(e) => *e.get(),
         Entry::Vacant(e) => {
-            let id = table.len() as u32;
-            table.push(e.key().clone());
-            e.insert(id);
-            id
+            e.insert(next);
+            next
         }
     }
 }
@@ -130,17 +99,40 @@ impl VortexRdfStore {
                 })
             })
             .map_err(store_err)?;
-        Ok(Self { store, path })
+        Ok(Self {
+            store,
+            path: Some(path),
+        })
+    }
+
+    /// Open a store from native-container bytes — what [`Self::to_bytes`]
+    /// (or the JS bindings' `toBytes`, or reading a `.vortex` file into
+    /// memory) produces. Unlike the path constructor there is no file to
+    /// stay lazily backed by: the whole store lives in memory, and the
+    /// buffer crosses the Python boundary in one bulk copy.
+    #[staticmethod]
+    fn from_bytes(py: Python<'_>, data: Vec<u8>) -> PyResult<Self> {
+        let store = py
+            .detach(|| RUNTIME.block_on(CoreStore::from_bytes_owned(data)))
+            .map_err(store_err)?;
+        Ok(Self { store, path: None })
+    }
+
+    /// Serialize the store to native-container bytes: the exchange format
+    /// shared with [`Self::from_bytes`], the JS bindings and the on-disk
+    /// `.vortex` file, carrying the quad table plus the dictionary and
+    /// index components.
+    fn to_bytes<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        let bytes = py
+            .detach(|| RUNTIME.block_on(self.store.to_bytes()))
+            .map_err(store_err)?;
+        Ok(PyBytes::new(py, &bytes))
     }
 
     /// Column layout detected from the file: "default", "typed-object" or
-    /// "dictionary".
-    fn layout(&self) -> &'static str {
-        match self.store.layout() {
-            LayoutStrategy::Default => "default",
-            LayoutStrategy::TypedObject => "typed-object",
-            LayoutStrategy::Dictionary => "dictionary",
-        }
+    /// "dictionary" — core's canonical strategy names.
+    fn layout(&self) -> String {
+        self.store.layout().to_string()
     }
 
     fn __len__(&self, py: Python<'_>) -> PyResult<usize> {
@@ -149,11 +141,14 @@ impl VortexRdfStore {
     }
 
     fn __repr__(&self) -> String {
-        format!(
-            "VortexRdfStore(path={:?}, layout={:?})",
-            self.path,
-            self.layout()
-        )
+        match &self.path {
+            Some(path) => format!(
+                "VortexRdfStore(path={:?}, layout={:?})",
+                path,
+                self.layout()
+            ),
+            None => format!("VortexRdfStore(layout={:?})", self.layout()),
+        }
     }
 
     /// Match a triple pattern and return `(subject, predicate, object)`
@@ -168,7 +163,7 @@ impl VortexRdfStore {
         o: Option<&str>,
         g: Option<&str>,
     ) -> PyResult<Vec<(String, String, String)>> {
-        let pattern = parse_pattern(s, p, o, g)?;
+        let pattern = parse_pattern_checked(s, p, o, g).map_err(parse_err)?;
         py.detach(|| -> Result<_, VortexRdfError> {
             let quads = RUNTIME.block_on(self.matched_quads(&pattern))?;
             Ok(quads
@@ -191,11 +186,8 @@ impl VortexRdfStore {
     /// dictionary. Pair with [`Self::match_codes`]; decode each distinct
     /// code once, caching on the Python side.
     fn term_dict(&self) -> Option<TermDict> {
-        if self.store.tail_len() != 0 {
-            return None;
-        }
         self.store
-            .dictionary_snapshot()
+            .code_read_snapshot()
             .map(|snapshot| TermDict { snapshot })
     }
 
@@ -212,13 +204,10 @@ impl VortexRdfStore {
         o: Option<&str>,
         g: Option<&str>,
     ) -> PyResult<Option<CodeColumns>> {
-        if self.store.layout() != LayoutStrategy::Dictionary
-            || self.store.tail_len() != 0
-            || self.store.dictionary_snapshot().is_none()
-        {
+        if self.store.code_read_snapshot().is_none() {
             return Ok(None);
         }
-        let pattern = parse_pattern(s, p, o, g)?;
+        let pattern = parse_pattern_checked(s, p, o, g).map_err(parse_err)?;
         let columns = py
             .detach(|| -> Result<_, VortexRdfError> {
                 RUNTIME.block_on(async {
@@ -253,18 +242,24 @@ impl VortexRdfStore {
         o: Option<&str>,
         g: Option<&str>,
     ) -> PyResult<CompactTriples> {
-        let pattern = parse_pattern(s, p, o, g)?;
+        let pattern = parse_pattern_checked(s, p, o, g).map_err(parse_err)?;
         py.detach(|| -> Result<_, VortexRdfError> {
             let quads = RUNTIME.block_on(self.matched_quads(&pattern))?;
-            let mut table = Vec::new();
             let mut ids = HashMap::new();
             let mut rows = Vec::with_capacity(quads.len());
             for q in quads {
                 rows.push((
-                    intern(&mut ids, &mut table, q.subject.to_string()),
-                    intern(&mut ids, &mut table, q.predicate.to_string()),
-                    intern(&mut ids, &mut table, q.object.to_string()),
+                    intern(&mut ids, q.subject.to_string()),
+                    intern(&mut ids, q.predicate.to_string()),
+                    intern(&mut ids, q.object.to_string()),
                 ));
+            }
+            // Move the interned terms out of the map into id order (the
+            // placeholder Strings do not allocate): each distinct term is
+            // allocated once for the whole call.
+            let mut table = vec![String::new(); ids.len()];
+            for (term, id) in ids {
+                table[id as usize] = term;
             }
             Ok((table, rows))
         })

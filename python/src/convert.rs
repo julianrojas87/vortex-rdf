@@ -2,39 +2,21 @@ use std::path::PathBuf;
 
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use vortex_rdf_core::common::formats::{detect_format, format_from_name};
+use vortex_rdf_core::common::formats::{detect_format, format_from_name, supported_format_names};
 use vortex_rdf_core::common::terms::parse_quads_from_reader;
 use vortex_rdf_core::io::quads_stream_to_vortex_file;
-use vortex_rdf_core::{BuilderStrategy, LayoutStrategy, VortexRdfError};
+use vortex_rdf_core::{BuilderStrategy, IndexType, LayoutStrategy, VortexRdfError};
 
-use crate::{RUNTIME, store_err};
-
-fn parse_layout(name: &str) -> PyResult<LayoutStrategy> {
-    match name.to_ascii_lowercase().as_str() {
-        "default" => Ok(LayoutStrategy::Default),
-        "typed-object" | "typed_object" => Ok(LayoutStrategy::TypedObject),
-        "dictionary" => Ok(LayoutStrategy::Dictionary),
-        other => Err(PyValueError::new_err(format!(
-            "unknown layout {other:?}; expected \"default\", \"typed-object\" or \"dictionary\""
-        ))),
-    }
-}
-
-fn parse_builder(name: &str) -> PyResult<BuilderStrategy> {
-    match name.to_ascii_lowercase().as_str() {
-        "unsorted-stream" | "unsorted" => Ok(BuilderStrategy::UnsortedStream),
-        "sorted-in-memory" | "sorted" => Ok(BuilderStrategy::SortedInMemory),
-        "sorted-stream" => Ok(BuilderStrategy::SortedStream),
-        other => Err(PyValueError::new_err(format!(
-            "unknown builder {other:?}; expected \"unsorted-stream\", \"sorted-in-memory\" or \"sorted-stream\""
-        ))),
-    }
-}
+use crate::{RUNTIME, parse_err, store_err};
 
 /// Serialize an RDF file into a `.vortex` store file.
 ///
 /// `format` is an RDF format name ("ntriples", "nquads", "turtle", ...);
-/// when omitted it is detected from the input file extension.
+/// when omitted it is detected from the input file extension. `layout`,
+/// `builder` and `indexes` take core's canonical kebab-case strategy names
+/// (the spelling `VortexRdfStore.layout()` reports); `indexes` lists the
+/// secondary index components to build into the file
+/// ("secondary-by-copy", "secondary-by-reference").
 #[pyfunction]
 #[pyo3(signature = (
     input_path,
@@ -42,6 +24,7 @@ fn parse_builder(name: &str) -> PyResult<BuilderStrategy> {
     layout="default",
     format=None,
     builder="unsorted-stream",
+    indexes=Vec::new(),
 ))]
 pub fn serialize_rdf(
     py: Python<'_>,
@@ -50,12 +33,22 @@ pub fn serialize_rdf(
     layout: &str,
     format: Option<&str>,
     builder: &str,
+    indexes: Vec<String>,
 ) -> PyResult<()> {
-    let layout = parse_layout(layout)?;
-    let builder = parse_builder(builder)?;
+    let layout: LayoutStrategy = layout.parse().map_err(parse_err)?;
+    let builder: BuilderStrategy = builder.parse().map_err(parse_err)?;
+    let indexes = indexes
+        .iter()
+        .map(|name| name.parse::<IndexType>())
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(parse_err)?;
     let format = match format {
-        Some(name) => format_from_name(name)
-            .ok_or_else(|| PyValueError::new_err(format!("unknown RDF format {name:?}")))?,
+        Some(name) => format_from_name(name).ok_or_else(|| {
+            PyValueError::new_err(format!(
+                "unknown RDF format {name:?}; expected one of: {}",
+                supported_format_names().join(", ")
+            ))
+        })?,
         None => detect_format(&Some(input_path.clone())).ok_or_else(|| {
             PyValueError::new_err(
                 "could not detect RDF format from the input file extension; pass format=",
@@ -70,7 +63,7 @@ pub fn serialize_rdf(
             quads,
             &output_path,
             layout,
-            Vec::new(),
+            indexes,
             builder,
         ))
     })

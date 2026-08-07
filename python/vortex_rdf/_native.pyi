@@ -1,7 +1,7 @@
 """Type stubs for the private native extension module."""
 
 import os
-from typing import List, Optional, Tuple, Union
+from typing import List, Optional, Sequence, Tuple, Union
 
 __version__: str
 
@@ -14,7 +14,14 @@ class VortexRdfError(Exception):
 
 class TermDict:
     def decode(self, code: int) -> Optional[str]: ...
-    def decode_many(self, codes: List[int]) -> List[Optional[str]]: ...
+    def decode_many(
+        self,
+        # Preferably a u32 buffer (``memoryview(col).cast("I")``,
+        # ``array("I", ...)``, a uint32 NumPy array) or the raw byte view a
+        # `U32Column` exports, read in one bulk copy; any int sequence also
+        # works, at one Python-int extraction per code.
+        codes: Union[Sequence[int], memoryview, bytes, bytearray],
+    ) -> List[Optional[str]]: ...
     def __len__(self) -> int: ...
 
 class U32Column:
@@ -31,6 +38,9 @@ class VortexRdfStore:
         max_resident_bytes: Optional[int] = None,
         in_memory: bool = False,
     ) -> None: ...
+    @staticmethod
+    def from_bytes(data: bytes) -> "VortexRdfStore": ...
+    def to_bytes(self) -> bytes: ...
     def layout(self) -> str: ...
     def __len__(self) -> int: ...
     def term_dict(self) -> Optional[TermDict]: ...
@@ -62,4 +72,5 @@ def serialize_rdf(
     layout: str = "default",
     format: Optional[str] = None,
     builder: str = "unsorted-stream",
+    indexes: List[str] = [],
 ) -> None: ...

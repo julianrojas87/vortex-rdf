@@ -5,7 +5,8 @@
 
 use std::os::raw::{c_int, c_void};
 
-use pyo3::exceptions::PySystemError;
+use pyo3::buffer::PyBuffer;
+use pyo3::exceptions::{PySystemError, PyValueError};
 use pyo3::ffi;
 use pyo3::prelude::*;
 use vortex_buffer::Buffer;
@@ -17,6 +18,17 @@ use vortex_rdf_core::DictSnapshot;
 #[pyclass(frozen, module = "vortex_rdf._native")]
 pub struct TermDict {
     pub(crate) snapshot: DictSnapshot,
+}
+
+impl TermDict {
+    /// The GIL-released bulk decode behind [`decode_many`](Self::decode_many)
+    /// once the codes are owned. Releasing the GIL needs owned codes: pyo3's
+    /// borrowed buffer views (`ReadOnlyCell`) may not cross a GIL release,
+    /// and lending Python-owned memory to a detached thread would race a
+    /// writable exporter mutated from another Python thread anyway.
+    fn decode_owned(&self, py: Python<'_>, codes: Vec<u32>) -> Vec<Option<String>> {
+        py.detach(|| codes.into_iter().map(|c| self.snapshot.decode(c)).collect())
+    }
 }
 
 #[pymethods]
@@ -32,8 +44,37 @@ impl TermDict {
     /// result sets (each FSST-backed decode pays a per-term decompression;
     /// per-code Python calls additionally pay the FFI round-trip and hold
     /// the GIL throughout).
-    fn decode_many(&self, py: Python<'_>, codes: Vec<u32>) -> Vec<Option<String>> {
-        py.detach(|| codes.into_iter().map(|c| self.snapshot.decode(c)).collect())
+    ///
+    /// `codes` is preferably a u32 buffer (`memoryview(col).cast("I")`,
+    /// `array("I", ...)`, a `uint32` NumPy array), read in one bulk copy
+    /// with no per-element Python-int conversion. A byte-typed buffer — the
+    /// raw view a [`U32Column`] itself exports — is reinterpreted as
+    /// native-endian u32s, so a column from `match_codes` passes directly.
+    /// Any other sequence of ints still works, at one `PyLong` extraction
+    /// per code.
+    fn decode_many(
+        &self,
+        py: Python<'_>,
+        codes: &Bound<'_, PyAny>,
+    ) -> PyResult<Vec<Option<String>>> {
+        if let Ok(buf) = PyBuffer::<u32>::get(codes) {
+            return Ok(self.decode_owned(py, buf.to_vec(py)?));
+        }
+        if let Ok(buf) = PyBuffer::<u8>::get(codes) {
+            let bytes = buf.to_vec(py)?;
+            if !bytes.len().is_multiple_of(4) {
+                return Err(PyValueError::new_err(format!(
+                    "byte buffer of {} bytes is not a whole number of u32 codes",
+                    bytes.len()
+                )));
+            }
+            let codes = bytes
+                .chunks_exact(4)
+                .map(|b| u32::from_ne_bytes(b.try_into().expect("chunks_exact(4)")))
+                .collect();
+            return Ok(self.decode_owned(py, codes));
+        }
+        Ok(self.decode_owned(py, codes.extract()?))
     }
 
     fn __len__(&self) -> usize {

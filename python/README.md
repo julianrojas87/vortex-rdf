@@ -6,7 +6,7 @@ modern, high-performance columnar RDF serialization format.
 
 Stores can be **opened lazily from `.vortex` files** and queried in place, without loading the dataset into memory.
 
-The [`vortex-rdflib`](https://pypi.org/project/vortex-rdflib/) package, which implements an rdflib `Store` (with SPARQL capabilities) on top of these bindings.
+The [`vortex-rdflib`](https://pypi.org/project/vortex-rdflib/) package implements an rdflib `Store` (with SPARQL capabilities) on top of these bindings.
 
 ## Install
 
@@ -65,7 +65,15 @@ cols = store.match_codes(p="<http://xmlns.com/foaf/0.1/name>")  # (s, p, o, g)
 dictionary = store.term_dict()
 subjects = memoryview(cols[0]).cast("I")
 dictionary.decode(subjects[0])           # N-Triples string for that code
+dictionary.decode_many(cols[0])          # bulk-decode a whole column at once
 ```
+
+`decode_many` decodes a batch in one GIL-released call. Buffer-protocol
+inputs — a column straight from `match_codes`, an `array("I", ...)`, a
+`uint32` NumPy array — are read in a single bulk copy with no per-element
+int conversion; any sequence of ints works too. Both `term_dict()` and
+`match_codes` return `None` when the code path does not apply (non-Dictionary
+layout, or a dictionary left file-backed by the residency budget).
 
 Consumers can join, count, and de-duplicate entirely in code space and decode
 each distinct term once — this is what powers `vortex-rdflib`'s SPARQL BGP
@@ -74,8 +82,14 @@ pushdown.
 ## Layouts
 
 `serialize_rdf(..., layout=...)` accepts `"default"`, `"typed-object"` and
-`"dictionary"`. Opening auto-detects the layout — `VortexRdfStore` takes no
-layout argument.
+`"dictionary"`; `store.layout()` reports the same names. `builder=` picks the
+build pipeline (`"unsorted-stream"`, `"sorted-in-memory"`, `"sorted-stream"`)
+and `indexes=[...]` lists secondary index components to build into the file
+(`"secondary-by-copy"`, `"secondary-by-reference"`). `format=` is an RDF
+format name (`"ntriples"`, `"nquads"`, `"turtle"`, `"trig"`, `"n3"`,
+`"rdfxml"`, `"jsonld"`, or their short aliases), detected from the input file
+extension when omitted. Opening auto-detects the layout — `VortexRdfStore`
+takes no layout argument.
 
 For Dictionary-layout files, the term dictionary (carried in the file as its
 own dictionary component) is held in memory when its byte size fits the
@@ -88,9 +102,13 @@ The default open is lazy and file-backed. `VortexRdfStore(path, in_memory=True)`
 loads the store into memory once: each subsequent match skips the per-call
 file-scan pipeline (~1 ms → ~0.15 ms per call).
 
+Stores also round-trip through bytes: `store.to_bytes()` serializes to the
+native container (the same exchange format as the `.vortex` file and the JS
+bindings), and `VortexRdfStore.from_bytes(data)` opens such a buffer as a
+fully in-memory store.
+
 ## Tests
 
 ```bash
-pip install -e .[test]   # or: maturin develop && pip install pytest
-pytest tests
+uv run pytest tests   # or: maturin develop && pip install pytest && pytest tests
 ```
