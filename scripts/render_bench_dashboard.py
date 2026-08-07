@@ -124,9 +124,9 @@ def cpu_model():
 
 
 def default_bench_size():
-    """The fallback dataset size baked into `core/benches/benchmark.rs`'s
+    """The fallback dataset size baked into `core/benches/support/mod.rs`'s
     `bench_size()`, i.e. what a run used if it didn't override `BENCH_SIZE`."""
-    src = (REPO_ROOT / "core" / "benches" / "benchmark.rs").read_text(encoding="utf-8")
+    src = (REPO_ROOT / "core" / "benches" / "support" / "mod.rs").read_text(encoding="utf-8")
     m = re.search(r"fn bench_size.*?unwrap_or\(([\d_]+)\)", src, re.DOTALL)
     return int(m.group(1).replace("_", "")) if m else None
 
