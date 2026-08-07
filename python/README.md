@@ -126,3 +126,43 @@ fully in-memory store.
 ```bash
 uv run pytest tests   # or: maturin develop && pip install pytest && pytest tests
 ```
+
+## Comparative benchmark
+
+`python/bench/run.py` measures these bindings against
+[pyoxigraph](https://pypi.org/project/pyoxigraph/),
+[pycottas](https://pypi.org/project/pycottas/),
+[rdflib](https://pypi.org/project/rdflib/), and
+[lightrdf](https://pypi.org/project/lightrdf/), and writes `bench/results.json`
+for the dashboard's Python tab.
+
+```bash
+python3 python/bench/run.py                 # full run (D=128, 2,097,152 triples)
+BENCH_DIM=32 python3 python/bench/run.py    # quick pilot
+```
+
+It provisions **one virtualenv per library** (via `uv`, on first run) rather
+than installing them together: pycottas hard-pins `pyoxigraph==0.3.18`, so a
+shared environment would quietly measure a pyoxigraph two minor versions behind
+the oxigraph the JavaScript tab compares against. Each library also runs in its
+own process, so peak RSS is attributable to one library alone.
+
+Two things differ from the JavaScript comparative bench, both because the
+libraries do:
+
+- **The workload is file → store → query.** Every library ingests from a file,
+  and lightrdf has no store at all, so a serialized dataset is the only input
+  the five share. That makes `open` a first-class measurement — a file-backed
+  format opens its artifact, while an in-memory store re-parses the source
+  every process start.
+- **Not every library can do everything.** Cells read `unsupported` where the
+  API does not exist: the Python bindings expose no mutation (unlike the JS
+  ones), pycottas's store raises *"The COTTAS store is read only!"*, and
+  lightrdf is a streaming parser with nothing to mutate.
+
+The dataset generator is a deliberate port of `js/bench/datasets.ts` — same
+moduli, same term spellings — so rows on the two tabs describe the same data.
+The run cross-checks every library's matched-row counts against the others and
+records any disagreement in `config.countWarnings`, which the dashboard shows:
+five libraries with five term-spelling conventions are being asked the same
+question, and a mismatch means at least one was asked it wrongly.
