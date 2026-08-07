@@ -25,7 +25,9 @@ classifiers = [
 dependencies = []
 
 [dependency-groups]
-dev = ["pytest>=8", "maturin>=1.8,<2"]
+# pytest-codspeed instruments bench/test_codspeed.py; it is a dev
+# dependency rather than a bench extra so `uv sync` alone can run it.
+dev = ["pytest>=8", "maturin>=1.8,<2", "pytest-codspeed>=4"]
 
 [project.urls]
 Repository = "https://github.com/vortex-rdf/vortex-rdf"

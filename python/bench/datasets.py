@@ -258,3 +258,80 @@ def dataset_probes(n: int, opts: Optional[DatasetOpts] = None) -> dict[str, list
         "quads": quads,
         "full": [FULL_SCAN_PATTERN],
     }
+
+
+# ─── Dense-cube datasets (the instrumented suite's routing-pattern data) ─────
+#
+# A d**3 / d**4 cube over a tiny closed namespace: every routing decision is
+# exercised while the dataset stays small enough to instrument. Deliberately
+# NOT cardinality-realistic -- 3*d distinct terms over d**3 rows is exactly the
+# pathology the generator above exists to avoid -- so term-handling-sensitive
+# tasks must use `write_dataset` instead; the cube is for tasks where routing,
+# not term volume, is what is being measured.
+#
+# Ported from `js/bench/datasets.ts` alongside the generator above, so the
+# instrumented Python and JavaScript suites measure the same shapes.
+
+EX = "http://example.org/#"
+
+XSD_INTEGER = "<http://www.w3.org/2001/XMLSchema#integer>"
+
+
+def nn(n) -> str:
+    return f"<{EX}{n}>"
+
+
+def escape_literal(value: str) -> str:
+    """N-Triples escaping for a literal's lexical form.
+
+    Needed only by `write_literal_triples`, whose escape-bearing case carries
+    quotes, backslashes and newlines on purpose; every other generator here
+    emits values that pass through unchanged.
+    """
+    out = value.replace("\\", "\\\\").replace('"', '\\"')
+    return out.replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
+
+
+def write_triples_cube(path: str, d: int) -> str:
+    """d**3 triples in the default graph: (ex#s, ex#p, ex#o)."""
+    with open(path, "w", encoding="utf-8", buffering=1 << 20) as f:
+        for s in range(d):
+            for p in range(d):
+                for o in range(d):
+                    f.write(f"{nn(s)} {nn(p)} {nn(o)} .\n")
+    return path
+
+
+def write_quads_cube(path: str, d: int) -> str:
+    """d**4 quads across named graphs: (ex#s, ex#p, ex#o, ex#g)."""
+    with open(path, "w", encoding="utf-8", buffering=1 << 20) as f:
+        for s in range(d):
+            for p in range(d):
+                for o in range(d):
+                    for g in range(d):
+                        f.write(f"{nn(s)} {nn(p)} {nn(o)} {nn(g)} .\n")
+    return path
+
+
+def write_literal_triples(path: str, d: int) -> str:
+    """d**3 triples whose objects are literals -- plain, language-tagged, typed,
+    and escape-bearing (quotes, backslashes, newlines, and `"@`/`^^` lookalikes
+    inside the value). The other cube datasets are named-node-only, so tasks
+    over this one are the only cube coverage of literal escaping."""
+    i = 0
+    with open(path, "w", encoding="utf-8", buffering=1 << 20) as f:
+        for s in range(d):
+            for p in range(d):
+                for o in range(d):
+                    if i % 4 == 0:
+                        obj = f'"plain value {o}"'
+                    elif i % 4 == 1:
+                        obj = f'"tagged value {o}"@en'
+                    elif i % 4 == 2:
+                        obj = f'"{o}"^^{XSD_INTEGER}'
+                    else:
+                        raw = f'say "hi"@home ^^ line\nbreak back\\slash {o}'
+                        obj = f'"{escape_literal(raw)}"'
+                    f.write(f"{nn(s)} {nn(p)} {obj} .\n")
+                    i += 1
+    return path

@@ -91,3 +91,35 @@ jobs:
           # compile cost is absorbed by the plugin's untimed warmup calls.
           run: node --import tsx --expose-gc --no-liftoff bench/codspeed.bench.ts
           working-directory: js
+
+  python-benchmarks:
+    name: Run Python benchmarks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # The extension is compiled fresh so the benchmark measures HEAD, the
+      # same reason the JS job rebuilds the wasm bindings.
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: python-codspeed
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+
+      - name: Build the bindings
+        working-directory: python
+        run: uv sync
+
+      # Same CodSpeed project and mode as the other jobs (simulation =
+      # instruction counting), so the Python read paths publish alongside them.
+      - name: Run the Python benchmarks
+        uses: CodSpeedHQ/action@v5
+        with:
+          mode: simulation
+          run: uv run pytest bench/test_codspeed.py --codspeed
+          working-directory: python
