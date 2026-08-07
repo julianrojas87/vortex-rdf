@@ -5,6 +5,34 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased](https://github.com/vortex-rdf/vortex-rdf/compare/v0.5.0...HEAD)
+
+### Added
+
+- Trigger releases on v*.*.* tag pushes ([`6ed1eb3`](https://github.com/vortex-rdf/vortex-rdf/commit/6ed1eb35b40c38f7c789e13f72ca5d382cf9f643) by @julianrojas87)
+- Embed the dictionary and a manifest as file metadata segments ([`4f482e3`](https://github.com/vortex-rdf/vortex-rdf/commit/4f482e34ceb2391abacb4f791afa8bd9f9da4351) by @julianrojas87)
+- Track the embedded dictionary format in the bindings (python) ([`03ad85c`](https://github.com/vortex-rdf/vortex-rdf/commit/03ad85ca5271fb990a410d64f62c478e0c3913e4) by @julianrojas87)
+- Adopt the native vortex-rdf.store.v1 container as the only format ([`a749aaf`](https://github.com/vortex-rdf/vortex-rdf/commit/a749aafa77776076c6caa8412b9b56ea4ac7894b) by @julianrojas87)
+- Add checked term parsing and value dispatch, and fix escaped literals ([`128c2d1`](https://github.com/vortex-rdf/vortex-rdf/commit/128c2d1f9da1997d2c79ddff8a52d3801b1eb797) by @julianrojas87)
+- Stabilize the instrumented JS suite and cover literal decoding (bench) ([`685e66e`](https://github.com/vortex-rdf/vortex-rdf/commit/685e66e56adc8be061bdd6465c2cae1f1c65fbf4) by @julianrojas87)
+- Restructure around subsystems and prune the API (core) ([`e09d37d`](https://github.com/vortex-rdf/vortex-rdf/commit/e09d37dd18b94602cf931b8b02390fcf9e97fcce) by julianrojas87)
+- Canonical vocabulary, termDict door, owned byte loads (js) ([`8e365ee`](https://github.com/vortex-rdf/vortex-rdf/commit/8e365eea6f3f9d33d16038c4efe99b0494125ce4) by julianrojas87)
+- Bytes round-trip, index building, buffer decode (python) ([`944142e`](https://github.com/vortex-rdf/vortex-rdf/commit/944142e92108d2be557b4a015342104457b0fb5d) by julianrojas87)
+- Subcommand modules and split match formats (cli) ([`e036435`](https://github.com/vortex-rdf/vortex-rdf/commit/e036435465e62203f7ecaef245a5834b470f451c) by julianrojas87)
+
+### Changed
+
+- Memoize the embedded dictionary blob across serializations (core) ([`4e2e28d`](https://github.com/vortex-rdf/vortex-rdf/commit/4e2e28d984e0dc6d5477fd380ab4f1a7e1d21e7d) by @julianrojas87)
+- Stamp index leads when a full first chunk is the whole dataset (core) ([`cd4260f`](https://github.com/vortex-rdf/vortex-rdf/commit/cd4260f98d08e5ab328f2d4a7aa77a80eba2114a) by @julianrojas87)
+- Memoize per-role term decoding of a dictionary chunk (core) ([`6b3ebf8`](https://github.com/vortex-rdf/vortex-rdf/commit/6b3ebf8caefd31215b4090320b958c27584bd243) by @julianrojas87)
+
+### Fixed
+
+- IDE complaints about missing dependencies (js) ([`2db6d8b`](https://github.com/vortex-rdf/vortex-rdf/commit/2db6d8b01c87f0bc16f1bee65abaf5f646ac8e44) by @julianrojas87)
+- Realign the type stub with the compiled surface (python) ([`0f48ecc`](https://github.com/vortex-rdf/vortex-rdf/commit/0f48ecc4831ac30f7eceeca5ccf4bee603d4698c) by @julianrojas87)
+- Ship the wasm payload and the curated types (js) ([`6469bb3`](https://github.com/vortex-rdf/vortex-rdf/commit/6469bb3c2f49bc106a4555f98833201d36b0374d) by @julianrojas87)
+- Decontaminate shared state and measure real term handling (bench) ([`b718ef3`](https://github.com/vortex-rdf/vortex-rdf/commit/b718ef3172723c9005250465d649cdaf8f77ff2f) by julianrojas87)
+
 ## [0.5.0](https://github.com/vortex-rdf/vortex-rdf/compare/v0.4.0...v0.5.0) - 2026-07-29
 
 ### Added
