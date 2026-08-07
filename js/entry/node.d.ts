@@ -2,6 +2,7 @@
 // wasm bindings, minus the low-level `init`/`initSync` (the entry calls init
 // for the caller). Kept in sync with entry/node.js's re-exports.
 export {
+    TermDict,
     VortexRdfStore,
     rdf_to_vortex,
     vortex_to_rdf,

@@ -27,29 +27,30 @@ const NQUADS = [
     '<http://example.org/s4> <http://example.org/p4> "hola"@es .',
 ].join('\n') + '\n';
 
-/** Every build variant reachable from JS. */
+/** Every build variant reachable from JS, in the canonical kebab-case
+ *  vocabulary — the only spellings accepted, and what `layout()` reports. */
 const VARIANTS: { name: string; options: BuildOptions }[] = [
-    { name: 'Unsorted/Default', options: { builder: 'Unsorted', layout: 'Default' } },
-    { name: 'Unsorted/TypedObject', options: { builder: 'Unsorted', layout: 'TypedObject' } },
-    { name: 'Unsorted/Dictionary', options: { builder: 'Unsorted', layout: 'Dictionary' } },
-    { name: 'Sorted/Default', options: { builder: 'Sorted', layout: 'Default' } },
-    { name: 'Sorted/TypedObject', options: { builder: 'Sorted', layout: 'TypedObject' } },
-    { name: 'Sorted/Dictionary', options: { builder: 'Sorted', layout: 'Dictionary' } },
+    { name: 'Unsorted/Default', options: { builder: 'unsorted-stream', layout: 'default' } },
+    { name: 'Unsorted/TypedObject', options: { builder: 'unsorted-stream', layout: 'typed-object' } },
+    { name: 'Unsorted/Dictionary', options: { builder: 'unsorted-stream', layout: 'dictionary' } },
+    { name: 'Sorted/Default', options: { builder: 'sorted-in-memory', layout: 'default' } },
+    { name: 'Sorted/TypedObject', options: { builder: 'sorted-in-memory', layout: 'typed-object' } },
+    { name: 'Sorted/Dictionary', options: { builder: 'sorted-in-memory', layout: 'dictionary' } },
     {
         name: 'Sorted/Default+index',
-        options: { builder: 'Sorted', layout: 'Default', indexes: ['SecondaryByReference'] },
+        options: { builder: 'sorted-in-memory', layout: 'default', indexes: ['secondary-by-reference'] },
     },
     {
         name: 'Sorted/Dictionary+index',
-        options: { builder: 'Sorted', layout: 'Dictionary', indexes: ['SecondaryByReference'] },
+        options: { builder: 'sorted-in-memory', layout: 'dictionary', indexes: ['secondary-by-reference'] },
     },
     {
         name: 'Sorted/Default+copy-index',
-        options: { builder: 'Sorted', layout: 'Default', indexes: ['SecondaryByCopy'] },
+        options: { builder: 'sorted-in-memory', layout: 'default', indexes: ['secondary-by-copy'] },
     },
     {
         name: 'Sorted/Dictionary+copy-index',
-        options: { builder: 'Sorted', layout: 'Dictionary', indexes: ['SecondaryByCopy'] },
+        options: { builder: 'sorted-in-memory', layout: 'dictionary', indexes: ['secondary-by-copy'] },
     },
 ];
 
@@ -245,9 +246,9 @@ describe('RDF format support', () => {
 describe('free functions', () => {
     test('rdf_to_vortex / vortex_to_rdf round-trip with options', async () => {
         const bytes = await rdf_to_vortex(NQUADS, 'nquads', {
-            builder: 'Sorted',
-            layout: 'Dictionary',
-            indexes: ['SecondaryByReference'],
+            builder: 'sorted-in-memory',
+            layout: 'dictionary',
+            indexes: ['secondary-by-reference'],
         });
         expect(bytes).toBeInstanceOf(Uint8Array);
 
@@ -262,9 +263,9 @@ describe('free functions', () => {
     });
 
     test('rdf_to_vortex accepts a BuildOptions object', async () => {
-        const bytes = await rdf_to_vortex(NQUADS, 'nquads', { builder: 'Sorted', layout: 'Dictionary' });
+        const bytes = await rdf_to_vortex(NQUADS, 'nquads', { builder: 'sorted-in-memory', layout: 'dictionary' });
         const store = await VortexRdfStore.fromBytes(bytes);
-        expect(store.layout()).toBe('Dictionary');
+        expect(store.layout()).toBe('dictionary');
         expect(await store.size()).toBe(6);
     });
 });
@@ -275,7 +276,7 @@ describe('lazy terms outliving a dictionary rebuild', () => {
     // *fresh* dictionary, renumbering every term, so lazy quads that decoded
     // against the live store would silently resolve old codes to other terms.
     // They must decode against the snapshot taken when they were produced.
-    const dictOpts: BuildOptions = { builder: 'Sorted', layout: 'Dictionary' };
+    const dictOpts: BuildOptions = { builder: 'sorted-in-memory', layout: 'dictionary' };
     const PROBE = '<http://example.org/s3>';
 
     /** Enough quads to cross the auto-compaction floor, all sorting *before*
@@ -299,14 +300,14 @@ describe('lazy terms outliving a dictionary rebuild', () => {
         const held = await store.getQuads(null, df.namedNode('http://example.org/p3'), null, null);
         expect(held.length).toBe(1);
 
-        const codeBefore = store.encodeTerm(PROBE);
+        const codeBefore = store.termDict()!.encode(PROBE);
         await store.addQuads(compactionTrigger());
         // Preconditions, so this cannot pass vacuously if compaction stops
         // firing: the term was renumbered, and its old code now names a
         // *different* term — which is precisely what a lazy quad decoding
         // against the live store would hand back.
-        expect(store.encodeTerm(PROBE)).not.toBe(codeBefore);
-        expect(store.decodeTerm(codeBefore!)).not.toBe(PROBE);
+        expect(store.termDict()!.encode(PROBE)).not.toBe(codeBefore);
+        expect(store.termDict()!.decode(codeBefore!)).not.toBe(PROBE);
 
         expect(held[0].subject.value).toBe('http://example.org/s3');
         expect(held[0].predicate.value).toBe('http://example.org/p3');
@@ -320,9 +321,9 @@ describe('lazy terms outliving a dictionary rebuild', () => {
         const held = await collect(store.match(null, df.namedNode('http://example.org/p4'), null, null));
         expect(held.length).toBe(1);
 
-        const codeBefore = store.encodeTerm(PROBE);
+        const codeBefore = store.termDict()!.encode(PROBE);
         await store.addQuads(compactionTrigger());
-        expect(store.encodeTerm(PROBE)).not.toBe(codeBefore);
+        expect(store.termDict()!.encode(PROBE)).not.toBe(codeBefore);
 
         expect(held[0].subject.value).toBe('http://example.org/s4');
         expect(held[0].object.value).toBe('hola');
@@ -343,17 +344,28 @@ describe('lazy terms outliving a dictionary rebuild', () => {
 describe('option validation', () => {
     test('rejects an unknown builder', async () => {
         await expect(VortexRdfStore.fromString(NQUADS, 'nquads', { builder: 'Nope' as any })).rejects
-            .toThrow(/Unknown builder strategy/);
+            .toThrow(/unknown builder strategy/);
     });
 
     test('rejects an unknown layout', async () => {
         await expect(VortexRdfStore.fromString(NQUADS, 'nquads', { layout: 'Nope' as any })).rejects
-            .toThrow(/Unknown layout strategy/);
+            .toThrow(/unknown layout strategy/);
     });
 
     test('rejects an unknown index', async () => {
         await expect(VortexRdfStore.fromString(NQUADS, 'nquads', { indexes: ['Nope'] as any })).rejects
-            .toThrow(/Unknown index type/);
+            .toThrow(/unknown index type/);
+    });
+
+    test('rejects retired spellings, naming the canonical vocabulary', async () => {
+        // Parsing is strict kebab-case: the old PascalCase inputs error, and
+        // the message lists the canonical names.
+        await expect(VortexRdfStore.fromString(NQUADS, 'nquads', { builder: 'Sorted' as any })).rejects
+            .toThrow(/unknown builder strategy "Sorted".*"sorted-in-memory"/);
+        await expect(VortexRdfStore.fromString(NQUADS, 'nquads', { layout: 'Dictionary' as any })).rejects
+            .toThrow(/unknown layout strategy "Dictionary".*"dictionary"/);
+        await expect(VortexRdfStore.fromString(NQUADS, 'nquads', { indexes: ['SecondaryByCopy'] as any })).rejects
+            .toThrow(/unknown index type "SecondaryByCopy".*"secondary-by-copy"/);
     });
 
     test('rejects a non-array indexes option', async () => {
@@ -366,14 +378,16 @@ describe('option validation', () => {
             .toThrow(/must be a string/);
     });
 
-    test('SortedStream stays unavailable in WASM', async () => {
-        await expect(VortexRdfStore.fromString(NQUADS, 'nquads', { builder: 'SortedStream' as any }))
-            .rejects.toThrow(/Unknown builder strategy/);
+    test('sorted-stream stays unavailable in WASM', async () => {
+        // The name parses (core's shared vocabulary includes it), but the wasm
+        // build gate rejects the strategy itself: it spills sorted runs to disk.
+        await expect(VortexRdfStore.fromString(NQUADS, 'nquads', { builder: 'sorted-stream' as any }))
+            .rejects.toThrow(/not available in WebAssembly/);
     });
 
     test('defaults to Unsorted/Dictionary when options are omitted', async () => {
         const store = await VortexRdfStore.fromString(NQUADS, 'nquads');
-        expect(store.layout()).toBe('Dictionary');
+        expect(store.layout()).toBe('dictionary');
         expect(await store.size()).toBe(6);
     });
 });
@@ -415,9 +429,9 @@ describe('multi-chunk payloads', () => {
 }, 120_000);
 
 describe('match / getQuads across layouts', () => {
-    for (const layout of ['Default', 'TypedObject', 'Dictionary'] as const) {
+    for (const layout of ['default', 'typed-object', 'dictionary'] as const) {
         test(`${layout}: getQuads returns correctly-decoded terms`, async () => {
-            const store = await VortexRdfStore.fromString(NQUADS, 'nquads', { builder: 'Sorted', layout });
+            const store = await VortexRdfStore.fromString(NQUADS, 'nquads', { builder: 'sorted-in-memory', layout });
             const quads = await store.getQuads(null, df.namedNode('http://example.org/p1'), null, null);
             expect(quads.length).toBe(3);
 
@@ -431,11 +445,11 @@ describe('match / getQuads across layouts', () => {
         });
 
         test(`${layout}: a matched subset round-trips through fromQuads → bytes`, async () => {
-            const store = await VortexRdfStore.fromString(NQUADS, 'nquads', { builder: 'Sorted', layout });
+            const store = await VortexRdfStore.fromString(NQUADS, 'nquads', { builder: 'sorted-in-memory', layout });
             const quads = await store.getQuads(null, df.namedNode('http://example.org/p1'), null, null);
 
             // Rebuild a standalone store from the matched quads and round-trip it.
-            const derived = await VortexRdfStore.fromQuads(quads, { builder: 'Sorted', layout });
+            const derived = await VortexRdfStore.fromQuads(quads, { builder: 'sorted-in-memory', layout });
             const restored = await VortexRdfStore.fromBytes(await derived.toBytes());
             expect(await restored.size()).toBe(3);
 
@@ -502,7 +516,7 @@ describe('lazy terms', () => {
     });
 
     test('Default layout: .equals falls back to value/termType compare', async () => {
-        const store = await VortexRdfStore.fromString(NQUADS, 'nquads', { layout: 'Default' });
+        const store = await VortexRdfStore.fromString(NQUADS, 'nquads', { layout: 'default' });
         const a = await store.getQuads(null, df.namedNode('http://example.org/p1'), null, null);
         // <o1> appears twice under p1 — equal by value even without codes.
         const o1s = a.filter((q: Quad) => q.object.value === 'http://example.org/o1');
@@ -514,7 +528,7 @@ describe('lazy terms', () => {
 
 describe('adding quads', () => {
     test('Dictionary layout supports addQuad via the string tail', async () => {
-        const store = await VortexRdfStore.fromString(NQUADS, 'nquads', { layout: 'Dictionary' });
+        const store = await VortexRdfStore.fromString(NQUADS, 'nquads', { layout: 'dictionary' });
         // Every term here is absent from the dictionary built at load time;
         // the quad lands in the string tail and must still be found by match.
         const quad = df.quad(
@@ -544,7 +558,7 @@ describe('adding quads', () => {
     });
 
     test('Default layout supports addQuad', async () => {
-        const store = await VortexRdfStore.fromString(NQUADS, 'nquads', { layout: 'Default' });
+        const store = await VortexRdfStore.fromString(NQUADS, 'nquads', { layout: 'default' });
         const quad = df.quad(
             df.namedNode('http://example.org/s9'),
             df.namedNode('http://example.org/p9'),
@@ -639,7 +653,7 @@ describe('getQuads without a pattern', () => {
 
 describe('BuildOptionsInput string shorthand', () => {
     // A bare builder name stands in for the whole options object.
-    for (const strategy of ['Unsorted', 'Sorted'] as const) {
+    for (const strategy of ['unsorted-stream', 'sorted-in-memory'] as const) {
         test(`fromString accepts the bare '${strategy}' builder name`, async () => {
             const store = await VortexRdfStore.fromString(NQUADS, 'nquads', strategy);
             expect(await store.size()).toBe(6);

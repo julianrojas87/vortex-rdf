@@ -5,22 +5,25 @@
 use futures::Stream;
 use js_sys::Reflect;
 use oxrdfio::RdfFormat;
-use vortex_rdf_core::common::formats::format_from_name;
+use vortex_rdf_core::common::formats::{format_from_name, supported_format_names};
 use vortex_rdf_core::error::Result as CoreResult;
 use vortex_rdf_core::store::{BuiltArray, RawQuad};
-use vortex_rdf_core::{
-    BuilderStrategy, IndexType, Indexes, LayoutStrategy, VortexRdfStore as CoreStore,
-};
+use vortex_rdf_core::{BuilderStrategy, IndexType, Indexes, LayoutStrategy};
 use wasm_bindgen::prelude::*;
 
 use crate::error::{js_err, js_err_ctx};
 
 pub(crate) fn parse_format(format_name: &str) -> Result<RdfFormat, JsValue> {
     format_from_name(format_name).ok_or_else(|| {
+        // Quote core's own name list, so this message cannot understate what
+        // `format_from_name` actually accepts.
+        let supported = supported_format_names()
+            .iter()
+            .map(|name| format!("'{name}'"))
+            .collect::<Vec<_>>()
+            .join(", ");
         js_err(format!(
-            "Unsupported format: {}. Supported formats are 'ntriples', 'nquads', 'turtle', \
-             'trig', 'n3', 'rdfxml' and 'jsonld'.",
-            format_name
+            "Unsupported format: {format_name}. Supported formats are {supported}."
         ))
     })
 }
@@ -58,13 +61,16 @@ pub(crate) async fn build_array(
         layout,
         indexes,
     } = config;
-    // Defensive: `parse_builder` never yields SortedStream, which spills to disk.
+    // `parse_builder` accepts core's full vocabulary, including sorted-stream,
+    // which spills sorted runs to disk — a filesystem wasm does not have. This
+    // is the one gate rejecting it.
     if builder == BuilderStrategy::SortedStream {
         return Err(js_err(
             "The sorted-stream builder strategy is not available in WebAssembly.",
         ));
     }
-    CoreStore::build_vortex_array_with_strategy(quads, layout, indexes, builder)
+    builder
+        .build_vortex_array(Box::new(quads), layout, indexes)
         .await
         .map_err(|e| js_err_ctx("Vortex build error", e))
 }
@@ -119,46 +125,18 @@ fn get_string_option(options: &JsValue, key: &str) -> Result<Option<String>, JsV
     }
 }
 
+// The strategy vocabularies live on core's `FromStr` impls — the canonical
+// kebab-case names shared by every frontend, and nothing else. These wrappers
+// only shape the failure into a JS exception.
+
 fn parse_builder(name: &str) -> Result<BuilderStrategy, JsValue> {
-    match name {
-        "Unsorted" => Ok(BuilderStrategy::UnsortedStream),
-        "Sorted" => Ok(BuilderStrategy::SortedInMemory),
-        other => Err(js_err(format!(
-            "Unknown builder strategy: {}. Supported strategies are 'Unsorted' and 'Sorted'.",
-            other
-        ))),
-    }
+    name.parse().map_err(js_err)
 }
 
 fn parse_layout(name: &str) -> Result<LayoutStrategy, JsValue> {
-    match name {
-        "Default" => Ok(LayoutStrategy::Default),
-        "TypedObject" => Ok(LayoutStrategy::TypedObject),
-        "Dictionary" => Ok(LayoutStrategy::Dictionary),
-        other => Err(js_err(format!(
-            "Unknown layout strategy: {}. Supported layouts are 'Default', 'TypedObject' \
-             and 'Dictionary'.",
-            other
-        ))),
-    }
+    name.parse().map_err(js_err)
 }
 
 fn parse_index(name: &str) -> Result<IndexType, JsValue> {
-    match name {
-        "SecondaryByReference" => Ok(IndexType::SecondaryByReference),
-        "SecondaryByCopy" => Ok(IndexType::SecondaryByCopy),
-        other => Err(js_err(format!(
-            "Unknown index type: {}. Supported indexes are 'SecondaryByReference' \
-             and 'SecondaryByCopy'.",
-            other
-        ))),
-    }
-}
-
-pub(crate) fn layout_name(layout: LayoutStrategy) -> &'static str {
-    match layout {
-        LayoutStrategy::Default => "Default",
-        LayoutStrategy::TypedObject => "TypedObject",
-        LayoutStrategy::Dictionary => "Dictionary",
-    }
+    name.parse().map_err(js_err)
 }

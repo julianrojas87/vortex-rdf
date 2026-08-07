@@ -40,9 +40,12 @@ pub async fn rdf_to_vortex(
         .await
 }
 
-/// One-shot conversion: native-container bytes in, RDF text out.
+/// One-shot conversion: native-container bytes in, RDF text out. `Vec<u8>`
+/// for the same reason as [`VortexRdfStore::from_bytes`]: the marshalled
+/// buffer's ownership passes straight through to core, so the load never
+/// holds two copies of the file bytes.
 #[wasm_bindgen(skip_typescript)]
-pub async fn vortex_to_rdf(vortex_bytes: &[u8], format_name: &str) -> Result<String, JsValue> {
+pub async fn vortex_to_rdf(vortex_bytes: Vec<u8>, format_name: &str) -> Result<String, JsValue> {
     VortexRdfStore::from_bytes(vortex_bytes)
         .await?
         .to_rdf(format_name)

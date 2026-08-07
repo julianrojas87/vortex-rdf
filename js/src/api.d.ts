@@ -2,38 +2,44 @@ import { Quad, Term, Stream } from '@rdfjs/types';
 
 /**
  * How quads are ordered while the columnar array is built.
- * - 'Unsorted': natural insertion order. Cheapest to build, but every `match`
- *   falls back to a full column scan.
- * - 'Sorted': global in-memory sort by subject -> predicate -> object -> graph.
- *   Costs a sort at build time, but unlocks binary-search lookups on subject.
+ * - 'unsorted-stream': natural insertion order. Cheapest to build, but every
+ *   `match` falls back to a full column scan.
+ * - 'sorted-in-memory': global in-memory sort by subject -> predicate ->
+ *   object -> graph. Costs a sort at build time, but unlocks binary-search
+ *   lookups on subject.
  *
- * The core's out-of-core 'SortedStream' builder is not available here: it
- * spills sorted runs to disk, which WebAssembly has no access to.
+ * These kebab-case names are the canonical vocabulary shared by every
+ * vortex-rdf frontend. The core's out-of-core 'sorted-stream' builder is not
+ * available here: it spills sorted runs to disk, which WebAssembly has no
+ * access to.
  */
-export type BuilderStrategy = 'Unsorted' | 'Sorted';
+export type BuilderStrategy = 'unsorted-stream' | 'sorted-in-memory';
 
 /**
  * How quad terms are encoded into columns.
- * - 'Default': all four terms as N-Triples strings natively optimised by Vortex.
- * - 'TypedObject': the object is split into kind/value/datatype/language columns.
- * - 'Dictionary': every term is replaced by a u32 code into a global sorted term
- *   dictionary. More compact than 'Default'. Added quads live in an
+ * - 'default': all four terms as N-Triples strings natively optimised by Vortex.
+ * - 'typed-object': the object is split into kind/value/datatype/language columns.
+ * - 'dictionary': every term is replaced by a u32 code into a global sorted term
+ *   dictionary. More compact than 'default'. Added quads live in an
  *   in-memory string tail until the store is serialized or compacted.
+ *
+ * These kebab-case names are the canonical vocabulary shared by every
+ * vortex-rdf frontend; `layout()` reports them.
  */
-export type LayoutStrategy = 'Default' | 'TypedObject' | 'Dictionary';
+export type LayoutStrategy = 'default' | 'typed-object' | 'dictionary';
 
 /**
  * Secondary indexes embedded alongside the primary quad columns.
- * 'SecondaryByReference' adds sorted predicate/object columns plus row-id
+ * 'secondary-by-reference' adds sorted predicate/object columns plus row-id
  * back-references, letting predicate-only and object-only patterns use a
  * binary search instead of a full scan.
- * 'SecondaryByCopy' embeds two complete extra copies of the quad columns —
+ * 'secondary-by-copy' embeds two complete extra copies of the quad columns —
  * one sorted by (p, o, s, g), one by (o, s, p, g) — so predicate- and
  * object-bound patterns (including predicate+object prefix lookups) get the
  * same sorted access path subjects have, at ~2x the storage.
- * Both are only effective with a 'Sorted' builder.
+ * Both are only effective with a sorted builder.
  */
-export type IndexType = 'SecondaryByReference' | 'SecondaryByCopy';
+export type IndexType = 'secondary-by-reference' | 'secondary-by-copy';
 
 /** RDF syntaxes accepted for parsing and emitted for serialization. */
 export type RdfFormatName =
@@ -47,15 +53,15 @@ export type RdfFormatName =
 
 /** Build-time configuration. Any omitted field keeps its default. */
 export interface BuildOptions {
-    /** @default 'Unsorted' */
+    /** @default 'unsorted-stream' */
     builder?: BuilderStrategy;
-    /** @default 'Dictionary' */
+    /** @default 'dictionary' */
     layout?: LayoutStrategy;
     /** @default [] */
     indexes?: IndexType[];
 }
 
-/** A bare BuilderStrategy string is accepted as shorthand for `{ builder }`. */
+/** A bare builder-strategy string is accepted as shorthand for `{ builder }`. */
 export type BuildOptionsInput = BuildOptions | BuilderStrategy;
 
 export class VortexRdfStore {
@@ -65,7 +71,7 @@ export class VortexRdfStore {
     /** `quads` may be an array, or an RDF/JS `Stream<Quad>` (a Node-style event emitter). */
     static fromQuads(quads: Quad[] | Stream<Quad>, options?: BuildOptionsInput): Promise<VortexRdfStore>;
 
-    /** The layout this store's columns are encoded with. */
+    /** The layout this store's columns are encoded with (canonical kebab-case name). */
     layout(): LayoutStrategy;
     size(): Promise<number>;
     has(quad: Quad): Promise<boolean>;
@@ -99,19 +105,38 @@ export class VortexRdfStore {
      * which build their own columnar payload rather than going through this.
      * Resolves a pattern to the matched rows' raw u32 term codes — four
      * columnar `Uint32Array`s — without materializing any term strings;
-     * resolve codes to terms with `decodeTerm`. Returns `null` unless the
+     * resolve codes to terms with `termDict()`. Returns `null` unless the
      * store is Dictionary layout with no pending appends (appended quads are
      * encoded against a fresh dictionary, so their codes would not decode).
      */
     matchCodes(subject?: Term | null, predicate?: Term | null, object?: Term | null, graph?: Term | null): Promise<{ s: Uint32Array; p: Uint32Array; o: Uint32Array; g: Uint32Array; length: number } | null>;
-    /** Low-level. Decode a Dictionary-layout term code to its N-Triples term string. */
-    decodeTerm(code: number): string | undefined;
-    /** Low-level. Encode an N-Triples term string to its Dictionary-layout code (inverse of decodeTerm). */
-    encodeTerm(term: string): number | undefined;
+    /**
+     * Low-level. An immutable handle on this store's term dictionary — the one
+     * door to code↔term translation. `undefined` unless the store's rows are
+     * code-addressable (Dictionary layout, no pending appends, resident
+     * dictionary). The handle keeps decoding correctly after the store is
+     * mutated: it retains the dictionary its codes address.
+     */
+    termDict(): TermDict | undefined;
     /** Serialize to Vortex file bytes; read back with `VortexRdfStore.fromBytes` or write to disk as a `.vortex` file. */
     toBytes(): Promise<Uint8Array>;
     /** Serialize the quads to an RDF syntax. */
     toRdf(format: RdfFormatName): Promise<string>;
+}
+
+/**
+ * An immutable snapshot of a Dictionary-layout store's term dictionary,
+ * translating u32 term codes to N-Triples term strings (`<iri>`, `_:blank`,
+ * `"lit"@lang`, `"lit"^^<dt>`, or `''` for the default graph) and back.
+ * Obtained with `VortexRdfStore.termDict()`.
+ */
+export class TermDict {
+    /** Decode a term code, or `undefined` when it is out of range. */
+    decode(code: number): string | undefined;
+    /** Encode an N-Triples term string to its code (inverse of `decode`), or `undefined` when the term is absent. */
+    encode(term: string): number | undefined;
+    /** Release the wasm-side handle (also invoked by `Symbol.dispose`). */
+    free(): void;
 }
 
 export function rdf_to_vortex(input: string, format: RdfFormatName, options?: BuildOptionsInput): Promise<Uint8Array>;

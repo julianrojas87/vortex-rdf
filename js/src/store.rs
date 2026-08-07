@@ -2,20 +2,20 @@
 //! payload construction behind `match`/`getQuads` (`match_columns`).
 
 use std::cell::RefCell;
-use std::io::Cursor;
+use std::io::{Cursor, Write};
 
 use futures::StreamExt;
 use js_sys::{Object, Reflect};
 use oxrdf::{GraphName, NamedNode, NamedOrBlankNode, Term};
+use vortex_rdf_core::common::export::export_rdf;
 use vortex_rdf_core::common::terms::parse_quads_from_reader;
-use vortex_rdf_core::io::deserialize;
 use vortex_rdf_core::{BuilderStrategy, DictSnapshot, LayoutStrategy, VortexRdfStore as CoreStore};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::future_to_promise;
 
 use crate::error::{js_err, js_err_ctx};
 use crate::ingest::{js_array_to_dictionary_array, js_array_to_quads, js_to_quad_stream};
-use crate::options::{build_array, layout_name, parse_build_options, parse_format};
+use crate::options::{build_array, parse_build_options, parse_format};
 use crate::terms::{js_to_graph, js_to_named_node, js_to_quad, js_to_subject, js_to_term};
 
 // The lazy RDF/JS read model (LazyQuad/LazyTerm + stream) lives in a local
@@ -59,19 +59,17 @@ impl VortexRdfStore {
     }
 
     /// The dictionary for decoding a match's `u32` code columns, or `None` when
-    /// the code path does not apply (non-Dictionary layout, or the store carries
-    /// an append tail — appended quads are re-encoded against a *fresh*
-    /// dictionary, so `get_quads_array`'s codes would not match the store's
-    /// cached one; those reads fall back to the always-correct term path).
+    /// the code path does not apply. Core's
+    /// [`code_read_snapshot`](CoreStore::code_read_snapshot) is the one
+    /// "codes are decodable" gate (Dictionary layout, no append tail, resident
+    /// dictionary — see its doc for why anything less decodes to wrong terms);
+    /// reads it declines fall back to the always-correct term path.
     fn code_path_dict(&self) -> Option<JsValue> {
-        if self.inner.tail_len() != 0 {
-            return None;
-        }
-        self.dict_view()
+        let snapshot = self.inner.code_read_snapshot()?;
+        Some(self.dict_view(snapshot))
     }
 
-    /// The store's `LazyDict`, or `None` when this store is not
-    /// Dictionary-layout.
+    /// The store's `LazyDict` over `snapshot`, built once and cached.
     ///
     /// The `LazyDict` holds a [`DictSnapshot`] and decodes each code the first
     /// time it is observed, interning the result — so a query pays one boundary
@@ -82,15 +80,13 @@ impl VortexRdfStore {
     /// Because the snapshot is immutable, `LazyQuad`s handed out before a
     /// mutation keep decoding against the dictionary their codes address, even
     /// though `self.dict_view` is dropped so later reads pick up the new one.
-    fn dict_view(&self) -> Option<JsValue> {
+    fn dict_view(&self, snapshot: DictSnapshot) -> JsValue {
         if let Some(dv) = self.dict_view.borrow().as_ref() {
-            return Some(dv.clone());
+            return dv.clone();
         }
-        let dv = make_dict_view(TermDict {
-            snapshot: self.inner.dictionary_snapshot()?,
-        });
+        let dv = make_dict_view(TermDict { snapshot });
         *self.dict_view.borrow_mut() = Some(dv.clone());
-        Some(dv)
+        dv
     }
 }
 
@@ -113,6 +109,14 @@ impl TermDict {
     pub fn decode(&self, code: u32) -> Option<String> {
         self.snapshot.decode(code)
     }
+
+    /// Encode an N-Triples term string to its code (inverse of
+    /// [`decode`](Self::decode)), or `undefined` when this dictionary does
+    /// not hold the term.
+    #[wasm_bindgen(js_name = encode)]
+    pub fn encode(&self, term: &str) -> Option<u32> {
+        self.snapshot.encode(term)
+    }
 }
 
 #[wasm_bindgen]
@@ -122,9 +126,15 @@ impl VortexRdfStore {
         VortexRdfStore::wrap(CoreStore::empty())
     }
 
+    /// Taking `Vec<u8>` makes wasm-bindgen hand over ownership of the buffer
+    /// it marshalled from the caller's `Uint8Array`, so the whole load pays
+    /// exactly one copy — the unavoidable JS→wasm boundary crossing. A
+    /// borrowed `&[u8]` here would anchor that marshalled buffer for the
+    /// whole async decode while core copied it again: 2x file size of
+    /// transient high-water, which wasm linear memory never gives back.
     #[wasm_bindgen(js_name = fromBytes, skip_typescript)]
-    pub async fn from_bytes(bytes: &[u8]) -> Result<VortexRdfStore, JsValue> {
-        let inner = CoreStore::from_bytes(bytes).await.map_err(js_err)?;
+    pub async fn from_bytes(bytes: Vec<u8>) -> Result<VortexRdfStore, JsValue> {
+        let inner = CoreStore::from_bytes_owned(bytes).await.map_err(js_err)?;
         Ok(VortexRdfStore::wrap(inner))
     }
 
@@ -171,7 +181,8 @@ impl VortexRdfStore {
 
     #[wasm_bindgen(skip_typescript)]
     pub fn layout(&self) -> String {
-        layout_name(self.inner.layout()).to_string()
+        // Core's Display: the canonical kebab-case name every frontend reports.
+        self.inner.layout().to_string()
     }
 
     #[wasm_bindgen(js_name = toBytes, skip_typescript)]
@@ -193,7 +204,7 @@ impl VortexRdfStore {
         let mut buffer = Vec::new();
         // Serialize through this store's own resolved layout, so a store derived
         // from `match` still decodes against the term dictionary it carries.
-        deserialize(self.inner.clone(), &mut buffer, format)
+        export_rdf(self.inner.clone(), &mut buffer, format)
             .await
             .map_err(|e| js_err_ctx("Deserialize error", e))?;
         String::from_utf8(buffer).map_err(|e| js_err_ctx("UTF-8 error", e))
@@ -314,9 +325,10 @@ impl VortexRdfStore {
     /// the matched rows as raw `u32` term codes — four `Uint32Array` columns
     /// `{ s, p, o, g, length }`, or `null` unless this store is Dictionary
     /// layout with no append tail. No term strings are materialized; the caller
-    /// resolves codes to terms lazily via [`decodeTerm`](Self::decode_term).
-    /// This is the zero-copy-until-observed read path being evaluated against
-    /// `getQuads`, which builds its own columnar payload rather than this one.
+    /// resolves codes to terms lazily through the [`termDict`](Self::term_dict)
+    /// handle. This is the zero-copy-until-observed read path being evaluated
+    /// against `getQuads`, which builds its own columnar payload rather than
+    /// this one.
     #[wasm_bindgen(js_name = matchCodes, skip_typescript)]
     pub async fn match_codes(
         &self,
@@ -325,10 +337,12 @@ impl VortexRdfStore {
         object: JsValue,
         graph: JsValue,
     ) -> Result<JsValue, JsValue> {
-        // Codes are only meaningful against the store's cached dictionary, which
-        // holds for a pristine Dictionary store. An append tail re-encodes
-        // against a fresh dictionary, so codes would not resolve via `decodeTerm`.
-        if self.inner.layout() != LayoutStrategy::Dictionary || self.inner.tail_len() != 0 {
+        // Codes are only meaningful against the store's cached dictionary.
+        // Core's `code_read_snapshot` is the one gate for that (Dictionary
+        // layout, no append tail — appends re-encode against a fresh
+        // dictionary — and a resident snapshot); short of it, codes would not
+        // resolve via `termDict`, so report the code read model unavailable.
+        if self.inner.code_read_snapshot().is_none() {
             return Ok(JsValue::NULL);
         }
         let s = js_to_subject(subject);
@@ -349,20 +363,18 @@ impl VortexRdfStore {
         Ok(result.into())
     }
 
-    /// **Prototype.** Decode a Dictionary-layout term code to its N-Triples term
-    /// string (`<iri>`, `_:blank`, `"lit"@lang`, `"lit"^^<dt>`, or `""` for the
-    /// default graph). `undefined` if not Dictionary layout or out of range.
-    #[wasm_bindgen(js_name = decodeTerm, skip_typescript)]
-    pub fn decode_term(&self, code: u32) -> Option<String> {
-        self.inner.decode_code(code)
-    }
-
-    /// **Prototype.** Encode an N-Triples term string to its Dictionary-layout
-    /// code (inverse of `decodeTerm`). `undefined` if not Dictionary layout or
-    /// the term is absent from the dictionary.
-    #[wasm_bindgen(js_name = encodeTerm, skip_typescript)]
-    pub fn encode_term(&self, term: &str) -> Option<u32> {
-        self.inner.encode_code(term)
+    /// **Prototype.** An immutable [`TermDict`] handle on this store's term
+    /// dictionary — the one door to code↔term translation (`decode`/`encode`
+    /// of N-Triples term strings: `<iri>`, `_:blank`, `"lit"@lang`,
+    /// `"lit"^^<dt>`, or `""` for the default graph). `undefined` short of
+    /// core's code-read gate ([`code_read_snapshot`](CoreStore::code_read_snapshot):
+    /// Dictionary layout, no append tail, resident dictionary). The handle
+    /// stays valid — and keeps decoding correctly — after the store is
+    /// mutated, because it retains the dictionary its codes address.
+    #[wasm_bindgen(js_name = termDict, skip_typescript)]
+    pub fn term_dict(&self) -> Option<TermDict> {
+        let snapshot = self.inner.code_read_snapshot()?;
+        Some(TermDict { snapshot })
     }
 }
 
@@ -415,17 +427,21 @@ async fn match_columns(
     let mut n = 0u32;
     while let Some(q_res) = quads_stream.next().await {
         let q = q_res.map_err(js_err)?;
-        let terms = [
-            q.subject.to_string(),
-            q.predicate.to_string(),
-            q.object.to_string(),
+        // Each term's N-Triples form is written straight into its column's
+        // byte buffer (oxrdf terms `Display` as N-Triples) — no per-term
+        // String transient. The default graph is the empty string in this
+        // payload's vocabulary, not the "DEFAULT" its `Display` prints.
+        let terms: [&dyn std::fmt::Display; 4] = [
+            &q.subject,
+            &q.predicate,
+            &q.object,
             match &q.graph_name {
-                GraphName::DefaultGraph => String::new(),
-                other => other.to_string(),
+                GraphName::DefaultGraph => &"",
+                other => other,
             },
         ];
-        for (col, term) in cols.iter_mut().zip(terms.iter()) {
-            col.1.extend_from_slice(term.as_bytes());
+        for (col, term) in cols.iter_mut().zip(terms) {
+            write!(col.1, "{term}").expect("writing to a Vec<u8> cannot fail");
             col.0.push(col.1.len() as u32);
         }
         n += 1;
