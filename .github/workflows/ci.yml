@@ -93,28 +93,6 @@ jobs:
   js-tests:
     name: JS Tests
     runs-on: ubuntu-latest
-    env:
-      # Matches release.yml's npm job, so this job tests the codegen config
-      # that actually ships. Also the standard wasm size lever.
-      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "1"
-      #
-      # EXPERIMENT (branch ci/measure-wasm-build-memory): two further knobs
-      # used to live here and are deliberately removed —
-      #
-      #   CARGO_PROFILE_RELEASE_OPT_LEVEL: "s"
-      #   CARGO_BUILD_JOBS: "1"
-      #
-      # They were added to stop the wasm build exhausting memory, but that
-      # was never measured on a runner, and opt-level is not really a memory
-      # knob: it made this job validate an opt-level="s" binary while npm
-      # ships opt-level=3 (release.yml sets CODEGEN_UNITS only). Dropping
-      # both restores test/ship parity and lets the default 4-way fan-out
-      # use the 4-vCPU runner.
-      #
-      # The "Build WASM package" step below reports peak RSS so this can be
-      # decided on numbers. If the job OOMs or peaks near the runner's 16 GB,
-      # reinstate CARGO_BUILD_JOBS (the pure memory knob, no artifact effect)
-      # first — and only then opt-level, accepting the parity gap.
     steps:
       - uses: actions/checkout@v7
       - name: Setup Node.js
@@ -127,15 +105,10 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
-      # EXPERIMENT: the key is bumped off `js` on purpose. A fresh namespace
-      # means the first run on this branch restores nothing and compiles the
-      # whole ~900-crate wasm dependency tree — the cold path the removed env
-      # vars were guarding, and the only one whose peak RSS is worth reading.
-      # Cache-warm reruns are not evidence. Restore `key: js` when done.
       - name: Cache Rust artifacts
         uses: Swatinem/rust-cache@v2
         with:
-          key: js-cold-probe
+          key: js
       # wasm-pack is a pinned npm devDependency; `npm ci` installs it and npm
       # run puts node_modules/.bin ahead of anything on PATH.
       - name: Install dependencies
@@ -143,21 +116,7 @@ jobs:
         run: npm ci
       - name: Build WASM package
         working-directory: js
-        shell: bash
-        run: |
-          # `/usr/bin/time` — the binary, not bash's `time` keyword — is what
-          # reports peak RSS, and it is not on every runner image. `-o` keeps
-          # the report out of the build's own output and preserves the exit
-          # status, so a failed build still fails the step.
-          if ! command -v /usr/bin/time >/dev/null; then
-            sudo apt-get update -qq && sudo apt-get install -y -qq time
-          fi
-          /usr/bin/time -v -o /tmp/wasm-build-time.log npm run build
-          peak_kb=$(awk '/Maximum resident set size/ {print $NF}' /tmp/wasm-build-time.log)
-          wall=$(awk -F': ' '/Elapsed \(wall clock\)/ {print $2}' /tmp/wasm-build-time.log)
-          wasm_kib=$(( $(stat -c%s pkg/web/vortex_rdf_bg.wasm) / 1024 ))
-          echo "::notice title=wasm cold build::peak RSS $((peak_kb / 1024)) MiB (runner has 16 GiB), wall ${wall}, wasm ${wasm_kib} KiB"
-          cat /tmp/wasm-build-time.log
+        run: npm run build
       # Typechecks after the build: the tsconfigs resolve against the generated
       # pkg/web/vortex_rdf.d.ts.
       - name: Run typecheck
