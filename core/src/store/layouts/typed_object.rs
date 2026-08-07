@@ -13,7 +13,7 @@ use vortex_array::{ArrayRef, IntoArray, VortexSessionExecute};
 
 use crate::common::terms::{get_as_term, parse_graph_name, parse_named_node, parse_subject};
 use crate::error::{Result, VortexRdfError};
-use crate::io::VORTEX_SESSION;
+use crate::session::VORTEX_SESSION;
 use crate::store::RawQuad;
 use crate::store::array::{StrColReader, make_nullable_string_array, make_string_array};
 use crate::store::schema::{COL_G, COL_P, COL_S};

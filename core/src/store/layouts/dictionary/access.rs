@@ -1,16 +1,19 @@
 //! The *residency* axis of the Dictionary layout: how a resolved store
 //! reaches its term dictionary — held whole in memory, or left in the file's
-//! dictionary child and probed on demand. The dictionary itself (storage,
-//! FSST, probing, file-backing) lives in
-//! [`term_dictionary`](crate::store::term_dictionary); this seam is what
-//! couples it to the layout's pattern vocabulary.
+//! dictionary child and probed on demand. The dictionary itself lives in the
+//! sibling modules — storage, FSST, and probing in
+//! [`term_dict`](super::term_dict), the on-demand form in
+//! [`file_backed`](super::file_backed) — and this seam is what couples them
+//! to the layout's pattern vocabulary.
 
 use std::sync::Arc;
 
 use crate::error::Result;
+use crate::store::layouts::{PatternCodes, QuadPattern, TermRef};
+
 #[cfg(feature = "file-io")]
-use crate::store::term_dictionary::FileBackedDict;
-use crate::store::term_dictionary::TermDictionary;
+use super::file_backed::FileBackedDict;
+use super::term_dict::TermDictionary;
 
 /// How a resolved Dictionary layout reaches its term dictionary: the
 /// *residency* axis, sitting above `TermStore`'s encoding axis.
@@ -22,13 +25,12 @@ use crate::store::term_dictionary::TermDictionary;
 ///
 /// - [`resolve_pattern`](Self::resolve_pattern) is the **async prelude**: the
 ///   one place a dictionary is allowed to perform I/O during a match. It runs
-///   before the synchronous match core and pre-resolves every bound term of
-///   the pattern into the match's [`PatternCodes`](crate::store::layouts::PatternCodes), so everything downstream
-///   resolves from that cache without touching the dictionary again — which
-///   is what confines a file-backed dictionary's I/O to this method.
-/// - The sync accessors ([`get_id`](Self::get_id), [`term_at`](Self::term_at))
-///   are total for `Resident` and answer `None`/`Err` for `FileBacked` —
-///   callers needing them on a file-backed store go through the async paths.
+///   before the synchronous match core, pre-resolves every bound term of the
+///   pattern, and hands back the match's [`PatternCodes`] witness — the only
+///   way one is minted — so the core's synchronous probes can only ever run
+///   over a prelude that ran, and answer from its codes without touching the
+///   dictionary again. That witness is what confines a file-backed
+///   dictionary's I/O to this method.
 /// - [`resident`](Self::resident) hands out the in-memory dictionary itself
 ///   (`None` for `FileBacked`), for the paths that genuinely need the whole
 ///   column; [`ensure_resident`](Self::ensure_resident) lifts a file-backed
@@ -45,22 +47,19 @@ pub(crate) enum DictAccess {
 }
 
 impl DictAccess {
-    /// Pre-resolve every bound term of `pattern` into `codes` — the async
-    /// prelude run before the synchronous match core.
+    /// Pre-resolve every bound term of `pattern` — the async prelude run
+    /// before the synchronous match core — and mint the [`PatternCodes`]
+    /// witness the core's probes run on.
     ///
     /// For `Resident` the lookups are in-memory binary searches, resolved
     /// eagerly rather than lazily at each use site: what this buys is the
     /// invariant the match core is written against — *after the prelude,
-    /// every bound role is in `codes`* — which is what lets a file-backed
+    /// every bound role is in the witness* — which is what lets a file-backed
     /// dictionary do its I/O here and nowhere else.
-    pub(crate) async fn resolve_pattern(
-        &self,
-        pattern: super::QuadPattern<'_>,
-        codes: &mut super::PatternCodes,
-    ) -> Result<()> {
-        use super::TermRef;
+    pub(crate) async fn resolve_pattern(&self, pattern: QuadPattern<'_>) -> Result<PatternCodes> {
         match self {
             DictAccess::Resident(dict) => {
+                let mut codes = PatternCodes::resident(Arc::clone(dict));
                 if let Some(s) = pattern.subject {
                     codes.resolve(TermRef::Subject(s), |t| dict.get_id(t));
                 }
@@ -73,69 +72,53 @@ impl DictAccess {
                 if let Some(g) = pattern.graph {
                     codes.resolve(TermRef::Graph(g), |t| dict.get_id(t));
                 }
-                Ok(())
+                Ok(codes)
             }
             // Each bound role costs one filtered probe of the term column
             // (memoized in the probe cache); the resolved code is then seeded
-            // into `codes` so the sync match core never reaches back here.
+            // into the witness so the sync match core never reaches back here.
+            //
+            // The four probes are independent filtered split scans, so they
+            // run overlapped rather than one await after another — a
+            // fully-bound pattern on a cold probe cache pays ~1 scan latency
+            // instead of 4. Concurrency is why each term is rendered into its
+            // own String here instead of the pattern's shared scratch buffer,
+            // and a first-probe race on the fence is already handled by its
+            // drop-the-loser `OnceLock`.
             #[cfg(feature = "file-io")]
             DictAccess::FileBacked(fb) => {
+                let render = |term: Option<TermRef<'_>>| term.map(|t| t.to_string());
+                let probe = |term: Option<String>| async move {
+                    match term {
+                        Some(t) => fb.get_id(&t).await.map(Some),
+                        None => Ok(None),
+                    }
+                };
+                let (s_id, p_id, o_id, g_id) = futures::join!(
+                    probe(render(pattern.subject.map(TermRef::Subject))),
+                    probe(render(pattern.predicate.map(TermRef::Predicate))),
+                    probe(render(pattern.object.map(TermRef::Object))),
+                    probe(render(pattern.graph.map(TermRef::Graph))),
+                );
+                let mut codes = PatternCodes::preresolved();
                 if let Some(s) = pattern.subject {
-                    let id = fb.get_id(codes.render(TermRef::Subject(s))).await?;
+                    let id = s_id?.expect("the subject role is bound, so it was probed");
                     codes.resolve(TermRef::Subject(s), |_| id);
                 }
                 if let Some(p) = pattern.predicate {
-                    let id = fb.get_id(codes.render(TermRef::Predicate(p))).await?;
+                    let id = p_id?.expect("the predicate role is bound, so it was probed");
                     codes.resolve(TermRef::Predicate(p), |_| id);
                 }
                 if let Some(o) = pattern.object {
-                    let id = fb.get_id(codes.render(TermRef::Object(o))).await?;
+                    let id = o_id?.expect("the object role is bound, so it was probed");
                     codes.resolve(TermRef::Object(o), |_| id);
                 }
                 if let Some(g) = pattern.graph {
-                    let id = fb.get_id(codes.render(TermRef::Graph(g))).await?;
+                    let id = g_id?.expect("the graph role is bound, so it was probed");
                     codes.resolve(TermRef::Graph(g), |_| id);
                 }
-                Ok(())
+                Ok(codes)
             }
-        }
-    }
-
-    /// Look up a term's code through the *synchronous* surface
-    /// (`VortexRdfStore::encode_code`). A file-backed dictionary cannot probe
-    /// its file without I/O, so it answers `None` — callers needing
-    /// file-backed lookups go through the async prelude instead.
-    pub(crate) fn get_id(&self, term: &str) -> Option<u32> {
-        match self {
-            DictAccess::Resident(dict) => dict.get_id(term),
-            #[cfg(feature = "file-io")]
-            DictAccess::FileBacked(_) => None,
-        }
-    }
-
-    /// [`get_id`](Self::get_id) for the match core's probe closures, which run
-    /// strictly after [`resolve_pattern`](Self::resolve_pattern) has seeded
-    /// every bound role into the pattern's code cache — so a call ever
-    /// reaching a file-backed dictionary is a broken prelude, not a miss.
-    pub(crate) fn get_id_resolved(&self, term: &str) -> Option<u32> {
-        match self {
-            DictAccess::Resident(dict) => dict.get_id(term),
-            #[cfg(feature = "file-io")]
-            DictAccess::FileBacked(_) => unreachable!(
-                "the async prelude resolves every bound role before the sync match core runs"
-            ),
-        }
-    }
-
-    /// Decode a code back to its term string through the *synchronous*
-    /// surface (`VortexRdfStore::decode_code`), or `None` when out of range —
-    /// or when the dictionary is file-backed (same contract as
-    /// [`get_id`](Self::get_id)).
-    pub(crate) fn term_at(&self, code: u32) -> Option<String> {
-        match self {
-            DictAccess::Resident(dict) => dict.term_at(code),
-            #[cfg(feature = "file-io")]
-            DictAccess::FileBacked(_) => None,
         }
     }
 

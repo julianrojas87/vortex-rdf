@@ -1,8 +1,14 @@
 //! Column-building and decoding logic for [`LayoutStrategy::Dictionary`]:
 //! s/p/o/g stored as u32 codes into a global sorted term dictionary (see
-//! [`crate::store::term_dictionary`]), which travels beside the array in memory and
-//! reaches serialized files as the native container's `dictionary` child
-//! (see `crate::io::store_layout`).
+//! [`term_dict`](self::term_dict)), which travels beside the array in memory
+//! and reaches serialized files as the native container's `dictionary` child
+//! (see `crate::io::container`).
+//!
+//! This folder is the whole dictionary subsystem: this file owns the chunk
+//! encode/decode paths, [`ingest`] the build-side term collection and
+//! interning, [`term_dict`] the frozen dictionary itself, [`file_backed`]
+//! the on-demand file residency, and [`access`] the residency seam the
+//! resolved layout speaks through.
 //!
 //! Unlike the other layouts, chunks are not built through the generic
 //! `build_struct_array` path: encoding requires the global `TermDictionary`
@@ -21,24 +27,36 @@ use std::sync::Arc;
 use web_time::Instant;
 
 use oxrdf::Quad;
+use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::struct_::{StructArray, StructArrayExt};
-use vortex_array::arrays::{PrimitiveArray, VarBinViewArray};
 use vortex_array::validity::Validity;
 use vortex_array::{ArrayRef, IntoArray, VortexSessionExecute};
 
-use futures::{Stream, StreamExt};
-
 use crate::common::terms::{get_as_term, parse_graph_name, parse_named_node, parse_subject};
 use crate::error::{Result, VortexRdfError};
-use crate::io::VORTEX_SESSION;
+use crate::session::VORTEX_SESSION;
 use crate::store::RawQuad;
 use crate::store::array::stamp_is_sorted;
-use crate::store::builders::BuiltArray;
 use crate::store::builders::GlobalIndexes;
 use crate::store::indexes::secondary_by_copy::CopyKey;
-use crate::store::indexes::{IndexType, Indexes, unique_indexes};
+use crate::store::indexes::{IndexType, unique_indexes};
 use crate::store::schema::{COL_G, COL_O, COL_P, COL_S, PRIMARY_COLUMNS};
-use crate::store::term_dictionary::{DictReader, TermDictionary, TermIdMap};
+
+pub(crate) mod access;
+#[cfg(feature = "file-io")]
+pub(crate) mod file_backed;
+pub(crate) mod ingest;
+pub(crate) mod term_dict;
+
+#[cfg(feature = "file-io")]
+pub(crate) use self::file_backed::FileBackedDict;
+pub use self::ingest::DictionaryQuadSink;
+pub(crate) use self::ingest::{TermDictionaryBuilder, TermIdMap, ingest_interning};
+use self::term_dict::DictReader;
+pub use self::term_dict::DictSnapshot;
+#[cfg(any(feature = "file-io", target_arch = "wasm32"))]
+pub(crate) use self::term_dict::dict_child_chunks;
+pub(crate) use self::term_dict::{TermDictionary, dict_from_reader};
 
 /// Field names of the primary columns: `s`, `p`, `o`, `g` (all u32 codes).
 pub(crate) fn field_names() -> Vec<Arc<str>> {
@@ -56,70 +74,6 @@ pub(crate) struct QuadCodes {
     pub g: Vec<u32>,
 }
 
-/// Drain a quad stream into an [`InterningQuadBuilder`]: each quad's Strings
-/// die here, leaving one copy of every distinct term plus 16 bytes per quad.
-///
-/// The Dictionary-layout in-memory ingest for both the sorted and unsorted
-/// builders; `finish(sort)` then yields the dictionary and the coded quads.
-pub(crate) async fn ingest_interning(
-    mut quads_in: Box<dyn Stream<Item = Result<RawQuad>> + Unpin + Send + 'static>,
-) -> Result<InterningQuadBuilder> {
-    let mut interner = InterningQuadBuilder::new();
-    while let Some(res) = quads_in.next().await {
-        interner.push(res?);
-    }
-    Ok(interner)
-}
-
-/// Push-based Dictionary-layout ingest for callers that produce quads one at
-/// a time rather than as a `'static` stream — the wasm array path, whose
-/// quads are decoded chunk-by-chunk from a packed JS buffer.
-///
-/// Feeding those quads through the stream builders would require collecting
-/// them into a full `Vec<RawQuad>` first (a `'static` stream cannot borrow
-/// from the decode loop), resurrecting exactly the four-Strings-per-quad
-/// ingest high-water the interning ingest removes. Pushing into the sink
-/// instead lets each quad's Strings die on arrival; `finish` builds the same
-/// single-chunk array `SortedInMemoryBuilder`/`UnsortedStreamBuilder`
-/// produce for the Dictionary layout.
-pub struct DictionaryQuadSink {
-    interner: InterningQuadBuilder,
-    indexes: Indexes,
-    /// Sort the coded quads by (s, p, o, g) in `finish` —
-    /// [`BuilderStrategy::SortedInMemory`]'s semantics; `false` keeps arrival
-    /// order ([`BuilderStrategy::UnsortedStream`]).
-    ///
-    /// [`BuilderStrategy::SortedInMemory`]: crate::store::BuilderStrategy::SortedInMemory
-    /// [`BuilderStrategy::UnsortedStream`]: crate::store::BuilderStrategy::UnsortedStream
-    sorted: bool,
-}
-
-impl DictionaryQuadSink {
-    pub fn new(sorted: bool, indexes: Indexes) -> Self {
-        Self {
-            interner: InterningQuadBuilder::new(),
-            indexes,
-            sorted,
-        }
-    }
-
-    /// Consume one quad: intern its four terms, keep only their ids.
-    pub fn push(&mut self, quad: RawQuad) {
-        self.interner.push(quad);
-    }
-
-    /// Freeze the dictionary and build the single-chunk Dictionary-layout
-    /// array, exactly as the corresponding stream builder would.
-    pub fn finish(self) -> Result<BuiltArray> {
-        let (dict, codes) = self.interner.finish(self.sorted)?;
-        let array = build_array(&codes, &self.indexes, self.sorted)?;
-        Ok(BuiltArray {
-            array,
-            dict: Some(Arc::new(dict)),
-        })
-    }
-}
-
 /// Encode every term of every quad to its dictionary code.
 ///
 /// Generic over the map's key so both the owned [`TermIdMap`] (streaming
@@ -127,7 +81,7 @@ impl DictionaryQuadSink {
 /// quad slice) work without a second code path — `&str: Borrow<str>` makes the
 /// `get(term)` lookup identical for either.
 ///
-/// [`BorrowedTermIdMap`]: crate::store::term_dictionary::BorrowedTermIdMap
+/// [`BorrowedTermIdMap`]: self::ingest::BorrowedTermIdMap
 fn encode_quads<K>(
     quads: &[RawQuad],
     dict: &TermDictionary,
@@ -176,7 +130,7 @@ where
 /// `s_sorted` stamps the `IsSorted` statistic on the `s` column; valid
 /// because sorted-dictionary codes preserve lexicographic order.
 ///
-/// [`DictAccess`]: crate::store::layouts::dict_access::DictAccess
+/// [`DictAccess`]: self::access::DictAccess
 fn chunk_parts(
     codes: &QuadCodes,
     range: Range<usize>,
@@ -262,7 +216,7 @@ where
 /// (s, p, o, g) order, the unsorted builder in arrival order. Index columns
 /// are globally sorted either way (`GlobalIndexes::from_codes` sorts pairs).
 ///
-/// [`InterningQuadBuilder`]: self::InterningQuadBuilder
+/// [`InterningQuadBuilder`]: self::ingest::InterningQuadBuilder
 pub(crate) fn build_array(
     codes: &QuadCodes,
     indexes: &[IndexType],
@@ -300,15 +254,20 @@ pub(crate) fn build_chunk_global(
 
 /// The two `SecondaryByReference` code columns of a presorted chunk, as
 /// borrowed globally sorted (code, row ID) slices: (objects, predicates).
+// This vocabulary serves only the external-sort builder, compiled out on
+// wasm (see the module gate in `store::builders`).
+#[cfg_attr(all(target_arch = "wasm32", target_os = "unknown"), allow(dead_code))]
 type RefPairSlices<'a> = (&'a [(u32, u32)], &'a [(u32, u32)]);
 /// The two `SecondaryByCopy` code columns of a presorted chunk, as borrowed
 /// globally sorted (sort key, row ID) slices: (POSG, OSPG).
+#[cfg_attr(all(target_arch = "wasm32", target_os = "unknown"), allow(dead_code))]
 type CopyKeySlices<'a> = (&'a [(CopyKey<u32>, u32)], &'a [(CopyKey<u32>, u32)]);
 
 /// Build a Dictionary-layout chunk with index columns taken from
 /// already-globally-sorted (code, row ID) entries — the out-of-core sorted
 /// builder's emission path, where the entries are merged from disk runs.
 /// Each index family is appended only when its entries are supplied.
+#[cfg_attr(all(target_arch = "wasm32", target_os = "unknown"), allow(dead_code))]
 pub(crate) fn build_chunk_presorted_indexes(
     quads: &[RawQuad],
     dict: &TermDictionary,
@@ -538,6 +497,33 @@ pub(crate) fn decode_chunk(chunk: &ArrayRef, dict: &TermDictionary) -> Vec<Resul
     )
 }
 
+/// Decode one role's code column to owned term strings, reading each distinct
+/// code's term at most once (see [`TermMemo`]) — the [`raw_quads`]
+/// reconstruction path, where a predicate or graph column repeats a handful
+/// of codes over every row and each repeat would otherwise pay the dictionary
+/// read (an FSST decompress) again.
+///
+/// [`raw_quads`]: crate::store::layouts::ResolvedLayout::raw_quads
+pub(super) fn decode_code_column(dict: &TermDictionary, codes: &[u32]) -> Result<Vec<String>> {
+    let mut reader = dict.reader();
+    let mut memo: TermMemo<String> = TermMemo::new(codes.len());
+    codes
+        .iter()
+        .map(|&code| {
+            memo.get_or_insert(code, || {
+                if (code as usize) >= dict.len() {
+                    return Err(VortexRdfError::Deserialization(format!(
+                        "Term code {} out of dictionary bounds ({})",
+                        code,
+                        dict.len()
+                    )));
+                }
+                reader.str_at(code as usize).map(str::to_string)
+            })
+        })
+        .collect()
+}
+
 /// The distinct term codes a chunk's four code columns reference, ascending —
 /// what a file-backed dictionary must resolve to decode the chunk.
 #[cfg(feature = "file-io")]
@@ -582,118 +568,4 @@ pub(crate) fn decode_chunk_mapped(
         g_col.as_slice::<u32>(),
         &mut MappedTerms(terms),
     )
-}
-/// Ingest-time interner producing the dictionary and the coded quads in one
-/// pass: quads are consumed as they arrive, each unique term is held once, and
-/// each quad is kept as four u32 ids.
-///
-/// This replaces buffering the whole stream as a `Vec<RawQuad>` — four owned
-/// `String`s per quad, held live until the dictionary and codes were derived
-/// from them — which was the measured wasm ingest high-water mark (~377 B/row).
-/// The per-quad Strings still exist transiently (the stream hands them over),
-/// but they die inside [`push`](Self::push); what accumulates is one copy of
-/// each distinct term plus 16 bytes per quad.
-///
-/// Ids handed out during ingest are provisional (insertion order).
-/// [`finish`](Self::finish) sorts the unique terms, freezes them into the
-/// [`TermDictionary`], and remaps every quad id to its term's sorted rank —
-/// which *is* the dictionary code, since codes are lexicographic ranks. For
-/// sorted builders it then sorts the coded quads directly: `[u32; 4]`
-/// lexicographic order equals (s, p, o, g) term order (order-isomorphism
-/// again), and sorting 16-byte rows is far cheaper than sorting four-String
-/// structs.
-pub(crate) struct InterningQuadBuilder {
-    /// term → provisional id, owning each distinct term exactly once.
-    ids: HashMap<Box<str>, u32>,
-    /// One `[s, p, o, g]` of provisional ids per quad, in arrival order.
-    quads: Vec<[u32; 4]>,
-}
-
-impl InterningQuadBuilder {
-    pub(crate) fn new() -> Self {
-        Self {
-            ids: HashMap::new(),
-            quads: Vec::new(),
-        }
-    }
-
-    fn intern(&mut self, term: String) -> u32 {
-        let next = self.ids.len() as u32;
-        // `into_boxed_str` is free for exact-capacity Strings (the common
-        // case from `RawQuad::from_quad`) and shrinks the rest.
-        *self.ids.entry(term.into_boxed_str()).or_insert(next)
-    }
-
-    /// Consume one quad: intern its four terms, keep only their ids.
-    pub(crate) fn push(&mut self, q: RawQuad) {
-        let quad = [
-            self.intern(q.s),
-            self.intern(q.p),
-            self.intern(q.o),
-            self.intern(q.g),
-        ];
-        self.quads.push(quad);
-    }
-
-    /// Freeze the dictionary and produce the dataset's codes, sorted by
-    /// (s, p, o, g) when `sort` is set.
-    pub(crate) fn finish(mut self, sort: bool) -> Result<(TermDictionary, QuadCodes)> {
-        let total_start = Instant::now();
-        let n = self.quads.len();
-
-        let sort_start = Instant::now();
-        // Unique terms, so the tuple Ord never reaches the id.
-        let mut entries: Vec<(Box<str>, u32)> = self.ids.into_iter().collect();
-        entries.sort_unstable();
-        let sort_terms_elapsed = sort_start.elapsed();
-
-        // provisional id → sorted rank == dictionary code.
-        let mut rank_of = vec![0u32; entries.len()];
-        for (rank, (_, pid)) in entries.iter().enumerate() {
-            rank_of[*pid as usize] = rank as u32;
-        }
-
-        // Freeze by *consuming* the boxes: each term is freed as it is copied
-        // into the plain column, so the boxes and the column never coexist in
-        // full — that stacking was the finish-phase memory peak.
-        let freeze_start = Instant::now();
-        let plain = VarBinViewArray::from_iter_str(entries.into_iter().map(|(t, _)| t));
-        let dict = TermDictionary::from_sorted_column(plain)?;
-        let freeze_elapsed = freeze_start.elapsed();
-
-        let remap_start = Instant::now();
-        for quad in &mut self.quads {
-            for id in quad.iter_mut() {
-                *id = rank_of[*id as usize];
-            }
-        }
-        if sort {
-            self.quads.sort_unstable();
-        }
-        let remap_elapsed = remap_start.elapsed();
-
-        let mut codes = QuadCodes {
-            s: Vec::with_capacity(n),
-            p: Vec::with_capacity(n),
-            o: Vec::with_capacity(n),
-            g: Vec::with_capacity(n),
-        };
-        for [s, p, o, g] in self.quads {
-            codes.s.push(s);
-            codes.p.push(p);
-            codes.o.push(o);
-            codes.g.push(g);
-        }
-
-        log::debug!(
-            "[Dictionary] Interned {} quads ({} unique terms): sort terms {:?}, freeze {:?}, remap+sort quads {:?}, total {:?}",
-            n,
-            dict.len(),
-            sort_terms_elapsed,
-            freeze_elapsed,
-            remap_elapsed,
-            total_start.elapsed()
-        );
-        Ok((dict, codes))
-    }
 }

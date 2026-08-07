@@ -5,8 +5,8 @@
 //! subsystem live with that subsystem instead: index column names (`_idx_*`)
 //! in their index modules ([`secondary_by_copy::Family`],
 //! [`secondary_by_reference`]), the dictionary child's `_dict_term` in
-//! [`term_dictionary`](crate::store::term_dictionary), and the TypedObject
-//! layout's split object columns in [`typed_object`].
+//! [`term_dict`](crate::store::layouts::dictionary::term_dict), and the
+//! TypedObject layout's split object columns in [`typed_object`].
 //!
 //! [`secondary_by_copy::Family`]: crate::store::indexes::secondary_by_copy::Family
 //! [`secondary_by_reference`]: crate::store::indexes::secondary_by_reference

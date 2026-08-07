@@ -2,8 +2,8 @@
 //! strings back into `oxrdf` terms, and RDF documents into [`RawQuad`]
 //! streams.
 
+use crate::common::quad::RawQuad;
 use crate::error::{Result, VortexRdfError};
-use crate::store::RawQuad;
 
 use std::borrow::Cow;
 
@@ -184,7 +184,16 @@ fn literal_from_serialized(s: &str) -> Literal {
 }
 
 /// Parses an arbitrary RDF term (blank node, literal, or named node) from its string form.
-pub fn parse_term(s: &str) -> Result<Term> {
+///
+/// Crate-private on purpose: this is a trusted decode path (`new_unchecked`
+/// constructors) whose only callers are this crate's tests — production
+/// trusted decodes go through [`get_as_term`], and anything user-typed must
+/// take [`parse_term_checked`]. Exporting it would invite bindings to
+/// trust-parse input the store never validated.
+// Test-only callers, so non-test builds see it as dead; kept compiled (not
+// `#[cfg(test)]`) so the doc links above stay resolvable.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn parse_term(s: &str) -> Result<Term> {
     if s.starts_with('_') {
         Ok(Term::BlankNode(parse_blank_node(s)?))
     } else if s.starts_with('"') {
@@ -294,6 +303,37 @@ fn literal_checked(s: &str) -> Result<Literal> {
     }
 }
 
+/// A parsed quad pattern: the four term positions, each bound (`Some`) or
+/// free (`None`) — what [`parse_pattern_checked`] returns and
+/// `VortexRdfStore::match_pattern` borrows.
+pub type Pattern = (
+    Option<NamedOrBlankNode>,
+    Option<NamedNode>,
+    Option<Term>,
+    Option<GraphName>,
+);
+
+/// Parses a user-typed quad pattern — the four optional term strings every
+/// frontend's match surface accepts — through the checked family above:
+/// subject via [`parse_subject_checked`], predicate via
+/// [`parse_named_node_checked`], object via [`parse_term_checked`], graph via
+/// [`parse_graph_name_checked`]. A `None` slot stays free; the first invalid
+/// slot's error is returned as-is (callers wanting per-slot context wrap the
+/// error themselves).
+pub fn parse_pattern_checked(
+    s: Option<&str>,
+    p: Option<&str>,
+    o: Option<&str>,
+    g: Option<&str>,
+) -> Result<Pattern> {
+    Ok((
+        s.map(parse_subject_checked).transpose()?,
+        p.map(parse_named_node_checked).transpose()?,
+        o.map(parse_term_checked).transpose()?,
+        g.map(parse_graph_name_checked).transpose()?,
+    ))
+}
+
 /// Reconstructs a full structural oxrdf `Term` from its raw serialized string representation.
 /// Handles URIs, Blank Nodes, simple literals, language-tagged literals, and typed literals.
 pub fn get_as_term(s: &str) -> Option<Term> {
@@ -317,7 +357,7 @@ pub fn get_as_term(s: &str) -> Option<Term> {
 
 /// Parses a stream of RDF quads from any reader using the specified RDF format.
 ///
-/// Yields [`RawQuad`] rather than `oxrdf::Quad`: every builder converts to
+/// Yields [`RawQuad`]: every builder converts to
 /// `RawQuad` as its first act, so handing back the parsed `Quad` would keep a
 /// second owned copy of every term alive for no purpose. Converting here lets
 /// the `Quad` die inside the map.
@@ -331,4 +371,213 @@ pub fn parse_quads_from_reader<R: std::io::Read + Send + 'static>(
             .map_err(|e| VortexRdfError::Deserialization(format!("Parse error: {}", e)))
     });
     stream::iter(iter)
+}
+
+/// Mechanism tests for the parsers above: term parsing from serialized
+/// N-Triples strings, and the escape-aware structure scan the literal
+/// decoders are built on (a documented perf-sensitive area — see
+/// [`closing_quote`]). Store-level escaped-literal round-trips live in the
+/// central suite (`crate::tests::escaping`), whose shared case list the
+/// parser-agreement test below borrows.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tests::escaping::escaped_literal_cases;
+
+    #[test]
+    fn parse_term_simple_literal() {
+        assert_eq!(
+            parse_term("\"Alice\"").unwrap(),
+            Term::Literal(Literal::new_simple_literal("Alice"))
+        );
+    }
+
+    #[test]
+    fn parse_term_language_tagged_literal() {
+        assert_eq!(
+            parse_term("\"Bob\"@en").unwrap(),
+            Term::Literal(Literal::new_language_tagged_literal("Bob", "en").unwrap())
+        );
+    }
+
+    #[test]
+    fn parse_term_typed_literal() {
+        let dt = NamedNode::new("http://www.w3.org/2001/XMLSchema#integer").unwrap();
+        assert_eq!(
+            parse_term("\"42\"^^<http://www.w3.org/2001/XMLSchema#integer>").unwrap(),
+            Term::Literal(Literal::new_typed_literal("42", dt))
+        );
+    }
+
+    #[test]
+    fn parse_term_named_and_blank_nodes() {
+        assert_eq!(
+            parse_term("<http://example.org/x>").unwrap(),
+            Term::NamedNode(NamedNode::new("http://example.org/x").unwrap())
+        );
+        // Bare IRIs (no angle brackets) are accepted, e.g. from CLI arguments.
+        assert_eq!(
+            parse_term("http://example.org/x").unwrap(),
+            Term::NamedNode(NamedNode::new("http://example.org/x").unwrap())
+        );
+        assert!(matches!(
+            parse_term("_:b0").unwrap(),
+            Term::BlankNode(b) if b.as_str() == "b0"
+        ));
+    }
+
+    #[test]
+    fn parse_pattern_checked_binds_each_slot() {
+        let (s, p, o, g) = parse_pattern_checked(
+            Some("_:b0"),
+            Some("<http://example.org/p>"),
+            Some("\"v\"@en"),
+            Some("http://example.org/g"),
+        )
+        .unwrap();
+        assert!(matches!(s, Some(NamedOrBlankNode::BlankNode(b)) if b.as_str() == "b0"));
+        assert_eq!(p, Some(NamedNode::new("http://example.org/p").unwrap()));
+        assert_eq!(
+            o,
+            Some(Term::Literal(
+                Literal::new_language_tagged_literal("v", "en").unwrap()
+            ))
+        );
+        assert_eq!(
+            g,
+            Some(GraphName::NamedNode(
+                NamedNode::new("http://example.org/g").unwrap()
+            ))
+        );
+
+        // A `None` slot stays free; "default" names the default graph.
+        let (s, p, o, g) = parse_pattern_checked(None, None, None, Some("default")).unwrap();
+        assert!(s.is_none() && p.is_none() && o.is_none());
+        assert_eq!(g, Some(GraphName::DefaultGraph));
+    }
+
+    /// Pattern slots are user-typed, so they take the *checked* parse family: an
+    /// invalid term in any slot must error rather than silently match nothing.
+    #[test]
+    fn parse_pattern_checked_rejects_invalid_slots() {
+        assert!(parse_pattern_checked(Some("no spaces allowed"), None, None, None).is_err());
+        assert!(parse_pattern_checked(None, Some("not an iri"), None, None).is_err());
+        assert!(parse_pattern_checked(None, None, Some("\"unterminated"), None).is_err());
+        assert!(parse_pattern_checked(None, None, None, Some("bad graph iri")).is_err());
+    }
+
+    #[test]
+    fn parse_term_agrees_with_get_as_term_on_literals() {
+        for s in [
+            "\"plain\"",
+            "\"tagged\"@en-GB",
+            "\"7\"^^<http://www.w3.org/2001/XMLSchema#byte>",
+            "\"an @ inside\"",
+        ] {
+            assert_eq!(parse_term(s).unwrap(), get_as_term(s).unwrap());
+        }
+    }
+
+    #[test]
+    fn trusted_and_checked_parses_agree_on_escaped_literals() {
+        for term in escaped_literal_cases() {
+            let s = term.to_string();
+            assert_eq!(parse_term(&s).unwrap(), term, "trusted parse of {}", s);
+            assert_eq!(
+                parse_term_checked(&s).unwrap(),
+                term,
+                "checked parse of {}",
+                s
+            );
+            assert_eq!(get_as_term(&s).unwrap(), term, "get_as_term of {}", s);
+        }
+    }
+
+    #[test]
+    fn structure_scan_ignores_suffix_lookalikes_inside_the_value() {
+        // `"@` and `^^` inside the value must not be read as structure: both
+        // parses see a simple literal, and the checked one does not error.
+        for (serialized, value) in [
+            ("\"say \\\"hi\\\"@home\"", "say \"hi\"@home"),
+            ("\"a ^^ b\"", "a ^^ b"),
+            (
+                "\"\\\"^^<http://example.org/nope>\"",
+                "\"^^<http://example.org/nope>",
+            ),
+        ] {
+            let expected = Term::Literal(Literal::new_simple_literal(value));
+            assert_eq!(parse_term(serialized).unwrap(), expected);
+            assert_eq!(parse_term_checked(serialized).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn escape_sequences_decode_in_both_paths() {
+        for (serialized, value) in [
+            ("\"a\\u0041b\"", "aAb"),
+            ("\"\\U0001F600\"", "\u{1F600}"),
+            ("\"\\b\\f\"", "\u{8}\u{c}"),
+            ("\"\\'\"", "'"),
+            ("\"\\t\\n\\r\"", "\t\n\r"),
+            ("\"\\\\\\\"\"", "\\\""),
+        ] {
+            let expected = Term::Literal(Literal::new_simple_literal(value));
+            assert_eq!(parse_term(serialized).unwrap(), expected, "{}", serialized);
+            assert_eq!(
+                parse_term_checked(serialized).unwrap(),
+                expected,
+                "{}",
+                serialized
+            );
+        }
+    }
+
+    #[test]
+    fn escaped_suffixes_are_read_from_after_the_closing_quote() {
+        let dt = NamedNode::new("http://example.org/dt").unwrap();
+        assert_eq!(
+            parse_term("\"a\\\"b\"^^<http://example.org/dt>").unwrap(),
+            Term::Literal(Literal::new_typed_literal("a\"b", dt))
+        );
+        assert_eq!(
+            parse_term("\"a\\\"b\"@en").unwrap(),
+            Term::Literal(Literal::new_language_tagged_literal("a\"b", "en").unwrap())
+        );
+    }
+
+    /// A quote closes the literal only when the backslash run directly before it
+    /// has even length — the property the closing-quote scan is built on.
+    #[test]
+    fn backslash_run_parity_decides_the_closing_quote() {
+        // Serialized form -> the value it denotes, over runs of length 1..=3
+        // ending at a quote.
+        let cases = [
+            ("\"a\\\\\"", "a\\"),           // "a\\"      -> a\
+            ("\"a\\\"b\"", "a\"b"),         // "a\"b"     -> a"b
+            ("\"a\\\\\\\"b\"", "a\\\"b"),   // "a\\\"b"   -> a\"b
+            ("\"\\\\\\\\\"", "\\\\"),       // "\\\\"     -> \\
+            ("\"\\\\\\\\\\\"\"", "\\\\\""), // "\\\\\""   -> \\"
+        ];
+        for (serialized, value) in cases {
+            let expected = Term::Literal(Literal::new_simple_literal(value));
+            assert_eq!(parse_term(serialized).unwrap(), expected, "{}", serialized);
+            assert_eq!(
+                parse_term_checked(serialized).unwrap(),
+                expected,
+                "{}",
+                serialized
+            );
+            // And the value must render back to exactly the form we started from.
+            assert_eq!(expected.to_string(), serialized);
+        }
+    }
+
+    #[test]
+    fn malformed_literals_are_lenient_when_trusted_and_rejected_when_checked() {
+        for s in ["\"unterminated", "\"a\" trailing", "\"a\"\\"] {
+            // Trusted decode is infallible: it must not panic and must yield a term.
+            assert!(matches!(parse_term(s).unwrap(), Term::Literal(_)), "{}", s);
+            assert!(parse_term_checked(s).is_err(), "{}", s);
+        }
+    }
 }

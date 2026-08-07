@@ -7,13 +7,9 @@
 //! the query side, and the dictionary is held in its compact columnar form
 //! (`VarBinViewArray`) rather than as owned `String`s.
 //!
-//! [`LayoutStrategy::Dictionary`]: super::LayoutStrategy::Dictionary
+//! [`LayoutStrategy::Dictionary`]: crate::store::layouts::LayoutStrategy::Dictionary
 
-use std::collections::{HashMap, HashSet};
-#[cfg(feature = "file-io")]
-use std::ops::Range;
-#[cfg(feature = "file-io")]
-use std::sync::OnceLock;
+use std::collections::HashSet;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use web_time::Instant;
@@ -21,89 +17,25 @@ use web_time::Instant;
 use vortex_array::arrays::struct_::{StructArray, StructArrayExt};
 use vortex_array::arrays::{ChunkedArray, PrimitiveArray, VarBinViewArray};
 use vortex_array::dtype::DType;
-#[cfg(feature = "file-io")]
-use vortex_array::expr::{eq, get_item, lit};
 use vortex_array::expr::{root, select};
 use vortex_array::match_each_integer_ptype;
-#[cfg(feature = "file-io")]
-use vortex_array::stream::ArrayStreamExt as _;
 #[cfg(any(feature = "file-io", target_arch = "wasm32"))]
 use vortex_array::validity::Validity;
 use vortex_array::{ArrayRef, IntoArray, VortexSessionExecute};
 use vortex_fsst::{FSST, FSSTArray, FSSTArraySlotsExt as _, fsst_compress, fsst_train_compressor};
-#[cfg(feature = "file-io")]
-use vortex_mask::{AllOr, Mask};
 
 use crate::error::{Result, VortexRdfError};
-use crate::io::VORTEX_SESSION;
+use crate::session::VORTEX_SESSION;
 use crate::store::RawQuad;
 use crate::store::array::{StrColReader, buf_as_str};
+
+use super::ingest::BorrowedTermIdMap;
 
 /// The single column of the native container's `dictionary` child: non-nullable
 /// utf8, row i holding the term with code i (sorted, so codes are lexicographic
 /// ranks). Part of the wire contract, owned here — the module that builds and
 /// reads the child — per the ownership rule in [`crate::store::schema`].
 pub(crate) const TERM_FIELD: &str = "_dict_term";
-
-/// Build-only term-to-ID lookup table, keyed by owned terms. It is deliberately
-/// kept separate from [`TermDictionary`] so stores retain only the compact
-/// columnar dictionary; builders drop this map as soon as all quad terms have
-/// been encoded.
-///
-/// Prefer [`TermDictionary::from_quads_with_map`]'s borrowed map wherever the
-/// quads outlive the encode: the owned keys here duplicate the entire term set
-/// on the heap, which for a large dataset costs more than the dictionary
-/// itself. This variant exists for the streaming builders, whose quads are
-/// moved or re-read from a spill file and so cannot be borrowed from.
-pub(crate) type TermIdMap = HashMap<String, u32>;
-
-/// Term-to-ID lookup borrowing its keys from the quads being encoded — the
-/// allocation-free counterpart of [`TermIdMap`].
-pub(crate) type BorrowedTermIdMap<'a> = HashMap<&'a str, u32>;
-
-/// Incrementally collects the unique term strings of a dataset during the
-/// ingestion pass of a build. Owned strings exist only for the build's lifetime.
-pub(crate) struct TermDictionaryBuilder {
-    set: HashSet<String>,
-}
-
-impl TermDictionaryBuilder {
-    pub(crate) fn new() -> Self {
-        Self {
-            set: HashSet::new(),
-        }
-    }
-
-    pub(crate) fn insert_quad(&mut self, q: &RawQuad) {
-        for term in [&q.s, &q.p, &q.o, &q.g] {
-            if !self.set.contains(term.as_str()) {
-                self.set.insert(term.clone());
-            }
-        }
-    }
-
-    /// Sort the unique terms and freeze them into the columnar dictionary.
-    pub(crate) fn finish(self) -> Result<TermDictionary> {
-        let total_start = Instant::now();
-        let collect_start = Instant::now();
-        let mut terms: Vec<String> = self.set.into_iter().collect();
-        let collect_elapsed = collect_start.elapsed();
-        let sort_start = Instant::now();
-        terms.sort_unstable();
-        let sort_elapsed = sort_start.elapsed();
-        let freeze_start = Instant::now();
-        let dict = TermDictionary::from_sorted(terms.iter().map(String::as_str))?;
-        log::debug!(
-            "[Dictionary] Finished incremental dictionary ({} unique terms): collect {:?}, sort {:?}, freeze {:?}, total {:?}",
-            dict.len(),
-            collect_elapsed,
-            sort_elapsed,
-            freeze_start.elapsed(),
-            total_start.elapsed()
-        );
-        Ok(dict)
-    }
-}
 
 /// Terms per FSST window when compressing at the source (see
 /// [`TermDictionary::compress`]): the granularity at which a large
@@ -207,7 +139,7 @@ impl TermDictionary {
     /// at write time and is not guaranteed to be FSST, so compressing at the
     /// source is what makes "the dictionary is FSST" an invariant this code
     /// owns instead of an assumption about somebody else's heuristic.
-    fn from_sorted<'a>(terms: impl Iterator<Item = &'a str> + Clone) -> Result<Self> {
+    pub(super) fn from_sorted<'a>(terms: impl Iterator<Item = &'a str> + Clone) -> Result<Self> {
         Self::from_sorted_column(VarBinViewArray::from_iter_str(terms))
     }
 
@@ -320,7 +252,7 @@ impl TermDictionary {
 
     /// [`compress`](Self::compress) with an explicit window, so tests can
     /// exercise the multi-window path without building 64 Ki terms.
-    fn compress_windowed(plain: VarBinViewArray, window: usize) -> Result<Self> {
+    pub(super) fn compress_windowed(plain: VarBinViewArray, window: usize) -> Result<Self> {
         if plain.is_empty() {
             return Ok(Self::new(TermStore::Canonical(plain)));
         }
@@ -400,8 +332,12 @@ impl TermDictionary {
     /// A term's ID is its position in the sorted unique term list, which this
     /// already computes to build the dictionary — so the map costs one pointer
     /// pair per term and no string data at all. The owned-key alternative
-    /// ([`build_id_map`](Self::build_id_map)) re-materializes every term on the
-    /// heap, which on a large dataset outweighs the dictionary itself.
+    /// ([`TermDictionaryBuilder::finish`]) materializes every term on the heap
+    /// a second time, which on a large dataset outweighs the dictionary
+    /// itself; it exists for the streaming builders, whose quads cannot be
+    /// borrowed from.
+    ///
+    /// [`TermDictionaryBuilder::finish`]: super::ingest::TermDictionaryBuilder::finish
     pub(crate) fn from_quads_with_map(quads: &[RawQuad]) -> Result<(Self, BorrowedTermIdMap<'_>)> {
         let total_start = Instant::now();
         let (terms, collect_elapsed, sort_elapsed) = Self::sorted_unique_terms(quads);
@@ -475,38 +411,6 @@ impl TermDictionary {
         self.reader().str_at(i).ok().map(str::to_owned)
     }
 
-    /// Materialize a temporary O(1) lookup table for bulk encoding, with owned
-    /// keys.
-    ///
-    /// Query-side lookups remain binary searches over the compact dictionary,
-    /// but a build performs four lookups per quad and benefits substantially
-    /// from paying this allocation once per build.
-    ///
-    /// This copies every term onto the heap a second time, so it is only for
-    /// the streaming builders, whose quads are moved into the emitting stream
-    /// or re-read from a spill file and therefore cannot be borrowed from.
-    /// Builders holding a live `&[RawQuad]` must use
-    /// [`from_quads_with_map`](Self::from_quads_with_map).
-    pub(crate) fn build_id_map(&self) -> TermIdMap {
-        let start = Instant::now();
-        let mut reader = self.reader();
-        let map = (0..self.len())
-            .map(|id| {
-                let term = reader
-                    .str_at(id)
-                    .expect("term dictionary contains only valid UTF-8")
-                    .to_owned();
-                (term, id as u32)
-            })
-            .collect();
-        log::debug!(
-            "[Dictionary] Built temporary term-ID map for {} terms in {:?}",
-            self.len(),
-            start.elapsed()
-        );
-        map
-    }
-
     /// Look up a term's ID: its position in the sorted dictionary, or `None`
     /// when the dictionary does not hold it.
     ///
@@ -574,7 +478,11 @@ const PROBE_CACHE_SLOTS: usize = 256;
 /// code — or its absence, which is memoized too — is a property of the
 /// dictionary itself, not of when it was asked. Mutating a store builds a
 /// *new* dictionary, and with it a new cache.
-struct ProbeCache {
+///
+/// Shared by the resident dictionary above and the file-backed form
+/// ([`FileBackedDict`](super::file_backed::FileBackedDict)), whose misses are
+/// whole filtered scans rather than binary searches.
+pub(super) struct ProbeCache {
     slots: RwLock<Box<[Option<ProbeEntry>]>>,
 }
 
@@ -588,7 +496,7 @@ struct ProbeEntry {
 }
 
 impl ProbeCache {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
             slots: RwLock::new(
                 std::iter::repeat_with(|| None)
@@ -614,7 +522,7 @@ impl ProbeCache {
     ///
     /// A poisoned lock degrades to a miss rather than propagating: the memo is
     /// an optimization, and losing it must not fail a query.
-    fn get(&self, term: &str) -> Option<Option<u32>> {
+    pub(super) fn get(&self, term: &str) -> Option<Option<u32>> {
         let slots = self.slots.read().ok()?;
         match &slots[Self::slot(term)] {
             Some(entry) if entry.term == term => Some(entry.code),
@@ -622,7 +530,7 @@ impl ProbeCache {
         }
     }
 
-    fn put(&self, term: &str, code: Option<u32>) {
+    pub(super) fn put(&self, term: &str, code: Option<u32>) {
         if let Ok(mut slots) = self.slots.write() {
             let slot = Self::slot(term);
             match &mut slots[slot] {
@@ -792,7 +700,7 @@ impl DictReader<'_> {
 }
 
 /// An immutable handle on a Dictionary-layout store's term dictionary, taken
-/// with [`VortexRdfStore::dictionary_snapshot`](crate::store::VortexRdfStore::dictionary_snapshot).
+/// with [`VortexRdfStore::code_read_snapshot`](crate::store::VortexRdfStore::code_read_snapshot).
 ///
 /// Cloning is an `Arc` bump, and the snapshot retains only the dictionary — not
 /// the store or its quad columns.
@@ -813,6 +721,14 @@ impl DictSnapshot {
         self.0.term_at(code)
     }
 
+    /// Encode an N-Triples term string to its code (its position in the
+    /// sorted dictionary), or `None` when this dictionary does not hold the
+    /// term. The inverse of [`decode`](Self::decode); a binary search over
+    /// the dictionary.
+    pub fn encode(&self, term: &str) -> Option<u32> {
+        self.0.get_id(term)
+    }
+
     /// Number of terms in the dictionary.
     pub fn len(&self) -> usize {
         self.0.len()
@@ -824,215 +740,13 @@ impl DictSnapshot {
     }
 }
 
-/// The in-memory fence over a file-backed dictionary's splits: the first
-/// term of every dictionary-bearing split, in file order. The term column is
-/// sorted, so a probed term can only live in the last split whose first term
-/// is `<=` the probe — one in-RAM binary search replaces a per-split pruning
-/// loop, and a probe below the first fence term is absent without touching
-/// the file.
-///
-/// Built lazily on the first probe (one row-index scan of the per-split
-/// boundary rows), shared across clones, never persisted. It retains one
-/// term string per dictionary split — a few KB per file.
-#[cfg(feature = "file-io")]
-struct Fence {
-    /// First dictionary term of each split in `splits`, ascending.
-    first_terms: Vec<String>,
-    /// The dictionary-bearing splits, clamped to the dictionary rows.
-    splits: Vec<Range<u64>>,
-}
-
-/// A term dictionary left in its layout child: term→ID probes and ID→term
-/// decodes scan the sorted `_dict_term` column on demand instead of holding
-/// all terms resident.
-///
-/// `reader` is the dictionary child's layout reader (the native store root's
-/// `dictionary` component), so a term's code is its child row. A term probe
-/// binary-searches the in-memory [`Fence`] for the one split that can hold
-/// the term, evaluates an equality filter over just that split, and memoizes
-/// the answer in a [`ProbeCache`]. ID→term reads are row-index scans.
-#[cfg(feature = "file-io")]
-#[derive(Clone)]
-pub(crate) struct FileBackedDict {
-    /// The dictionary child's layout reader (child-local row coordinates).
-    reader: vortex_layout::LayoutReaderRef,
-    /// Number of terms.
-    len: u64,
-    /// term → code memo, shared across clones (every derived view of a store
-    /// probes the same immutable dictionary).
-    probes: Arc<ProbeCache>,
-    /// The probe fence, built on first use and shared across clones.
-    fence: Arc<OnceLock<Fence>>,
-}
-
-#[cfg(feature = "file-io")]
-impl FileBackedDict {
-    pub(crate) fn new(reader: vortex_layout::LayoutReaderRef, len: u64) -> Self {
-        Self {
-            reader,
-            len,
-            probes: Arc::new(ProbeCache::new()),
-            fence: Arc::new(OnceLock::new()),
-        }
-    }
-
-    /// A scan over the dictionary child — the reader-level equivalent of
-    /// `file.scan()`.
-    fn scan(&self) -> vortex_layout::scan::scan_builder::ScanBuilder<ArrayRef> {
-        vortex_layout::scan::scan_builder::ScanBuilder::new(
-            VORTEX_SESSION.clone(),
-            self.reader.clone(),
-        )
-    }
-
-    /// The fence, building it on first use. Concurrent first probes may race
-    /// to build; the loser's copy is dropped — the fence is derived
-    /// deterministically from the immutable file, so any winner is right.
-    async fn fence(&self) -> Result<&Fence> {
-        if self.fence.get().is_none() {
-            let built = self.build_fence().await?;
-            let _ = self.fence.set(built);
-        }
-        Ok(self
-            .fence
-            .get()
-            .expect("the fence was just initialized above"))
-    }
-
-    /// Collect the dictionary's splits (clamped to its rows, defensively) and
-    /// resolve each one's first term with a single row-index scan.
-    async fn build_fence(&self) -> Result<Fence> {
-        use itertools::Itertools as _;
-        use vortex_array::dtype::FieldMask;
-        use vortex_layout::scan::split_by::SplitBy;
-        let bounds = SplitBy::Layout
-            .splits(
-                self.reader.as_ref(),
-                &(0..self.reader.row_count()),
-                &[FieldMask::All],
-            )
-            .map_err(VortexRdfError::Vortex)?;
-        let mut splits = Vec::new();
-        for (start, end) in bounds.into_iter().tuple_windows() {
-            let stop = end.min(self.len);
-            if start < stop {
-                splits.push(start..stop);
-            }
-        }
-        let codes: Vec<u32> = splits.iter().map(|range| range.start as u32).collect();
-        let first_terms = self.resolve_terms(&codes).await?;
-        Ok(Fence {
-            first_terms,
-            splits,
-        })
-    }
-
-    /// Term→ID: the fence's binary search picks the one split whose range
-    /// can hold the term (the column is sorted), a single equality-filtered
-    /// evaluation of that split decides, and the answer is memoized.
-    pub(crate) async fn get_id(&self, term: &str) -> Result<Option<u32>> {
-        if let Some(memo) = self.probes.get(term) {
-            return Ok(memo);
-        }
-        let fence = self.fence().await?;
-        // The candidate is the last split whose first term is <= the probe;
-        // index 0 means every dictionary term sorts above it — absent.
-        let idx = fence.first_terms.partition_point(|t| t.as_str() <= term);
-        let candidate = idx.checked_sub(1).map(|i| fence.splits[i].clone());
-        let code = match candidate {
-            None => None,
-            Some(range) => {
-                let filter = [eq(get_item(TERM_FIELD, root()), lit(term))];
-                let mask = crate::store::file_scan::evaluate_filter_split(
-                    self.reader.clone(),
-                    &filter,
-                    &range,
-                    Mask::new_true((range.end - range.start) as usize),
-                )
-                .await?;
-                let row = match mask.indices() {
-                    AllOr::All => Some(range.start),
-                    AllOr::None => None,
-                    AllOr::Some(indices) => indices.first().map(|&i| range.start + i as u64),
-                };
-                row.map(|row| row as u32)
-            }
-        };
-        self.probes.put(term, code);
-        Ok(code)
-    }
-
-    /// ID→terms for reconstruction: resolve `codes` (ascending, unique) to
-    /// their term strings with a single row-index scan.
-    async fn resolve_terms(&self, codes: &[u32]) -> Result<Vec<String>> {
-        if codes.is_empty() {
-            return Ok(Vec::new());
-        }
-        if let Some(&max) = codes.last()
-            && max as u64 >= self.len
-        {
-            return Err(VortexRdfError::Deserialization(format!(
-                "Term code {} out of dictionary bounds ({})",
-                max, self.len
-            )));
-        }
-        let rows: vortex_buffer::Buffer<u64> = codes.iter().map(|&code| code as u64).collect();
-        let arr = self
-            .scan()
-            .with_row_indices(rows)
-            .with_projection(select([TERM_FIELD], root()))
-            .into_array_stream()
-            .map_err(VortexRdfError::Vortex)?
-            .read_all()
-            .await
-            .map_err(VortexRdfError::Vortex)?;
-        let mut ctx = VORTEX_SESSION.create_execution_ctx();
-        let struct_arr = arr
-            .execute::<StructArray>(&mut ctx)
-            .map_err(VortexRdfError::Vortex)?;
-        let col = struct_arr
-            .unmasked_field_by_name(TERM_FIELD)
-            .map_err(VortexRdfError::Vortex)?
-            .clone()
-            .execute::<VarBinViewArray>(&mut ctx)
-            .map_err(VortexRdfError::Vortex)?;
-        if col.len() != codes.len() {
-            return Err(VortexRdfError::Deserialization(format!(
-                "Dictionary row-index scan returned {} rows for {} codes",
-                col.len(),
-                codes.len()
-            )));
-        }
-        let reader = StrColReader::new(&col);
-        (0..col.len())
-            .map(|i| reader.str_at(i).map(str::to_string))
-            .collect()
-    }
-
-    /// The terms a chunk of code columns needs, as a code→term map: gather the
-    /// chunk's distinct codes, resolve them in one scan.
-    pub(crate) async fn chunk_term_map(&self, chunk: &ArrayRef) -> Result<HashMap<u32, String>> {
-        let codes = crate::store::layouts::dictionary::unique_codes(chunk)?;
-        let terms = self.resolve_terms(&codes).await?;
-        Ok(codes.into_iter().zip(terms).collect())
-    }
-
-    /// Lift the whole dictionary resident — the transient full-column read
-    /// behind [`DictAccess::ensure_resident`].
-    ///
-    /// [`DictAccess::ensure_resident`]: crate::store::layouts::dict_access::DictAccess::ensure_resident
-    pub(crate) async fn load_resident(&self) -> Result<TermDictionary> {
-        dict_from_reader(self.reader.clone()).await
-    }
-}
-
 /// Read a dictionary child's whole term column into a resident
 /// [`TermDictionary`], keeping each chunk's stored encoding (FSST where the
 /// writer compressed).
 ///
-/// Drives the scan's per-split futures inline (no runtime handle), so it
-/// serves the file-backed open, the buffered `open_buffer` open, and the
-/// wasm read path alike.
+/// Drives the scan's per-split futures inline and overlapped (`join_all`, no
+/// runtime handle), so it serves the file-backed open, the buffered
+/// `open_buffer` open, and the wasm read path alike.
 pub(crate) async fn dict_from_reader(
     reader: vortex_layout::LayoutReaderRef,
 ) -> Result<TermDictionary> {
@@ -1042,9 +756,10 @@ pub(crate) async fn dict_from_reader(
     let scan = vortex_layout::scan::scan_builder::ScanBuilder::new(VORTEX_SESSION.clone(), reader)
         .with_projection(select([TERM_FIELD], root()));
     let mut ctx = VORTEX_SESSION.create_execution_ctx();
+    let tasks = scan.build().map_err(VortexRdfError::Vortex)?;
     let mut chunks = Vec::new();
-    for task in scan.build().map_err(VortexRdfError::Vortex)? {
-        if let Some(chunk) = task.await.map_err(VortexRdfError::Vortex)? {
+    for res in futures::future::join_all(tasks).await {
+        if let Some(chunk) = res.map_err(VortexRdfError::Vortex)? {
             let struct_arr = chunk
                 .execute::<StructArray>(&mut ctx)
                 .map_err(VortexRdfError::Vortex)?;
@@ -1201,84 +916,5 @@ mod tests {
         }
         assert_eq!(windowed.get_id("<http://absent>"), None);
         assert_eq!(windowed.term_at(1_000), None);
-    }
-
-    /// The compression windows survive serialization as the child's splits:
-    /// a `FileBackedDict` over a windowed dictionary's written child fences
-    /// one split per window and probes correctly across all of them.
-    #[cfg(feature = "file-io")]
-    #[tokio::test]
-    async fn windowed_dict_child_fence_splits() {
-        use crate::io::store_layout;
-        use vortex_array::stream::ArrayStreamAdapter;
-        use vortex_buffer::ByteBuffer;
-        use vortex_file::OpenOptionsSessionExt as _;
-
-        let terms: Vec<String> = (0..600)
-            .map(|i| format!("<http://example.org/fence/{i:04}>"))
-            .collect();
-        let plain = VarBinViewArray::from_iter_str(terms.iter().map(String::as_str));
-        let d = TermDictionary::compress_windowed(plain, 100).unwrap();
-        let len = d.len() as u64;
-
-        // A minimal native file: a one-row quad child plus the dictionary.
-        let quads = StructArray::try_new(
-            ["s", "p", "o", "g"].into(),
-            (0..4)
-                .map(|_| vortex_buffer::Buffer::from_iter([0u32]).into_array())
-                .collect::<Vec<_>>(),
-            1,
-            Validity::NonNullable,
-        )
-        .unwrap()
-        .into_array();
-        let dtype = quads.dtype().clone();
-        let stream = ArrayStreamAdapter::new(
-            dtype,
-            Box::pin(futures::stream::once(async move { Ok(quads) })),
-        );
-        let mut bytes: Vec<u8> = Vec::new();
-        store_layout::write_store(
-            &VORTEX_SESSION,
-            &mut bytes,
-            stream,
-            store_layout::default_child_strategy(),
-            false,
-            vec![crate::io::ser::dict_component(&d).unwrap()],
-        )
-        .await
-        .unwrap();
-
-        let file = VORTEX_SESSION
-            .open_options()
-            .open_buffer(ByteBuffer::from(bytes))
-            .unwrap();
-        let native = crate::io::native_file::NativeStoreFile::try_new(file).unwrap();
-        let (_, reader) = native
-            .component_reader(store_layout::DICT_COMPONENT_NAME)
-            .unwrap()
-            .expect("the dictionary child must be present");
-        let fbd = FileBackedDict::new(reader, len);
-
-        // One split per compression window, none merged, none re-cut.
-        let fence = fbd.fence().await.unwrap();
-        assert_eq!(fence.splits.len(), 6);
-
-        // Probes across every window: interior, first-of-window,
-        // last-of-window, and absent.
-        for (i, term) in terms.iter().enumerate().step_by(97) {
-            assert_eq!(fbd.get_id(term).await.unwrap(), Some(i as u32), "{term}");
-        }
-        for boundary in (0..600).step_by(100) {
-            assert_eq!(
-                fbd.get_id(&terms[boundary]).await.unwrap(),
-                Some(boundary as u32)
-            );
-            assert_eq!(
-                fbd.get_id(&terms[boundary + 99]).await.unwrap(),
-                Some((boundary + 99) as u32)
-            );
-        }
-        assert_eq!(fbd.get_id("<http://zzz>").await.unwrap(), None);
     }
 }

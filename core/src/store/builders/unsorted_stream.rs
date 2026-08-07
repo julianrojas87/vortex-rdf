@@ -8,10 +8,11 @@
 //!
 //! Memory is O(chunk), with one exception the Dictionary layout forces: no
 //! chunk can be encoded before the term dictionary is complete, so that
-//! layout runs a two-pass pipeline over a [`spill`](super::spill) run
-//! (streaming builds) or interns into one materialized chunk (in-memory
-//! builds).
+//! layout runs a two-pass pipeline — buffered in memory up to one chunk,
+//! spilling to a `spill` run only when the dataset outgrows it (streaming
+//! builds) — or interns into one materialized chunk (in-memory builds).
 
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 use super::spill::{RunReader, RunWriter, TempRunsGuard, make_temp_dir};
 use super::{
     BuiltArray, BuiltStream, ChunkStream, DEFAULT_CHUNK_SIZE, VortexArrayBuilder, assemble_chunks,
@@ -21,9 +22,8 @@ use crate::error::{Result, VortexRdfError};
 use crate::store::RawQuad;
 use crate::store::indexes::Indexes;
 use crate::store::layouts::default::DirectChunkBuilder;
-use crate::store::layouts::dictionary::ingest_interning;
+use crate::store::layouts::dictionary::{TermDictionaryBuilder, ingest_interning};
 use crate::store::layouts::{LayoutStrategy, dictionary};
-use crate::store::term_dictionary::TermDictionaryBuilder;
 
 use futures::{Stream, StreamExt, TryStreamExt, stream};
 use std::sync::Arc;
@@ -67,6 +67,7 @@ impl VortexArrayBuilder for UnsortedStreamBuilder {
             );
             return Ok(BuiltArray {
                 array,
+                components: Vec::new(),
                 dict: Some(Arc::new(dict)),
             });
         }
@@ -87,6 +88,7 @@ impl VortexArrayBuilder for UnsortedStreamBuilder {
         );
         Ok(BuiltArray {
             array: result,
+            components: Vec::new(),
             dict: built.dict,
         })
     }
@@ -144,50 +146,77 @@ pub(crate) async fn build_chunk_stream(
 
 /// Two-pass Dictionary-layout chunk stream.
 ///
-/// Pass 1 spills quads to a temp file in arrival order while incrementally
-/// collecting the unique terms; the dictionary is then sorted and frozen.
-/// Pass 2 reads the spill back and lazily emits u32-encoded chunks, the first
-/// carrying the dictionary payload. Peak memory: O(unique terms + chunk).
+/// Pass 1 buffers quads in memory while incrementally collecting the unique
+/// terms, spilling to a temp file (in arrival order) only when the dataset
+/// outgrows one chunk — a dataset that fits never round-trips through rkyv
+/// and the filesystem at all, the same lazy-spill rationale as `spill::Run`,
+/// where the old unconditional spill paid a full serialize + write + read +
+/// deserialize of every quad. The dictionary is then sorted and frozen.
+/// Pass 2 lazily emits u32-encoded chunks from wherever pass 1 left the
+/// quads. Peak memory: O(unique terms + chunk).
+///
+/// On `wasm32-unknown-unknown` (no filesystem, `spill` compiled out) the
+/// in-memory pass covers datasets up to one chunk; the overflow that would
+/// spill errors instead.
 async fn build_dict_chunk_stream(
     mut quads: Box<dyn Stream<Item = Result<RawQuad>> + Unpin + Send + 'static>,
     indexes: Indexes,
     chunk_size: usize,
 ) -> Result<BuiltStream> {
-    // ── Pass 1: spill + incremental dictionary ──
-    let temp_dir = make_temp_dir("unsorted_dict")?;
-    let guard = TempRunsGuard {
-        dir: temp_dir.clone(),
-    };
-    let spill_path = temp_dir.join("quads.bin");
-
-    let mut writer = RunWriter::create(&spill_path)?;
+    // ── Pass 1: buffer (spill only on overflow) + incremental dictionary ──
     let mut dict_builder = TermDictionaryBuilder::new();
+    let mut buffer: Vec<RawQuad> = Vec::with_capacity(chunk_size.min(4096));
     let mut total = 0usize;
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    let mut spill: Option<DictSpill> = None;
     while let Some(res) = quads.next().await {
         let raw = res?;
         dict_builder.insert_quad(&raw);
-        writer.push(&raw)?;
         total += 1;
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+        if let Some(spill) = spill.as_mut() {
+            spill.writer.push(&raw)?;
+            continue;
+        }
+        // Spill only to make room for a quad that would not fit, never merely
+        // on reaching the chunk size — a dataset of exactly `chunk_size`
+        // quads then stays in memory.
+        if buffer.len() < chunk_size {
+            buffer.push(raw);
+            continue;
+        }
+        #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+        return Err(crate::error::VortexRdfError::Io(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "streaming a Dictionary-layout dataset larger than one chunk spills to disk, \
+             which is not available on wasm",
+        )));
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+        {
+            let mut sink = DictSpill::create(&buffer)?;
+            sink.writer.push(&raw)?;
+            spill = Some(sink);
+            buffer = Vec::new();
+        }
     }
-    writer.finish()?;
-    let dict = Arc::new(dict_builder.finish()?);
-    let id_map = Arc::new(dict.build_id_map());
+    let (dict, id_map) = dict_builder.finish()?;
+    let (dict, id_map) = (Arc::new(dict), Arc::new(id_map));
     log::debug!(
-        "[UnsortedStreamBuilder] Spilled {} quads; dictionary of {} terms",
+        "[UnsortedStreamBuilder] Ingested {} quads; dictionary of {} terms",
         total,
         dict.len()
     );
 
-    // ── Pass 2: lazily emit encoded chunks from the spill ──
-    let mut reader: RunReader<RawQuad> = RunReader::new(&spill_path)?;
-    let mut buf: Vec<RawQuad> = Vec::with_capacity(chunk_size.min(4096));
-    while buf.len() < chunk_size {
-        match reader.next()? {
-            Some(q) => buf.push(q),
-            None => break,
-        }
-    }
+    // ── Pass 2: lazily emit encoded chunks from wherever pass 1 left off ──
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    let mut source = match spill {
+        Some(sink) => sink.into_source()?,
+        None => DictSource::Memory(buffer.into_iter()),
+    };
+    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    let mut source = DictSource::Memory(buffer.into_iter());
 
+    let buf = source.next_chunk(chunk_size)?;
     let first = if buf.is_empty() {
         dictionary::empty_struct(&indexes)?
     } else {
@@ -209,28 +238,24 @@ async fn build_dict_chunk_stream(
 
     let stream_dict = Arc::clone(&dict);
     let rest = stream::unfold(
-        (reader, stream_dict, id_map, indexes, next_row, guard),
-        move |(mut reader, dict, id_map, indexes, row, guard)| async move {
-            let mut buf: Vec<RawQuad> = Vec::with_capacity(chunk_size.min(4096));
-            while buf.len() < chunk_size {
-                match reader.next() {
-                    Ok(Some(q)) => buf.push(q),
-                    Ok(None) => break,
-                    Err(e) => {
-                        return Some((
-                            Err(into_vortex_error(e)),
-                            (reader, dict, id_map, indexes, row, guard),
-                        ));
-                    }
+        (source, stream_dict, id_map, indexes, next_row),
+        move |(mut source, dict, id_map, indexes, row)| async move {
+            let buf = match source.next_chunk(chunk_size) {
+                Ok(b) => b,
+                Err(e) => {
+                    return Some((
+                        Err(into_vortex_error(e)),
+                        (source, dict, id_map, indexes, row),
+                    ));
                 }
-            }
+            };
             if buf.is_empty() {
                 return None;
             }
             let n = buf.len() as u32;
             let chunk = dictionary::build_chunk(&buf, &dict, &id_map, &indexes, row, false, false)
                 .map_err(into_vortex_error);
-            Some((chunk, (reader, dict, id_map, indexes, row + n, guard)))
+            Some((chunk, (source, dict, id_map, indexes, row + n)))
         },
     );
 
@@ -243,6 +268,79 @@ async fn build_dict_chunk_stream(
         chunks,
         dict: Some(dict),
     })
+}
+
+/// Pass 1's overflow spill for [`build_dict_chunk_stream`]: the arrival-order
+/// run every quad goes through once the dataset has outgrown one chunk.
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+struct DictSpill {
+    writer: RunWriter<RawQuad>,
+    path: std::path::PathBuf,
+    guard: TempRunsGuard,
+}
+
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+impl DictSpill {
+    /// Open the spill and move the already-buffered quads into it, so pass 2
+    /// reads one uniform run.
+    fn create(buffered: &[RawQuad]) -> Result<Self> {
+        let temp_dir = make_temp_dir("unsorted_dict", None)?;
+        let guard = TempRunsGuard {
+            dir: temp_dir.clone(),
+        };
+        let path = temp_dir.join("quads.bin");
+        let mut writer = RunWriter::create(&path)?;
+        for quad in buffered {
+            writer.push(quad)?;
+        }
+        Ok(Self {
+            writer,
+            path,
+            guard,
+        })
+    }
+
+    /// Close the run and hand it back as pass 2's read source.
+    fn into_source(self) -> Result<DictSource> {
+        self.writer.finish()?;
+        Ok(DictSource::File {
+            reader: RunReader::new(&self.path)?,
+            _guard: self.guard,
+        })
+    }
+}
+
+/// Where pass 1 of [`build_dict_chunk_stream`] left the quads for pass 2's
+/// encoding read-back: still in memory (the common, fits-in-one-chunk case)
+/// or in the spill file, whose temp dir lives exactly as long as the reader.
+enum DictSource {
+    Memory(std::vec::IntoIter<RawQuad>),
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    File {
+        reader: RunReader<RawQuad>,
+        _guard: TempRunsGuard,
+    },
+}
+
+impl DictSource {
+    /// Pull up to `chunk_size` quads, in arrival order.
+    fn next_chunk(&mut self, chunk_size: usize) -> Result<Vec<RawQuad>> {
+        let mut buf = Vec::with_capacity(chunk_size.min(4096));
+        while buf.len() < chunk_size {
+            match self {
+                DictSource::Memory(quads) => match quads.next() {
+                    Some(q) => buf.push(q),
+                    None => break,
+                },
+                #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+                DictSource::File { reader, .. } => match reader.next()? {
+                    Some(q) => buf.push(q),
+                    None => break,
+                },
+            }
+        }
+        Ok(buf)
+    }
 }
 
 /// General chunk-stream path: quads are buffered as `RawQuad`s per chunk, as
@@ -276,7 +374,7 @@ async fn build_buffered_chunk_stream(
         // Nothing follows the first chunk: it is the whole dataset and its
         // index columns are globally sorted (stamped for binary-search
         // routing).
-        build_struct_array(&buf, layout, &indexes, buf.len(), 0, false, whole_dataset)?
+        build_struct_array(&buf, layout, &indexes, 0, false, whole_dataset)?
     };
     let dtype = first.dtype().clone();
     let next_row = buf.len() as u32;
@@ -313,7 +411,7 @@ async fn build_buffered_chunk_stream(
                 return None;
             }
             let n = buf.len();
-            let chunk = build_struct_array(&buf, layout, &indexes, n, row, false, false)
+            let chunk = build_struct_array(&buf, layout, &indexes, row, false, false)
                 .map_err(into_vortex_error);
             Some((chunk, (quads, None, layout, indexes, row + n as u32)))
         },

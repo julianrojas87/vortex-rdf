@@ -1,19 +1,21 @@
 use super::*;
 #[cfg(feature = "file-io")]
-use crate::io::store_layout;
+use crate::io::container;
 #[cfg(feature = "file-io")]
-use crate::store::term_dictionary;
 use vortex_array::IntoArray as _;
+#[cfg(feature = "file-io")]
 use vortex_array::arrays::struct_::StructArray;
 #[cfg(feature = "file-io")]
 use vortex_array::stream::ArrayStreamAdapter;
+#[cfg(feature = "file-io")]
 use vortex_array::validity::Validity;
+#[cfg(feature = "file-io")]
 use vortex_buffer::Buffer;
 
 // ─── 7) Dictionary layout ──────────────────────────────────────────────
 async fn run_dictionary_roundtrip<B: VortexArrayBuilder>() {
     let quads = dictionary_test_quads();
-    let arr = VortexRdfStore::build_vortex_array_with_builder::<B>(
+    let arr = build_array::<B>(
         quad_stream(quads.clone()),
         LayoutStrategy::Dictionary,
         vec![],
@@ -56,7 +58,7 @@ async fn test_dictionary_decode_survives_memo_slot_collisions() {
         })
         .collect();
 
-    let arr = VortexRdfStore::build_vortex_array_with_builder::<SortedStreamBuilder>(
+    let arr = build_array::<SortedStreamBuilder>(
         quad_stream(quads.clone()),
         LayoutStrategy::Dictionary,
         vec![],
@@ -104,78 +106,9 @@ async fn test_dictionary_unsorted_stream() {
 }
 
 #[tokio::test]
-async fn test_dictionary_streaming_chunk_boundaries() {
-    use crate::store::builders::assemble_chunks;
-    use crate::store::builders::sorted_in_memory::build_sorted_chunk_stream;
-    use crate::store::builders::sorted_stream::build_sorted_stream_chunk_stream;
-    use crate::store::builders::unsorted_stream::build_chunk_stream;
-
-    let quads = dictionary_test_quads();
-
-    for (name, result) in [
-        (
-            "unsorted_stream",
-            build_chunk_stream(
-                Box::new(quad_stream(quads.clone())),
-                LayoutStrategy::Dictionary,
-                vec![],
-                3,
-            )
-            .await,
-        ),
-        (
-            "sorted_in_memory",
-            build_sorted_chunk_stream(
-                Box::new(quad_stream(quads.clone())),
-                LayoutStrategy::Dictionary,
-                vec![],
-                3,
-            )
-            .await,
-        ),
-        (
-            "sorted_stream",
-            build_sorted_stream_chunk_stream(
-                Box::new(quad_stream(quads.clone())),
-                LayoutStrategy::Dictionary,
-                vec![],
-                3,
-            )
-            .await,
-        ),
-    ] {
-        let built = result.unwrap_or_else(|e| panic!("{name}: {e}"));
-        let dict = built.dict.clone();
-        let collected: Vec<_> = built.chunks.collect().await;
-        let lens: Vec<usize> = collected
-            .iter()
-            .map(|c| c.as_ref().unwrap().len())
-            .collect();
-        assert_eq!(lens, [3, 3, 3, 1], "{name}: unexpected chunk sizes");
-
-        // Reassemble and decode through a store: the chunks hold bare
-        // codes, and the dictionary the stream carried beside them is
-        // handed back with the reassembled array — all chunks' codes must
-        // reference that same global dictionary.
-        let chunks: Vec<_> = collected.into_iter().map(|c| c.unwrap()).collect();
-        let arr = assemble_chunks(chunks, LayoutStrategy::Dictionary, &vec![]).unwrap();
-        let store =
-            VortexRdfStore::from_built(crate::store::builders::BuiltArray { array: arr, dict })
-                .unwrap();
-        assert_eq!(store.layout(), LayoutStrategy::Dictionary, "{name}");
-        let decoded: Vec<Quad> = store.quads().unwrap().try_collect().await.unwrap();
-        assert_eq!(
-            quad_strings(&decoded),
-            quad_strings(&quads),
-            "{name}: bad roundtrip"
-        );
-    }
-}
-
-#[tokio::test]
 async fn test_dictionary_match_and_mutations() {
     let quads = dictionary_test_quads();
-    let arr = VortexRdfStore::build_vortex_array_with_builder::<SortedInMemoryBuilder>(
+    let arr = build_array::<SortedInMemoryBuilder>(
         quad_stream(quads.clone()),
         LayoutStrategy::Dictionary,
         vec![],
@@ -247,7 +180,7 @@ async fn test_dictionary_layout_secondary_index_compatibility() {
     let quads = dictionary_test_quads();
 
     // Dictionary layout composes with secondary reference indexes.
-    let arr = VortexRdfStore::build_vortex_array_with_builder::<UnsortedStreamBuilder>(
+    let arr = build_array::<UnsortedStreamBuilder>(
         quad_stream(quads.clone()),
         LayoutStrategy::Dictionary,
         vec![
@@ -362,7 +295,7 @@ async fn test_dictionary_sorted_with_secondary_index() {
     // the subject slice, the derived store's stale index columns are
     // stripped and the remaining terms are mask-scanned.
     let quads = dictionary_test_quads();
-    let arr = VortexRdfStore::build_vortex_array_with_builder::<SortedInMemoryBuilder>(
+    let arr = build_array::<SortedInMemoryBuilder>(
         quad_stream(quads.clone()),
         LayoutStrategy::Dictionary,
         vec![IndexType::SecondaryByReference],
@@ -402,7 +335,7 @@ async fn test_dictionary_sorted_with_secondary_index() {
 
 #[tokio::test]
 async fn test_dictionary_empty_dataset() {
-    let arr = VortexRdfStore::build_vortex_array_with_builder::<UnsortedStreamBuilder>(
+    let arr = build_array::<UnsortedStreamBuilder>(
         quad_stream(vec![]),
         LayoutStrategy::Dictionary,
         vec![],
@@ -424,12 +357,12 @@ async fn test_dictionary_empty_dataset() {
 fn term_chunk_of(chunk: &vortex_array::ArrayRef) -> vortex_array::ArrayRef {
     use vortex_array::VortexSessionExecute as _;
     use vortex_array::arrays::struct_::StructArrayExt as _;
-    let mut ctx = crate::io::VORTEX_SESSION.create_execution_ctx();
+    let mut ctx = crate::session::VORTEX_SESSION.create_execution_ctx();
     chunk
         .clone()
         .execute::<StructArray>(&mut ctx)
         .unwrap()
-        .unmasked_field_by_name(crate::store::term_dictionary::TERM_FIELD)
+        .unmasked_field_by_name(crate::store::layouts::dictionary::term_dict::TERM_FIELD)
         .unwrap()
         .clone()
 }
@@ -453,7 +386,7 @@ async fn test_dictionary_terms_are_fsst_through_bytes() {
             )
         })
         .collect();
-    let arr = VortexRdfStore::build_vortex_array_with_builder::<SortedInMemoryBuilder>(
+    let arr = build_array::<SortedInMemoryBuilder>(
         quad_stream(quads),
         LayoutStrategy::Dictionary,
         vec![],
@@ -466,7 +399,7 @@ async fn test_dictionary_terms_are_fsst_through_bytes() {
     // canonicalized (decompressed) any chunk fails here.
     let assert_fsst = |store: &VortexRdfStore, when: &str| {
         let dict = store.dictionary_snapshot().unwrap().0;
-        for chunk in term_dictionary::dict_child_chunks(&dict).unwrap() {
+        for chunk in crate::store::layouts::dictionary::dict_child_chunks(&dict).unwrap() {
             assert_eq!(
                 term_chunk_of(&chunk).encoding_id().to_string(),
                 "vortex.fsst",
@@ -511,9 +444,8 @@ async fn test_dictionary_file_roundtrip() {
 
     // ...then open it as a file-backed store (loads the dictionary via a
     // single-column projection scan).
-    let dir = std::env::temp_dir().join(format!("vortex_rdf_dict_test_{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("dict.vortex");
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("dict.vortex");
     std::fs::write(&path, &bytes).unwrap();
 
     let store = VortexRdfStore::from_file(&path).await.unwrap();
@@ -544,8 +476,6 @@ async fn test_dictionary_file_roundtrip() {
         .await
         .unwrap();
     assert_eq!(empty.size().await.unwrap(), 0);
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// The native container end to end through the path-based writer: one
@@ -555,28 +485,20 @@ async fn test_dictionary_file_roundtrip() {
 #[tokio::test]
 async fn test_dictionary_native_file_roundtrip() {
     let quads = dictionary_test_quads();
-    let dir = std::env::temp_dir().join(format!(
-        "vortex_rdf_dict_child_test_{}",
-        uuid::Uuid::new_v4()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("data.vortex");
-    crate::io::quads_stream_to_vortex_file_with_builder::<SortedInMemoryBuilder, _>(
-        quad_stream(quads.clone()),
-        &path,
+    let (_dir, path) = write_store_file::<SortedInMemoryBuilder>(
+        quads.clone(),
         LayoutStrategy::Dictionary,
         vec![],
     )
-    .await
-    .unwrap();
+    .await;
 
     // One self-contained file: the native root with the quad-source child
     // and the dictionary as an auxiliary child.
-    assert!(!dir.join("data.dict.vortex").exists());
+    assert!(!path.with_extension("dict.vortex").exists());
     let file = crate::io::native_file::open_vortex_file(&path)
         .await
         .unwrap();
-    assert!(store_layout::is_native_file(&file));
+    assert!(container::is_native_file(&file));
     let names: Vec<_> = file.footer().layout().child_names().collect();
     assert_eq!(names.first().map(|n| n.as_ref()), Some("quad-source"));
     assert!(names.iter().any(|n| n.as_ref() == "dictionary"));
@@ -593,8 +515,6 @@ async fn test_dictionary_native_file_roundtrip() {
     assert_eq!(matched.size().await.unwrap(), 4);
     let decoded: Vec<Quad> = store.quads().unwrap().try_collect().await.unwrap();
     assert_eq!(quad_strings(&decoded), quad_strings(&quads));
-
-    std::fs::remove_dir_all(&dir).ok();
 }
 
 /// An empty Dictionary store still writes (and reopens through) the
@@ -602,25 +522,13 @@ async fn test_dictionary_native_file_roundtrip() {
 #[cfg(feature = "file-io")]
 #[tokio::test]
 async fn test_dictionary_empty_store_roundtrip() {
-    let dir = std::env::temp_dir().join(format!(
-        "vortex_rdf_dict_child_empty_{}",
-        uuid::Uuid::new_v4()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("empty.vortex");
-    crate::io::quads_stream_to_vortex_file_with_builder::<SortedInMemoryBuilder, _>(
-        quad_stream(Vec::new()),
-        &path,
-        LayoutStrategy::Dictionary,
-        vec![],
-    )
-    .await
-    .unwrap();
+    let (_dir, path) =
+        write_store_file::<SortedInMemoryBuilder>(Vec::new(), LayoutStrategy::Dictionary, vec![])
+            .await;
 
     let store = VortexRdfStore::from_file(&path).await.unwrap();
     assert_eq!(store.layout(), LayoutStrategy::Dictionary);
     assert_eq!(store.size().await.unwrap(), 0);
-    std::fs::remove_dir_all(&dir).ok();
 }
 
 /// A file written by a generic Vortex writer — a valid Vortex file, but not a
@@ -642,16 +550,15 @@ async fn test_foreign_vortex_file_is_rejected() {
     )
     .unwrap()
     .into_array();
-    let dir = std::env::temp_dir().join(format!("vortex_rdf_foreign_{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("bare.vortex");
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("bare.vortex");
     let dtype = array.dtype().clone();
     let stream = ArrayStreamAdapter::new(
         dtype,
         Box::pin(futures::stream::once(async move { Ok(array) })),
     );
     let mut writer = tokio::fs::File::create(&path).await.unwrap();
-    crate::io::VORTEX_SESSION
+    crate::session::VORTEX_SESSION
         .write_options()
         .write(&mut writer, stream)
         .await
@@ -665,26 +572,6 @@ async fn test_foreign_vortex_file_is_rejected() {
         err.to_string().contains("not a vortex-rdf store file"),
         "unexpected error: {err}"
     );
-    std::fs::remove_dir_all(&dir).ok();
-}
-
-/// A bare Dictionary-layout array cannot self-describe, and `new` says so.
-#[test]
-fn test_new_rejects_bare_dictionary_array() {
-    let col = || Buffer::from_iter([1u32, 2, 3]).into_array();
-    let array = StructArray::try_new(
-        ["s", "p", "o", "g"].into(),
-        vec![col(), col(), col(), col()],
-        3,
-        Validity::NonNullable,
-    )
-    .unwrap()
-    .into_array();
-    let err = VortexRdfStore::new(array).err().expect("new should fail");
-    assert!(
-        err.to_string().contains("from_built"),
-        "unexpected error: {err}"
-    );
 }
 
 /// A dictionary big enough that the writer splits its child into several
@@ -693,9 +580,11 @@ fn test_new_rejects_bare_dictionary_array() {
 #[cfg(feature = "file-io")]
 #[tokio::test]
 async fn test_large_dictionary_child_lift_keeps_fsst() {
-    use crate::io::store_layout::default_child_strategy;
+    use crate::io::container::default_child_strategy;
     use crate::store::RawQuad;
-    use crate::store::term_dictionary::TermDictionaryBuilder;
+    use crate::store::layouts::dictionary::{
+        TermDictionaryBuilder, dict_child_chunks, dict_from_reader,
+    };
     use vortex_buffer::ByteBuffer;
     use vortex_file::OpenOptionsSessionExt as _;
 
@@ -711,7 +600,7 @@ async fn test_large_dictionary_child_lift_keeps_fsst() {
             g: format!("<http://example.org/graph/{i:07}>"),
         });
     }
-    let dict = builder.finish().unwrap();
+    let (dict, _id_map) = builder.finish().unwrap();
     let len = dict.len() as u64;
 
     // A minimal native file: a one-row quad child plus the dictionary child.
@@ -732,8 +621,8 @@ async fn test_large_dictionary_child_lift_keeps_fsst() {
     );
     let component = crate::io::ser::dict_component(&dict).unwrap();
     let mut bytes: Vec<u8> = Vec::new();
-    store_layout::write_store(
-        &crate::io::VORTEX_SESSION,
+    container::write_store(
+        &crate::session::VORTEX_SESSION,
         &mut bytes,
         stream,
         default_child_strategy(),
@@ -744,30 +633,30 @@ async fn test_large_dictionary_child_lift_keeps_fsst() {
     .unwrap();
     assert!(bytes.len() > 1 << 20, "file too small to force chunking");
 
-    let file = crate::io::VORTEX_SESSION
+    let file = crate::session::VORTEX_SESSION
         .open_options()
         .open_buffer(ByteBuffer::from(bytes))
         .unwrap();
     let typed = file
         .footer()
         .layout()
-        .as_::<store_layout::RdfStoreLayoutVTable>();
-    let (_, child) = store_layout::store_component(typed, store_layout::DICT_COMPONENT_NAME)
+        .as_::<container::RdfStoreLayoutVTable>();
+    let (_, child) = container::store_component(typed, container::DICT_COMPONENT_NAME)
         .unwrap()
         .unwrap();
     assert_eq!(child.row_count(), len);
     let reader = child
         .new_reader(
-            store_layout::DICT_COMPONENT_NAME.into(),
+            container::DICT_COMPONENT_NAME.into(),
             file.segment_source(),
             file.session(),
             &Default::default(),
         )
         .unwrap();
-    let lifted = term_dictionary::dict_from_reader(reader).await.unwrap();
+    let lifted = dict_from_reader(reader).await.unwrap();
 
     // Multi-chunk, and every chunk still FSST.
-    let chunks = term_dictionary::dict_child_chunks(&lifted).unwrap();
+    let chunks = dict_child_chunks(&lifted).unwrap();
     assert!(chunks.len() > 1, "large dictionary should lift multi-chunk");
     for chunk in &chunks {
         assert_eq!(
@@ -785,32 +674,50 @@ async fn test_large_dictionary_child_lift_keeps_fsst() {
     assert_eq!(lifted.get_id("\u{10FFFF}"), None);
 }
 
-/// Serialization is deterministic: two `to_bytes` of the same store are
-/// byte-identical (the invariant the dictionary-child chunk memo will rely
-/// on when the pass-through strategy lands).
-#[cfg(feature = "file-io")]
+/// `code_read_snapshot` is the one "codes are decodable" gate the frontends
+/// share: Dictionary layout, empty append tail, resident dictionary — all
+/// three, or `None`. The residency term is covered beside the file-backed
+/// suite (`dictionary_file_backed`); this exercises the layout and tail terms.
 #[tokio::test]
-async fn test_to_bytes_is_byte_stable() {
-    let quads: Vec<Quad> = (0..500)
-        .map(|i| {
-            make_quad(
-                &format!("http://example.org/subject/{i:04}"),
-                &format!("http://example.org/predicate/{}", i % 8),
-                &format!("object value {i:04}"),
-                GraphName::DefaultGraph,
-            )
-        })
-        .collect();
-    let arr = VortexRdfStore::build_vortex_array_with_builder::<SortedStreamBuilder>(
-        quad_stream(quads),
+async fn test_code_read_snapshot_gate() {
+    let quads = dictionary_test_quads();
+    let arr = build_array::<UnsortedStreamBuilder>(
+        quad_stream(quads.clone()),
         LayoutStrategy::Dictionary,
         vec![],
     )
     .await
     .unwrap();
     let store = VortexRdfStore::from_built(arr).unwrap();
+    assert!(store.code_read_snapshot().is_some());
 
-    let bytes_a = store.to_bytes().await.unwrap();
-    let bytes_b = store.to_bytes().await.unwrap();
-    assert_eq!(bytes_a, bytes_b);
+    // An append opens a string tail whose rows have no codes in the cached
+    // dictionary: the gate closes even though `dictionary_snapshot` alone
+    // still answers — exactly the difference that makes the gate the safe
+    // predicate for code-typed reads.
+    let tailed = store
+        .add_quad(make_quad(
+            "http://example.org/appended",
+            "http://example.org/p0",
+            "fresh object",
+            GraphName::DefaultGraph,
+        ))
+        .await
+        .unwrap();
+    assert_ne!(tailed.tail_len(), 0);
+    assert!(tailed.dictionary_snapshot().is_some());
+    assert!(tailed.code_read_snapshot().is_none());
+
+    // Folding the tail back into the base reopens the gate.
+    let compacted = tailed.compact().await.unwrap();
+    assert_eq!(compacted.tail_len(), 0);
+    assert!(compacted.code_read_snapshot().is_some());
+
+    // Non-Dictionary layouts have no codes at all.
+    let arr =
+        build_array::<UnsortedStreamBuilder>(quad_stream(quads), LayoutStrategy::Default, vec![])
+            .await
+            .unwrap();
+    let string_store = VortexRdfStore::from_built(arr).unwrap();
+    assert!(string_store.code_read_snapshot().is_none());
 }

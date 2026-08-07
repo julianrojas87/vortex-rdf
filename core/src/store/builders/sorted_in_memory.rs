@@ -18,9 +18,8 @@ use crate::error::Result;
 use crate::store::RawQuad;
 use crate::store::builders::GlobalIndexes;
 use crate::store::indexes::Indexes;
-use crate::store::layouts::dictionary::{QuadCodes, ingest_interning};
+use crate::store::layouts::dictionary::{QuadCodes, TermDictionary, ingest_interning};
 use crate::store::layouts::{LayoutStrategy, dictionary};
-use crate::store::term_dictionary::TermDictionary;
 
 use futures::{Stream, StreamExt, stream};
 use std::sync::Arc;
@@ -55,6 +54,7 @@ impl VortexArrayBuilder for SortedInMemoryBuilder {
             build_start = Instant::now();
             built = BuiltArray {
                 array: dictionary::build_array(&codes, &indexes, true)?,
+                components: Vec::new(),
                 dict: Some(Arc::new(dict)),
             };
         } else {
@@ -62,7 +62,8 @@ impl VortexArrayBuilder for SortedInMemoryBuilder {
             n = quads.len();
             build_start = Instant::now();
             built = BuiltArray {
-                array: build_struct_array(&quads, layout, &indexes, n, 0, true, true)?,
+                array: build_struct_array(&quads, layout, &indexes, 0, true, true)?,
+                components: Vec::new(),
                 dict: None,
             };
         };

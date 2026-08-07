@@ -1,7 +1,7 @@
 use super::*;
-use crate::io::native_file::NativeStoreFile;
-use crate::io::store_layout::DICT_COMPONENT_NAME;
-use crate::store::term_dictionary::FileBackedDict;
+use crate::io::container::DICT_COMPONENT_NAME;
+use crate::store::layouts::dictionary::FileBackedDict;
+use crate::store::native_file::NativeStoreFile;
 
 // ─── 7b) File-backed dictionary ─────────────────────────────────────────
 
@@ -20,21 +20,9 @@ async fn matched_strings(
 /// pattern family identically to the resident open of the same file.
 async fn assert_file_backed_matches_resident(indexes: Indexes, tag: &str) {
     let quads = dictionary_test_quads();
-    let dir = std::env::temp_dir().join(format!(
-        "vortex_rdf_fbdict_{}_{}",
-        tag,
-        uuid::Uuid::new_v4()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("data.vortex");
-    crate::io::quads_stream_to_vortex_file_with_builder::<SortedStreamBuilder, _>(
-        quad_stream(quads.clone()),
-        &path,
-        LayoutStrategy::Dictionary,
-        indexes,
-    )
-    .await
-    .unwrap();
+    let (_dir, path) =
+        write_store_file::<SortedStreamBuilder>(quads.clone(), LayoutStrategy::Dictionary, indexes)
+            .await;
 
     let resident = VortexRdfStore::from_file(&path).await.unwrap();
     let fb = VortexRdfStore::from_file_with_dict_residency(&path, 0)
@@ -45,8 +33,16 @@ async fn assert_file_backed_matches_resident(indexes: Indexes, tag: &str) {
     // file-backed dictionary has no snapshot and no sync code translation.
     assert!(resident.dictionary_snapshot().is_some(), "{tag}");
     assert!(fb.dictionary_snapshot().is_none(), "{tag}");
-    assert_eq!(fb.encode_code("<http://example.org/p0>"), None, "{tag}");
-    assert_eq!(fb.decode_code(0), None, "{tag}");
+    // The code-read gate includes residency: no snapshot, no code decoding.
+    assert!(fb.code_read_snapshot().is_none(), "{tag}");
+    // The resident open hands one out, and it translates codes both ways.
+    let snapshot = resident.code_read_snapshot().expect(tag);
+    let code = snapshot.encode("<http://example.org/p0>").expect(tag);
+    assert_eq!(
+        snapshot.decode(code).as_deref(),
+        Some("<http://example.org/p0>"),
+        "{tag}"
+    );
 
     let s3 = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/s03").unwrap());
     let p0 = NamedNode::new("http://example.org/p0").unwrap();
@@ -99,8 +95,6 @@ async fn assert_file_backed_matches_resident(indexes: Indexes, tag: &str) {
     assert!(fb.contains(q0).await.unwrap(), "{tag}: contains");
     let empty = matched_strings(&fb, None, Some(&absent), None, None).await;
     assert!(empty.is_empty(), "{tag}: absent term matches nothing");
-
-    std::fs::remove_dir_all(&dir).ok();
 }
 
 #[tokio::test]
@@ -116,28 +110,22 @@ async fn test_file_backed_dictionary_serves_from_copy_index() {
 
     // And explicitly confirm the serving plan engages on the file-backed
     // store (the equality above would hold even off the fallback path).
-    let quads = dictionary_test_quads();
-    let dir =
-        std::env::temp_dir().join(format!("vortex_rdf_fbdict_serve_{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("data.vortex");
-    crate::io::quads_stream_to_vortex_file_with_builder::<SortedStreamBuilder, _>(
-        quad_stream(quads.clone()),
-        &path,
+    let (_dir, path) = write_store_file::<SortedStreamBuilder>(
+        dictionary_test_quads(),
         LayoutStrategy::Dictionary,
         vec![IndexType::SecondaryByCopy],
     )
-    .await
-    .unwrap();
+    .await;
     let fb = VortexRdfStore::from_file_with_dict_residency(&path, 0)
         .await
         .unwrap();
     let p0 = NamedNode::new("http://example.org/p0").unwrap();
     let matched = fb.match_pattern(None, Some(&p0), None, None).await.unwrap();
     assert!(matched.debug_has_serve_plan());
+    // The served match defers its rid scan; the served stream never runs it.
+    assert!(matched.debug_selection_pending());
     let served: Vec<Quad> = matched.quads().unwrap().try_collect().await.unwrap();
     assert_eq!(served.len(), 4);
-    std::fs::remove_dir_all(&dir).ok();
 }
 
 /// The residency threshold is inclusive and byte-based: exactly at the
@@ -146,17 +134,8 @@ async fn test_file_backed_dictionary_serves_from_copy_index() {
 #[tokio::test]
 async fn test_file_backed_dictionary_threshold_boundary() {
     let quads = dictionary_test_quads();
-    let dir = std::env::temp_dir().join(format!("vortex_rdf_fbdict_thr_{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("data.vortex");
-    crate::io::quads_stream_to_vortex_file_with_builder::<SortedInMemoryBuilder, _>(
-        quad_stream(quads.clone()),
-        &path,
-        LayoutStrategy::Dictionary,
-        vec![],
-    )
-    .await
-    .unwrap();
+    let (_dir, path) =
+        write_store_file::<SortedInMemoryBuilder>(quads, LayoutStrategy::Dictionary, vec![]).await;
 
     let file = NativeStoreFile::try_new(
         crate::io::native_file::open_vortex_file(&path)
@@ -178,7 +157,6 @@ async fn test_file_backed_dictionary_threshold_boundary() {
         .await
         .unwrap();
     assert!(below.dictionary_snapshot().is_none());
-    std::fs::remove_dir_all(&dir).ok();
 }
 
 /// The operations that need the whole dictionary — serialization, mutation
@@ -187,17 +165,12 @@ async fn test_file_backed_dictionary_threshold_boundary() {
 #[tokio::test]
 async fn test_file_backed_dictionary_serializes_and_mutates() {
     let quads = dictionary_test_quads();
-    let dir = std::env::temp_dir().join(format!("vortex_rdf_fbdict_mut_{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("data.vortex");
-    crate::io::quads_stream_to_vortex_file_with_builder::<SortedInMemoryBuilder, _>(
-        quad_stream(quads.clone()),
-        &path,
+    let (_dir, path) = write_store_file::<SortedInMemoryBuilder>(
+        quads.clone(),
         LayoutStrategy::Dictionary,
         vec![],
     )
-    .await
-    .unwrap();
+    .await;
     let fb = VortexRdfStore::from_file_with_dict_residency(&path, 0)
         .await
         .unwrap();
@@ -233,7 +206,57 @@ async fn test_file_backed_dictionary_serializes_and_mutates() {
     let compacted = deleted.compact().await.unwrap();
     assert_eq!(compacted.size().await.unwrap(), quads.len() - 1);
     assert!(!compacted.contains(&doomed).await.unwrap());
-    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Pins the rows-only read path's dictionary contract: a tombstoned,
+/// *indexed* owner (compacting nothing) must answer `code_columns_gathered`
+/// with codes addressing the store's cached dictionary — the one
+/// `dictionary_snapshot` hands out. The old serialization-shaped read path
+/// re-encoded exactly this shape against a fresh dictionary of the surviving
+/// terms, silently renumbering codes the caller could only decode wrongly.
+#[tokio::test]
+async fn test_tombstoned_indexed_codes_address_cached_dictionary() {
+    let quads = dictionary_test_quads();
+    let (_dir, path) = write_store_file::<SortedInMemoryBuilder>(
+        quads.clone(),
+        LayoutStrategy::Dictionary,
+        vec![IndexType::SecondaryByCopy],
+    )
+    .await;
+    // The default open lifts this small dictionary resident, so the sync
+    // snapshot below is available; the quad rows stay file-backed, which is
+    // what routes `code_columns_gathered` off the in-memory fast path and
+    // through the gathered read.
+    let store = VortexRdfStore::from_file(&path).await.unwrap();
+
+    // Tombstone the quad whose subject sorts first among the s-terms: a
+    // fresh re-encode of the survivors would shift every later subject's
+    // code down by one, so decoding through the cached snapshot would
+    // visibly name the wrong terms.
+    let deleted = store.delete_quad(&quads[0]).await.unwrap();
+
+    let cols = deleted
+        .code_columns_gathered()
+        .await
+        .unwrap()
+        .expect("a tombstoned Dictionary view still answers codes");
+    let dict = deleted.dictionary_snapshot().unwrap();
+    let got: std::collections::BTreeSet<[String; 4]> = (0..cols[0].len())
+        .map(|i| {
+            [&cols[0], &cols[1], &cols[2], &cols[3]].map(|col| {
+                dict.decode(col[i])
+                    .expect("returned codes address the cached dictionary")
+            })
+        })
+        .collect();
+    let expected: std::collections::BTreeSet<[String; 4]> = quads[1..]
+        .iter()
+        .map(|q| {
+            let raw = crate::store::RawQuad::from_quad(q);
+            [raw.s, raw.p, raw.o, raw.g]
+        })
+        .collect();
+    assert_eq!(got, expected);
 }
 
 /// Direct probe parity at multi-split scale: every sampled term must resolve
@@ -242,29 +265,36 @@ async fn test_file_backed_dictionary_serializes_and_mutates() {
 #[tokio::test]
 async fn test_file_backed_dictionary_fence_probe_parity() {
     // Enough unique terms to spread the dictionary across several splits, so
-    // the fence's binary search genuinely selects between candidates.
-    let quads: Vec<Quad> = (0..20_000)
-        .map(|i| {
-            make_quad(
-                &format!("http://example.org/s{i:06}"),
-                &format!("http://example.org/p{}", i % 3),
-                &format!("object {i:06}"),
-                GraphName::DefaultGraph,
-            )
-        })
-        .collect();
-
-    let dir = std::env::temp_dir().join(format!("vortex_rdf_fence_test_{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("data.vortex");
-    crate::io::quads_stream_to_vortex_file_with_builder::<SortedStreamBuilder, _>(
-        quad_stream(quads.clone()),
-        &path,
-        LayoutStrategy::Dictionary,
-        vec![],
-    )
-    .await
-    .unwrap();
+    // the fence's binary search genuinely selects between candidates. The
+    // 20k-quad serialize dominates this test's runtime, so the fixture's
+    // bytes are built once per process.
+    static BYTES: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+    let bytes = cached_store_bytes(&BYTES, || async {
+        let quads: Vec<Quad> = (0..20_000)
+            .map(|i| {
+                make_quad(
+                    &format!("http://example.org/s{i:06}"),
+                    &format!("http://example.org/p{}", i % 3),
+                    &format!("object {i:06}"),
+                    GraphName::DefaultGraph,
+                )
+            })
+            .collect();
+        let mut bytes: Vec<u8> = Vec::new();
+        quads_stream_to_vortex_writer_with_builder::<SortedStreamBuilder, _, _>(
+            quad_stream(quads),
+            &mut bytes,
+            LayoutStrategy::Dictionary,
+            vec![],
+        )
+        .await
+        .unwrap();
+        bytes
+    })
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("fence.vortex");
+    std::fs::write(&path, bytes).unwrap();
 
     // The reference answers, from a resident open of the same file.
     let resident = VortexRdfStore::from_file_with_dict_residency(&path, u64::MAX)
@@ -305,8 +335,6 @@ async fn test_file_backed_dictionary_fence_probe_parity() {
     }
     // Above every stored term: the last split is probed and misses.
     assert_eq!(fb.get_id("\u{10FFFF}").await.unwrap(), None);
-
-    std::fs::remove_dir_all(&dir).ok();
 }
 
 /// A probe sorting below the first dictionary term is answered absent by the
@@ -326,20 +354,8 @@ async fn test_file_backed_dictionary_fence_rejects_below_first_term() {
         })
         .collect();
 
-    let dir = std::env::temp_dir().join(format!(
-        "vortex_rdf_fence_edge_test_{}",
-        uuid::Uuid::new_v4()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("edge.vortex");
-    crate::io::quads_stream_to_vortex_file_with_builder::<SortedInMemoryBuilder, _>(
-        quad_stream(quads),
-        &path,
-        LayoutStrategy::Dictionary,
-        vec![],
-    )
-    .await
-    .unwrap();
+    let (_dir, path) =
+        write_store_file::<SortedInMemoryBuilder>(quads, LayoutStrategy::Dictionary, vec![]).await;
 
     let resident = VortexRdfStore::from_file_with_dict_residency(&path, u64::MAX)
         .await
@@ -367,6 +383,4 @@ async fn test_file_backed_dictionary_fence_rejects_below_first_term() {
     assert_eq!(fb.get_id("!").await.unwrap(), None);
     // And the ordinary path still resolves through the same fence.
     assert_eq!(fb.get_id(&first_term).await.unwrap(), Some(0));
-
-    std::fs::remove_dir_all(&dir).ok();
 }

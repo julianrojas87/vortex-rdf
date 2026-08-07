@@ -3,7 +3,7 @@
 //! and mask conversion.
 
 use crate::error::{Result, VortexRdfError};
-use crate::io::VORTEX_SESSION;
+use crate::session::VORTEX_SESSION;
 
 use vortex_array::arrays::varbinview::BinaryView;
 use vortex_array::arrays::{BoolArray, VarBinViewArray};

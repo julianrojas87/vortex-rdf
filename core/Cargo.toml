@@ -65,6 +65,9 @@ clap = ["dep:clap"]
 
 [dev-dependencies]
 divan = { version = "5.0.1", package = "codspeed-divan-compat" }
+# RAII temp dirs for the file-io tests: cleanup must survive a panicking
+# assertion, which hand-rolled `remove_file` tails never did.
+tempfile = "3"
 tokio = { workspace = true, features = ["time", "rt-multi-thread"] }
 
 [[bench]]

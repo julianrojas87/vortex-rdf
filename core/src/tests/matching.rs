@@ -16,7 +16,7 @@ async fn run_match_pattern_test<B: VortexArrayBuilder>() {
         GraphName::DefaultGraph,
     );
 
-    let arr = VortexRdfStore::build_vortex_array_with_builder::<B>(
+    let arr = build_array::<B>(
         quad_stream(vec![q1.clone(), q2.clone()]),
         LayoutStrategy::Default,
         vec![],
@@ -71,7 +71,7 @@ async fn test_match_typed_object_layout() {
         GraphName::DefaultGraph,
     );
 
-    let arr = VortexRdfStore::build_vortex_array_with_builder::<UnsortedStreamBuilder>(
+    let arr = build_array::<UnsortedStreamBuilder>(
         quad_stream(vec![q1.clone(), q2.clone()]),
         LayoutStrategy::TypedObject,
         vec![],
@@ -125,13 +125,10 @@ async fn test_sorted_subject_binary_search() {
         }
     }
 
-    let arr = VortexRdfStore::build_vortex_array_with_builder::<SortedInMemoryBuilder>(
-        quad_stream(quads),
-        LayoutStrategy::Default,
-        vec![],
-    )
-    .await
-    .unwrap();
+    let arr =
+        build_array::<SortedInMemoryBuilder>(quad_stream(quads), LayoutStrategy::Default, vec![])
+            .await
+            .unwrap();
     let store = VortexRdfStore::from_built(arr).unwrap();
 
     let s5 = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/s05").unwrap());
@@ -173,7 +170,7 @@ async fn test_derived_view_does_not_lose_base_rows() {
         })
         .collect();
 
-    let arr = VortexRdfStore::build_vortex_array_with_builder::<UnsortedStreamBuilder>(
+    let arr = build_array::<UnsortedStreamBuilder>(
         quad_stream(quads.clone()),
         LayoutStrategy::Default,
         vec![],
@@ -199,41 +196,44 @@ async fn test_derived_view_does_not_lose_base_rows() {
 
 // ─── 2b) File-backed matching matrix (by layout/builder) ───────────────
 
+/// One cell of the 3-builder × 3-layout matrix: write the layout's dataset
+/// through builder `B`, open the file, and hand the store to the layout's
+/// `probe` — the probes below each bind the term family their layout
+/// represents differently on disk.
 #[cfg(feature = "file-io")]
-async fn run_match_pattern_file_test<B: VortexArrayBuilder>(layout: LayoutStrategy) {
-    let q1 = make_quad(
-        "http://example.org/s1",
-        "http://example.org/p1",
-        "o1",
-        GraphName::DefaultGraph,
-    );
-    let q2 = make_quad(
-        "http://example.org/s2",
-        "http://example.org/p2",
-        "o2",
-        GraphName::DefaultGraph,
-    );
-
-    let mut bytes: Vec<u8> = Vec::new();
-    quads_stream_to_vortex_writer_with_builder::<B, _, _>(
-        quad_stream(vec![q1.clone(), q2.clone()]),
-        &mut bytes,
-        layout,
-        vec![],
-    )
-    .await
-    .unwrap();
-
-    let dir = std::env::temp_dir().join(format!(
-        "vortex_rdf_match_file_test_{}",
-        uuid::Uuid::new_v4()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("match.vortex");
-    std::fs::write(&path, &bytes).unwrap();
-
+async fn run_match_pattern_file_test<B, F, Fut>(layout: LayoutStrategy, quads: Vec<Quad>, probe: F)
+where
+    B: VortexArrayBuilder,
+    F: FnOnce(VortexRdfStore) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    let (_dir, path) = write_store_file::<B>(quads, layout, vec![]).await;
     let store = VortexRdfStore::from_file(&path).await.unwrap();
+    probe(store).await;
+}
 
+/// The two-quad dataset the Default and TypedObject probes match over.
+#[cfg(feature = "file-io")]
+fn two_quads() -> Vec<Quad> {
+    vec![
+        make_quad(
+            "http://example.org/s1",
+            "http://example.org/p1",
+            "o1",
+            GraphName::DefaultGraph,
+        ),
+        make_quad(
+            "http://example.org/s2",
+            "http://example.org/p2",
+            "o2",
+            GraphName::DefaultGraph,
+        ),
+    ]
+}
+
+/// Default layout: a bound predicate over the string columns, hit and miss.
+#[cfg(feature = "file-io")]
+async fn probe_default(store: VortexRdfStore) {
     let p1 = NamedNode::new("http://example.org/p1").unwrap();
     let filtered = store
         .match_pattern(None, Some(&p1), None, None)
@@ -241,7 +241,7 @@ async fn run_match_pattern_file_test<B: VortexArrayBuilder>(layout: LayoutStrate
         .unwrap();
     assert_eq!(filtered.size().await.unwrap(), 1);
     let results: Vec<Quad> = filtered.quads().unwrap().try_collect().await.unwrap();
-    assert_eq!(results[0].subject.to_string(), q1.subject.to_string());
+    assert_eq!(results[0].subject.to_string(), "<http://example.org/s1>");
 
     let p3 = NamedNode::new("http://example.org/p3").unwrap();
     let empty = store
@@ -249,45 +249,12 @@ async fn run_match_pattern_file_test<B: VortexArrayBuilder>(layout: LayoutStrate
         .await
         .unwrap();
     assert_eq!(empty.size().await.unwrap(), 0);
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// TypedObject layout: a bound object literal, so the match runs over the
+/// typed o_kind/o_value columns.
 #[cfg(feature = "file-io")]
-async fn run_match_pattern_file_typed_object_test<B: VortexArrayBuilder>() {
-    let q1 = make_quad(
-        "http://example.org/s1",
-        "http://example.org/p1",
-        "o1",
-        GraphName::DefaultGraph,
-    );
-    let q2 = make_quad(
-        "http://example.org/s2",
-        "http://example.org/p2",
-        "o2",
-        GraphName::DefaultGraph,
-    );
-
-    let mut bytes: Vec<u8> = Vec::new();
-    quads_stream_to_vortex_writer_with_builder::<B, _, _>(
-        quad_stream(vec![q1.clone(), q2.clone()]),
-        &mut bytes,
-        LayoutStrategy::TypedObject,
-        vec![],
-    )
-    .await
-    .unwrap();
-
-    let dir = std::env::temp_dir().join(format!(
-        "vortex_rdf_match_typed_file_test_{}",
-        uuid::Uuid::new_v4()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("match_typed.vortex");
-    std::fs::write(&path, &bytes).unwrap();
-
-    let store = VortexRdfStore::from_file(&path).await.unwrap();
-
+async fn probe_typed_object(store: VortexRdfStore) {
     let o1 = Term::Literal(Literal::new_simple_literal("o1"));
     let filtered = store
         .match_pattern(None, None, Some(&o1), None)
@@ -295,7 +262,7 @@ async fn run_match_pattern_file_typed_object_test<B: VortexArrayBuilder>() {
         .unwrap();
     assert_eq!(filtered.size().await.unwrap(), 1);
     let results: Vec<Quad> = filtered.quads().unwrap().try_collect().await.unwrap();
-    assert_eq!(results[0].subject.to_string(), q1.subject.to_string());
+    assert_eq!(results[0].subject.to_string(), "<http://example.org/s1>");
 
     let o3 = Term::Literal(Literal::new_simple_literal("o3"));
     let empty = store
@@ -303,34 +270,12 @@ async fn run_match_pattern_file_typed_object_test<B: VortexArrayBuilder>() {
         .await
         .unwrap();
     assert_eq!(empty.size().await.unwrap(), 0);
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Dictionary layout (over `dictionary_test_quads`): a pushed-down integer
+/// filter on the code columns, and a term absent from the dictionary.
 #[cfg(feature = "file-io")]
-async fn run_match_pattern_file_dictionary_test<B: VortexArrayBuilder>() {
-    let quads = dictionary_test_quads();
-
-    let mut bytes: Vec<u8> = Vec::new();
-    quads_stream_to_vortex_writer_with_builder::<B, _, _>(
-        quad_stream(quads),
-        &mut bytes,
-        LayoutStrategy::Dictionary,
-        vec![],
-    )
-    .await
-    .unwrap();
-
-    let dir = std::env::temp_dir().join(format!(
-        "vortex_rdf_match_dict_file_test_{}",
-        uuid::Uuid::new_v4()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("match_dict.vortex");
-    std::fs::write(&path, &bytes).unwrap();
-
-    let store = VortexRdfStore::from_file(&path).await.unwrap();
-
+async fn probe_dictionary(store: VortexRdfStore) {
     let p0 = NamedNode::new("http://example.org/p0").unwrap();
     let filtered = store
         .match_pattern(None, Some(&p0), None, None)
@@ -344,52 +289,95 @@ async fn run_match_pattern_file_dictionary_test<B: VortexArrayBuilder>() {
         .await
         .unwrap();
     assert_eq!(empty.size().await.unwrap(), 0);
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[cfg(feature = "file-io")]
 #[tokio::test]
 async fn test_match_file_sorted_in_memory() {
-    run_match_pattern_file_test::<SortedInMemoryBuilder>(LayoutStrategy::Default).await;
+    run_match_pattern_file_test::<SortedInMemoryBuilder, _, _>(
+        LayoutStrategy::Default,
+        two_quads(),
+        probe_default,
+    )
+    .await;
 }
 #[cfg(feature = "file-io")]
 #[tokio::test]
 async fn test_match_file_sorted_stream() {
-    run_match_pattern_file_test::<SortedStreamBuilder>(LayoutStrategy::Default).await;
+    run_match_pattern_file_test::<SortedStreamBuilder, _, _>(
+        LayoutStrategy::Default,
+        two_quads(),
+        probe_default,
+    )
+    .await;
 }
 #[cfg(feature = "file-io")]
 #[tokio::test]
 async fn test_match_file_unsorted_stream() {
-    run_match_pattern_file_test::<UnsortedStreamBuilder>(LayoutStrategy::Default).await;
+    run_match_pattern_file_test::<UnsortedStreamBuilder, _, _>(
+        LayoutStrategy::Default,
+        two_quads(),
+        probe_default,
+    )
+    .await;
 }
 #[cfg(feature = "file-io")]
 #[tokio::test]
 async fn test_match_file_typed_sorted_in_memory() {
-    run_match_pattern_file_typed_object_test::<SortedInMemoryBuilder>().await;
+    run_match_pattern_file_test::<SortedInMemoryBuilder, _, _>(
+        LayoutStrategy::TypedObject,
+        two_quads(),
+        probe_typed_object,
+    )
+    .await;
 }
 #[cfg(feature = "file-io")]
 #[tokio::test]
 async fn test_match_file_typed_sorted_stream() {
-    run_match_pattern_file_typed_object_test::<SortedStreamBuilder>().await;
+    run_match_pattern_file_test::<SortedStreamBuilder, _, _>(
+        LayoutStrategy::TypedObject,
+        two_quads(),
+        probe_typed_object,
+    )
+    .await;
 }
 #[cfg(feature = "file-io")]
 #[tokio::test]
 async fn test_match_file_typed_unsorted_stream() {
-    run_match_pattern_file_typed_object_test::<UnsortedStreamBuilder>().await;
+    run_match_pattern_file_test::<UnsortedStreamBuilder, _, _>(
+        LayoutStrategy::TypedObject,
+        two_quads(),
+        probe_typed_object,
+    )
+    .await;
 }
 #[cfg(feature = "file-io")]
 #[tokio::test]
 async fn test_match_file_dictionary_sorted_in_memory() {
-    run_match_pattern_file_dictionary_test::<SortedInMemoryBuilder>().await;
+    run_match_pattern_file_test::<SortedInMemoryBuilder, _, _>(
+        LayoutStrategy::Dictionary,
+        dictionary_test_quads(),
+        probe_dictionary,
+    )
+    .await;
 }
 #[cfg(feature = "file-io")]
 #[tokio::test]
 async fn test_match_file_dictionary_sorted_stream() {
-    run_match_pattern_file_dictionary_test::<SortedStreamBuilder>().await;
+    run_match_pattern_file_test::<SortedStreamBuilder, _, _>(
+        LayoutStrategy::Dictionary,
+        dictionary_test_quads(),
+        probe_dictionary,
+    )
+    .await;
 }
 #[cfg(feature = "file-io")]
 #[tokio::test]
 async fn test_match_file_dictionary_unsorted_stream() {
-    run_match_pattern_file_dictionary_test::<UnsortedStreamBuilder>().await;
+    run_match_pattern_file_test::<UnsortedStreamBuilder, _, _>(
+        LayoutStrategy::Dictionary,
+        dictionary_test_quads(),
+        probe_dictionary,
+    )
+    .await;
 }

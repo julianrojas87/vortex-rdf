@@ -16,27 +16,24 @@ use futures::StreamExt as _;
 use vortex_array::arrays::StructArray;
 use vortex_array::dtype::DType;
 use vortex_array::stream::ArrayStreamAdapter;
-use vortex_array::validity::Validity;
 use vortex_array::{ArrayRef, VortexSessionExecute as _};
 
 use crate::error::{Result, VortexRdfError};
-use crate::io::VORTEX_SESSION;
-use crate::io::store_layout::{
-    NativeComponentSource, NativeComponentWrite, default_child_strategy,
-};
+use crate::io::container::sources::NativeComponentSource;
+use crate::io::container::{NativeComponentWrite, default_child_strategy};
+use crate::session::VORTEX_SESSION;
 use crate::store::builders::{ChunkStream, into_vortex_error};
 
-use super::{IndexComponentSpec, index_component_specs, strip_index_columns};
+use super::components::child_struct;
+use super::{
+    ComponentRole, IndexComponentSpec, index_component_specs, primary_dtype, strip_index_columns,
+};
 
-/// Rebuild a subset of a row-space chunk's columns as a standalone struct
+/// Rebuild a role's columns out of a row-space chunk as a standalone struct
 /// under the child's own column names (e.g. `_idx_posg_s → s`). The arrays
 /// are shared, so per-column statistics (the `IsSorted` lead stamps) travel
 /// with them.
-fn project_chunk(
-    chunk: &ArrayRef,
-    source_columns: &[&'static str],
-    target_columns: &[&'static str],
-) -> Result<ArrayRef> {
+fn project_chunk(chunk: &ArrayRef, role: &ComponentRole) -> Result<ArrayRef> {
     use vortex_array::IntoArray as _;
     use vortex_array::arrays::struct_::StructArrayExt as _;
     let mut ctx = VORTEX_SESSION.create_execution_ctx();
@@ -44,7 +41,8 @@ fn project_chunk(
         .clone()
         .execute::<StructArray>(&mut ctx)
         .map_err(VortexRdfError::Vortex)?;
-    let arrays: Vec<ArrayRef> = source_columns
+    let arrays: Vec<ArrayRef> = role
+        .source_columns
         .iter()
         .map(|n| {
             struct_arr
@@ -54,18 +52,7 @@ fn project_chunk(
         })
         .collect::<Result<_>>()?;
     let len = struct_arr.len();
-    StructArray::try_new(
-        target_columns
-            .iter()
-            .map(|n| (*n).into())
-            .collect::<Vec<Arc<str>>>()
-            .into(),
-        arrays,
-        len,
-        Validity::NonNullable,
-    )
-    .map(|arr| arr.into_array())
-    .map_err(VortexRdfError::Vortex)
+    child_struct(role.child_columns, arrays, len).map(|arr| arr.into_array())
 }
 
 /// A component source fed chunk-by-chunk by the quad stream's own poll loop
@@ -153,8 +140,7 @@ pub(crate) fn split_row_space(
                 Err(e) => return Some((Err(e), (chunks, senders, specs))),
             };
             for (spec, sender) in specs.iter().zip(senders.iter_mut()) {
-                let child = match project_chunk(&chunk, &spec.source_columns, &spec.target_columns)
-                {
+                let child = match project_chunk(&chunk, spec.role) {
                     Ok(child) => child,
                     Err(e) => {
                         return Some((Err(into_vortex_error(e)), (chunks, senders, specs)));
@@ -179,34 +165,4 @@ pub(crate) fn split_row_space(
         quad_chunks,
         components,
     })
-}
-
-/// The primary (non-`_idx_*`) projection of a row-space dtype.
-fn primary_dtype(dtype: &DType) -> DType {
-    use vortex_array::dtype::{Nullability, StructFields};
-    match dtype {
-        DType::Struct(fields, _)
-            if fields
-                .names()
-                .iter()
-                .any(|n| n.as_ref().starts_with("_idx_")) =>
-        {
-            let keep: Vec<usize> = (0..fields.names().len())
-                .filter(|&i| !fields.names()[i].as_ref().starts_with("_idx_"))
-                .collect();
-            DType::Struct(
-                StructFields::new(
-                    keep.iter()
-                        .map(|&i| fields.names()[i].clone())
-                        .collect::<Vec<_>>()
-                        .into(),
-                    keep.iter()
-                        .map(|&i| fields.fields().nth(i).expect("index in range"))
-                        .collect(),
-                ),
-                Nullability::NonNullable,
-            )
-        }
-        other => other.clone(),
-    }
 }

@@ -10,7 +10,7 @@ async fn run_add_delete_test<B: VortexArrayBuilder>() {
         GraphName::DefaultGraph,
     );
 
-    let arr = VortexRdfStore::build_vortex_array_with_builder::<B>(
+    let arr = build_array::<B>(
         quad_stream(vec![q1.clone()]),
         LayoutStrategy::Default,
         vec![],
@@ -85,18 +85,9 @@ async fn test_multiple_append() {
 /// tail scan.
 #[tokio::test]
 async fn test_add_quads_keeps_indexes() {
-    let quads: Vec<Quad> = (0..12)
-        .map(|i| {
-            make_quad(
-                &format!("http://example.org/s{:02}", i),
-                &format!("http://example.org/p{}", i % 2),
-                &format!("object {}", i % 3),
-                GraphName::DefaultGraph,
-            )
-        })
-        .collect();
+    let quads = modular_quads(12, 2, 3);
 
-    let arr = VortexRdfStore::build_vortex_array_with_builder::<SortedInMemoryBuilder>(
+    let arr = build_array::<SortedInMemoryBuilder>(
         quad_stream(quads.clone()),
         LayoutStrategy::Default,
         vec![IndexType::SecondaryByReference],
@@ -229,7 +220,7 @@ async fn test_add_quads_set_semantics() {
         GraphName::DefaultGraph,
     );
 
-    let arr = VortexRdfStore::build_vortex_array_with_builder::<UnsortedStreamBuilder>(
+    let arr = build_array::<UnsortedStreamBuilder>(
         quad_stream(vec![q1.clone(), q2.clone()]),
         LayoutStrategy::Default,
         vec![],
@@ -259,6 +250,56 @@ async fn test_add_quads_set_semantics() {
     assert!(readded.contains(&q3).await.unwrap());
 }
 
+/// `delete_matching` drops every quad a pattern selects, using the same
+/// matcher `match_pattern` uses to find them.
+#[tokio::test]
+async fn test_delete_matching_pattern() {
+    let quads = modular_quads(12, 2, 3);
+
+    let arr = build_array::<UnsortedStreamBuilder>(
+        quad_stream(quads.clone()),
+        LayoutStrategy::Default,
+        vec![],
+    )
+    .await
+    .unwrap();
+    let store = VortexRdfStore::from_built(arr).unwrap();
+
+    // Delete every quad with predicate p0 (i even): 6 of the 12.
+    let p0 = NamedNode::new("http://example.org/p0").unwrap();
+    let after = store
+        .delete_matching(None, Some(&p0), None, None)
+        .await
+        .unwrap();
+    assert_eq!(after.size().await.unwrap(), 6);
+    assert_eq!(
+        after
+            .match_pattern(None, Some(&p0), None, None)
+            .await
+            .unwrap()
+            .size()
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(after.quads().unwrap().count().await, 6);
+
+    // Deleting the same pattern twice is idempotent, not a double-count.
+    let again = after
+        .delete_matching(None, Some(&p0), None, None)
+        .await
+        .unwrap();
+    assert_eq!(again.size().await.unwrap(), 6);
+
+    // A pattern matching nothing leaves the store alone.
+    let missing = NamedNode::new("http://example.org/nope").unwrap();
+    let untouched = again
+        .delete_matching(None, Some(&missing), None, None)
+        .await
+        .unwrap();
+    assert_eq!(untouched.size().await.unwrap(), 6);
+}
+
 /// When an append pushes the tail past the auto-compaction thresholds,
 /// `add_quads` finishes by folding the tail into the base: the returned
 /// store is compacted — SPOG-sorted, tail-less, indexes rebuilt — while
@@ -278,7 +319,7 @@ async fn test_add_quads_auto_compacts_past_threshold() {
             .collect()
     };
 
-    let arr = VortexRdfStore::build_vortex_array_with_builder::<SortedInMemoryBuilder>(
+    let arr = build_array::<SortedInMemoryBuilder>(
         quad_stream(batch(0..10)),
         LayoutStrategy::Default,
         vec![IndexType::SecondaryByReference],
@@ -343,19 +384,12 @@ async fn test_file_backed_add_auto_compacts_past_threshold() {
         })
         .collect();
 
-    let path = std::env::temp_dir().join(format!(
-        "vortex_rdf_autocompact_{}.vortex",
-        uuid::Uuid::new_v4()
-    ));
-    let file = tokio::fs::File::create(&path).await.unwrap();
-    quads_stream_to_vortex_writer_with_builder::<SortedInMemoryBuilder, _, _>(
-        quad_stream(quads.clone()),
-        file,
+    let (_dir, path) = write_store_file::<SortedInMemoryBuilder>(
+        quads.clone(),
         LayoutStrategy::Default,
         vec![IndexType::SecondaryByReference],
     )
-    .await
-    .unwrap();
+    .await;
 
     let store = VortexRdfStore::from_file(&path).await.unwrap();
 
@@ -418,8 +452,6 @@ async fn test_file_backed_add_auto_compacts_past_threshold() {
             .unwrap(),
         1
     );
-
-    tokio::fs::remove_file(&path).await.ok();
 }
 
 /// Under the Dictionary layout the tail stores term strings (an appended
@@ -439,7 +471,7 @@ async fn test_dictionary_add_probes_tail_by_string() {
         })
         .collect();
 
-    let arr = VortexRdfStore::build_vortex_array_with_builder::<SortedInMemoryBuilder>(
+    let arr = build_array::<SortedInMemoryBuilder>(
         quad_stream(quads.clone()),
         LayoutStrategy::Dictionary,
         vec![IndexType::SecondaryByReference],
@@ -550,7 +582,7 @@ async fn test_compaction_folds_tail_and_sorts() {
         })
         .collect();
 
-    let arr = VortexRdfStore::build_vortex_array_with_builder::<UnsortedStreamBuilder>(
+    let arr = build_array::<UnsortedStreamBuilder>(
         quad_stream(quads.clone()),
         LayoutStrategy::Default,
         vec![],
@@ -644,27 +676,14 @@ async fn test_compaction_folds_tail_and_sorts() {
 #[cfg(feature = "file-io")]
 #[tokio::test]
 async fn test_file_backed_add_quads() {
-    let quads: Vec<Quad> = (0..12)
-        .map(|i| {
-            make_quad(
-                &format!("http://example.org/s{:02}", i),
-                &format!("http://example.org/p{}", i % 2),
-                &format!("object {}", i % 3),
-                GraphName::DefaultGraph,
-            )
-        })
-        .collect();
+    let quads = modular_quads(12, 2, 3);
 
-    let path = std::env::temp_dir().join(format!("vortex_rdf_add_{}.vortex", std::process::id()));
-    let file = tokio::fs::File::create(&path).await.unwrap();
-    quads_stream_to_vortex_writer_with_builder::<SortedInMemoryBuilder, _, _>(
-        quad_stream(quads.clone()),
-        file,
+    let (_dir, path) = write_store_file::<SortedInMemoryBuilder>(
+        quads.clone(),
         LayoutStrategy::Default,
         vec![IndexType::SecondaryByReference],
     )
-    .await
-    .unwrap();
+    .await;
 
     let store = VortexRdfStore::from_file(&path).await.unwrap();
     let added = store
@@ -737,79 +756,6 @@ async fn test_file_backed_add_quads() {
             .unwrap(),
         1
     );
-
-    tokio::fs::remove_file(&path).await.ok();
-}
-
-/// The tailed-serialization wart is fixed: a tailed store's `to_bytes`
-/// REBUILDS its index components over the merged rows instead of silently
-/// dropping them, so the round-tripped store keeps its index set — under the
-/// Dictionary layout (fresh dictionary, code components) and the string
-/// layouts alike.
-#[cfg(feature = "file-io")]
-#[tokio::test]
-async fn test_tailed_store_serialization_keeps_indexes() {
-    for layout in [LayoutStrategy::Dictionary, LayoutStrategy::Default] {
-        let quads: Vec<Quad> = (0..12)
-            .map(|i| {
-                make_quad(
-                    &format!("http://example.org/s{:02}", i),
-                    &format!("http://example.org/p{}", i % 3),
-                    &format!("object {}", i % 4),
-                    GraphName::DefaultGraph,
-                )
-            })
-            .collect();
-        let arr = VortexRdfStore::build_vortex_array_with_builder::<SortedInMemoryBuilder>(
-            quad_stream(quads.clone()),
-            layout,
-            vec![IndexType::SecondaryByCopy, IndexType::SecondaryByReference],
-        )
-        .await
-        .unwrap();
-        let store = VortexRdfStore::from_built(arr).unwrap();
-
-        // Tail with a brand-new term (no code in the cached dictionary).
-        let added = store
-            .add_quads([make_quad(
-                "http://example.org/s99",
-                "http://example.org/p1",
-                "fresh object",
-                GraphName::DefaultGraph,
-            )])
-            .await
-            .unwrap();
-
-        let bytes = added.to_bytes().await.unwrap();
-        let reread = VortexRdfStore::from_bytes(&bytes).await.unwrap();
-        assert_eq!(
-            reread.indexes(),
-            &[IndexType::SecondaryByCopy, IndexType::SecondaryByReference],
-            "{layout:?}: a tailed store's serialization must keep its indexes"
-        );
-        assert_eq!(reread.size().await.unwrap(), 13);
-
-        // The rebuilt components actually answer: p1 is on base rows 1, 4,
-        // 7, 10 plus the appended s99.
-        let p1 = NamedNode::new("http://example.org/p1").unwrap();
-        let matched = reread
-            .match_pattern(None, Some(&p1), None, None)
-            .await
-            .unwrap();
-        assert_eq!(matched.size().await.unwrap(), 5, "{layout:?}");
-        let fresh = Term::Literal(Literal::new_simple_literal("fresh object"));
-        assert_eq!(
-            reread
-                .match_pattern(None, None, Some(&fresh), None)
-                .await
-                .unwrap()
-                .size()
-                .await
-                .unwrap(),
-            1,
-            "{layout:?}: the tail row survives the round-trip"
-        );
-    }
 }
 
 /// `owned()` on a file-backed match view must produce an independent
@@ -819,30 +765,10 @@ async fn test_tailed_store_serialization_keeps_indexes() {
 #[cfg(feature = "file-io")]
 #[tokio::test]
 async fn test_owned_file_view_leaves_source_file_intact() {
-    let quads: Vec<Quad> = (0..12)
-        .map(|i| {
-            make_quad(
-                &format!("http://example.org/s{:02}", i),
-                &format!("http://example.org/p{}", i % 3),
-                &format!("object {}", i % 4),
-                GraphName::DefaultGraph,
-            )
-        })
-        .collect();
-    let dir = std::env::temp_dir().join(format!("vortex_rdf_owned_{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("shared.vortex");
-    crate::io::ser::quads_stream_to_vortex_file_with_builder::<
-        crate::store::builders::SortedStreamBuilder,
-        _,
-    >(
-        quad_stream(quads.clone()),
-        &path,
-        LayoutStrategy::Default,
-        vec![],
-    )
-    .await
-    .unwrap();
+    let quads = modular_quads(12, 3, 4);
+    let (_dir, path) =
+        write_store_file::<SortedStreamBuilder>(quads.clone(), LayoutStrategy::Default, vec![])
+            .await;
 
     let store = VortexRdfStore::from_file(&path).await.unwrap();
     let p1 = NamedNode::new("http://example.org/p1").unwrap();
@@ -875,66 +801,6 @@ async fn test_owned_file_view_leaves_source_file_intact() {
             .unwrap(),
         12
     );
-    std::fs::remove_dir_all(&dir).ok();
-}
-
-/// A mutated owner's serialization keeps BOTH provenance channels: tombstones
-/// must not silently drop the index children (they are rebuilt over the
-/// surviving rows) nor the subject sortedness (a gather preserves row
-/// order).
-#[cfg(feature = "file-io")]
-#[tokio::test]
-async fn test_tombstoned_store_serialization_keeps_indexes_and_sortedness() {
-    let quads: Vec<Quad> = (0..12)
-        .map(|i| {
-            make_quad(
-                &format!("http://example.org/s{:02}", i),
-                &format!("http://example.org/p{}", i % 3),
-                &format!("object {}", i % 4),
-                GraphName::DefaultGraph,
-            )
-        })
-        .collect();
-    let arr = VortexRdfStore::build_vortex_array_with_builder::<SortedInMemoryBuilder>(
-        quad_stream(quads.clone()),
-        LayoutStrategy::Default,
-        vec![IndexType::SecondaryByCopy],
-    )
-    .await
-    .unwrap();
-    let store = VortexRdfStore::from_built(arr).unwrap();
-    let s0 = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/s00").unwrap());
-    let deleted = store
-        .delete_matching(Some(&s0), None, None, None)
-        .await
-        .unwrap();
-    assert_eq!(deleted.size().await.unwrap(), 11);
-
-    let bytes = deleted.to_bytes().await.unwrap();
-    // Sortedness provenance survives the tombstoned gather on the wire.
-    assert!(
-        String::from_utf8_lossy(&bytes).contains("\"quads_sorted\":true"),
-        "tombstoned sorted store must keep quads_sorted"
-    );
-    let reread = VortexRdfStore::from_bytes(&bytes).await.unwrap();
-    assert_eq!(
-        reread.indexes(),
-        &[IndexType::SecondaryByCopy],
-        "tombstoned serialization must rebuild, not drop, the indexes"
-    );
-    assert_eq!(reread.size().await.unwrap(), 11);
-    let p0 = NamedNode::new("http://example.org/p0").unwrap();
-    // p0 was on rows 0, 3, 6, 9; row 0 was deleted.
-    assert_eq!(
-        reread
-            .match_pattern(None, Some(&p0), None, None)
-            .await
-            .unwrap()
-            .size()
-            .await
-            .unwrap(),
-        3
-    );
 }
 
 /// Mutations belong to the store that owns its rows. A narrowed view is a
@@ -952,7 +818,7 @@ async fn test_derived_view_rejects_mutations() {
         })
         .collect();
 
-    let arr = VortexRdfStore::build_vortex_array_with_builder::<UnsortedStreamBuilder>(
+    let arr = build_array::<UnsortedStreamBuilder>(
         quad_stream(quads.clone()),
         LayoutStrategy::Default,
         vec![],

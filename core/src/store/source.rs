@@ -3,11 +3,13 @@ use std::sync::Arc;
 use vortex_array::ArrayRef;
 use vortex_mask::Mask;
 
-use crate::store::indexes::{IndexComponent, ServePlan};
-use crate::store::selection::RowSelection;
+use crate::store::indexes::{InMemoryServePlan, IndexComponent};
+use crate::store::selection::{RowSelection, ViewSelection};
 
 #[cfg(feature = "file-io")]
-use crate::io::native_file::NativeStoreFile;
+use crate::store::indexes::FileServePlan;
+#[cfg(feature = "file-io")]
+use crate::store::native_file::NativeStoreFile;
 #[cfg(feature = "file-io")]
 use std::path::PathBuf;
 #[cfg(feature = "file-io")]
@@ -29,8 +31,9 @@ pub(crate) enum QuadsSource {
         /// and secondary-index row ids are defined.
         base: ArrayRef,
         /// The base row ids visible through this particular store or derived
-        /// view; narrowing a view changes this without rewriting `base`.
-        selection: RowSelection,
+        /// view; narrowing a view changes this without rewriting `base`. May
+        /// still be pending on a served match — see `serve`.
+        selection: ViewSelection,
         /// The secondary-index components held beside `base` — the in-memory
         /// twins of a native file's index children, in the same child schema.
         /// Empty for stores built without indexes. Views share them (`Arc`):
@@ -57,11 +60,17 @@ pub(crate) enum QuadsSource {
         /// contiguous run of its own columns, the plan for `quads()` to slice
         /// them straight from `base` instead of gathering the primary columns at
         /// scattered row ids. Index-agnostic: only `SecondaryByCopy` currently
-        /// supplies one (see [`ServePlan`]). `None` on any view narrowed further
-        /// — the plan is only valid while its row run is exactly the selection.
+        /// supplies one (see [`InMemoryServePlan`] — the backend-typed plan,
+        /// so this variant structurally cannot carry a file plan). `None` on
+        /// any view narrowed further — the plan is only valid while its row
+        /// run is exactly the selection.
         ///
-        /// [`ServePlan`]: crate::store::indexes::ServePlan
-        serve: Option<ServePlan>,
+        /// A `Pending` selection implies `serve` is `Some`: the plan is what
+        /// makes deferring the resolution's exact ids safe, so any narrowing
+        /// that drops the plan materializes the selection first.
+        ///
+        /// [`InMemoryServePlan`]: crate::store::indexes::InMemoryServePlan
+        serve: Option<InMemoryServePlan>,
     },
     #[cfg(feature = "file-io")]
     /// Quad data read lazily from a Vortex file when a query is executed.
@@ -86,8 +95,9 @@ pub(crate) enum QuadsSource {
         /// Pattern components not resolved to row ids, pushed down to the scan.
         filter: Option<Expression>,
         /// The file row ids visible through this store or derived view,
-        /// typically narrowed by index lookups or pruning.
-        selection: RowSelection,
+        /// typically narrowed by index lookups or pruning. May still be
+        /// pending on a served match — see `serve`.
+        selection: ViewSelection,
         /// File rows deleted since the store was opened, one bit per file row
         /// (`None` until something is deleted).
         ///
@@ -105,12 +115,19 @@ pub(crate) enum QuadsSource {
         /// run — the plan for `quads()` to stream them from there instead of
         /// scattering row-id reads across the primary columns. Index-agnostic:
         /// any serving index supplies one, and only `SecondaryByCopy` currently
-        /// does (see [`ServePlan`]). `None` on any view whose selection has been
-        /// narrowed further — the plan is only valid while its filter selects
-        /// exactly the selection's rows.
+        /// does (see [`FileServePlan`] — the backend-typed plan, so this
+        /// variant structurally cannot carry an in-memory plan). `None` on any
+        /// view whose selection has been narrowed further — the plan is only
+        /// valid while its filter selects exactly the selection's rows.
         ///
-        /// [`ServePlan`]: crate::store::indexes::ServePlan
-        serve: Option<ServePlan>,
+        /// A `Pending` selection implies `serve` is `Some`: with the plan
+        /// attached, the resolution's exact ids — a second pushed-down scan of
+        /// the same index child — stay deferred until a consumer needs the
+        /// selection itself; any narrowing that drops the plan materializes
+        /// the selection first.
+        ///
+        /// [`FileServePlan`]: crate::store::indexes::FileServePlan
+        serve: Option<FileServePlan>,
     },
 }
 
@@ -136,8 +153,9 @@ pub(crate) enum QuadsSource {
 /// and every read path applies both (`gather_live`).
 #[derive(Clone)]
 pub(crate) struct Tail {
-    /// The appended rows, one contiguous StructArray (never per-add chunks —
-    /// appends rebuild it, so scans stay flat).
+    /// The appended rows. Appends accrete as chunks of a ChunkedArray and are
+    /// folded flat once the accreted rows outgrow the flatten policy
+    /// (`add_quads`), so scans see at most a bounded chunk count.
     pub(crate) rows: ArrayRef,
     /// The tail rows visible through this store or derived view, in tail-local
     /// ids.

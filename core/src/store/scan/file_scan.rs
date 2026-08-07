@@ -1,6 +1,7 @@
 //! Filter evaluation over a native store file's splits: the scan-side
 //! machinery behind the store's file-backed counting, deletion, and pruning
-//! paths. Everything here is a pure function of a [`NativeStoreFile`] and a
+//! paths, plus the translation of a [`RowSelection`] onto vortex's scan
+//! knobs. Everything here is a pure function of a [`NativeStoreFile`] and a
 //! filter expression — no store state — which is what lets the dictionary's
 //! file-backed probe reuse [`evaluate_filter_split`] directly.
 
@@ -12,13 +13,102 @@ use oxrdf::{GraphName, NamedNode, NamedOrBlankNode, Term};
 use vortex_array::MaskFuture;
 use vortex_array::expr::forms::conjuncts;
 use vortex_array::expr::{Expression, and, eq, get_item, lit, root};
+use vortex_buffer::Buffer;
 use vortex_layout::LayoutReader;
-use vortex_mask::Mask;
+use vortex_layout::scan::scan_builder::ScanBuilder;
+use vortex_mask::{AllOr, Mask};
+use vortex_scan::selection::Selection;
 
 use crate::error::{Result, VortexRdfError};
-use crate::io::native_file::NativeStoreFile;
-use crate::store::layouts::{Constraints, PatternCodes, ResolvedLayout};
-use crate::store::selection::{RowSelection, split_bounds, split_start_mask};
+use crate::store::layouts::{Constraints, PatternCodes};
+use crate::store::native_file::NativeStoreFile;
+use crate::store::selection::RowSelection;
+
+impl RowSelection {
+    /// Apply this selection — and any tombstones — to a file scan.
+    ///
+    /// A range and an id list reach the scan through different knobs (a row
+    /// range and a [`Selection`]), and the variants being exclusive is what
+    /// keeps them from being set together — vortex's exact-range planning
+    /// (`attempt_split_ranges`) bails out when a row range accompanies an
+    /// `IncludeByIndex` selection. `All` leaves the scan's full row range in
+    /// place (every file row is a quad row).
+    ///
+    /// Tombstoned rows are dropped inside the scan rather than by post-filtering
+    /// its output, so this composes with a pushed-down filter (whose output
+    /// carries no row ids to re-align against). They ride the same `Selection`
+    /// knob as an id list, so the one case where both would claim it — a sparse
+    /// `Ids` selection with deletes — is resolved by subtracting the tombstones
+    /// from the id list up front; `All`/`Range` leave that knob free for an
+    /// `ExcludeByIndex` of the (sparse) deleted rows.
+    pub(crate) fn restrict_scan<A: 'static + Send>(
+        &self,
+        scan: ScanBuilder<A>,
+        deleted: Option<&Mask>,
+    ) -> ScanBuilder<A> {
+        match (self, deleted) {
+            (RowSelection::All, None) => scan,
+            (RowSelection::All, Some(deleted)) => {
+                scan.with_selection(Selection::ExcludeByIndex(deleted_ids(deleted)))
+            }
+            (RowSelection::Range(range), None) => scan.with_row_range(range.clone()),
+            (RowSelection::Range(range), Some(deleted)) => scan
+                .with_row_range(range.clone())
+                .with_selection(Selection::ExcludeByIndex(deleted_ids(deleted))),
+            (RowSelection::Ids(ids), None) => scan.with_row_indices(ids.clone()),
+            (RowSelection::Ids(ids), Some(deleted)) => {
+                scan.with_row_indices(subtract_deleted(ids, deleted))
+            }
+        }
+    }
+}
+
+/// The set positions of a tombstone mask as an ascending id list — the sparse
+/// form the scan wants for an exclusion.
+fn deleted_ids(deleted: &Mask) -> Buffer<u64> {
+    match deleted.indices() {
+        AllOr::All => Buffer::from_iter(0..deleted.len() as u64),
+        AllOr::None => Buffer::empty(),
+        AllOr::Some(indices) => Buffer::from_iter(indices.iter().map(|&i| i as u64)),
+    }
+}
+
+/// An ascending id list with the tombstoned rows removed — used when a sparse
+/// id selection and the deletions would both want the scan's selection knob.
+fn subtract_deleted(ids: &Buffer<u64>, deleted: &Mask) -> Buffer<u64> {
+    Buffer::from_iter(
+        ids.iter()
+            .copied()
+            .filter(|&id| !deleted.value(id as usize)),
+    )
+}
+
+/// Split a file view's [`RowSelection`] into the two knobs the per-split filter
+/// loop understands: a [`Selection`] narrowing the mask (an id list, e.g. from a
+/// secondary index) and the row-id `bounds` it iterates. A `Range` narrows the
+/// bounds; an `Ids` list narrows the mask; `All` narrows neither.
+fn split_bounds(selection: &RowSelection, row_count: u64) -> (Selection, Range<u64>) {
+    match selection {
+        RowSelection::All => (Selection::All, 0..row_count),
+        RowSelection::Range(range) => (Selection::All, range.clone()),
+        RowSelection::Ids(ids) => (Selection::IncludeByIndex(ids.clone()), 0..row_count),
+    }
+}
+
+/// The starting mask for one file split: the rows `selection` covers within
+/// `range`, minus any that `deleted` has tombstoned. Returned split-relative
+/// (one bit per row of `range`), ready for the store's per-split filter
+/// evaluation (`evaluate_filter_split`).
+fn split_start_mask(selection: &Selection, deleted: Option<&Mask>, range: &Range<u64>) -> Mask {
+    let mask = selection.row_mask(range).mask().clone();
+    match deleted {
+        None => mask,
+        Some(deleted) => {
+            let live = !&deleted.slice(range.start as usize..range.end as usize);
+            mask.bitand(&live)
+        }
+    }
+}
 
 /// The host's available parallelism, read once — split-loop concurrency is
 /// derived from it on every counting/matching call, and the syscall is not
@@ -189,37 +279,39 @@ pub(crate) async fn matching_file_rows(
 /// Convert an RDF pattern (subject, predicate, object, graph) into a Vortex
 /// filter expression that can be applied to a file-backed array during
 /// scanning. This allows the file reader to push filters down and avoid
-/// reading unnecessary data.
+/// reading unnecessary data. `codes` is the match's prepared witness, which
+/// carries the layout's term → constraint mapping.
 pub(crate) fn build_file_filter(
-    layout: &ResolvedLayout,
     subject: Option<&NamedOrBlankNode>,
     predicate: Option<&NamedNode>,
     object: Option<&Term>,
     graph: Option<&GraphName>,
     codes: &mut PatternCodes,
-) -> Option<Expression> {
-    match layout.constraints_cached(subject, predicate, object, graph, codes) {
-        // If the layout determines that no rows can possibly match (e.g.,
-        // asking for a term that doesn't exist in a dictionary layout),
-        // return a filter that matches nothing (always evaluates to false).
-        Constraints::AlwaysFalse => Some(lit(false)),
+) -> Result<Option<Expression>> {
+    Ok(
+        match codes.constraints(subject, predicate, object, graph)? {
+            // If the layout determines that no rows can possibly match (e.g.,
+            // asking for a term that doesn't exist in a dictionary layout),
+            // return a filter that matches nothing (always evaluates to false).
+            Constraints::AlwaysFalse => Some(lit(false)),
 
-        // If the layout provides equality constraints (field_name, value
-        // pairs), build a filter expression by combining them with AND
-        // operations. Each constraint requires a specific column to equal a
-        // specific value.
-        Constraints::Eq(eqs) => {
-            let mut filter: Option<Expression> = None;
-            for (field, value) in eqs {
-                let expr = eq(get_item(field, root()), lit(value));
-                filter = Some(match filter.take() {
-                    Some(f) => and(f, expr),
-                    None => expr,
-                });
+            // If the layout provides equality constraints (field_name, value
+            // pairs), build a filter expression by combining them with AND
+            // operations. Each constraint requires a specific column to equal a
+            // specific value.
+            Constraints::Eq(eqs) => {
+                let mut filter: Option<Expression> = None;
+                for (field, value) in eqs {
+                    let expr = eq(get_item(field, root()), lit(value));
+                    filter = Some(match filter.take() {
+                        Some(f) => and(f, expr),
+                        None => expr,
+                    });
+                }
+                filter
             }
-            filter
-        }
-    }
+        },
+    )
 }
 
 /// Zone-map envelope of `filter`: the contiguous row range outside of which
@@ -253,9 +345,9 @@ pub(crate) async fn row_range_from_pruning(
     }
     // Statistics-only and file-immutable, so the envelope is a pure function
     // of the filter shape — memoized on the shared file handle for the
-    // repeated-pattern workloads the bindings serve.
-    let memo_key = filter.to_string();
-    if let Some(envelope) = file.pruning_envelope(&memo_key) {
+    // repeated-pattern workloads the bindings serve. Keyed by the expression
+    // itself (structural `Eq`/`Hash`), so a hit allocates nothing.
+    if let Some(envelope) = file.pruning_envelope(filter) {
         return Ok(envelope);
     }
 
@@ -297,6 +389,6 @@ pub(crate) async fn row_range_from_pruning(
         // No bit survived: the filter provably matches nothing in this file.
         _ => Some(0..0),
     };
-    file.memoize_pruning_envelope(memo_key, envelope.clone());
+    file.memoize_pruning_envelope(filter.clone(), envelope.clone());
     Ok(envelope)
 }

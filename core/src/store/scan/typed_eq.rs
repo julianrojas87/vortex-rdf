@@ -10,7 +10,7 @@ use vortex_array::arrays::{Primitive, PrimitiveArray, StructArray, VarBinView, V
 use vortex_array::scalar::Scalar;
 use vortex_array::{ArrayRef, VortexSessionExecute};
 
-use crate::io::VORTEX_SESSION;
+use crate::session::VORTEX_SESSION;
 use crate::store::selection::RowSelection;
 
 /// A residual equality constraint's probe value, extracted from its `Scalar`
