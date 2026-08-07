@@ -1,9 +1,9 @@
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 
-use pyo3::exceptions::PyFileNotFoundError;
+use pyo3::exceptions::{PyFileNotFoundError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::PyBytes;
+use pyo3::types::{PyBytes, PyString};
 use vortex_rdf_core::common::terms::{Pattern, parse_pattern_checked};
 use vortex_rdf_core::{VortexRdfError, VortexRdfStore as CoreStore};
 
@@ -15,6 +15,50 @@ type CompactTriples = (Vec<String>, Vec<(u32, u32, u32)>);
 
 /// `(s, p, o, g)` code columns as returned by [`VortexRdfStore::match_codes`].
 type CodeColumns = (U32Column, U32Column, U32Column, U32Column);
+
+/// One row of [`VortexRdfStore::get_quads`]: subject, predicate, object, graph.
+/// Held as `Py<PyString>` so a term repeated down a column is one Python object
+/// shared by every row that uses it.
+type PyQuad = (Py<PyString>, Py<PyString>, Py<PyString>, Py<PyString>);
+
+/// `(subjects, predicates, objects, graphs)` as returned by
+/// [`VortexRdfStore::match_columns`].
+type StringColumns = (
+    Vec<Py<PyString>>,
+    Vec<Py<PyString>>,
+    Vec<Py<PyString>>,
+    Vec<Py<PyString>>,
+);
+
+/// Unwrap decoded columns, rejecting anything that cannot be a valid result.
+///
+/// A `None` term is a matched row carrying a code the dictionary snapshot
+/// cannot resolve; unequal column lengths are a match that produced ragged
+/// columns. Both indicate an inconsistent store, and either would otherwise
+/// surface as a silently wrong result set.
+fn resolve_columns(columns: [Vec<Option<Py<PyString>>>; 4]) -> PyResult<[Vec<Py<PyString>>; 4]> {
+    let rows = columns[0].len();
+    if columns.iter().any(|c| c.len() != rows) {
+        return Err(PyValueError::new_err(format!(
+            "matched code columns have unequal lengths: {:?}",
+            columns.iter().map(Vec::len).collect::<Vec<_>>()
+        )));
+    }
+    let mut out: [Vec<Py<PyString>>; 4] = std::array::from_fn(|_| Vec::with_capacity(rows));
+    for (position, column) in columns.into_iter().enumerate() {
+        for (row, term) in column.into_iter().enumerate() {
+            match term {
+                Some(term) => out[position].push(term),
+                None => {
+                    return Err(PyValueError::new_err(format!(
+                        "matched row {row} has a term code outside the store dictionary"
+                    )));
+                }
+            }
+        }
+    }
+    Ok(out)
+}
 
 /// A read-only Vortex-RDF store opened from a `.vortex` file.
 ///
@@ -54,6 +98,64 @@ impl VortexRdfStore {
             .match_pattern(s.as_ref(), p.as_ref(), o.as_ref(), g.as_ref())
             .await?;
         view.quads_vec().await
+    }
+
+    /// The matched rows as four columns of N-Triples strings, in
+    /// subject-predicate-object-graph order. The default graph is the empty
+    /// string, matching what `parse_graph_name` accepts for it.
+    ///
+    /// Backs both [`Self::get_quads`] and [`Self::match_columns`], so the two
+    /// resolve a pattern the same way.
+    fn matched_columns(
+        &self,
+        py: Python<'_>,
+        pattern: &Pattern,
+    ) -> PyResult<[Vec<Py<PyString>>; 4]> {
+        if let Some(snapshot) = self.store.code_read_snapshot() {
+            let columns = py
+                .detach(|| -> Result<_, VortexRdfError> {
+                    RUNTIME.block_on(async {
+                        let (s, p, o, g) = pattern;
+                        self.store
+                            .match_pattern(s.as_ref(), p.as_ref(), o.as_ref(), g.as_ref())
+                            .await?
+                            .code_columns_gathered()
+                            .await
+                    })
+                })
+                .map_err(store_err)?;
+            // `code_read_snapshot` reports only that the path can apply; the
+            // match itself still decides, so fall through when it declines.
+            if let Some(codes) = columns {
+                let dict = TermDict { snapshot };
+                let decoded = std::array::from_fn(|i| dict.decode_owned(py, codes[i].as_slice()));
+                return resolve_columns(decoded);
+            }
+        }
+
+        let quads = py
+            .detach(|| RUNTIME.block_on(self.matched_quads(pattern)))
+            .map_err(store_err)?;
+        let mut out: [Vec<Py<PyString>>; 4] =
+            std::array::from_fn(|_| Vec::with_capacity(quads.len()));
+        for quad in quads {
+            // `GraphName`'s own `Display` spells the default graph as a term;
+            // the empty string is what the pattern parser accepts for it, so
+            // both paths agree and a returned graph can be fed straight back.
+            let graph = match &quad.graph_name {
+                oxrdf::GraphName::DefaultGraph => String::new(),
+                named => named.to_string(),
+            };
+            for (column, term) in out.iter_mut().zip([
+                quad.subject.to_string(),
+                quad.predicate.to_string(),
+                quad.object.to_string(),
+                graph,
+            ]) {
+                column.push(PyString::new(py, &term).unbind());
+            }
+        }
+        Ok(out)
     }
 }
 
@@ -151,33 +253,60 @@ impl VortexRdfStore {
         }
     }
 
-    /// Match a triple pattern and return `(subject, predicate, object)`
-    /// N-Triples strings. `None` positions are wildcards; `g` narrows to one
-    /// graph (default: any graph).
+    /// Match a pattern and return the matching quads as
+    /// `(subject, predicate, object, graph)` N-Triples strings. `None`
+    /// positions are wildcards; the graph of a quad in the default graph is
+    /// the empty string, which is also how a pattern selects it.
+    ///
+    /// Served from the term-code columns when the store supports them
+    /// (Dictionary layout, resident dictionary, no append tail), reading terms
+    /// out of the dictionary and sharing one Python string across repeats of a
+    /// code; otherwise every matched quad is re-serialized through `oxrdf`'s
+    /// `Display`. Both paths return the same rows.
     #[pyo3(signature = (s=None, p=None, o=None, g=None))]
-    fn match_triples(
+    fn get_quads(
         &self,
         py: Python<'_>,
         s: Option<&str>,
         p: Option<&str>,
         o: Option<&str>,
         g: Option<&str>,
-    ) -> PyResult<Vec<(String, String, String)>> {
+    ) -> PyResult<Vec<PyQuad>> {
         let pattern = parse_pattern_checked(s, p, o, g).map_err(parse_err)?;
-        py.detach(|| -> Result<_, VortexRdfError> {
-            let quads = RUNTIME.block_on(self.matched_quads(&pattern))?;
-            Ok(quads
-                .into_iter()
-                .map(|q| {
-                    (
-                        q.subject.to_string(),
-                        q.predicate.to_string(),
-                        q.object.to_string(),
-                    )
-                })
-                .collect())
-        })
-        .map_err(store_err)
+        let [subjects, predicates, objects, graphs] = self.matched_columns(py, &pattern)?;
+        let mut rows = Vec::with_capacity(subjects.len());
+        for (((s, p), o), g) in subjects
+            .into_iter()
+            .zip(predicates)
+            .zip(objects)
+            .zip(graphs)
+        {
+            rows.push((s, p, o, g));
+        }
+        Ok(rows)
+    }
+
+    /// Match a pattern and return the matching quads as four parallel columns
+    /// of N-Triples strings — `(subjects, predicates, objects, graphs)`, each
+    /// as long as the result.
+    ///
+    /// The column-oriented counterpart of [`Self::get_quads`], for callers that
+    /// work a position at a time (filtering on objects, collecting distinct
+    /// subjects) and would otherwise build a tuple per row to take it apart
+    /// again. Unlike [`Self::match_codes`] it is available on every layout,
+    /// falling back to re-serialized quads when the code path does not apply.
+    #[pyo3(signature = (s=None, p=None, o=None, g=None))]
+    fn match_columns(
+        &self,
+        py: Python<'_>,
+        s: Option<&str>,
+        p: Option<&str>,
+        o: Option<&str>,
+        g: Option<&str>,
+    ) -> PyResult<StringColumns> {
+        let pattern = parse_pattern_checked(s, p, o, g).map_err(parse_err)?;
+        let [subjects, predicates, objects, graphs] = self.matched_columns(py, &pattern)?;
+        Ok((subjects, predicates, objects, graphs))
     }
 
     /// The store's term dictionary, or `None` when the code path does not

@@ -51,13 +51,25 @@ class VortexRdfStore:
         o: Optional[str] = None,
         g: Optional[str] = None,
     ) -> Optional[Tuple[U32Column, U32Column, U32Column, U32Column]]: ...
-    def match_triples(
+    def get_quads(
         self,
         s: Optional[str] = None,
         p: Optional[str] = None,
         o: Optional[str] = None,
         g: Optional[str] = None,
-    ) -> List[Tuple[str, str, str]]: ...
+    ) -> List[Tuple[str, str, str, str]]:
+        """Matching quads as (subject, predicate, object, graph) N-Triples
+        strings; the default graph is the empty string."""
+        ...
+    def match_columns(
+        self,
+        s: Optional[str] = None,
+        p: Optional[str] = None,
+        o: Optional[str] = None,
+        g: Optional[str] = None,
+    ) -> Tuple[List[str], List[str], List[str], List[str]]:
+        """The same rows as `get_quads`, as four parallel columns."""
+        ...
     def match_compact(
         self,
         s: Optional[str] = None,

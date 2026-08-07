@@ -288,7 +288,7 @@ pip install vortex-rdf
 from vortex_rdf import VortexRdfStore
 
 store = VortexRdfStore("data.vortex")
-store.match_triples(p="<http://xmlns.com/foaf/0.1/name>")
+store.get_quads(p="<http://xmlns.com/foaf/0.1/name>")
 ```
 
 For SPARQL over [rdflib](https://rdflib.readthedocs.io/), use the separate
