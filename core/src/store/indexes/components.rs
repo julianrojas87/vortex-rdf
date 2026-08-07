@@ -262,14 +262,17 @@ impl IndexComponent {
     }
 
     /// The component's rows as an `ArrayRef` (an `Arc` bump past the first
-    /// materialization).
+    /// materialization). Consumed only by `ser`'s component write, gated the
+    /// same way.
+    #[cfg(any(feature = "file-io", target_arch = "wasm32"))]
     pub(crate) fn as_array(&self) -> Result<ArrayRef> {
         Ok(self.rows()?.clone().into_array())
     }
 
     /// Whether the rows have been canonicalized yet — the laziness probe the
-    /// deferral tests pin `from_bytes` on.
-    #[cfg(test)]
+    /// deferral tests pin `from_bytes` on (those tests need `to_bytes`, hence
+    /// the file-io bound).
+    #[cfg(all(test, feature = "file-io"))]
     pub(crate) fn is_materialized(&self) -> bool {
         match &self.rows {
             ComponentRows::Built(_) => true,

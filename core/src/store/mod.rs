@@ -445,8 +445,9 @@ impl VortexRdfStore {
 
     /// Test-only: whether the named in-memory index component has
     /// canonicalized its rows yet (`None` when this store holds no such
-    /// component) — how the deferral tests pin `from_bytes`' laziness.
-    #[cfg(test)]
+    /// component) — how the deferral tests pin `from_bytes`' laziness. The
+    /// tests need `to_bytes`, hence the file-io bound.
+    #[cfg(all(test, feature = "file-io"))]
     pub(crate) fn index_component_materialized(&self, name: &str) -> Option<bool> {
         match &self.quads {
             QuadsSource::InMemory { components, .. } => components

@@ -165,7 +165,7 @@ pub(crate) fn store_component(
 /// tests assert on the decoded fields through this instead of
 /// substring-searching the file for JSON fragments, which breaks on any
 /// metadata re-serialization and can false-positive inside compressed data.
-#[cfg(test)]
+#[cfg(all(test, feature = "file-io"))]
 pub(crate) fn store_metadata_of_bytes(bytes: &[u8]) -> (bool, Vec<StoreComponentDescriptor>) {
     use vortex_file::OpenOptionsSessionExt as _;
     let file = crate::session::VORTEX_SESSION

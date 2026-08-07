@@ -47,7 +47,7 @@ pub(crate) const DICT_COMPONENT_NAME: &str = "dictionary";
 /// term column, FSST-compressed as held.
 pub(crate) const DICT_IMPLEMENTATION: &str = "sorted-terms-fsst-v1";
 
-#[cfg(test)]
+#[cfg(all(test, feature = "file-io"))]
 pub(crate) use layout::store_metadata_of_bytes;
 #[cfg(feature = "file-io")]
 pub(crate) use layout::subtree_bytes;
@@ -64,8 +64,10 @@ pub(crate) use write::{dict_child_strategy, write_store};
 
 #[cfg(test)]
 mod tests {
+    #[cfg(any(feature = "file-io", target_arch = "wasm32"))]
     use std::sync::Arc;
 
+    #[cfg(any(feature = "file-io", target_arch = "wasm32"))]
     use super::layout::is_native_root;
     use super::wire::{decode_store_metadata, encode_store_metadata};
     use super::*;
