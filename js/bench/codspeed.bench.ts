@@ -26,88 +26,35 @@
 
 import { Bench, type BenchOptions } from 'tinybench';
 import { withCodSpeed } from '@codspeed/tinybench-plugin';
-import { DataFactory } from 'rdf-data-factory';
-import type { Quad, Term } from '@rdfjs/types';
+import type { Quad } from '@rdfjs/types';
 
 import { VortexRdfStore, type BuildOptions } from '../entry/node.js';
-// Only ./util.js is importable here — it is the one bench module with no store
-// library behind it (see its purity contract); shared.ts loads oxigraph and
-// rdf-stores at module scope, which this instrumented process must never do.
+// Only the pure bench modules are importable here — ./util.js and
+// ./datasets.js, the two with no store library behind them (see their purity
+// contracts); shared.ts loads oxigraph and rdf-stores at module scope, which
+// this instrumented process must never do.
 import { decodeAll, fmtNs, freeWasm } from './util.js';
-
-const df = new DataFactory();
-const EX = 'http://example.org/#';
-const nn = (n: number | string) => df.namedNode(EX + n);
+import {
+    FULL_SCAN_PATTERN, genDataset, genFresh, genLiteralTriples, genQuads,
+    genTriples, genTriplesPrefix, nn, type Pat,
+} from './datasets.js';
 
 // ─── Dataset shape (env-tunable) ─────────────────────────────────────────────
 // Small by default: CodSpeed instrumentation runs under Valgrind (~50× slower)
 // and counts instructions deterministically, so a representative size catches
 // regressions on every path — a larger one only multiplies Valgrind cost.
+//
+// Two dataset shapes, per task sensitivity: the dense cube (genTriples and
+// friends — 3·DIM distinct terms over DIM³ rows) for the tasks measuring
+// routing and boundary cost, and the cardinality-realistic genDataset (terms
+// scaling with rows; see datasets.ts) for the term-handling-sensitive tasks,
+// where the cube's ~48 distinct terms would make dictionary build and
+// per-distinct-term decode invisible.
 const DIM = Number(process.env.CODSPEED_BENCH_DIM ?? 16); // triples: DIM³ rows
 const DIM_QUADS = Number(process.env.CODSPEED_BENCH_DIM_QUADS ?? 8); // quads: DIM_QUADS⁴ rows
 const MUT_N = Number(process.env.CODSPEED_MUT_N ?? 500); // add/delete batch size
 
-/** DIM³ triples in the default graph: quad(ex#s, ex#p, ex#o). */
-function genTriples(d: number): Quad[] {
-    const out: Quad[] = [];
-    for (let s = 0; s < d; s++)
-        for (let p = 0; p < d; p++)
-            for (let o = 0; o < d; o++) out.push(df.quad(nn(s), nn(p), nn(o)));
-    return out;
-}
-
-/** DIM_QUADS⁴ quads across named graphs: quad(ex#s, ex#p, ex#o, ex#g). */
-function genQuads(d: number): Quad[] {
-    const out: Quad[] = [];
-    for (let s = 0; s < d; s++)
-        for (let p = 0; p < d; p++)
-            for (let o = 0; o < d; o++)
-                for (let g = 0; g < d; g++) out.push(df.quad(nn(s), nn(p), nn(o), nn(g)));
-    return out;
-}
-
-/** DIM³ triples whose objects are literals — plain, language-tagged, typed,
- * and escape-bearing (quotes, backslashes, newlines, and `"@`/`^^` lookalikes
- * inside the value). Every other dataset in this file is named-node-only, so
- * the tasks over this one are the only coverage of literal escaping on ingest
- * and the unescape path on decode/export. */
-function genLiteralTriples(d: number): Quad[] {
-    const dt = df.namedNode('http://www.w3.org/2001/XMLSchema#integer');
-    const out: Quad[] = [];
-    let i = 0;
-    for (let s = 0; s < d; s++)
-        for (let p = 0; p < d; p++)
-            for (let o = 0; o < d; o++) {
-                const object =
-                    i % 4 === 0 ? df.literal(`plain value ${o}`)
-                    : i % 4 === 1 ? df.literal(`tagged value ${o}`, 'en')
-                    : i % 4 === 2 ? df.literal(String(o), dt)
-                    : df.literal(`say "hi"@home ^^ line\nbreak back\\slash ${o}`);
-                out.push(df.quad(nn(s), nn(p), object));
-                i++;
-            }
-    return out;
-}
-
-/** A batch of fresh quads (disjoint namespace) for the add phase. */
-function genFresh(n: number): Quad[] {
-    const out: Quad[] = [];
-    for (let i = 0; i < n; i++) out.push(df.quad(nn('add-s' + i), nn('add-p'), nn('add-o' + i)));
-    return out;
-}
-
-/** The first `n` triples genTriples(DIM) would emit — the delete phase only
- * needs a batch-sized slice of quads that actually exist in the store. */
-function genTriplesPrefix(d: number, n: number): Quad[] {
-    const out: Quad[] = [];
-    for (let s = 0; s < d && out.length < n; s++)
-        for (let p = 0; p < d && out.length < n; p++)
-            for (let o = 0; o < d && out.length < n; o++) out.push(df.quad(nn(s), nn(p), nn(o)));
-    return out;
-}
-
 // ─── Query patterns (probe terms fixed at index 0, so they always hit rows) ──
-type Pat = { name: string; s: Term | null; p: Term | null; o: Term | null; g: Term | null };
 const t0 = nn(0);
 const g0 = nn(0);
 // The six routing classes the resolver branches on, split by which dataset can
@@ -119,7 +66,6 @@ const TRIPLE_PATTERNS: Pat[] = [
     { name: 'PO', s: null, p: t0, o: t0, g: null },
     { name: 'SPO', s: t0, p: t0, o: t0, g: null },
 ];
-const FULL_SCAN_PATTERN: Pat = { name: 'full', s: null, p: null, o: null, g: null };
 const QUAD_PATTERNS: Pat[] = [
     { name: 'G', s: null, p: null, o: null, g: g0 },
     { name: 'SPOG', s: t0, p: t0, o: t0, g: g0 },
@@ -132,21 +78,21 @@ type Variant = { slug: string; options: BuildOptions };
 // around an Unsorted/Dictionary baseline (the JS default), matching the Rust
 // serialize group's axes.
 const BUILD_VARIANTS: Variant[] = [
-    { slug: 'unsorted_dict', options: { builder: 'Unsorted', layout: 'Dictionary' } }, // baseline / JS default
-    { slug: 'unsorted_default', options: { builder: 'Unsorted', layout: 'Default' } },
-    { slug: 'sorted_dict', options: { builder: 'Sorted', layout: 'Dictionary' } },
-    { slug: 'sorted_default', options: { builder: 'Sorted', layout: 'Default' } },
-    { slug: 'sorted_typedobject', options: { builder: 'Sorted', layout: 'TypedObject' } },
-    { slug: 'sorted_dict_byref', options: { builder: 'Sorted', layout: 'Dictionary', indexes: ['SecondaryByReference'] } },
-    { slug: 'sorted_dict_bycopy', options: { builder: 'Sorted', layout: 'Dictionary', indexes: ['SecondaryByCopy'] } },
+    { slug: 'unsorted_dict', options: { builder: 'unsorted-stream', layout: 'dictionary' } }, // baseline / JS default
+    { slug: 'unsorted_default', options: { builder: 'unsorted-stream', layout: 'default' } },
+    { slug: 'sorted_dict', options: { builder: 'sorted-in-memory', layout: 'dictionary' } },
+    { slug: 'sorted_default', options: { builder: 'sorted-in-memory', layout: 'default' } },
+    { slug: 'sorted_typedobject', options: { builder: 'sorted-in-memory', layout: 'typed-object' } },
+    { slug: 'sorted_dict_byref', options: { builder: 'sorted-in-memory', layout: 'dictionary', indexes: ['secondary-by-reference'] } },
+    { slug: 'sorted_dict_bycopy', options: { builder: 'sorted-in-memory', layout: 'dictionary', indexes: ['secondary-by-copy'] } },
 ];
 
 // Query (read) path: two representative configs — the JS default (no sorted
 // access path, the optimization target js_read_path.rs was chasing) and the
 // fully-indexed fast path (where a bound predicate/object binary-searches).
 const QUERY_VARIANTS: Variant[] = [
-    { slug: 'unsorted_dict', options: { builder: 'Unsorted', layout: 'Dictionary' } },
-    { slug: 'sorted_dict_bycopy', options: { builder: 'Sorted', layout: 'Dictionary', indexes: ['SecondaryByCopy'] } },
+    { slug: 'unsorted_dict', options: { builder: 'unsorted-stream', layout: 'dictionary' } },
+    { slug: 'sorted_dict_bycopy', options: { builder: 'sorted-in-memory', layout: 'dictionary', indexes: ['secondary-by-copy'] } },
 ];
 
 async function drain(stream: unknown): Promise<number> {
@@ -186,25 +132,31 @@ async function runGroup(opts: BenchOptions, add: (b: Bench) => void): Promise<vo
 /** build::<config> — VortexRdfStore.fromQuads over each star variant, plus a
  * fromString (parse + build) task to cover the RDF-text entry point and a
  * literal-bearing build covering term escaping on ingest. */
-async function benchBuild(triples: Quad[], literals: Quad[]): Promise<void> {
+async function benchBuild(triples: Quad[], realistic: Quad[], literals: Quad[]): Promise<void> {
     // All generated terms are named nodes, so N-Triples serialization is trivial.
     const nquads = triples
         .map((q) => `<${q.subject.value}> <${q.predicate.value}> <${q.object.value}> .`)
         .join('\n');
     await runGroup(HEAVY_OPTS, (b) => {
         for (const v of BUILD_VARIANTS) {
+            // build::sorted_dict is the guard on dictionary construction, so it
+            // runs over the cardinality-realistic dataset — on the dense cube
+            // the dictionary is ~48 terms and its build cost invisible. Its
+            // numbers are therefore NOT comparable with the dense-cube
+            // variants beside it.
+            const data = v.slug === 'sorted_dict' ? realistic : triples;
             let h: VortexRdfStore | undefined;
-            b.add(`build::${v.slug}`, async () => { h = await VortexRdfStore.fromQuads(triples, v.options); }, {
+            b.add(`build::${v.slug}`, async () => { h = await VortexRdfStore.fromQuads(data, v.options); }, {
                 afterEach: () => { if (h) freeWasm(h); h = undefined; },
             });
         }
         let hs: VortexRdfStore | undefined;
         b.add('build::fromString_nquads', async () => {
-            hs = await VortexRdfStore.fromString(nquads, 'nquads', { builder: 'Sorted', layout: 'Dictionary' });
+            hs = await VortexRdfStore.fromString(nquads, 'nquads', { builder: 'sorted-in-memory', layout: 'dictionary' });
         }, { afterEach: () => { if (hs) freeWasm(hs); hs = undefined; } });
         let hl: VortexRdfStore | undefined;
         b.add('build::sorted_dict_literals', async () => {
-            hl = await VortexRdfStore.fromQuads(literals, { builder: 'Sorted', layout: 'Dictionary' });
+            hl = await VortexRdfStore.fromQuads(literals, { builder: 'sorted-in-memory', layout: 'dictionary' });
         }, { afterEach: () => { if (hl) freeWasm(hl); hl = undefined; } });
     });
 }
@@ -213,7 +165,7 @@ async function benchBuild(triples: Quad[], literals: Quad[]): Promise<void> {
  * genLiteralTriples' dataset: toRdf re-escapes every literal on export, and
  * the decoded read parses every literal's serialized form on the JS side. */
 async function benchLiterals(literals: Quad[]): Promise<void> {
-    const store = await VortexRdfStore.fromQuads(literals, { builder: 'Sorted', layout: 'Dictionary' });
+    const store = await VortexRdfStore.fromQuads(literals, { builder: 'sorted-in-memory', layout: 'dictionary' });
     await runGroup(READ_OPTS, (b) => {
         b.add('readback::toRdf_nquads_literals', async () => { await store.toRdf('nquads'); });
         b.add('readpath::full_decoded_literals', async () => {
@@ -256,8 +208,14 @@ async function benchQuery(triples: Quad[], quads: Quad[]): Promise<void> {
  * stop at the lazy quads — so they are what guards the term dictionary's
  * per-lookup cost against regressions. `full_decoded` is the worst case: every
  * row, every term, i.e. every distinct code resolved once. */
-async function benchReadPath(triples: Quad[]): Promise<void> {
-    const store = await VortexRdfStore.fromQuads(triples, { builder: 'Unsorted', layout: 'Dictionary' });
+async function benchReadPath(triples: Quad[], realistic: Quad[]): Promise<void> {
+    const store = await VortexRdfStore.fromQuads(triples, { builder: 'unsorted-stream', layout: 'dictionary' });
+    // full_decoded resolves every distinct code once, so it runs over the
+    // cardinality-realistic dataset: on the dense cube it would resolve ~48
+    // codes and the per-distinct-term dictionary cost it exists to guard
+    // would be invisible. Same store config, different data — do not compare
+    // it row-for-row with the selective dense-cube tasks beside it.
+    const storeReal = await VortexRdfStore.fromQuads(realistic, { builder: 'unsorted-stream', layout: 'dictionary' });
     const p = TRIPLE_PATTERNS[0]; // S
     const f = FULL_SCAN_PATTERN;
     await runGroup(READ_OPTS, (b) => {
@@ -268,16 +226,17 @@ async function benchReadPath(triples: Quad[]): Promise<void> {
             decodeAll(await store.getQuads(p.s, p.p, p.o, p.g));
         });
         b.add('readpath::full_decoded', async () => {
-            decodeAll(await store.getQuads(f.s, f.p, f.o, f.g));
+            decodeAll(await storeReal.getQuads(f.s, f.p, f.o, f.g));
         });
     });
     freeWasm(store);
+    freeWasm(storeReal);
 }
 
 /** readback::<op> — serialize/deserialize the store across the boundary:
  * toBytes (IPC out), fromBytes (IPC in), toRdf (N-Quads out). */
 async function benchReadback(triples: Quad[]): Promise<void> {
-    const store = await VortexRdfStore.fromQuads(triples, { builder: 'Sorted', layout: 'Dictionary' });
+    const store = await VortexRdfStore.fromQuads(triples, { builder: 'sorted-in-memory', layout: 'dictionary' });
     const bytes = await store.toBytes();
     await runGroup(READ_OPTS, (b) => {
         b.add('readback::toBytes', async () => { await store.toBytes(); });
@@ -295,7 +254,7 @@ async function benchReadback(triples: Quad[]): Promise<void> {
 async function benchMutate(): Promise<void> {
     const fresh = genFresh(MUT_N);
     const delSlice = genTriplesPrefix(DIM, MUT_N);
-    const opts: BuildOptions = { layout: 'Dictionary' };
+    const opts: BuildOptions = { layout: 'dictionary' };
 
     await runGroup(HEAVY_OPTS, (b) => {
         let h: VortexRdfStore | undefined;
@@ -328,10 +287,13 @@ async function main(): Promise<void> {
     const triples = genTriples(DIM);
     const quads = genQuads(DIM_QUADS);
     const literals = genLiteralTriples(DIM);
+    // Same row count as the dense cube, realistic term cardinality — for the
+    // term-handling-sensitive tasks (build::sorted_dict, readpath::full_decoded).
+    const realistic = genDataset(DIM ** 3);
 
-    await benchBuild(triples, literals);
+    await benchBuild(triples, realistic, literals);
     await benchQuery(triples, quads);
-    await benchReadPath(triples);
+    await benchReadPath(triples, realistic);
     await benchReadback(triples);
     await benchLiterals(literals);
     await benchMutate();

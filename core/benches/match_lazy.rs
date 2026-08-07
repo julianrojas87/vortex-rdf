@@ -33,10 +33,13 @@ fn run_lazy_match(
     source: Source,
     pattern: Pattern,
 ) {
+    // Probe construction stays OUTSIDE the timed closure: this suite times
+    // ~31 µs of pure match setup, so terms_for's ~4 String allocations per
+    // iteration would be a visible fraction of the measurement.
+    let (s, p, o, g) = terms_for(pattern);
     bencher
         .with_inputs(|| make_store(source, builder, layout, index, bench_size()))
         .bench_refs(|store| {
-            let (s, p, o, g) = terms_for(pattern);
             rt().block_on(async {
                 let matched = store
                     .match_pattern(s.as_ref(), p.as_ref(), o.as_ref(), g.as_ref())

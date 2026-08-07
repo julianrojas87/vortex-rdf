@@ -1,21 +1,31 @@
 //! Benchmark suite for `vortex-rdf-core`.
 //!
-//! # Design: a star (one-factor-at-a-time) layout, not a full factorial
+//! # Design: a star write path, a deliberately factorial match matrix
 //!
 //! The library exposes four independent axes — builder strategy, layout,
 //! secondary index, and source (file vs in-memory) — plus a query pattern with
-//! 15 shapes. Their full cross product is ~2,400 match instances, most of which
-//! measure the *same* code path: at query time both sorted builders emit
-//! identically stamped columns (the store reads only the `IsSorted` stat, so it
-//! cannot tell `SortedInMemory` from `SortedStream`), a bound subject always
-//! declines every secondary index in favour of the primary sorted `s` column,
-//! and a bound graph never routes through an index at all. Measuring those
-//! combinations three times over buys no signal and bloats CodSpeed.
+//! 15 shapes. Their full cross product is ~2,400 match instances; the suite
+//! spends its upload budget differently per group:
 //!
-//! Instead we fix a baseline and vary one axis at a time, adding back only the
-//! interactions that genuinely change behaviour (e.g. Dictionary × index, where
-//! the index columns hold u32 codes rather than term strings). Each group below
-//! documents its baseline and which axis it sweeps.
+//! * **Serialize (Group 1)** is a star (one-factor-at-a-time) sweep: most
+//!   write-path cross-products measure the same code, so we fix a baseline and
+//!   vary one axis at a time, adding back only the interactions that genuinely
+//!   change behaviour (e.g. Dictionary × index, where the index columns hold
+//!   u32 codes rather than term strings).
+//! * **Match (Group 2)** is a full 18-cell layout × index × source factorial
+//!   (× 6 routing patterns), plus a two-cell unsorted-builder axis and a
+//!   chained-view pair. Some cells are redundant on paper — a bound subject
+//!   declines every secondary index in favour of the primary sorted `s`
+//!   column, and a bound graph never routes through an index at all — but
+//!   index-decline routing is exactly where regressions have hidden, and the
+//!   cell names are long-lived CodSpeed baselines, so the matrix is kept
+//!   whole. The one collapse it does make: `SortedInMemory` is omitted
+//!   because it is query-indistinguishable from `SortedStream` (both emit
+//!   identically stamped columns; the store reads only the `IsSorted` stat).
+//! * **Decode/load (Group 3) and dictionary residency (Group 4)** sweep only
+//!   the axis each path actually branches on.
+//!
+//! Each group below documents its baseline and what it sweeps.
 //!
 //! ## Query patterns, reduced to routing classes
 //!
@@ -38,12 +48,11 @@ use std::collections::HashMap;
 use std::fmt;
 use std::hint::black_box;
 use std::path::PathBuf;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use futures::stream;
 use oxrdf::{GraphName, NamedNode, NamedOrBlankNode, Term};
 
-use support::generate_rdf_data_stream;
 use vortex_rdf_core::{LayoutStrategy, SortedStreamBuilder, VortexRdfError, VortexRdfStore, io};
 
 mod support;
@@ -53,17 +62,19 @@ fn main() {
     divan::main();
 }
 
-static BYTES_CACHE: OnceLock<Mutex<HashMap<CacheKey, Vec<u8>>>> = OnceLock::new();
+// The payload is `Arc`-wrapped so a cache hit is a pointer bump, not a
+// multi-MB buffer copy per `with_inputs` call around the measured region.
+static BYTES_CACHE: OnceLock<Mutex<HashMap<CacheKey, Arc<Vec<u8>>>>> = OnceLock::new();
 
-fn cached_store_bytes(builder: Builder, layout: Layout, index: Index, size: usize) -> Vec<u8> {
+fn cached_store_bytes(builder: Builder, layout: Layout, index: Index, size: usize) -> Arc<Vec<u8>> {
     let cache = BYTES_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     let key = (builder, layout, index, size);
     if let Some(bytes) = cache.lock().unwrap().get(&key) {
-        return bytes.clone();
+        return Arc::clone(bytes);
     }
     let store = cached_store(builder, layout, index, size);
-    let buf = rt().block_on(store.to_bytes()).expect("store bytes");
-    cache.lock().unwrap().insert(key, buf.clone());
+    let buf = Arc::new(rt().block_on(store.to_bytes()).expect("store bytes"));
+    cache.lock().unwrap().insert(key, Arc::clone(&buf));
     buf
 }
 
@@ -191,10 +202,13 @@ fn run_match(
     source: Source,
     pattern: Pattern,
 ) {
+    // Probe construction stays OUTSIDE the timed closure (as dict_probe_warm's
+    // does): its ~4 String allocations per iteration are fixed setup, and at
+    // the lazy suite's ~31 µs match floor they are visible noise.
+    let (s, p, o, g) = terms_for(pattern);
     bencher
         .with_inputs(|| make_store(source, builder, layout, index, bench_size()))
         .bench_refs(|store| {
-            let (s, p, o, g) = terms_for(pattern);
             rt().block_on(async {
                 let matched = store
                     .match_pattern(s.as_ref(), p.as_ref(), o.as_ref(), g.as_ref())
@@ -270,6 +284,8 @@ match_bench!(
 #[divan::bench(args = [Source::File, Source::InMemory])]
 fn match_chained(bencher: divan::Bencher, source: &Source) {
     let source = *source;
+    let p = NamedNode::new_unchecked("http://example.org/predicate/0");
+    let o = Term::NamedNode(NamedNode::new_unchecked("http://example.org/object/0"));
     bencher
         .with_inputs(|| {
             make_store(
@@ -281,8 +297,6 @@ fn match_chained(bencher: divan::Bencher, source: &Source) {
             )
         })
         .bench_refs(|store| {
-            let p = NamedNode::new_unchecked("http://example.org/predicate/0");
-            let o = Term::NamedNode(NamedNode::new_unchecked("http://example.org/object/0"));
             rt().block_on(async {
                 let after_p = store
                     .match_pattern(None, Some(&p), None, None)
@@ -524,15 +538,13 @@ fn dict_open(bencher: divan::Bencher, residency: &DictResidency) {
 #[divan::bench(args = DICT_CONFIGS)]
 fn dict_probe_cold(bencher: divan::Bencher, residency: &DictResidency) {
     let residency = *residency;
+    let s = NamedOrBlankNode::NamedNode(NamedNode::new_unchecked("http://example.org/subject/0"));
+    let p = NamedNode::new_unchecked("http://example.org/predicate/0");
+    let o = Term::NamedNode(NamedNode::new_unchecked("http://example.org/object/0"));
+    let g = GraphName::NamedNode(NamedNode::new_unchecked("http://example.org/graph/0"));
     bencher
         .with_inputs(|| open_dict_store(residency, bench_size()))
         .bench_refs(|store| {
-            let s = NamedOrBlankNode::NamedNode(NamedNode::new_unchecked(
-                "http://example.org/subject/0",
-            ));
-            let p = NamedNode::new_unchecked("http://example.org/predicate/0");
-            let o = Term::NamedNode(NamedNode::new_unchecked("http://example.org/object/0"));
-            let g = GraphName::NamedNode(NamedNode::new_unchecked("http://example.org/graph/0"));
             rt().block_on(async {
                 let matched = store
                     .match_pattern(Some(&s), Some(&p), Some(&o), Some(&g))

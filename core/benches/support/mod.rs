@@ -15,7 +15,7 @@ use tokio::runtime::Runtime;
 
 use vortex_rdf_core::error::Result;
 use vortex_rdf_core::store::RawQuad;
-use vortex_rdf_core::{BuilderStrategy, IndexType, LayoutStrategy, VortexRdfStore};
+use vortex_rdf_core::{BuilderStrategy, BuiltArray, IndexType, LayoutStrategy, VortexRdfStore};
 
 /// Single dataset size for the whole suite. In simulation mode CodSpeed counts
 /// instructions deterministically, so one representative size catches
@@ -159,42 +159,60 @@ pub fn materialize_quads(size: usize) -> Vec<RawQuad> {
     })
 }
 
-/// Build the in-memory store for a config. A store rather than a bare array:
-/// under the Dictionary layout the array holds only u32 codes, and the term
-/// dictionary travels beside it in the builder's `BuiltArray` — `from_built`
-/// is the one constructor that accepts that pair.
-pub fn build_store(builder: Builder, layout: Layout, index: Index, size: usize) -> VortexRdfStore {
+/// Run a config's ingest to the builder's `BuiltArray`: the quad array plus
+/// whatever travels beside it — under the Dictionary layout the array holds
+/// only u32 codes and the term dictionary rides alongside; `from_built` is
+/// the one constructor that accepts that pair.
+fn build_built(builder: Builder, layout: Layout, index: Index, size: usize) -> BuiltArray {
     rt().block_on(async move {
-        VortexRdfStore::build_vortex_array_with_strategy(
-            generate_rdf_data_stream(size),
-            layout.strategy(),
-            index.types(),
-            builder.strategy(),
-        )
-        .await
-        .and_then(VortexRdfStore::from_built)
-        .expect("failed to build vortex store")
+        builder
+            .strategy()
+            .build_vortex_array(
+                Box::new(generate_rdf_data_stream(size)),
+                layout.strategy(),
+                index.types(),
+            )
+            .await
+            .expect("failed to build vortex array")
     })
 }
 
 pub type CacheKey = (Builder, Layout, Index, usize);
 
-/// Cache of built in-memory stores (cheaply cloneable: Arc-shared internals).
-/// Under the star design only a handful of distinct configs are ever
+/// Cache of ingest products (`BuiltArray`, cheaply cloneable: Arc-shared
+/// buffers). Only the expensive ingest is cached — stores are rebuilt per
+/// handout, see [`cached_store`]. Only a handful of distinct configs are ever
 /// requested, so this stays naturally bounded (unlike the old full-factorial
 /// cache, which held every combination for the process lifetime).
-static STORE_CACHE: OnceLock<Mutex<HashMap<CacheKey, VortexRdfStore>>> = OnceLock::new();
+static BUILT_CACHE: OnceLock<Mutex<HashMap<CacheKey, BuiltArray>>> = OnceLock::new();
 static FILE_CACHE: OnceLock<Mutex<HashMap<CacheKey, PathBuf>>> = OnceLock::new();
 
-pub fn cached_store(builder: Builder, layout: Layout, index: Index, size: usize) -> VortexRdfStore {
-    let cache = STORE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+fn cached_built(builder: Builder, layout: Layout, index: Index, size: usize) -> BuiltArray {
+    let cache = BUILT_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     let key = (builder, layout, index, size);
-    if let Some(store) = cache.lock().unwrap().get(&key) {
-        return store.clone();
+    if let Some(built) = cache.lock().unwrap().get(&key) {
+        return built.clone();
     }
-    let store = build_store(builder, layout, index, size);
-    cache.lock().unwrap().insert(key, store.clone());
-    store
+    let built = build_built(builder, layout, index, size);
+    cache.lock().unwrap().insert(key, built.clone());
+    built
+}
+
+/// A FRESH store over a config's cached ingest product: `from_built` re-runs
+/// component adoption and store construction every call, so no store-level
+/// state is shared between the stores this returns. Handing out clones of one
+/// cached store instead already produced a documented phantom regression
+/// under CodSpeed's single-measured-invocation model (the file bench warming
+/// the shared store shifted the in-memory match baselines) — tasks must start
+/// cold and order-independent. Known residual: the immutable Arc'd buffers —
+/// and vortex's interior-mutable per-array stats riding on them — remain
+/// shared with the cache. That was the incident's actual channel (the writer
+/// computing file stats on the shared array); today's writer repartitions
+/// into copies, but any stat a read lazily computes still lands on the shared
+/// array. Closing that too would take a deep copy per handout.
+pub fn cached_store(builder: Builder, layout: Layout, index: Index, size: usize) -> VortexRdfStore {
+    VortexRdfStore::from_built(cached_built(builder, layout, index, size))
+        .expect("failed to build vortex store")
 }
 
 pub fn cached_file(builder: Builder, layout: Layout, index: Index, size: usize) -> PathBuf {
@@ -222,8 +240,8 @@ pub fn cached_file(builder: Builder, layout: Layout, index: Index, size: usize) 
 }
 
 /// Construct a store over a config's data, from the requested source. Both are
-/// untimed: `from_file` reads the footer only, and the in-memory arm clones a
-/// cached (Arc-shared) store.
+/// untimed: `from_file` reads the footer only, and the in-memory arm rebuilds
+/// a fresh store from the cached ingest product (see [`cached_store`]).
 pub fn make_store(
     source: Source,
     builder: Builder,
@@ -356,26 +374,29 @@ pub fn generate_literal_rdf_data_stream(size: usize) -> impl Stream<Item = Resul
     }))
 }
 
-/// The literal-bearing store for `decode_all_literals`, cached like the star
-/// stores: SortedStream builder, Dictionary layout, no index — the config
-/// whose full decode term-decodes every row.
+/// The literal-bearing store for `decode_all_literals`: SortedStream builder,
+/// Dictionary layout, no index — the config whose full decode term-decodes
+/// every row. Cached and handed out like the star stores: only the ingest
+/// product is cached, and each call rebuilds a fresh store from it (see
+/// [`cached_store`] for why shared clones are a contamination hazard).
 pub fn cached_literal_store(size: usize) -> VortexRdfStore {
-    static CACHE: OnceLock<Mutex<HashMap<usize, VortexRdfStore>>> = OnceLock::new();
+    static CACHE: OnceLock<Mutex<HashMap<usize, BuiltArray>>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Some(store) = cache.lock().unwrap().get(&size) {
-        return store.clone();
-    }
-    let store = rt().block_on(async move {
-        VortexRdfStore::build_vortex_array_with_strategy(
-            generate_literal_rdf_data_stream(size),
-            LayoutStrategy::Dictionary,
-            Vec::new(),
-            BuilderStrategy::SortedStream,
-        )
-        .await
-        .and_then(VortexRdfStore::from_built)
-        .expect("failed to build literal store")
-    });
-    cache.lock().unwrap().insert(size, store.clone());
-    store
+    let built = if let Some(built) = cache.lock().unwrap().get(&size) {
+        built.clone()
+    } else {
+        let built = rt().block_on(async move {
+            BuilderStrategy::SortedStream
+                .build_vortex_array(
+                    Box::new(generate_literal_rdf_data_stream(size)),
+                    LayoutStrategy::Dictionary,
+                    Vec::new(),
+                )
+                .await
+                .expect("failed to build literal array")
+        });
+        cache.lock().unwrap().insert(size, built.clone());
+        built
+    };
+    VortexRdfStore::from_built(built).expect("failed to build literal store")
 }
