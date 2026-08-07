@@ -469,16 +469,18 @@ function fmtRatio(a,b){ return (a/b).toFixed(2) + "×"; }
 
 // ---- panel configs (Rust tab) ----
 // Serialize: every measured builder × layout × index configuration in one
-// table, grouped (ruled rows) by the axis varied around the sorted-stream /
-// Default / no-index baseline; the last group holds the two interaction
-// configs that don't reduce to a single axis.
+// table, ordered fastest to slowest (sortByColumn) so the cost ranking reads
+// straight down the column. The rows are still declared as axis groups around
+// the sorted-stream / Default / no-index baseline -- that is what makes each
+// row's cost attributable to one axis -- but sorting supersedes the grouping,
+// so the `break` rules those declarations carry are dropped at render time.
 function serRow(builder, layout, index, id, brk){
   return { labels:[builder, layout, index], ids:[`serialize::${id}`], break:brk };
 }
 const serializePanel = {
   title:"Serialize: builder × layout × index",
-  note:"Median time to build and write the dataset. Row groups vary one axis at a time around the sorted-stream / Default / no-index baseline; the last group is the two interaction configs.",
-  rowHeaders:["Builder","Layout","Index"], columns:["Serialize"],
+  note:"Median time to build and write the dataset, fastest first. Each configuration varies one axis around the sorted-stream / Default / no-index baseline, except the last two, which combine a layout or builder with an index.",
+  rowHeaders:["Builder","Layout","Index"], columns:["Serialize"], sortByColumn:0,
   rows:[
     serRow("Sorted stream","Default","none","sorted_stream_default_no_index"),
     serRow("Sorted in-memory","Default","none","sorted_in_memory_default_no_index"),
