@@ -141,11 +141,18 @@ impl VortexRdfStore {
     /// integer children are decoded to canonical primitives here — a
     /// serialized store's rows arrive wire-encoded, and canonical columns are
     /// what the match fast paths read (see
-    /// [`with_canonical_int_children`](array::with_canonical_int_children)).
+    /// [`with_canonical_int_children`](array::with_canonical_int_children)) —
+    /// and every index component is materialized into the same resident form,
+    /// so its sorted probes bind typed columns too.
     pub fn from_parts(parts: StoreParts) -> Result<Self> {
         let layout = resolved_layout(parts.dict, parts.array.dtype())?;
         let base = array::with_canonical_int_children(parts.array)?;
-        Self::from_parts_internal(base, parts.components, layout)
+        let components = parts
+            .components
+            .into_iter()
+            .map(crate::store::indexes::IndexComponent::into_resident)
+            .collect::<Result<Vec<_>>>()?;
+        Self::from_parts_internal(base, components, layout)
     }
 
     /// Test-only hook: whether every non-nullable integer child of an
@@ -155,21 +162,30 @@ impl VortexRdfStore {
     /// is not held in memory at all.
     #[cfg(all(test, feature = "file-io"))]
     pub(crate) fn debug_base_int_children_canonical(&self) -> bool {
-        use vortex_array::arrays::struct_::StructArrayExt;
-        use vortex_array::arrays::{Primitive, Struct};
+        use vortex_array::arrays::Struct;
         let QuadsSource::InMemory { base, .. } = &self.quads else {
             return true;
         };
         let Ok(struct_arr) = base.clone().try_downcast::<Struct>() else {
             return false;
         };
-        struct_arr.names().iter().all(|name| {
-            let Ok(child) = struct_arr.unmasked_field_by_name(name.as_ref()) else {
-                return false;
-            };
-            let int = child.dtype().is_int() && !child.dtype().is_nullable();
-            !int || child.clone().try_downcast::<Primitive>().is_ok()
-        })
+        debug_int_children_canonical(&struct_arr)
+    }
+
+    /// Test-only hook: whether the named in-memory index component's rows
+    /// hold canonical integer children — the resident form
+    /// [`IndexComponent::into_resident`] establishes. `None` when this store
+    /// holds no such component.
+    ///
+    /// [`IndexComponent::into_resident`]: indexes::IndexComponent::into_resident
+    #[cfg(all(test, feature = "file-io"))]
+    pub(crate) fn debug_index_component_int_children_canonical(&self, name: &str) -> Option<bool> {
+        let QuadsSource::InMemory { components, .. } = &self.quads else {
+            return None;
+        };
+        let component = components.iter().find(|c| c.name == name)?;
+        let rows = component.rows().ok()?;
+        Some(debug_int_children_canonical(rows))
     }
 
     /// Test-only hook: whether an in-memory base's `s` column carries the
@@ -500,6 +516,21 @@ impl VortexRdfStore {
             QuadsSource::File { .. } => None,
         }
     }
+}
+
+/// Whether every non-nullable integer child of `struct_arr` is a canonical
+/// primitive — the shared predicate behind the resident-adoption test hooks.
+#[cfg(all(test, feature = "file-io"))]
+fn debug_int_children_canonical(struct_arr: &StructArray) -> bool {
+    use vortex_array::arrays::Primitive;
+    use vortex_array::arrays::struct_::StructArrayExt;
+    struct_arr.names().iter().all(|name| {
+        let Ok(child) = struct_arr.unmasked_field_by_name(name.as_ref()) else {
+            return false;
+        };
+        let int = child.dtype().is_int() && !child.dtype().is_nullable();
+        !int || child.clone().try_downcast::<Primitive>().is_ok()
+    })
 }
 
 #[cfg(test)]

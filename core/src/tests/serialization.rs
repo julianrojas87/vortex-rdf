@@ -402,6 +402,13 @@ async fn test_from_parts_adopts_canonical_int_children() {
         store.debug_base_subject_sorted(),
         "the sorted build's subject stamp must survive the re-encoding"
     );
+    for name in ["index:posg", "index:ospg"] {
+        assert_eq!(
+            store.debug_index_component_int_children_canonical(name),
+            Some(true),
+            "{name}: from_parts must adopt components in resident form"
+        );
+    }
 
     // The canonical base answers a fully-bound pattern: s01 p1 "object 1"
     // is row 1 exactly.
