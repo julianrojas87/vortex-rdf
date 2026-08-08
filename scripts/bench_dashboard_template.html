@@ -457,7 +457,6 @@
     <a href="#py-ingest">Build &amp; open</a>
     <a href="#py-query">Query</a>
     <a href="#py-mutations">Mutations</a>
-    <a href="#py-variants">Variants</a>
     <a href="#py-footprint">Footprint</a>
     <a href="#py-data">Raw data</a>
   </nav>
@@ -480,6 +479,15 @@
       artifact, while an in-memory store must re-parse the source on every process start. Two
       libraries are read-only and one is not a store at all — those cells read
       <span class="mono">unsupported</span>, which records an absent API, not a slow result.
+    </p>
+    <p class="lede">
+      Vortex appears once per build configuration rather than as a single row, because its
+      knobs — builder, column layout, secondary index, and whether the store is read from the
+      file or loaded up front — move these numbers as much as the choice of library does.
+      Residency is crossed with the secondary index, so each <em>(file, memory)</em> pair
+      shares a build: the difference between the two is residency alone, and it can be read
+      with an index and without one. The in-memory indexed rows are the configurations that
+      match how pyoxigraph and rdflib hold their data.
     </p>
     <div class="kpi-row" id="py-kpi-row"></div>
     <p class="lede mono" id="py-matched-rows"></p>
@@ -506,7 +514,7 @@
   <section id="py-query" class="group">
     <div class="group-head">
       <span class="chan-tag mono">QUERY</span>
-      <h2>Match — cross-library</h2>
+      <h2>Match by pattern</h2>
     </div>
     <p class="group-desc">
       Resolving each pattern and counting results:
@@ -514,9 +522,9 @@
       on triples, <span class="mono">G</span>/<span class="mono">SPOG</span> on named graphs.
       Counting is the only unit all five share, and each library materializes its own natural
       result form — Vortex builds N-Triples strings in Rust, pyoxigraph and rdflib yield term
-      objects, pycottas and lightrdf yield tuples of strings. Residency differs too: Vortex
-      (file) and pycottas read from disk per query, while pyoxigraph and rdflib answer from
-      memory — the Variants panel shows Vortex in both modes.
+      objects, pycottas and lightrdf yield tuples of strings. Residency differs too: the Vortex
+      <em>(file)</em> rows and pycottas read from disk per query, while the Vortex
+      <em>(memory)</em> rows, pyoxigraph and rdflib answer from memory.
       <strong>lightrdf is the no-index baseline</strong>: it has no store, so every pattern
       re-parses the whole source file and costs about the same regardless of selectivity.
     </p>
@@ -536,19 +544,6 @@
       no store to mutate. Hover an <span class="mono">unsupported</span> cell for the reason.
     </p>
     <div class="panel-grid" id="py-mut-panels"></div>
-  </section>
-
-  <section id="py-variants" class="group">
-    <div class="group-head">
-      <span class="chan-tag mono">VARIANTS</span>
-      <h2>Vortex config variants</h2>
-    </div>
-    <p class="group-desc">
-      The same star design as the other tabs — builder, column layout, secondary index — plus
-      the residency axis the Rust tab also measures: the same file read per query
-      (<em>file</em>) versus loaded up front (<em>in-memory</em>).
-    </p>
-    <div class="panel-grid" id="py-variant-panels"></div>
   </section>
 
   <section id="py-footprint" class="group">
@@ -1089,25 +1084,32 @@ function renderJs(){
 
 // ---- Python tab ----
 // Mirrors python/bench/adapters.py's registry. The first Vortex entry is the
-// one that stands for Vortex in the cross-library panels; the in-memory entry
-// exists so the residency difference against pyoxigraph/rdflib is visible
-// rather than buried in a footnote.
+// one that stands for Vortex in the cross-library panels; the in-memory entries
+// exist so the residency difference against pyoxigraph/rdflib is visible rather
+// than buried in a footnote, and they are crossed with the secondary index so
+// that difference can be read both with and without one.
 const PY_VORTEX = [
-  { slug:"vortex_sorted_dict",        label:"Vortex Sorted/Dict (file)" },
-  { slug:"vortex_sorted_dict_mem",    label:"Vortex Sorted/Dict (in-memory)" },
-  { slug:"vortex_unsorted_default",   label:"Vortex Unsorted/Default (file)" },
-  { slug:"vortex_sorted_default",     label:"Vortex Sorted/Default (file)" },
-  { slug:"vortex_sorted_dict_bycopy", label:"Vortex Sorted/Dict+ByCopy (file)" },
-  { slug:"vortex_sorted_dict_byref",  label:"Vortex Sorted/Dict+ByRef (file)" },
+  { slug:"vortex_sorted_dict",            label:"vortex-rdf Sorted/Dict (file)" },
+  { slug:"vortex_sorted_dict_mem",        label:"vortex-rdf Sorted/Dict (memory)" },
+  { slug:"vortex_unsorted_default",       label:"vortex-rdf Unsorted/Default (file)" },
+  { slug:"vortex_sorted_default",         label:"vortex-rdf Sorted/Default (file)" },
+  { slug:"vortex_sorted_dict_bycopy",     label:"vortex-rdf Sorted/Dict+ByCopy (file)" },
+  { slug:"vortex_sorted_dict_bycopy_mem", label:"vortex-rdf Sorted/Dict+ByCopy (memory)" },
+  { slug:"vortex_sorted_dict_byref",      label:"vortex-rdf Sorted/Dict+ByRef (file)" },
+  { slug:"vortex_sorted_dict_byref_mem",  label:"vortex-rdf Sorted/Dict+ByRef (memory)" },
 ];
-const PY_CROSS_LIB = [
-  { slug:"vortex_sorted_dict", label:"vortex-rdf (file)" },
-  { slug:"pyoxigraph",         label:"pyoxigraph (memory)" },
-  { slug:"pycottas",           label:"pycottas (file)" },
-  { slug:"rdflib",             label:"rdflib (memory)" },
-  { slug:"lightrdf",           label:"lightrdf (no index)" },
+// The four libraries Vortex is measured against.
+const PY_OTHER_LIBS = [
+  { slug:"pyoxigraph", label:"pyoxigraph (memory)" },
+  { slug:"pycottas",   label:"pycottas (file)" },
+  { slug:"rdflib",     label:"rdflib (memory)" },
+  { slug:"lightrdf",   label:"lightrdf (no index)" },
 ];
-const PY_ADAPTERS = [...PY_VORTEX, ...PY_CROSS_LIB.slice(1)];
+// Every measured configuration — what the timing and footprint panels render.
+const PY_ADAPTERS = [...PY_VORTEX, ...PY_OTHER_LIBS];
+// One row per library, for the facts that are about a library rather than a
+// build: whether it has a mutation API, and how many libraries there are.
+const PY_LIBRARIES = [{ slug:PY_VORTEX[0].slug, label:"vortex-rdf" }, ...PY_OTHER_LIBS];
 const PY_PATTERNS = ["S","P","O","PO","SPO","full","G","SPOG"];
 
 function renderPy(){
@@ -1117,39 +1119,33 @@ function renderPy(){
     return;
   }
 
-  // Build & open — the two costs of getting a library queryable.
+  // Build & open — the two costs of getting a library queryable. Every Vortex
+  // variant is its own row here and in the panels below: the build knobs move
+  // these numbers as much as the choice of library does, so a single "vortex"
+  // row would be picking one configuration and calling it the library.
   renderMatrixPanel(document.getElementById("py-ingest-panels"), {
-    title:"Build and open, by library",
+    title:"Build and open",
     note:"Build: file → queryable store, each library's idiomatic path. Open: what a fresh process pays to query an already-built artifact — a file-backed format opens it, an in-memory store re-parses the source. Green = fastest per column.",
-    rowHeaders:["Library"], columns:["Build","Open"],
-    rows: PY_CROSS_LIB.map(a => ({ labels:[a.label], ids:[`ingest::${a.slug}`, `open::${a.slug}`] })),
+    rowHeaders:["Configuration"], columns:["Build","Open"],
+    rows: PY_ADAPTERS.map(a => ({ labels:[a.label], ids:[`ingest::${a.slug}`, `open::${a.slug}`] })),
   }, pyById);
 
-  // Query — cross-library, per routing shape.
+  // Query — every configuration against every routing shape.
   renderMatrixPanel(document.getElementById("py-query-panels"), {
-    title:"Match by pattern, cross-library",
-    wide:true, rowHeaders:["Library"], columns:PY_PATTERNS,
+    title:"Match by pattern",
+    wide:true, rowHeaders:["Configuration"], columns:PY_PATTERNS,
     note:"Median time to resolve each pattern and count the results. lightrdf re-parses the whole file per call, so its row is flat across selectivity — that flatness is what having no index costs.",
-    rows: PY_CROSS_LIB.map(a => ({ labels:[a.label], ids:patternIds(a.slug, PY_PATTERNS) })),
+    rows: PY_ADAPTERS.map(a => ({ labels:[a.label], ids:patternIds(a.slug, PY_PATTERNS) })),
   }, pyById);
 
-  // Mutations — two of five libraries can do this at all.
+  // Mutations — two of the five libraries can do this at all. One row per
+  // library, not per configuration: whether an add/delete API exists is a
+  // property of the bindings, so every Vortex build reports the same absence.
   renderMatrixPanel(document.getElementById("py-mut-panels"), {
     title:"Add and delete a batch",
     note:`Per-quad add and delete of ${(PY_CONFIG.mutBatch||0).toLocaleString()} quads. Hover an unsupported cell for why that library has no such API.`,
     rowHeaders:["Library"], columns:["Add","Delete"],
-    rows: PY_CROSS_LIB.map(a => ({ labels:[a.label], ids:[`add::${a.slug}`, `delete::${a.slug}`] })),
-  }, pyById);
-
-  // Vortex variants — build/open plus every pattern, over the config axes.
-  renderMatrixPanel(document.getElementById("py-variant-panels"), {
-    title:"Vortex variants: build, open, and match",
-    note:"Every variant reachable from the Python bindings. The residency pair (file vs in-memory, same build) is the like-for-like comparison against the in-memory libraries above.",
-    wide:true, rowHeaders:["Variant"], columns:["Build","Open", ...PY_PATTERNS],
-    rows: PY_VORTEX.map(a => ({
-      labels:[a.label],
-      ids:[`ingest::${a.slug}`, `open::${a.slug}`, ...patternIds(a.slug, PY_PATTERNS)],
-    })),
+    rows: PY_LIBRARIES.map(a => ({ labels:[a.label], ids:[`add::${a.slug}`, `delete::${a.slug}`] })),
   }, pyById);
 
   // Footprint — peak RSS per phase, then on-disk artifact size.
@@ -1157,7 +1153,7 @@ function renderPy(){
   renderMatrixPanel(footHost, {
     title:"Query phase — peak RSS",
     note:"Peak resident set size of each adapter's own process and virtualenv: build + open + every pattern. Smallest first.",
-    rowHeaders:["Library"], columns:["Peak RSS"], sortByColumn:0,
+    rowHeaders:["Configuration"], columns:["Peak RSS"], sortByColumn:0,
     rows: PY_ADAPTERS.map(a => ({ labels:[a.label], ids:[`${a.slug}::query`] })),
   }, pyMemById);
   // Only libraries that actually mutated have a reading: a process that found
@@ -1168,7 +1164,7 @@ function renderPy(){
     title:"Mutation phase — peak RSS",
     note:"Add + delete in one process per library — only the libraries that can mutate appear here.",
     rowHeaders:["Library"], columns:["Peak RSS"], sortByColumn:0,
-    rows: PY_CROSS_LIB
+    rows: PY_ADAPTERS
       .filter(a => pyMemById.has(`${a.slug}::mutate`))
       .map(a => ({ labels:[a.label], ids:[`${a.slug}::mutate`] })),
   }, pyMemById);
@@ -1193,22 +1189,22 @@ function renderPy(){
   renderMatrixPanel(footHost, {
     title:"On-disk artifact size",
     note:"Bytes the build wrote. Absent for a library whose store lives only in memory; for lightrdf it is the source N-Triples file, since re-reading that file is its query path. Smallest first.",
-    rowHeaders:["Library"], columns:["Size"], sortByColumn:0,
+    rowHeaders:["Configuration"], columns:["Size"], sortByColumn:0,
     rows: PY_ADAPTERS.map(a => ({ labels:[a.label], ids:[`${a.slug}::size`] })),
   }, pySizeById);
 
-  const supported = PY_CROSS_LIB.filter(a => {
+  const supported = PY_LIBRARIES.filter(a => {
     const r = pyById.get(`add::${a.slug}`);
     return r && !r.unsupported;
   }).length;
   renderKpis("#py-kpi-row", [
-    { label:"Libraries", value:String(PY_CROSS_LIB.length), sub:"vortex · pyoxigraph · pycottas · rdflib · lightrdf" },
+    { label:"Libraries", value:String(PY_LIBRARIES.length), sub:"vortex · pyoxigraph · pycottas · rdflib · lightrdf" },
     { label:"Vortex variants", value:String(PY_VORTEX.length), sub:"builder × layout × index × residency" },
     { label:"Benchmarks", value:String(PY_DATA.length), sub:"leaf measurements" },
     { label:"Quads", value:(PY_CONFIG.triplesCount||0).toLocaleString(), sub:(PY_CONFIG.quadsCount||0).toLocaleString()+" named-graph quads" },
     { label:"Distinct terms", value:(PY_CONFIG.cardinality?.triples?.terms||0).toLocaleString(),
       sub:(PY_CONFIG.cardinality?.quads?.terms||0).toLocaleString()+" in the quads dataset" },
-    { label:"Can mutate", value:`${supported} / ${PY_CROSS_LIB.length}`, sub:"libraries with an add/delete API" },
+    { label:"Can mutate", value:`${supported} / ${PY_LIBRARIES.length}`, sub:"libraries with an add/delete API" },
   ]);
   renderMatchedRows(PY_CONFIG.matchedRows, "py-matched-rows");
 

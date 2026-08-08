@@ -32,7 +32,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from adapters import ALL_SLUGS, CROSS_LIB, VENV_FOR  # noqa: E402
+from adapters import ALL_SLUGS, VENV_FOR  # noqa: E402
 from datasets import DatasetOpts, moduli, write_dataset  # noqa: E402
 
 BENCH_DIR = Path(__file__).resolve().parent
@@ -209,7 +209,11 @@ def main() -> int:
             {"slug": slug, "label": res["label"], "bytes": res.get("artifact_bytes")}
         )
 
-    for slug in CROSS_LIB:
+    # Every adapter, including the ones that cannot mutate: a worker that finds
+    # the operation unsupported exits before building anything, so the sweep is
+    # cheap, and the rows it emits are what the dashboard renders as an
+    # explained `unsupported` cell rather than a blank one.
+    for slug in ALL_SLUGS:
         res = run_worker(slug, "mutate", triples, quads)
         if not res:
             continue

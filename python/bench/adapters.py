@@ -394,19 +394,24 @@ class RdflibAdapter(Adapter):
 # ─── Registry ───────────────────────────────────────────────────────────────
 
 #: Vortex build variants, the same star design the Rust and JS tabs use:
-#: builder x layout x secondary index. The first is the one that stands for
-#: Vortex in the cross-library panels.
+#: builder x layout x secondary index x residency. Every one of them is a row
+#: in the cross-library panels.
+#:
+#: Residency and secondary indexes are crossed rather than varied one at a
+#: time: every Dictionary build appears file-backed and in-memory, so the
+#: index's effect can be read within a residency mode and residency's within
+#: an index configuration. The in-memory indexed cells are the ones that match
+#: how pyoxigraph and rdflib are configured.
 VORTEX_VARIANTS = [
     ("vortex_sorted_dict", "Vortex Sorted/Dict", "dictionary", "sorted-in-memory", [], False),
     ("vortex_sorted_dict_mem", "Vortex Sorted/Dict (in-memory)", "dictionary", "sorted-in-memory", [], True),
     ("vortex_unsorted_default", "Vortex Unsorted/Default", "default", "unsorted-stream", [], False),
     ("vortex_sorted_default", "Vortex Sorted/Default", "default", "sorted-in-memory", [], False),
     ("vortex_sorted_dict_bycopy", "Vortex Sorted/Dict+ByCopy", "dictionary", "sorted-in-memory", ["secondary-by-copy"], False),
+    ("vortex_sorted_dict_bycopy_mem", "Vortex Sorted/Dict+ByCopy (in-memory)", "dictionary", "sorted-in-memory", ["secondary-by-copy"], True),
     ("vortex_sorted_dict_byref", "Vortex Sorted/Dict+ByRef", "dictionary", "sorted-in-memory", ["secondary-by-reference"], False),
+    ("vortex_sorted_dict_byref_mem", "Vortex Sorted/Dict+ByRef (in-memory)", "dictionary", "sorted-in-memory", ["secondary-by-reference"], True),
 ]
-
-#: The adapter that represents Vortex in the cross-library comparison.
-VORTEX_PRIMARY = "vortex_sorted_dict"
 
 
 def build_adapter(slug: str) -> Adapter:
@@ -425,10 +430,9 @@ def build_adapter(slug: str) -> Adapter:
     raise KeyError(f"unknown adapter slug: {slug}")
 
 
-#: Cross-library comparison set, in dashboard row order.
-CROSS_LIB = [VORTEX_PRIMARY, "pyoxigraph", "pycottas", "rdflib", "lightrdf"]
-
-#: Every adapter a full run measures.
+#: Every adapter a full run measures, in dashboard row order: each Vortex
+#: variant is a row in the cross-library panels alongside the other libraries,
+#: not a footnote to them.
 ALL_SLUGS = [v[0] for v in VORTEX_VARIANTS] + ["pyoxigraph", "pycottas", "rdflib", "lightrdf"]
 
 #: Which virtualenv each adapter needs. Vortex variants share one.
