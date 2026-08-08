@@ -281,18 +281,19 @@ impl IndexComponent {
     }
 
     /// This component in resident form: rows materialized, integer children
-    /// decoded to canonical primitives (see
-    /// [`array::with_canonical_int_children`]), so the sorted probes bind the
-    /// value and `rid` columns directly instead of running the generic search
-    /// kernel per call. The adoption step of a store loaded wholesale into
-    /// memory; sortedness provenance is the component's own `sorted` field
-    /// and carries across unchanged.
+    /// kept compressed wherever the encoded search probes bind them and
+    /// decoded to canonical primitives otherwise (see
+    /// [`array::with_searchable_int_children`]), so the sorted probes bind
+    /// the value and `rid` columns directly instead of running the generic
+    /// search kernel per call. The adoption step of a store loaded wholesale
+    /// into memory; sortedness provenance is the component's own `sorted`
+    /// field and carries across unchanged.
     ///
-    /// [`array::with_canonical_int_children`]: crate::store::array::with_canonical_int_children
+    /// [`array::with_searchable_int_children`]: crate::store::array::with_searchable_int_children
     pub(crate) fn into_resident(self) -> Result<Self> {
         use vortex_array::arrays::Struct;
         let rows = self.rows()?.clone().into_array();
-        let canonical = crate::store::array::with_canonical_int_children(rows)?;
+        let canonical = crate::store::array::with_searchable_int_children(rows)?;
         // The helper only ever hands back a struct (its input was one), so
         // the downcast is a cast, not work.
         let array = match canonical.try_downcast::<Struct>() {

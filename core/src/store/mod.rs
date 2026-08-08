@@ -137,16 +137,16 @@ impl VortexRdfStore {
     /// it: dict-less Dictionary parts are refused (bare code columns carry no
     /// way back to their terms).
     ///
-    /// This is the bindings' explicit resident adoption, so the base's
-    /// integer children are decoded to canonical primitives here — a
-    /// serialized store's rows arrive wire-encoded, and canonical columns are
-    /// what the match fast paths read (see
-    /// [`with_canonical_int_children`](array::with_canonical_int_children)) —
-    /// and every index component is materialized into the same resident form,
-    /// so its sorted probes bind typed columns too.
+    /// This is the bindings' explicit resident adoption: the base's integer
+    /// children stay in their compressed form wherever the match fast paths
+    /// can bind them through encoded search probes, and only children outside
+    /// the probe's supported set are decoded to canonical primitives (see
+    /// [`with_searchable_int_children`](array::with_searchable_int_children));
+    /// every index component is materialized into the same resident form, so
+    /// its sorted probes bind directly too.
     pub fn from_parts(parts: StoreParts) -> Result<Self> {
         let layout = resolved_layout(parts.dict, parts.array.dtype())?;
-        let base = array::with_canonical_int_children(parts.array)?;
+        let base = array::with_searchable_int_children(parts.array)?;
         let components = parts
             .components
             .into_iter()
@@ -156,10 +156,10 @@ impl VortexRdfStore {
     }
 
     /// Test-only hook: whether every non-nullable integer child of an
-    /// in-memory base is a canonical primitive — the property
-    /// [`array::with_canonical_int_children`] establishes and the match fast
-    /// paths bind against. Vacuously true for a file-backed store, whose base
-    /// is not held in memory at all.
+    /// in-memory base is a canonical primitive — true only when adoption
+    /// decoded everything (or the children were built canonical), so tests
+    /// assert compression *retention* by negating it. Vacuously true for a
+    /// file-backed store, whose base is not held in memory at all.
     #[cfg(all(test, feature = "file-io"))]
     pub(crate) fn debug_base_int_children_canonical(&self) -> bool {
         use vortex_array::arrays::Struct;

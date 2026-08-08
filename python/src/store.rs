@@ -142,11 +142,12 @@ impl VortexRdfStore {
 impl VortexRdfStore {
     /// Open `path`. By default the store stays file-backed and lazy (only the
     /// footer is read up front). `in_memory=True` loads the whole store into
-    /// memory instead, decoding its term-code columns to their canonical
-    /// resident form — every subsequent match skips the per-call file-scan
-    /// pipeline and binds the columns directly. `max_resident_bytes`
-    /// overrides the Dictionary layout's term-dictionary residency budget
-    /// (the dictionary child's compressed size in bytes).
+    /// memory instead, keeping its columns in their compressed form wherever
+    /// matches can bind them directly and decoding only the remainder —
+    /// every subsequent match skips the per-call file-scan pipeline.
+    /// `max_resident_bytes` overrides the Dictionary layout's
+    /// term-dictionary residency budget (the dictionary child's compressed
+    /// size in bytes).
     #[new]
     #[pyo3(signature = (path, max_resident_bytes=None, in_memory=false))]
     fn new(

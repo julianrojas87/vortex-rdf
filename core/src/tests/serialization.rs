@@ -369,12 +369,13 @@ async fn test_from_bytes_defers_index_child_materialization() {
     );
 }
 
-/// `from_parts` decodes a wire-encoded base's integer children to canonical
-/// primitives — the form the match fast paths bind against — while carrying
-/// the subject sortedness provenance honestly in both directions: a sorted
-/// build's stamp survives the re-encoding, an unsorted build gains none.
+/// `from_parts` adopts a wire-encoded base into searchable resident form —
+/// every sorted column binds an encoded search probe, with children outside
+/// the probe's set decoded — while carrying the subject sortedness
+/// provenance honestly in both directions: a sorted build's stamp survives
+/// the re-encoding, an unsorted build gains none.
 #[tokio::test]
-async fn test_from_parts_adopts_canonical_int_children() {
+async fn test_from_parts_adopts_searchable_children() {
     let quads = modular_quads(12, 3, 4);
 
     // Sorted Dictionary build: code columns arrive wire-encoded after a
@@ -395,8 +396,8 @@ async fn test_from_parts_adopts_canonical_int_children() {
     let parts = adopted.to_serializable_parts().await.unwrap();
     let store = VortexRdfStore::from_parts(parts).unwrap();
     assert!(
-        store.debug_base_int_children_canonical(),
-        "from_parts must decode integer children to canonical primitives"
+        store.debug_base_probe_resolvable(),
+        "from_parts must leave every sorted column probe-bindable"
     );
     assert!(
         store.debug_base_subject_sorted(),
@@ -404,7 +405,7 @@ async fn test_from_parts_adopts_canonical_int_children() {
     );
     for name in ["index:posg", "index:ospg"] {
         assert_eq!(
-            store.debug_index_component_int_children_canonical(name),
+            store.index_component_materialized(name),
             Some(true),
             "{name}: from_parts must adopt components in resident form"
         );
@@ -442,7 +443,7 @@ async fn test_from_parts_adopts_canonical_int_children() {
     let adopted = VortexRdfStore::from_bytes(&bytes).await.unwrap();
     let parts = adopted.to_serializable_parts().await.unwrap();
     let store = VortexRdfStore::from_parts(parts).unwrap();
-    assert!(store.debug_base_int_children_canonical());
+    assert!(store.debug_base_probe_resolvable());
     assert!(
         !store.debug_base_subject_sorted(),
         "an unsorted build must stay unstamped through adoption"
@@ -477,6 +478,7 @@ async fn test_from_bytes_matches_equal_canonical_across_patterns() {
     let canonical = VortexRdfStore::from_built(arr).unwrap();
     let bytes = canonical.to_bytes().await.unwrap();
     let lean = VortexRdfStore::from_bytes(&bytes).await.unwrap();
+    let resident = VortexRdfStore::from_parts(lean.to_serializable_parts().await.unwrap()).unwrap();
 
     assert!(canonical.debug_base_probe_resolvable());
     assert!(
@@ -486,6 +488,14 @@ async fn test_from_bytes_matches_equal_canonical_across_patterns() {
     assert!(
         !lean.debug_base_int_children_canonical(),
         "fixture must exercise a wire-encoded base"
+    );
+    assert!(
+        resident.debug_base_probe_resolvable(),
+        "resident adoption must stay probe-bindable"
+    );
+    assert!(
+        !resident.debug_base_int_children_canonical(),
+        "resident adoption must retain probeable children compressed"
     );
 
     let s = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/s02500").unwrap());
@@ -515,17 +525,19 @@ async fn test_from_bytes_matches_equal_canonical_across_patterns() {
     ];
     for (name, ps, pp, po, pg) in patterns {
         let want = canonical.match_pattern(ps, pp, po, pg).await.unwrap();
-        let got = lean.match_pattern(ps, pp, po, pg).await.unwrap();
-        assert_eq!(
-            got.size().await.unwrap(),
-            want.size().await.unwrap(),
-            "size diverged on [{name}]"
-        );
-        assert_eq!(
-            view_strings(&got).await,
-            view_strings(&want).await,
-            "results diverged on [{name}]"
-        );
+        for (kind, store) in [("lean", &lean), ("resident", &resident)] {
+            let got = store.match_pattern(ps, pp, po, pg).await.unwrap();
+            assert_eq!(
+                got.size().await.unwrap(),
+                want.size().await.unwrap(),
+                "size diverged on [{name}] ({kind})"
+            );
+            assert_eq!(
+                view_strings(&got).await,
+                view_strings(&want).await,
+                "results diverged on [{name}] ({kind})"
+            );
+        }
     }
 
     // The subject run itself: 4 quads per subject by construction.
