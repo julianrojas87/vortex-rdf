@@ -31,6 +31,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Stamp index leads when a full first chunk is the whole dataset (core) ([`cd4260f`](https://github.com/vortex-rdf/vortex-rdf/commit/cd4260f98d08e5ab328f2d4a7aa77a80eba2114a) by @julianrojas87)
 - Memoize per-role term decoding of a dictionary chunk (core) ([`6b3ebf8`](https://github.com/vortex-rdf/vortex-rdf/commit/6b3ebf8caefd31215b4090320b958c27584bd243) by @julianrojas87)
 - Adopt resident bases with canonical integer columns (core) ([`5184c02`](https://github.com/vortex-rdf/vortex-rdf/commit/5184c02a8946a520b5644e61b3495b9796543bff) by julianrojas87)
+- Adopt index components in resident form too (core) ([`74690e5`](https://github.com/vortex-rdf/vortex-rdf/commit/74690e5766db38506e8742cfc6178538c106849b) by julianrojas87)
 
 ### Removed
 
