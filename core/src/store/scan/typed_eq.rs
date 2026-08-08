@@ -1,8 +1,10 @@
 //! Typed residual equality filtering: the row-at-a-time fast paths
 //! `match_pattern` uses instead of the vectorized mask pipeline when every
-//! residual constraint binds to a canonical column — u32 code compares for the
-//! Dictionary layout's columns, view-level string compares for the Default /
-//! TypedObject / tail string columns. Anything else declines, and the caller
+//! residual constraint binds a typed column view — slice compares for
+//! canonical u32 code columns, encoded point reads for compressed integer
+//! columns, view-level string compares for the Default / TypedObject / tail
+//! string columns. Anything else declines — as do wide selections over
+//! encoded columns, where the vectorized pipeline wins — and the caller
 //! falls back to the general mask-scan pipeline.
 
 use vortex_array::ArrayRef;
@@ -38,14 +40,18 @@ impl Needle {
 }
 
 /// One equality constraint bound to a concrete typed column view, for the
-/// typed residual-filter fast paths. Two column shapes qualify: canonical
-/// non-nullable u32 primitives (the Dictionary layout's code columns, compared
-/// as integers) and canonical non-nullable Utf8 `VarBinView`s (the Default /
+/// typed residual-filter fast paths. Three column shapes qualify: canonical
+/// non-nullable u32 primitives (the Dictionary layout's code columns,
+/// compared as slice loads), non-nullable unsigned-integer columns whose
+/// encoding resolves an encoded search probe (wire-encoded adoptions and
+/// non-u32 widths like TypedObject's kind column, compared through per-row
+/// point reads), and canonical non-nullable Utf8 `VarBinView`s (the Default /
 /// TypedObject / tail string columns, compared at the view level). Anything
-/// else — nullable, compressed, or chunked — declines, and the caller falls
-/// back to the general mask-scan pipeline.
+/// else — nullable, unsupported encodings, string-encoded columns — declines,
+/// and the caller falls back to the general mask-scan pipeline.
 enum TypedEq<'a> {
     Code(PrimitiveArray, u32),
+    CodeProbe(vortex_encoded_search::SortedProbe<'a>, u32),
     Str(StrEq<'a>),
 }
 
@@ -77,13 +83,12 @@ impl StrEq<'_> {
 }
 
 impl<'a> TypedEq<'a> {
-    /// Bind one constraint to its column, or decline. Only a column already
-    /// in canonical form qualifies: these paths run per match call, so
-    /// decoding an encoded column here would cost O(column) every call — a
-    /// resident store canonicalizes its integer children once at adoption
-    /// (`array::with_canonical_int_children`), and the mask scan covers
-    /// encoded columns at selection cost.
-    fn bind_col(col: &ArrayRef, needle: &'a Needle) -> Option<TypedEq<'a>> {
+    /// Bind one constraint to its column, or decline. A canonical u32 column
+    /// binds by slice; any other non-nullable unsigned-integer column binds
+    /// through an encoded search probe when its encoding resolves — never by
+    /// decoding, which would cost O(column) on every match call. The mask
+    /// scan covers what declines, at selection cost.
+    fn bind_col(col: &'a ArrayRef, needle: &'a Needle) -> Option<TypedEq<'a>> {
         use vortex_array::dtype::DType;
         if col.dtype().is_nullable() {
             return None;
@@ -93,11 +98,13 @@ impl<'a> TypedEq<'a> {
                 if !col.dtype().is_unsigned_int() {
                     return None;
                 }
-                let prim = col.clone().try_downcast::<Primitive>().ok()?;
-                if prim.ptype() != vortex_array::dtype::PType::U32 {
-                    return None;
+                if let Ok(prim) = col.clone().try_downcast::<Primitive>()
+                    && prim.ptype() == vortex_array::dtype::PType::U32
+                {
+                    return Some(TypedEq::Code(prim, *code));
                 }
-                Some(TypedEq::Code(prim, *code))
+                let probe = vortex_encoded_search::SortedProbe::resolve(col)?;
+                Some(TypedEq::CodeProbe(probe, *code))
             }
             Needle::Str(s) => {
                 if !matches!(col.dtype(), DType::Utf8(_)) {
@@ -114,7 +121,7 @@ impl<'a> TypedEq<'a> {
 
     /// Bind every constraint to its typed column, or `None` if any declines.
     fn bind(
-        struct_arr: &StructArray,
+        struct_arr: &'a StructArray,
         eqs: &[(&'static str, Scalar)],
         needles: &'a [Needle],
     ) -> Option<Vec<TypedEq<'a>>> {
@@ -134,6 +141,7 @@ impl<'a> TypedEq<'a> {
     fn matches(&self, i: usize) -> bool {
         match self {
             TypedEq::Code(prim, code) => prim.as_slice::<u32>()[i] == *code,
+            TypedEq::CodeProbe(probe, code) => probe.value_at(i) == u64::from(*code),
             TypedEq::Str(s) => s.matches(i),
         }
     }
@@ -148,7 +156,7 @@ impl<'a> TypedEq<'a> {
         cols.iter()
             .map(|c| match c {
                 TypedEq::Code(prim, code) => Some((prim.as_slice::<u32>(), *code)),
-                TypedEq::Str(..) => None,
+                TypedEq::CodeProbe(..) | TypedEq::Str(..) => None,
             })
             .collect()
     }
@@ -179,8 +187,9 @@ pub(crate) fn typed_residual_ids(
     base_len: usize,
     eqs: &[(&'static str, Scalar)],
 ) -> Option<vortex_buffer::Buffer<u64>> {
-    // With ≥2 columns the typed residual wins outright: it short-circuits
-    // the conjunction per row, which the vectorized pipeline cannot.
+    // With ≥2 slice-bound columns the typed residual wins outright: it
+    // short-circuits the conjunction per row, which the vectorized pipeline
+    // cannot.
     //
     // With a lone constraint there is nothing to short-circuit, and the
     // row-at-a-time `views()` access (an erased-array deref per row) loses
@@ -196,14 +205,19 @@ pub(crate) fn typed_residual_ids(
     // store (14 columns) `SP` cost 106 µs against `SPO`'s 8 µs, purely
     // because the second constraint let it take this path instead.
     //
-    // So the single-constraint rule is about selection size, not column
-    // count: keep the mask scan while there are enough rows for SIMD to pay
-    // for the setup, and take the typed loop below that.
-    if eqs.len() < 2 && selection.len(base_len) > TYPED_SINGLE_EQ_MAX_ROWS {
-        return None;
-    }
+    // So the rule is about selection size, not column count: keep the mask
+    // scan while there are enough rows for SIMD to pay for the setup, take
+    // the typed loop below that. A probe-bound (encoded) column pays a
+    // per-row point read tens of times a slice load, so its short-circuit
+    // never outruns the vectorized compare on wide selections — the same
+    // size gate applies to it regardless of constraint count. Binding is
+    // downcasts only, so it is safe to bind before gating.
     let needles = Needle::extract(eqs)?;
     let cols = TypedEq::bind(struct_arr, eqs, &needles)?;
+    let any_probe = cols.iter().any(|c| matches!(c, TypedEq::CodeProbe(..)));
+    if (eqs.len() < 2 || any_probe) && selection.len(base_len) > TYPED_SINGLE_EQ_MAX_ROWS {
+        return None;
+    }
     fn collect_ids(
         selection: &RowSelection,
         base_len: usize,
@@ -286,4 +300,78 @@ pub(crate) fn typed_positions(
         return Some(out);
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::selection::RowSelection;
+    use vortex_array::validity::Validity;
+    use vortex_array::{IntoArray, VortexSessionExecute};
+    use vortex_buffer::Buffer;
+
+    /// A struct of {canonical u32 `p`, bit-packed u32 `o`} — one slice-bound
+    /// and one probe-bound column.
+    fn mixed_struct(n: u32) -> StructArray {
+        let p = Buffer::from_iter((0..n).map(|i| i % 7)).into_array();
+        let o_canonical =
+            vortex_array::arrays::PrimitiveArray::from_iter((0..n).map(|i| i % 11));
+        let mut ctx = crate::session::VORTEX_SESSION.create_execution_ctx();
+        let o = vortex::encodings::fastlanes::bitpack_compress::bitpack_encode(
+            &o_canonical,
+            4,
+            None,
+            &mut ctx,
+        )
+        .unwrap()
+        .into_array();
+        assert!(
+            o.clone().try_downcast::<Primitive>().is_err(),
+            "fixture column must stay encoded"
+        );
+        StructArray::try_new(["p", "o"].into(), vec![p, o], n as usize, Validity::NonNullable)
+            .unwrap()
+    }
+
+    fn eqs(pairs: &[(&'static str, u32)]) -> Vec<(&'static str, Scalar)> {
+        pairs.iter().map(|&(f, v)| (f, Scalar::from(v))).collect()
+    }
+
+    /// An encoded column binds through the probe and filters exactly like the
+    /// canonical ground truth.
+    #[test]
+    fn probe_bound_column_filters_rows() {
+        let sa = mixed_struct(1000);
+        let eqs = eqs(&[("p", 3), ("o", 10)]);
+        let ids = typed_residual_ids(&sa, &RowSelection::All, 1000, &eqs).unwrap();
+        let want: Vec<u64> = (0..1000u64).filter(|i| i % 7 == 3 && i % 11 == 10).collect();
+        assert_eq!(ids.as_slice(), &want[..]);
+    }
+
+    /// A probe-bound constraint keeps the selection-size gate even with a
+    /// second constraint beside it: wide selections decline to the mask scan.
+    #[test]
+    fn probe_bound_column_declines_wide_selection() {
+        let n = (TYPED_SINGLE_EQ_MAX_ROWS as u32) * 2;
+        let sa = mixed_struct(n);
+        let eqs = eqs(&[("p", 3), ("o", 10)]);
+        assert!(typed_residual_ids(&sa, &RowSelection::All, n as usize, &eqs).is_none());
+        let narrow = RowSelection::Range(10..90);
+        let ids = typed_residual_ids(&sa, &narrow, n as usize, &eqs).unwrap();
+        let want: Vec<u64> = (10..90u64).filter(|i| i % 7 == 3 && i % 11 == 10).collect();
+        assert_eq!(ids.as_slice(), &want[..]);
+    }
+
+    /// A canonical non-u32 unsigned column (TypedObject's kind byte) now
+    /// binds through the probe instead of declining.
+    #[test]
+    fn canonical_u8_column_binds() {
+        let kind = Buffer::from_iter((0..100u32).map(|i| (i % 3) as u8)).into_array();
+        let sa = StructArray::try_new(["k"].into(), vec![kind], 100, Validity::NonNullable)
+            .unwrap();
+        let eqs = vec![("k", Scalar::from(2u8))];
+        let ids = typed_residual_ids(&sa, &RowSelection::All, 100, &eqs).unwrap();
+        let want: Vec<u64> = (0..100u64).filter(|i| i % 3 == 2).collect();
+        assert_eq!(ids.as_slice(), &want[..]);
+    }
 }
