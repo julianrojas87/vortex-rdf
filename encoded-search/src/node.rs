@@ -67,12 +67,11 @@ impl Words<'_> {
     }
 }
 
-/// One resolved chunk of a [`Node::Chunked`] tree, with its logical start row
-/// and the chunk's first/last values hoisted for chunk-level narrowing.
+/// One resolved chunk of a [`Node::Chunked`] tree, with its logical start
+/// row. Chunk extremes are read on demand during bounds searches — resolving
+/// stays downcast-only, which matters because a probe is resolved per call.
 pub(crate) struct Chunk<'a> {
     pub(crate) start: usize,
-    pub(crate) first: u64,
-    pub(crate) last: u64,
     pub(crate) node: Node<'a>,
 }
 
@@ -278,7 +277,12 @@ impl Node<'_> {
                 partition(*len, |i| child.value_at(*start + i) < needle)
             }
             Node::Chunked { chunks, len } => {
-                let c = chunks.partition_point(|c| c.last < needle);
+                // Chunk extremes read on demand: first chunk whose last
+                // value reaches the needle holds the boundary.
+                let c = partition(chunks.len(), |c| {
+                    let node = &chunks[c].node;
+                    node.value_at(node.len() - 1) < needle
+                });
                 if c == chunks.len() {
                     *len
                 } else {
@@ -335,7 +339,7 @@ impl Node<'_> {
                 partition(*len, |i| child.value_at(*start + i) <= needle)
             }
             Node::Chunked { chunks, .. } => {
-                let c = chunks.partition_point(|c| c.first <= needle);
+                let c = partition(chunks.len(), |c| chunks[c].node.value_at(0) <= needle);
                 if c == 0 {
                     0
                 } else {
@@ -513,20 +517,7 @@ mod tests {
         let a = Node::Primitive(Words::U32(&[1, 2, 2]));
         let b = Node::Primitive(Words::U32(&[2, 2, 3]));
         let n = Node::Chunked {
-            chunks: vec![
-                Chunk {
-                    start: 0,
-                    first: 1,
-                    last: 2,
-                    node: a,
-                },
-                Chunk {
-                    start: 3,
-                    first: 2,
-                    last: 3,
-                    node: b,
-                },
-            ],
+            chunks: vec![Chunk { start: 0, node: a }, Chunk { start: 3, node: b }],
             len: 6,
         };
         assert_eq!((n.lower_bound(2), n.upper_bound(2)), (1, 5));

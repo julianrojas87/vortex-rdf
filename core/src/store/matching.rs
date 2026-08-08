@@ -515,7 +515,13 @@ impl VortexRdfStore {
             // resolved to its range, when it was) becomes the pushed-down
             // filter.
             IndexResolution::Declined => (
-                file_scan::build_file_filter(pat.subject, pat.predicate, pat.object, pat.graph, codes)?,
+                file_scan::build_file_filter(
+                    pat.subject,
+                    pat.predicate,
+                    pat.object,
+                    pat.graph,
+                    codes,
+                )?,
                 None,
                 None,
             ),

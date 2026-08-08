@@ -141,19 +141,49 @@ pub(crate) fn resolve_node<'a>(arr: &'a ArrayRef) -> Option<Node<'a>> {
         let slots = view.slots();
         let first_chunk_slot = slots.len() - nchunks;
         let mut chunks = Vec::with_capacity(nchunks);
-        for (&start, chunk_slot) in offsets.iter().zip(first_chunk_slot..slots.len()) {
-            let child = slot(slots, chunk_slot)?;
+        let mut i = 0usize;
+        while i < nchunks {
+            let child = slot(slots, first_chunk_slot + i)?;
             if child.is_empty() {
+                i += 1;
                 continue;
             }
-            let node = resolve_node(child)?;
-            let last = node.value_at(node.len() - 1);
+            // Consecutive chunks that are contiguous slices of one shared
+            // parent (a coalesced block read back split-by-split) merge into
+            // a single window over that parent — fewer nodes to resolve and
+            // one search instead of a per-chunk cascade.
+            if let Some((parent, mut range)) = as_slice_parts(child) {
+                let start = offsets[i];
+                let mut j = i + 1;
+                while j < nchunks {
+                    let Some(next) = slot(slots, first_chunk_slot + j) else {
+                        break;
+                    };
+                    let Some((next_parent, next_range)) = as_slice_parts(next) else {
+                        break;
+                    };
+                    if next_parent.addr() != parent.addr() || next_range.start != range.end {
+                        break;
+                    }
+                    range.end = next_range.end;
+                    j += 1;
+                }
+                chunks.push(Chunk {
+                    start,
+                    node: Node::Slice {
+                        child: Box::new(resolve_node(parent)?),
+                        start: range.start,
+                        len: range.end - range.start,
+                    },
+                });
+                i = j;
+                continue;
+            }
             chunks.push(Chunk {
-                start,
-                first: node.value_at(0),
-                last,
-                node,
+                start: offsets[i],
+                node: resolve_node(child)?,
             });
+            i += 1;
         }
         return Some(Node::Chunked {
             chunks,
@@ -162,6 +192,13 @@ pub(crate) fn resolve_node<'a>(arr: &'a ArrayRef) -> Option<Node<'a>> {
     }
 
     None
+}
+
+/// A slice child's `(parent, range)`, when `arr` is a slice wrapper.
+fn as_slice_parts(arr: &ArrayRef) -> Option<(&ArrayRef, std::ops::Range<usize>)> {
+    let view = arr.as_opt::<Slice>()?;
+    let parent = slot(view.slots(), SliceSlots::CHILD)?;
+    Some((parent, view.data().slice_range().clone()))
 }
 
 fn pvalue_u64(value: PValue) -> Option<u64> {

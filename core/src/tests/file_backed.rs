@@ -342,9 +342,7 @@ async fn test_file_subject_probe_matches_memory() {
     }
 
     // Absent subject (never in the dictionary) short-circuits to empty.
-    let absent = NamedOrBlankNode::NamedNode(
-        NamedNode::new("http://example.org/zz").unwrap(),
-    );
+    let absent = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/zz").unwrap());
     let empty = store
         .match_pattern(Some(&absent), None, None, None)
         .await
@@ -372,7 +370,11 @@ async fn test_file_subject_probe_with_mutation() {
         .match_pattern(Some(&s50), None, None, None)
         .await
         .unwrap();
-    assert_eq!(matched.size().await.unwrap(), 2, "tombstone must leave the run");
+    assert_eq!(
+        matched.size().await.unwrap(),
+        2,
+        "tombstone must leave the run"
+    );
 
     let fresh = make_quad(
         "http://example.org/s0050",
@@ -385,7 +387,11 @@ async fn test_file_subject_probe_with_mutation() {
         .match_pattern(Some(&s50), None, None, None)
         .await
         .unwrap();
-    assert_eq!(matched.size().await.unwrap(), 3, "the tail must rejoin the run");
+    assert_eq!(
+        matched.size().await.unwrap(),
+        3,
+        "the tail must rejoin the run"
+    );
 }
 
 /// A chained match composes: narrowing by predicate first, then by subject,
@@ -412,8 +418,14 @@ async fn test_file_subject_probe_chained() {
 
     let p = NamedNode::new("http://example.org/p2").unwrap();
     let s = subject(444);
-    let got_first = store.match_pattern(None, Some(&p), None, None).await.unwrap();
-    let got = got_first.match_pattern(Some(&s), None, None, None).await.unwrap();
+    let got_first = store
+        .match_pattern(None, Some(&p), None, None)
+        .await
+        .unwrap();
+    let got = got_first
+        .match_pattern(Some(&s), None, None, None)
+        .await
+        .unwrap();
     assert!(!got.debug_has_serve_plan());
     let want = memory
         .match_pattern(None, Some(&p), None, None)
@@ -439,6 +451,9 @@ async fn test_file_subject_probe_requires_sorted() {
     let store = VortexRdfStore::from_file(&path).await.unwrap();
     let s = subject(10);
     assert_eq!(store.debug_subject_bounds_range(&s).await.unwrap(), None);
-    let matched = store.match_pattern(Some(&s), None, None, None).await.unwrap();
+    let matched = store
+        .match_pattern(Some(&s), None, None, None)
+        .await
+        .unwrap();
     assert_eq!(matched.size().await.unwrap(), 3);
 }

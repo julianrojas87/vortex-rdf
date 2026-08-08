@@ -314,8 +314,7 @@ mod tests {
     /// and one probe-bound column.
     fn mixed_struct(n: u32) -> StructArray {
         let p = Buffer::from_iter((0..n).map(|i| i % 7)).into_array();
-        let o_canonical =
-            vortex_array::arrays::PrimitiveArray::from_iter((0..n).map(|i| i % 11));
+        let o_canonical = vortex_array::arrays::PrimitiveArray::from_iter((0..n).map(|i| i % 11));
         let mut ctx = crate::session::VORTEX_SESSION.create_execution_ctx();
         let o = vortex::encodings::fastlanes::bitpack_compress::bitpack_encode(
             &o_canonical,
@@ -329,8 +328,13 @@ mod tests {
             o.clone().try_downcast::<Primitive>().is_err(),
             "fixture column must stay encoded"
         );
-        StructArray::try_new(["p", "o"].into(), vec![p, o], n as usize, Validity::NonNullable)
-            .unwrap()
+        StructArray::try_new(
+            ["p", "o"].into(),
+            vec![p, o],
+            n as usize,
+            Validity::NonNullable,
+        )
+        .unwrap()
     }
 
     fn eqs(pairs: &[(&'static str, u32)]) -> Vec<(&'static str, Scalar)> {
@@ -344,7 +348,9 @@ mod tests {
         let sa = mixed_struct(1000);
         let eqs = eqs(&[("p", 3), ("o", 10)]);
         let ids = typed_residual_ids(&sa, &RowSelection::All, 1000, &eqs).unwrap();
-        let want: Vec<u64> = (0..1000u64).filter(|i| i % 7 == 3 && i % 11 == 10).collect();
+        let want: Vec<u64> = (0..1000u64)
+            .filter(|i| i % 7 == 3 && i % 11 == 10)
+            .collect();
         assert_eq!(ids.as_slice(), &want[..]);
     }
 
@@ -367,8 +373,8 @@ mod tests {
     #[test]
     fn canonical_u8_column_binds() {
         let kind = Buffer::from_iter((0..100u32).map(|i| (i % 3) as u8)).into_array();
-        let sa = StructArray::try_new(["k"].into(), vec![kind], 100, Validity::NonNullable)
-            .unwrap();
+        let sa =
+            StructArray::try_new(["k"].into(), vec![kind], 100, Validity::NonNullable).unwrap();
         let eqs = vec![("k", Scalar::from(2u8))];
         let ids = typed_residual_ids(&sa, &RowSelection::All, 100, &eqs).unwrap();
         let want: Vec<u64> = (0..100u64).filter(|i| i % 3 == 2).collect();

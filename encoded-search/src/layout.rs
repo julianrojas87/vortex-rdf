@@ -178,8 +178,8 @@ impl SortedColumnChunks {
                 Some(tree) => SerializedArray::from_flatbuffer_and_segment(tree, segment)?,
                 None => SerializedArray::try_from(segment)?,
             };
-            let row_count = usize::try_from(spec.row_count)
-                .vortex_expect("chunk row count must fit in usize");
+            let row_count =
+                usize::try_from(spec.row_count).vortex_expect("chunk row count must fit in usize");
             let array = parts.decode(flat.dtype(), row_count, flat.array_ctx(), session)?;
             let _ = spec.cell.set(array);
         }

@@ -47,7 +47,8 @@ pub(crate) struct NativeStoreFile {
     /// or dtype does not support it), resolved once per open file. The handle
     /// caches fetched chunk arrays internally, so repeated bound-subject
     /// queries probe without further segment reads.
-    s_chunks: std::sync::OnceLock<Option<std::sync::Arc<vortex_encoded_search::SortedColumnChunks>>>,
+    s_chunks:
+        std::sync::OnceLock<Option<std::sync::Arc<vortex_encoded_search::SortedColumnChunks>>>,
 }
 
 /// Entry cap on [`NativeStoreFile::pruning_envelopes`] — sized for a query

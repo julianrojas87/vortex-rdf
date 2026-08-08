@@ -56,8 +56,8 @@ async fn layout_chunks_probe_matches_canonical() {
     let file = session.open_options().open_buffer(bytes).unwrap();
     let root = file.footer().layout().clone();
 
-    let column = SortedColumnChunks::from_struct_layout(&root, "s")
-        .expect("the written shape must resolve");
+    let column =
+        SortedColumnChunks::from_struct_layout(&root, "s").expect("the written shape must resolve");
     assert!(SortedColumnChunks::from_struct_layout(&root, "absent").is_none());
 
     let source = file.segment_source();
@@ -71,7 +71,11 @@ async fn layout_chunks_probe_matches_canonical() {
     let mut needles: Vec<u64> = vec![0, 1, max, max + 1, u64::MAX];
     // Every ~997th distinct value and its neighbors, plus the values at the
     // input-chunk boundaries (where equal runs span chunks).
-    needles.extend((0..max).step_by(997).flat_map(|v| [v.saturating_sub(1), v, v + 1]));
+    needles.extend(
+        (0..max)
+            .step_by(997)
+            .flat_map(|v| [v.saturating_sub(1), v, v + 1]),
+    );
     for boundary in [200_000u64, 400_000] {
         let v = u64::from(data[boundary as usize]);
         needles.extend([v - 1, v, v + 1]);

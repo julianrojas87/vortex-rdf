@@ -113,6 +113,17 @@ impl ServeDecode {
         )
         .map_err(VortexRdfError::Vortex)?
         .into_array();
+        // A small served run over still-encoded component columns reads
+        // faster point-by-point than through the per-column decode pipeline;
+        // wide runs and non-probeable columns keep the vectorized path.
+        let rows = match crate::store::selection::gather_by_point_reads(
+            &rows,
+            &crate::store::selection::RowSelection::Range(0..len as u64),
+            None,
+        )? {
+            Some(canonical) => canonical,
+            None => rows,
+        };
 
         let Some(deleted) = deleted else {
             return Ok(rows);

@@ -543,6 +543,9 @@ async fn test_from_bytes_matches_equal_canonical_across_patterns() {
     }
 
     // The subject run itself: 4 quads per subject by construction.
-    let s_view = lean.match_pattern(Some(&s), None, None, None).await.unwrap();
+    let s_view = lean
+        .match_pattern(Some(&s), None, None, None)
+        .await
+        .unwrap();
     assert_eq!(s_view.size().await.unwrap(), 4);
 }
