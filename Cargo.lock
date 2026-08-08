@@ -3191,6 +3191,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "vortex-encoded-search"
+version = "0.5.0"
+dependencies = [
+ "codspeed-divan-compat",
+ "futures",
+ "vortex-array",
+ "vortex-btrblocks",
+ "vortex-buffer",
+ "vortex-error",
+ "vortex-fastlanes",
+ "vortex-file",
+ "vortex-io",
+ "vortex-layout",
+ "vortex-runend",
+ "vortex-sequence",
+ "vortex-session",
+]
+
+[[package]]
 name = "vortex-error"
 version = "0.83.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

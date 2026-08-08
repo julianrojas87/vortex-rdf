@@ -1,9 +1,9 @@
 [workspace]
 resolver = "2"
-members = ["core", "js", "cli", "python"]
+members = ["core", "encoded-search", "js", "cli", "python"]
 # The python crate is a PyO3 extension module built by maturin; keep it out of
 # the default cargo build/test surface.
-default-members = ["core", "js", "cli"]
+default-members = ["core", "encoded-search", "js", "cli"]
 
 [workspace.package]
 version = "0.5.0"
@@ -19,10 +19,15 @@ categories = ["database-implementations", "encoding", "data-structures"]
 
 [workspace.dependencies]
 vortex-rdf-core = { path = "core", version = "0.5.0" }
+vortex-encoded-search = { path = "encoded-search", version = "0.5.0" }
 vortex = { version = "0.83.0", default-features = false }
 vortex-array = { version = "0.83.0" }
+vortex-btrblocks = "0.83.0"
 vortex-error = "0.83.0"
+vortex-fastlanes = "0.83.0"
 vortex-io = "0.83.0"
+vortex-runend = "0.83.0"
+vortex-sequence = "0.83.0"
 vortex-session = "0.83.0"
 vortex-fsst = "0.83.0"
 vortex-mask = "0.83.0"
