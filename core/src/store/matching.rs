@@ -413,25 +413,58 @@ impl VortexRdfStore {
         else {
             unreachable!("match_base routes only File sources here");
         };
+        // A bound subject on a sorted file resolves to its exact row range
+        // first, by binary-searching the subject column's encoded chunks —
+        // the file mirror of the in-memory subject fast path. Both index
+        // resolvers decline bound-subject patterns, so this takes over an
+        // uncontested route; the subject then leaves the pattern, and the
+        // residual terms ride the narrowed range. Any decline (unsorted
+        // file, string-subject layout, unknown term, unsupported chunk
+        // encoding) leaves the pattern intact for today's scan path.
+        let mut pat = QuadPattern::new(subject, predicate, object, graph);
+        let mut subject_range: Option<std::ops::Range<u64>> = None;
+        if let Some(subj) = pat.subject
+            && file.quads_sorted()
+            && let Ok(Some(probe)) = codes.probe_scalar(TermRef::Subject(subj))
+            && let Ok(needle) = u64::try_from(&probe)
+            && let Some(chunks) = file.sorted_subject_chunks()
+            && let Some(range) = chunks
+                .bounds(needle, &file.segment_source(), file.session())
+                .await
+                .map_err(VortexRdfError::Vortex)?
+        {
+            subject_range = Some(range);
+            pat.subject = None;
+        }
+        // With the subject already resolved to a tiny range, an index
+        // resolution for the residual terms is a pessimization (its pushed
+        // scan costs O(rows matching that component)) — the same routing
+        // rule the in-memory path applies.
+        let worth_indexing = subject_range
+            .as_ref()
+            .is_none_or(|r| (r.end - r.start) as usize >= INDEX_ROUTING_MIN_ROWS);
         // Ask the configured indexes to resolve this pattern to exact
         // row ids — each index owns its own scan over its columns. A
         // resolved component is then left out of the pushed-down filter:
         // the row ids already are exactly its matches, so re-filtering
         // them would only re-read and re-compare that column.
-        let resolution = resolve_indexes_file(
-            &self.indexes,
-            file,
-            &self.layout,
-            QuadPattern::new(subject, predicate, object, graph),
-            codes,
-        )
-        .await?;
+        let resolution = if worth_indexing {
+            resolve_indexes_file(&self.indexes, file, &self.layout, pat, codes).await?
+        } else {
+            IndexResolution::Declined
+        };
         // If the index hands back a serving plan, it is kept only when this
         // match is the view's sole restriction: the plan's filter selects
         // exactly the matched rows over the index's own columns, which no
-        // longer equals the selection once an earlier filter or narrowing
-        // also applies (see `FileServePlan`).
-        let keep_serve = existing_filter.is_none() && existing_selection.is_all();
+        // longer equals the selection once an earlier filter, narrowing, or
+        // subject range also applies (see `FileServePlan`).
+        let keep_serve =
+            existing_filter.is_none() && existing_selection.is_all() && subject_range.is_none();
+        // Fold the subject range into an exact selection, when present.
+        let apply_subject = |selection: RowSelection| match &subject_range {
+            Some(range) => selection.intersect_range(range.clone()),
+            None => selection,
+        };
         let (next_filter, resolved_selection, serve) = match resolution {
             // The probed term is absent — nothing can match. Short-
             // circuit to the empty view (an empty id set would just
@@ -444,7 +477,7 @@ impl VortexRdfStore {
                 resolves,
                 serve,
             } => {
-                let pat = resolves.clear(QuadPattern::new(subject, predicate, object, graph));
+                let pat = resolves.clear(pat);
                 let (s, p, o, g) = (pat.subject, pat.predicate, pat.object, pat.graph);
                 let serve = keep_serve.then_some(serve).flatten();
                 let selection = match row_ids {
@@ -457,20 +490,20 @@ impl VortexRdfStore {
                     // No plan kept (this view was already restricted): the
                     // ids are needed now — run the deferred scan and fold
                     // it exactly as an eager resolution would be.
-                    ResolvedRowIds::Lazy(lazy) => ViewSelection::Exact(
+                    ResolvedRowIds::Lazy(lazy) => ViewSelection::Exact(apply_subject(
                         existing_selection
                             .materialized()
                             .await?
                             .intersect_ids(lazy.materialized().await?),
-                    ),
+                    )),
                     // An index answered with exact ids: fold them into the
                     // selection, which drops it to `Ids` — narrowing
                     // whatever a previous match had established (a range,
                     // or an earlier lookup's ids) without ever setting two
                     // restrictions at once.
-                    ResolvedRowIds::Eager(ids) => ViewSelection::Exact(
+                    ResolvedRowIds::Eager(ids) => ViewSelection::Exact(apply_subject(
                         existing_selection.materialized().await?.intersect_ids(ids),
-                    ),
+                    )),
                 };
                 (
                     file_scan::build_file_filter(s, p, o, g, codes)?,
@@ -478,9 +511,11 @@ impl VortexRdfStore {
                     serve,
                 )
             }
-            // No index applies: the whole pattern becomes the pushed-down filter.
+            // No index applies: the residual pattern (the subject already
+            // resolved to its range, when it was) becomes the pushed-down
+            // filter.
             IndexResolution::Declined => (
-                file_scan::build_file_filter(subject, predicate, object, graph, codes)?,
+                file_scan::build_file_filter(pat.subject, pat.predicate, pat.object, pat.graph, codes)?,
                 None,
                 None,
             ),
@@ -495,19 +530,21 @@ impl VortexRdfStore {
 
         let selection = match resolved_selection {
             Some(selection) => selection,
-            // No index involved: narrow using zone-map statistics
-            // instead. One full-range pruning evaluation on the cached
-            // layout reader replaces any per-split probing. (A chained
-            // match materializes a still-pending selection to fold into —
-            // exactly one of the consumers the deferral is for.)
+            // No index involved: the subject's exact range narrows directly
+            // (a zone envelope could only be wider), else narrow using
+            // zone-map statistics. One full-range pruning evaluation on the
+            // cached layout reader replaces any per-split probing. (A
+            // chained match materializes a still-pending selection to fold
+            // into — exactly one of the consumers the deferral is for.)
             None => {
                 let existing = existing_selection.materialized().await?;
-                ViewSelection::Exact(match &filter {
-                    Some(f) => match file_scan::row_range_from_pruning(file, f).await? {
+                ViewSelection::Exact(match (&subject_range, &filter) {
+                    (Some(_), _) => apply_subject(existing),
+                    (None, Some(f)) => match file_scan::row_range_from_pruning(file, f).await? {
                         Some(range) => existing.intersect_range(range),
                         None => existing,
                     },
-                    None => existing,
+                    (None, None) => existing,
                 })
             }
         };
@@ -670,6 +707,40 @@ impl VortexRdfStore {
             }
             QuadsSource::InMemory { .. } => Ok(None),
         }
+    }
+
+    /// Test-only hook exposing the exact row range the encoded chunk-probe
+    /// fast path computes for a bound subject — `None` when the fast path
+    /// would not engage (unsorted file, unsupported layout, unknown term) —
+    /// so tests can assert engagement instead of inferring it from results.
+    #[cfg(all(test, feature = "file-io"))]
+    pub(crate) async fn debug_subject_bounds_range(
+        &self,
+        subject: &NamedOrBlankNode,
+    ) -> Result<Option<Range<u64>>> {
+        let QuadsSource::File { file, .. } = &self.quads else {
+            return Ok(None);
+        };
+        if !file.quads_sorted() {
+            return Ok(None);
+        }
+        let mut codes = self
+            .layout
+            .prepare_pattern(QuadPattern::new(Some(subject), None, None, None))
+            .await?;
+        let Ok(Some(probe)) = codes.probe_scalar(TermRef::Subject(subject)) else {
+            return Ok(None);
+        };
+        let Ok(needle) = u64::try_from(&probe) else {
+            return Ok(None);
+        };
+        let Some(chunks) = file.sorted_subject_chunks() else {
+            return Ok(None);
+        };
+        chunks
+            .bounds(needle, &file.segment_source(), file.session())
+            .await
+            .map_err(VortexRdfError::Vortex)
     }
 
     /// Whether the store holds a quad equal to `quad` (tombstoned rows count

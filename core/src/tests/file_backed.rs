@@ -271,3 +271,174 @@ async fn test_file_backed_subject_metadata_range_for_missing_subject() {
         0
     );
 }
+
+// ─── Bound-subject chunk-probe fast path ───────────────────────────────
+
+/// Sorted Dictionary quads with 3-quad subject runs — the shape the encoded
+/// chunk-probe fast path serves.
+fn probe_path_quads(n_subjects: usize) -> Vec<Quad> {
+    (0..n_subjects * 3)
+        .map(|i| {
+            make_quad(
+                &format!("http://example.org/s{:04}", i / 3),
+                &format!("http://example.org/p{}", i % 5),
+                &format!("object {}", i % 9),
+                GraphName::DefaultGraph,
+            )
+        })
+        .collect()
+}
+
+fn subject(i: usize) -> NamedOrBlankNode {
+    NamedOrBlankNode::NamedNode(NamedNode::new(format!("http://example.org/s{i:04}")).unwrap())
+}
+
+/// The fast path engages on a sorted Dictionary file — the debug hook
+/// reports the exact run — and every subject-bound shape answers exactly
+/// like the in-memory store over the same quads: first/mid/last subjects,
+/// absent subjects, and [S]/[SP]/[SPO]/[SG] residual composition.
+#[tokio::test]
+async fn test_file_subject_probe_matches_memory() {
+    let quads = probe_path_quads(2000);
+    let (_dir, path) = write_store_file::<SortedInMemoryBuilder>(
+        quads.clone(),
+        LayoutStrategy::Dictionary,
+        vec![IndexType::SecondaryByCopy],
+    )
+    .await;
+    let store = VortexRdfStore::from_file(&path).await.unwrap();
+    let arr = build_array::<SortedInMemoryBuilder>(
+        quad_stream(quads),
+        LayoutStrategy::Dictionary,
+        vec![IndexType::SecondaryByCopy],
+    )
+    .await
+    .unwrap();
+    let memory = VortexRdfStore::from_built(arr).unwrap();
+
+    // Engagement, pinned directly: the exact 3-row run for a mid subject.
+    let mid = subject(777);
+    let range = store.debug_subject_bounds_range(&mid).await.unwrap();
+    assert_eq!(range, Some(777 * 3..777 * 3 + 3), "fast path must engage");
+
+    let p = NamedNode::new("http://example.org/p1").unwrap();
+    let o = Term::Literal(Literal::new_simple_literal("object 3"));
+    let g = GraphName::DefaultGraph;
+    for s in [subject(0), subject(777), subject(1999)] {
+        for (pp, po, pg) in [
+            (None, None, None),
+            (Some(&p), None, None),
+            (Some(&p), Some(&o), None),
+            (None, None, Some(&g)),
+        ] {
+            let got = store.match_pattern(Some(&s), pp, po, pg).await.unwrap();
+            let want = memory.match_pattern(Some(&s), pp, po, pg).await.unwrap();
+            assert_eq!(
+                view_strings(&got).await,
+                view_strings(&want).await,
+                "diverged on subject {s} pattern ({pp:?}, {po:?}, {pg:?})"
+            );
+        }
+    }
+
+    // Absent subject (never in the dictionary) short-circuits to empty.
+    let absent = NamedOrBlankNode::NamedNode(
+        NamedNode::new("http://example.org/zz").unwrap(),
+    );
+    let empty = store
+        .match_pattern(Some(&absent), None, None, None)
+        .await
+        .unwrap();
+    assert_eq!(empty.size().await.unwrap(), 0);
+}
+
+/// Tombstones and tails compose with the probed range: a deleted quad
+/// leaves the run, an added quad joins it through the tail.
+#[tokio::test]
+async fn test_file_subject_probe_with_mutation() {
+    let quads = probe_path_quads(100);
+    let (_dir, path) = write_store_file::<SortedInMemoryBuilder>(
+        quads.clone(),
+        LayoutStrategy::Dictionary,
+        vec![],
+    )
+    .await;
+    let store = VortexRdfStore::from_file(&path).await.unwrap();
+
+    let s50 = subject(50);
+    let doomed = quads[50 * 3].clone();
+    let store = store.delete_quad(&doomed).await.unwrap();
+    let matched = store
+        .match_pattern(Some(&s50), None, None, None)
+        .await
+        .unwrap();
+    assert_eq!(matched.size().await.unwrap(), 2, "tombstone must leave the run");
+
+    let fresh = make_quad(
+        "http://example.org/s0050",
+        "http://example.org/pnew",
+        "fresh",
+        GraphName::DefaultGraph,
+    );
+    let store = store.add_quads([fresh]).await.unwrap();
+    let matched = store
+        .match_pattern(Some(&s50), None, None, None)
+        .await
+        .unwrap();
+    assert_eq!(matched.size().await.unwrap(), 3, "the tail must rejoin the run");
+}
+
+/// A chained match composes: narrowing by predicate first, then by subject,
+/// must equal the in-memory result — and the second match must not attach a
+/// serve plan (the view already carries a restriction).
+#[tokio::test]
+async fn test_file_subject_probe_chained() {
+    let quads = probe_path_quads(500);
+    let (_dir, path) = write_store_file::<SortedInMemoryBuilder>(
+        quads.clone(),
+        LayoutStrategy::Dictionary,
+        vec![IndexType::SecondaryByCopy],
+    )
+    .await;
+    let store = VortexRdfStore::from_file(&path).await.unwrap();
+    let arr = build_array::<SortedInMemoryBuilder>(
+        quad_stream(quads),
+        LayoutStrategy::Dictionary,
+        vec![IndexType::SecondaryByCopy],
+    )
+    .await
+    .unwrap();
+    let memory = VortexRdfStore::from_built(arr).unwrap();
+
+    let p = NamedNode::new("http://example.org/p2").unwrap();
+    let s = subject(444);
+    let got_first = store.match_pattern(None, Some(&p), None, None).await.unwrap();
+    let got = got_first.match_pattern(Some(&s), None, None, None).await.unwrap();
+    assert!(!got.debug_has_serve_plan());
+    let want = memory
+        .match_pattern(None, Some(&p), None, None)
+        .await
+        .unwrap()
+        .match_pattern(Some(&s), None, None, None)
+        .await
+        .unwrap();
+    assert_eq!(view_strings(&got).await, view_strings(&want).await);
+}
+
+/// An unsorted build must NOT engage the fast path — no sortedness, no
+/// binary search — while subject matches stay correct through the scan path.
+#[tokio::test]
+async fn test_file_subject_probe_requires_sorted() {
+    let quads = probe_path_quads(50);
+    let (_dir, path) = write_store_file::<UnsortedStreamBuilder>(
+        quads.clone(),
+        LayoutStrategy::Dictionary,
+        vec![],
+    )
+    .await;
+    let store = VortexRdfStore::from_file(&path).await.unwrap();
+    let s = subject(10);
+    assert_eq!(store.debug_subject_bounds_range(&s).await.unwrap(), None);
+    let matched = store.match_pattern(Some(&s), None, None, None).await.unwrap();
+    assert_eq!(matched.size().await.unwrap(), 3);
+}

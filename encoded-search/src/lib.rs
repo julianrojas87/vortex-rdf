@@ -17,6 +17,11 @@ mod node;
 mod patches;
 mod resolve;
 
+#[cfg(feature = "layout")]
+mod layout;
+#[cfg(feature = "layout")]
+pub use layout::SortedColumnChunks;
+
 use vortex_array::ArrayRef;
 
 /// A resolved, borrowed probe over one encoded (or canonical) array.

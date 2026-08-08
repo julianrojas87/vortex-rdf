@@ -56,7 +56,13 @@ mimalloc = { workspace = true, optional = true }
 default = ["file-io"]
 # No `vortex/zstd`: files must decode on every target, and the wasm reader has
 # no Zstd registered — the compressor never selects it for our columns anyway.
-file-io = ["vortex-io/tokio", "vortex/files", "vortex-file/tokio", "tokio/fs"]
+file-io = [
+    "vortex-io/tokio",
+    "vortex/files",
+    "vortex-file/tokio",
+    "tokio/fs",
+    "vortex-encoded-search/layout",
+]
 # Opt-in: let a binary that depends on this crate have it install mimalloc as
 # the process's global allocator, instead of picking one itself.
 mimalloc = ["dep:mimalloc"]

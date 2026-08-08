@@ -43,6 +43,11 @@ pub(crate) struct NativeStoreFile {
     /// [`PRUNING_MEMO_MAX`].
     pruning_envelopes:
         std::sync::Mutex<std::collections::HashMap<Expression, Option<std::ops::Range<u64>>>>,
+    /// The subject column's chunk-probe handle (`None` when the layout shape
+    /// or dtype does not support it), resolved once per open file. The handle
+    /// caches fetched chunk arrays internally, so repeated bound-subject
+    /// queries probe without further segment reads.
+    s_chunks: std::sync::OnceLock<Option<std::sync::Arc<vortex_encoded_search::SortedColumnChunks>>>,
 }
 
 /// Entry cap on [`NativeStoreFile::pruning_envelopes`] — sized for a query
@@ -80,7 +85,27 @@ impl NativeStoreFile {
             child_readers,
             splits: std::sync::OnceLock::new(),
             pruning_envelopes: std::sync::Mutex::new(std::collections::HashMap::new()),
+            s_chunks: std::sync::OnceLock::new(),
         })
+    }
+
+    /// The subject column's chunk-probe handle, for exact bound-subject row
+    /// ranges via encoded chunk probes. `None` (memoized) when the quad
+    /// child's layout shape declines — callers then keep the scan path.
+    pub(crate) fn sorted_subject_chunks(
+        &self,
+    ) -> Option<std::sync::Arc<vortex_encoded_search::SortedColumnChunks>> {
+        self.s_chunks
+            .get_or_init(|| {
+                let typed = self.file.footer().layout().as_::<RdfStoreLayoutVTable>();
+                let quads = typed.child(0).ok()?;
+                vortex_encoded_search::SortedColumnChunks::from_struct_layout(
+                    &quads,
+                    crate::store::schema::COL_S,
+                )
+                .map(std::sync::Arc::new)
+            })
+            .clone()
     }
 
     /// The quad table's natural splits, memoized. Shadows the inner file's
