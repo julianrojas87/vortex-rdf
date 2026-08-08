@@ -338,5 +338,4 @@ impl VortexRdfStore {
             )
         }))
     }
-
 }
