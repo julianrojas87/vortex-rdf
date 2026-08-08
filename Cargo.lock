@@ -3517,6 +3517,7 @@ dependencies = [
  "vortex",
  "vortex-array",
  "vortex-buffer",
+ "vortex-encoded-search",
  "vortex-error",
  "vortex-file",
  "vortex-fsst",

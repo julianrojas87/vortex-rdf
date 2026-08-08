@@ -142,6 +142,26 @@ lazy_match_bench!(
     Index::ByReference,
     Source::File
 );
+// Lean from_bytes adoption (wire-encoded base, deferred components) on the
+// Dictionary layout: the encoded-probe counterpart of the `_mem` rows.
+lazy_match_bench!(
+    lazy_match_sorted_dict_noindex_bytes,
+    Layout::Dictionary,
+    Index::None,
+    Source::Bytes
+);
+lazy_match_bench!(
+    lazy_match_sorted_dict_byref_bytes,
+    Layout::Dictionary,
+    Index::ByReference,
+    Source::Bytes
+);
+lazy_match_bench!(
+    lazy_match_sorted_dict_bycopy_bytes,
+    Layout::Dictionary,
+    Index::ByCopy,
+    Source::Bytes
+);
 // Secondary by copy.
 lazy_match_bench!(
     lazy_match_sorted_default_bycopy_mem,

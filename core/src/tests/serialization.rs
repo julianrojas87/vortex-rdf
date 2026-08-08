@@ -448,3 +448,87 @@ async fn test_from_parts_adopts_canonical_int_children() {
         "an unsorted build must stay unstamped through adoption"
     );
 }
+
+/// A lean `from_bytes` store — wire-encoded base, deferred components — must
+/// answer every pattern class exactly like the canonical `from_built` store
+/// it was serialized from, with its sorted columns bound by encoded search
+/// probes rather than the generic per-scalar kernel.
+#[tokio::test]
+async fn test_from_bytes_matches_equal_canonical_across_patterns() {
+    // Repeated subjects (4 quads each) over enough rows that the sorted
+    // subject column keeps a compressed wire form worth probing.
+    let quads: Vec<Quad> = (0..20_000)
+        .map(|i| {
+            make_quad(
+                &format!("http://example.org/s{:05}", i / 4),
+                &format!("http://example.org/p{}", i % 7),
+                &format!("object {}", i % 11),
+                GraphName::DefaultGraph,
+            )
+        })
+        .collect();
+    let arr = build_array::<SortedInMemoryBuilder>(
+        quad_stream(quads),
+        LayoutStrategy::Dictionary,
+        vec![IndexType::SecondaryByCopy, IndexType::SecondaryByReference],
+    )
+    .await
+    .unwrap();
+    let canonical = VortexRdfStore::from_built(arr).unwrap();
+    let bytes = canonical.to_bytes().await.unwrap();
+    let lean = VortexRdfStore::from_bytes(&bytes).await.unwrap();
+
+    assert!(canonical.debug_base_probe_resolvable());
+    assert!(
+        lean.debug_base_probe_resolvable(),
+        "the lean base's sorted columns must bind encoded probes"
+    );
+    assert!(
+        !lean.debug_base_int_children_canonical(),
+        "fixture must exercise a wire-encoded base"
+    );
+
+    let s = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/s02500").unwrap());
+    let s_absent = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/zz").unwrap());
+    let p = NamedNode::new("http://example.org/p4").unwrap();
+    let o = Term::Literal(Literal::new_simple_literal("object 7"));
+    let g = GraphName::DefaultGraph;
+
+    type Pattern<'a> = (
+        &'a str,
+        Option<&'a NamedOrBlankNode>,
+        Option<&'a NamedNode>,
+        Option<&'a Term>,
+        Option<&'a GraphName>,
+    );
+    let patterns: [Pattern<'_>; 10] = [
+        ("S", Some(&s), None, None, None),
+        ("S absent", Some(&s_absent), None, None, None),
+        ("P", None, Some(&p), None, None),
+        ("O", None, None, Some(&o), None),
+        ("G", None, None, None, Some(&g)),
+        ("SP", Some(&s), Some(&p), None, None),
+        ("PO", None, Some(&p), Some(&o), None),
+        ("SPO", Some(&s), Some(&p), Some(&o), None),
+        ("SPOG", Some(&s), Some(&p), Some(&o), Some(&g)),
+        ("full", None, None, None, None),
+    ];
+    for (name, ps, pp, po, pg) in patterns {
+        let want = canonical.match_pattern(ps, pp, po, pg).await.unwrap();
+        let got = lean.match_pattern(ps, pp, po, pg).await.unwrap();
+        assert_eq!(
+            got.size().await.unwrap(),
+            want.size().await.unwrap(),
+            "size diverged on [{name}]"
+        );
+        assert_eq!(
+            view_strings(&got).await,
+            view_strings(&want).await,
+            "results diverged on [{name}]"
+        );
+    }
+
+    // The subject run itself: 4 quads per subject by construction.
+    let s_view = lean.match_pattern(Some(&s), None, None, None).await.unwrap();
+    assert_eq!(s_view.size().await.unwrap(), 4);
+}

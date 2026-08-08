@@ -127,6 +127,10 @@ impl Index {
 pub enum Source {
     File,
     InMemory,
+    /// Lean adoption: `from_bytes` over the serialized store, keeping the
+    /// base wire-encoded and the index components deferred — the shape js
+    /// `fromBytes` and python `from_bytes` hand out.
+    Bytes,
 }
 
 impl Source {
@@ -134,6 +138,7 @@ impl Source {
         match self {
             Self::File => "file",
             Self::InMemory => "in_memory",
+            Self::Bytes => "from_bytes",
         }
     }
 }
@@ -259,6 +264,15 @@ pub fn make_store(
             })
         }
         Source::InMemory => cached_store(builder, layout, index, size),
+        Source::Bytes => {
+            let path = cached_file(builder, layout, index, size);
+            let bytes = std::fs::read(path).expect("read serialized store");
+            rt().block_on(async {
+                VortexRdfStore::from_bytes_owned(bytes)
+                    .await
+                    .expect("adopt bytes store")
+            })
+        }
     }
 }
 

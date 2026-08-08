@@ -188,6 +188,24 @@ impl VortexRdfStore {
         Some(debug_int_children_canonical(rows))
     }
 
+    /// Test-only hook: whether every sorted-stamped child of an in-memory
+    /// base resolves an encoded search probe (see
+    /// [`debug_sorted_children_probe_resolvable`]) — true for canonical and
+    /// wire-encoded adoptions alike, false only when a bounds search on some
+    /// child would fall through to the generic kernel. Vacuously true for a
+    /// file-backed store.
+    #[cfg(all(test, feature = "file-io"))]
+    pub(crate) fn debug_base_probe_resolvable(&self) -> bool {
+        use vortex_array::arrays::Struct;
+        let QuadsSource::InMemory { base, .. } = &self.quads else {
+            return true;
+        };
+        let Ok(struct_arr) = base.clone().try_downcast::<Struct>() else {
+            return false;
+        };
+        debug_sorted_children_probe_resolvable(&struct_arr)
+    }
+
     /// Test-only hook: whether an in-memory base's `s` column carries the
     /// sorted stamp, so tests can assert the stamp survives adoption instead
     /// of only observing (order-insensitive) match results.
@@ -530,6 +548,23 @@ fn debug_int_children_canonical(struct_arr: &StructArray) -> bool {
         };
         let int = child.dtype().is_int() && !child.dtype().is_nullable();
         !int || child.clone().try_downcast::<Primitive>().is_ok()
+    })
+}
+
+/// Whether every sorted-stamped child of `struct_arr` binds an encoded
+/// search probe — the property that keeps every bounds search off the
+/// generic per-scalar kernel, whether the child is canonical or
+/// wire-encoded. Unsorted children never take bounds searches, and their
+/// equality path has the mask scan behind it, so they are not constrained.
+#[cfg(all(test, feature = "file-io"))]
+fn debug_sorted_children_probe_resolvable(struct_arr: &StructArray) -> bool {
+    use vortex_array::arrays::struct_::StructArrayExt;
+    struct_arr.names().iter().all(|name| {
+        let Ok(child) = struct_arr.unmasked_field_by_name(name.as_ref()) else {
+            return false;
+        };
+        !array::column_is_sorted(child)
+            || vortex_encoded_search::SortedProbe::resolve(child).is_some()
     })
 }
 

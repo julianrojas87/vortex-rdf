@@ -112,6 +112,17 @@ pub(crate) fn search_sorted_bounds(
         return Ok((lo, hi));
     }
 
+    // Encoded fast path: probe the compressed representation directly. Covers
+    // wire-encoded columns (`from_bytes` adoption, sliced index runs) without
+    // decoding them; declines fall through to the generic kernel.
+    if arr.dtype().is_unsigned_int()
+        && !arr.dtype().is_nullable()
+        && let Ok(needle) = u64::try_from(probe)
+        && let Some(encoded) = vortex_encoded_search::SortedProbe::resolve(arr)
+    {
+        return Ok(encoded.bounds(needle));
+    }
+
     let index_of = |result: SearchResult| match result {
         SearchResult::Found(i) | SearchResult::NotFound(i) => i,
     };
