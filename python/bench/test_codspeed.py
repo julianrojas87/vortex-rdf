@@ -22,8 +22,7 @@ Where the two suites cannot correspond:
   makes it the analogue of the JS suite's `build::fromString_nquads` as much as
   of its `fromQuads` variants, and the two are not comparable in absolute
   terms — only against themselves over time.
-* `match_columns` and `match_compact` are Python-only read paths and have no
-  JavaScript row.
+* `match_columns` is a Python-only read path and has no JavaScript row.
 
 Run locally (after `maturin develop`):
     uv run pytest bench/test_codspeed.py --codspeed
@@ -199,14 +198,14 @@ def test_query_quads(benchmark, stores, variant, pattern):
 
 
 @pytest.mark.benchmark
-@pytest.mark.parametrize("op", ["get_quads", "match_codes", "match_columns", "match_compact"])
+@pytest.mark.parametrize("op", ["get_quads", "match_codes", "match_columns"])
 def test_readpath(benchmark, stores, op):
     """The read entry points on the unindexed store for one selective pattern
     (S), isolating the boundary cost each carries.
 
     `match_codes` is the lazy one — u32 columns, no term strings — so it is the
-    Python analogue of the JS suite's `readpath::matchCodes`. The other three
-    all materialize terms, which in JS is `readpath::getQuads_decoded`; the
+    Python analogue of the JS suite's `readpath::matchCodes`. The other two
+    materialize terms, which in JS is `readpath::getQuads_decoded`; the
     bindings have no lazy quad object, so there is no undecoded `get_quads`.
     """
     store = stores["triples::unsorted_dict"]

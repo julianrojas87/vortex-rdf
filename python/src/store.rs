@@ -1,18 +1,11 @@
-use std::collections::HashMap;
-use std::collections::hash_map::Entry;
-
 use pyo3::exceptions::{PyFileNotFoundError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyString};
 use vortex_rdf_core::common::terms::{Pattern, parse_pattern_checked};
-use vortex_rdf_core::{DictSnapshot, VortexRdfError, VortexRdfStore as CoreStore};
+use vortex_rdf_core::{VortexRdfError, VortexRdfStore as CoreStore};
 
 use crate::codes::{TermDict, U32Column};
 use crate::{RUNTIME, parse_err, store_err};
-
-/// `(term_table, rows)` as returned by [`VortexRdfStore::match_compact`]:
-/// distinct N-Triples terms, plus `(s, p, o, g)` indices into them per row.
-type CompactQuads = (Vec<String>, Vec<(u32, u32, u32, u32)>);
 
 /// `(s, p, o, g)` code columns as returned by [`VortexRdfStore::match_codes`].
 type CodeColumns = (U32Column, U32Column, U32Column, U32Column);
@@ -61,51 +54,6 @@ fn resolve_columns(columns: [Vec<Option<Py<PyString>>>; 4]) -> PyResult<[Vec<Py<
     Ok(out)
 }
 
-/// Build the compact form directly from term-code columns.
-///
-/// The codes are the dedupe key, so distinct terms are found by hashing `u32`s
-/// rather than decoded strings, and each distinct code is decompressed exactly
-/// once. The dictionary is shared across all four positions, so one table
-/// covers the whole result.
-fn compact_from_codes(
-    py: Python<'_>,
-    snapshot: &DictSnapshot,
-    columns: [&[u32]; 4],
-) -> PyResult<CompactQuads> {
-    let rows = columns[0].len();
-    if columns.iter().any(|c| c.len() != rows) {
-        return Err(PyValueError::new_err(format!(
-            "matched code columns have unequal lengths: {:?}",
-            columns.map(<[u32]>::len)
-        )));
-    }
-    py.detach(|| -> Result<_, u32> {
-        let mut ids: HashMap<u32, u32> = HashMap::new();
-        let mut table: Vec<String> = Vec::new();
-        let mut out = Vec::with_capacity(rows);
-        for row in 0..rows {
-            let mut index = [0u32; 4];
-            for (position, column) in columns.iter().enumerate() {
-                let code = column[row];
-                index[position] = match ids.get(&code) {
-                    Some(&id) => id,
-                    None => {
-                        let id = table.len() as u32;
-                        table.push(snapshot.decode(code).ok_or(code)?);
-                        ids.insert(code, id);
-                        id
-                    }
-                };
-            }
-            out.push((index[0], index[1], index[2], index[3]));
-        }
-        Ok((table, out))
-    })
-    .map_err(|code| {
-        PyValueError::new_err(format!("term code {code} is not in the store dictionary"))
-    })
-}
-
 /// A read-only Vortex-RDF store opened from a `.vortex` file.
 ///
 /// The file is opened lazily: constructing the object reads only the file
@@ -118,21 +66,6 @@ pub struct VortexRdfStore {
     store: CoreStore,
     /// `None` for stores opened from bytes rather than a file.
     path: Option<String>,
-}
-
-/// Interns `term`, storing each distinct term exactly once (as the map key —
-/// no cloned side table). Ids are assigned in first-appearance order;
-/// [`VortexRdfStore::match_compact`] rebuilds the id-ordered term table by
-/// moving the keys out of the map after the match loop.
-fn intern(ids: &mut HashMap<String, u32>, term: String) -> u32 {
-    let next = ids.len() as u32;
-    match ids.entry(term) {
-        Entry::Occupied(e) => *e.get(),
-        Entry::Vacant(e) => {
-            e.insert(next);
-            next
-        }
-    }
 }
 
 impl VortexRdfStore {
@@ -369,7 +302,8 @@ impl VortexRdfStore {
     /// Match a pattern and return the rows as four zero-copy `u32` term-code
     /// columns `(s, p, o, g)` decodable through [`Self::term_dict`], or
     /// `None` when the code path does not apply (see `term_dict`). Callers
-    /// fall back to [`Self::match_compact`].
+    /// fall back to [`Self::get_quads`] or [`Self::match_columns`], which
+    /// resolve terms on every layout.
     #[pyo3(signature = (s=None, p=None, o=None, g=None))]
     fn match_codes(
         &self,
@@ -405,78 +339,4 @@ impl VortexRdfStore {
         }))
     }
 
-    /// Match a pattern and return `(term_table, rows)`: a de-duplicated list of
-    /// N-Triples term strings plus `(s, p, o, g)` indices into it per row. The
-    /// caller turns each distinct term into its own representation once instead
-    /// of once per occurrence — the shape to reach for when constructing that
-    /// representation costs more than indexing into a table.
-    ///
-    /// Served from the term-code columns when the store supports them: the
-    /// codes are already the dedupe key, so no string is hashed and each
-    /// distinct term is decompressed once. Otherwise the matched quads are
-    /// re-serialized and de-duplicated by value.
-    #[pyo3(signature = (s=None, p=None, o=None, g=None))]
-    fn match_compact(
-        &self,
-        py: Python<'_>,
-        s: Option<&str>,
-        p: Option<&str>,
-        o: Option<&str>,
-        g: Option<&str>,
-    ) -> PyResult<CompactQuads> {
-        let pattern = parse_pattern_checked(s, p, o, g).map_err(parse_err)?;
-
-        if let Some(snapshot) = self.store.code_read_snapshot() {
-            let columns = py
-                .detach(|| -> Result<_, VortexRdfError> {
-                    RUNTIME.block_on(async {
-                        let (s, p, o, g) = &pattern;
-                        self.store
-                            .match_pattern(s.as_ref(), p.as_ref(), o.as_ref(), g.as_ref())
-                            .await?
-                            .code_columns_gathered()
-                            .await
-                    })
-                })
-                .map_err(store_err)?;
-            if let Some(codes) = columns {
-                let slices = [
-                    codes[0].as_slice(),
-                    codes[1].as_slice(),
-                    codes[2].as_slice(),
-                    codes[3].as_slice(),
-                ];
-                return compact_from_codes(py, &snapshot, slices);
-            }
-        }
-
-        py.detach(|| -> Result<_, VortexRdfError> {
-            let quads = RUNTIME.block_on(self.matched_quads(&pattern))?;
-            let mut ids = HashMap::new();
-            let mut rows = Vec::with_capacity(quads.len());
-            for q in quads {
-                // The default graph is the empty string here as everywhere
-                // else, so a term table entry can be fed back as a pattern.
-                let graph = match &q.graph_name {
-                    oxrdf::GraphName::DefaultGraph => String::new(),
-                    named => named.to_string(),
-                };
-                rows.push((
-                    intern(&mut ids, q.subject.to_string()),
-                    intern(&mut ids, q.predicate.to_string()),
-                    intern(&mut ids, q.object.to_string()),
-                    intern(&mut ids, graph),
-                ));
-            }
-            // Move the interned terms out of the map into id order (the
-            // placeholder Strings do not allocate): each distinct term is
-            // allocated once for the whole call.
-            let mut table = vec![String::new(); ids.len()];
-            for (term, id) in ids {
-                table[id as usize] = term;
-            }
-            Ok((table, rows))
-        })
-        .map_err(store_err)
-    }
 }

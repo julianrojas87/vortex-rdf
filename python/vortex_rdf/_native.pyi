@@ -70,17 +70,6 @@ class VortexRdfStore:
     ) -> Tuple[List[str], List[str], List[str], List[str]]:
         """The same rows as `get_quads`, as four parallel columns."""
         ...
-    def match_compact(
-        self,
-        s: Optional[str] = None,
-        p: Optional[str] = None,
-        o: Optional[str] = None,
-        g: Optional[str] = None,
-    ) -> Tuple[List[str], List[Tuple[int, int, int, int]]]:
-        """A de-duplicated term table plus (s, p, o, g) indices into it per
-        row, so each distinct term is converted once rather than per
-        occurrence."""
-        ...
 
 def serialize_rdf(
     input_path: StrPath,

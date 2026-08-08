@@ -14,6 +14,9 @@ in Rust, pyoxigraph yields Quad objects, rdflib yields term objects, and
 pycottas/lightrdf yield tuples of strings. Each pays for its own natural
 result form, the same contract the JavaScript tab's `countMatch` uses.
 
+That contract cuts against Vortex on triple patterns: its result is a quad, so
+it materializes a graph term per row that rdflib, lightrdf and pycottas do not.
+
 TERM SPELLING. The canonical form throughout the harness is N-Triples
 (`<iri>`, `"literal"`) -- what `datasets.py` writes and what the generated file
 contains. Adapters convert inward. Vortex and lightrdf accept that form
@@ -168,6 +171,9 @@ class VortexAdapter(Adapter):
         return native.VortexRdfStore(artifact, in_memory=self.in_memory)
 
     def count(self, handle: Any, pat: Pat) -> int:
+        # `get_quads` is the idiomatic read, and it materializes four terms per
+        # row. On a triple pattern the libraries whose result is a triple build
+        # three, so Vortex is doing strictly more work per row here, not less.
         return len(handle.get_quads(pat.s, pat.p, pat.o, pat.g))
 
 

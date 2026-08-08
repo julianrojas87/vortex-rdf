@@ -44,20 +44,13 @@ def test_get_quads_patterns(vortex_files, layout):
     assert store.get_quads(s="<http://ex.org/nobody>") == []
 
 
-@pytest.mark.parametrize("layout", LAYOUTS)
-def test_match_compact_indices_are_consistent(vortex_files, layout):
-    store = VortexRdfStore(str(vortex_files[layout]))
-    table, rows = store.match_compact(p=NAME)
-    assert len(rows) == 3
-    # Every index points into the table, and the table is de-duplicated.
-    assert all(i < len(table) for row in rows for i in row)
-    assert len(set(table)) == len(table)
-    # Reconstructed quads equal the plain form, graph included.
-    reconstructed = sorted((table[s], table[p], table[o], table[g]) for s, p, o, g in rows)
-    assert reconstructed == sorted(store.get_quads(p=NAME))
+def test_code_path_matches_decoded_rows(vortex_files):
+    """Decoding the code columns position by position reproduces `get_quads`.
 
-
-def test_code_path_matches_compact_path(vortex_files):
+    `get_quads` assembles its rows from those same columns, so this pins the
+    decode-and-zip assembly: columns swapped or misaligned would still yield
+    plausible-looking rows of real terms.
+    """
     store = VortexRdfStore(str(vortex_files["dictionary"]))
     dictionary = store.term_dict()
     assert dictionary is not None and len(dictionary) > 0
@@ -65,14 +58,11 @@ def test_code_path_matches_compact_path(vortex_files):
     for pattern in ({}, {"p": NAME}, {"s": "<http://ex.org/bob>"}, {"o": '"Bob"@en'}):
         cols = store.match_codes(**pattern)
         assert cols is not None
-        views = [memoryview(c).cast("I").tolist() for c in cols[:3]]
+        views = [memoryview(c).cast("I").tolist() for c in cols]
         from_codes = sorted(
-            (dictionary.decode(s), dictionary.decode(p), dictionary.decode(o))
-            for s, p, o in zip(*views)
+            tuple(dictionary.decode(code) for code in row) for row in zip(*views)
         )
-        table, rows = store.match_compact(**pattern)
-        from_compact = sorted((table[s], table[p], table[o]) for s, p, o, _ in rows)
-        assert from_codes == from_compact
+        assert from_codes == sorted(store.get_quads(**pattern))
 
 
 def test_code_path_unavailable_on_other_layouts(vortex_files):
@@ -248,45 +238,3 @@ def test_get_quads_carries_named_graphs(tmp_path):
         for graph in graphs:
             selected = store.get_quads(g=graph)
             assert len(selected) == 1 and selected[0][3] == graph, (layout, graph)
-
-
-def test_match_compact_agrees_across_layouts(vortex_files):
-    """The code path and the re-serializing path produce the same compact form.
-
-    A Dictionary store de-duplicates by term code and never reaches the
-    by-value path, so only a cross-layout comparison exercises both. Table
-    order is an implementation detail — the reconstructed rows are what must
-    match.
-    """
-    fallback = VortexRdfStore(str(vortex_files["default"]))
-    codes = VortexRdfStore(str(vortex_files["dictionary"]))
-    assert codes.match_codes() is not None and fallback.match_codes() is None
-
-    for pattern in ({}, {"p": NAME}, {"o": '"Bob"@en'}):
-        rebuilt = []
-        for store in (fallback, codes):
-            table, rows = store.match_compact(**pattern)
-            assert len(set(table)) == len(table), "term table is not de-duplicated"
-            assert all(i < len(table) for row in rows for i in row)
-            rebuilt.append(sorted((table[s], table[p], table[o], table[g]) for s, p, o, g in rows))
-        assert rebuilt[0] == rebuilt[1], f"paths disagree for {pattern}"
-        assert rebuilt[0] == sorted(codes.get_quads(**pattern))
-
-
-def test_match_compact_carries_named_graphs(tmp_path):
-    """The graph is a table entry like any other term, and the default graph is
-    the empty string — so a compact row round-trips to the same quad."""
-    source = tmp_path / "quads.nq"
-    source.write_text(
-        '<http://ex.org/s1> <http://ex.org/p> <http://ex.org/o1> <http://ex.org/g1> .\n'
-        '<http://ex.org/s2> <http://ex.org/p> <http://ex.org/o2> <http://ex.org/g2> .\n'
-        '<http://ex.org/s3> <http://ex.org/p> <http://ex.org/o3> .\n',
-        encoding="utf-8",
-    )
-    for layout in LAYOUTS:
-        out = tmp_path / f"quads-{layout}.vortex"
-        serialize_rdf(str(source), str(out), layout=layout)
-        store = VortexRdfStore(str(out))
-        table, rows = store.match_compact()
-        graphs = sorted(table[g] for *_, g in rows)
-        assert graphs == ["", "<http://ex.org/g1>", "<http://ex.org/g2>"], layout
