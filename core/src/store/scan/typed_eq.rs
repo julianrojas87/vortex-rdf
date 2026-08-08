@@ -5,12 +5,11 @@
 //! TypedObject / tail string columns. Anything else declines, and the caller
 //! falls back to the general mask-scan pipeline.
 
+use vortex_array::ArrayRef;
 use vortex_array::arrays::struct_::StructArrayExt;
 use vortex_array::arrays::{Primitive, PrimitiveArray, StructArray, VarBinView, VarBinViewArray};
 use vortex_array::scalar::Scalar;
-use vortex_array::{ArrayRef, VortexSessionExecute};
 
-use crate::session::VORTEX_SESSION;
 use crate::store::selection::RowSelection;
 
 /// A residual equality constraint's probe value, extracted from its `Scalar`
@@ -78,11 +77,13 @@ impl StrEq<'_> {
 }
 
 impl<'a> TypedEq<'a> {
-    fn bind_col(
-        col: &ArrayRef,
-        needle: &'a Needle,
-        ctx: &mut vortex_array::ExecutionCtx,
-    ) -> Option<TypedEq<'a>> {
+    /// Bind one constraint to its column, or decline. Only a column already
+    /// in canonical form qualifies: these paths run per match call, so
+    /// decoding an encoded column here would cost O(column) every call — a
+    /// resident store canonicalizes its integer children once at adoption
+    /// (`array::with_canonical_int_children`), and the mask scan covers
+    /// encoded columns at selection cost.
+    fn bind_col(col: &ArrayRef, needle: &'a Needle) -> Option<TypedEq<'a>> {
         use vortex_array::dtype::DType;
         if col.dtype().is_nullable() {
             return None;
@@ -92,15 +93,7 @@ impl<'a> TypedEq<'a> {
                 if !col.dtype().is_unsigned_int() {
                     return None;
                 }
-                // A struct canonicalization does not recurse into its children,
-                // so a code column stored under a compression (BtrBlocks) is not
-                // a bare `Primitive` yet. Try the cheap downcast first — the
-                // Dictionary layout's codes are already canonical, the hot case —
-                // and only pay a one-off `execute` to decode an encoded column.
-                let prim = match col.clone().try_downcast::<Primitive>() {
-                    Ok(p) => p,
-                    Err(_) => col.clone().execute::<PrimitiveArray>(ctx).ok()?,
-                };
+                let prim = col.clone().try_downcast::<Primitive>().ok()?;
                 if prim.ptype() != vortex_array::dtype::PType::U32 {
                     return None;
                 }
@@ -110,19 +103,7 @@ impl<'a> TypedEq<'a> {
                 if !matches!(col.dtype(), DType::Utf8(_)) {
                     return None;
                 }
-                // Same as the code arm: the Default / TypedObject layouts hold
-                // their string columns BtrBlocks-encoded, so the direct downcast
-                // fails and they used to fall to the general mask-scan pipeline (a
-                // per-column `compare_views_constant` over the whole array, then a
-                // boolean AND — no per-row short-circuit). Decoding once to
-                // canonical views here lets `StrEq` run the length-first,
-                // conjunction-short-circuiting loop instead. Only reached with ≥2
-                // constraints (see `typed_residual_ids`), where
-                // the short-circuit repays the decode.
-                let arr = match col.clone().try_downcast::<VarBinView>() {
-                    Ok(a) => a,
-                    Err(_) => col.clone().execute::<VarBinViewArray>(ctx).ok()?,
-                };
+                let arr = col.clone().try_downcast::<VarBinView>().ok()?;
                 Some(TypedEq::Str(StrEq {
                     arr,
                     needle: s.as_bytes(),
@@ -136,12 +117,11 @@ impl<'a> TypedEq<'a> {
         struct_arr: &StructArray,
         eqs: &[(&'static str, Scalar)],
         needles: &'a [Needle],
-        ctx: &mut vortex_array::ExecutionCtx,
     ) -> Option<Vec<TypedEq<'a>>> {
         let mut cols = Vec::with_capacity(eqs.len());
         for ((field, _), needle) in eqs.iter().zip(needles) {
             let col = struct_arr.unmasked_field_by_name(field).ok()?;
-            cols.push(TypedEq::bind_col(col, needle, ctx)?);
+            cols.push(TypedEq::bind_col(col, needle)?);
         }
         Some(cols)
     }
@@ -223,8 +203,7 @@ pub(crate) fn typed_residual_ids(
         return None;
     }
     let needles = Needle::extract(eqs)?;
-    let mut ctx = VORTEX_SESSION.create_execution_ctx();
-    let cols = TypedEq::bind(struct_arr, eqs, &needles, &mut ctx)?;
+    let cols = TypedEq::bind(struct_arr, eqs, &needles)?;
     fn collect_ids(
         selection: &RowSelection,
         base_len: usize,
@@ -269,16 +248,14 @@ pub(crate) fn typed_positions(
         return None;
     }
     let needles = Needle::extract(eqs)?;
-    let mut ctx = VORTEX_SESSION.create_execution_ctx();
     fn positions_of(
         sa: &StructArray,
         eqs: &[(&'static str, Scalar)],
         needles: &[Needle],
         offset: usize,
         out: &mut Vec<usize>,
-        ctx: &mut vortex_array::ExecutionCtx,
     ) -> Option<()> {
-        let cols = TypedEq::bind(sa, eqs, needles, ctx)?;
+        let cols = TypedEq::bind(sa, eqs, needles)?;
         if let Some(codes) = TypedEq::code_views(&cols) {
             out.extend(
                 (0..sa.len())
@@ -296,14 +273,14 @@ pub(crate) fn typed_positions(
     }
     let mut out = Vec::new();
     if let Ok(sa) = applied.clone().try_downcast::<Struct>() {
-        positions_of(&sa, eqs, &needles, 0, &mut out, &mut ctx)?;
+        positions_of(&sa, eqs, &needles, 0, &mut out)?;
         return Some(out);
     }
     if let Ok(ch) = applied.clone().try_downcast::<Chunked>() {
         let mut offset = 0usize;
         for chunk in ch.chunks() {
             let sa = chunk.try_downcast::<Struct>().ok()?;
-            positions_of(&sa, eqs, &needles, offset, &mut out, &mut ctx)?;
+            positions_of(&sa, eqs, &needles, offset, &mut out)?;
             offset += sa.len();
         }
         return Some(out);

@@ -124,6 +124,71 @@ pub(crate) fn search_sorted_bounds(
     Ok((index_of(lo), index_of(hi)))
 }
 
+/// Decode a base struct's integer children (the Dictionary layout's term
+/// codes, TypedObject's kind column) to canonical primitives, keeping each
+/// child's `IsSorted` stamp across the re-encoding.
+///
+/// The per-row match fast paths — [`search_sorted_bounds`]' `partition_point`
+/// probe and the typed residual loops — read canonical primitives directly
+/// and decline encoded columns, so an adopted base that keeps its wire
+/// encoding pays a per-call fallback on every match. Decoding once here makes
+/// those paths engage for the store's lifetime. String children keep their
+/// encoded form: their canonical `VarBinView` costs real memory, and the mask
+/// scan handles them at selection cost. Serialization re-compresses every
+/// child through the default write strategy, so the wire format is unaffected.
+///
+/// A nullable struct passes through untouched — the base schema is
+/// non-nullable, and rebuilding a struct with validity is not this helper's
+/// business.
+pub(crate) fn with_canonical_int_children(rows: ArrayRef) -> Result<ArrayRef> {
+    use vortex_array::arrays::struct_::StructArrayExt;
+    use vortex_array::arrays::{Primitive, PrimitiveArray, StructArray};
+    use vortex_array::validity::Validity;
+
+    if rows.dtype().is_nullable() {
+        return Ok(rows);
+    }
+    let mut ctx = VORTEX_SESSION.create_execution_ctx();
+    let struct_arr = rows
+        .execute::<StructArray>(&mut ctx)
+        .map_err(VortexRdfError::Vortex)?;
+    let names = struct_arr.names().clone();
+    let mut children = Vec::with_capacity(names.len());
+    let mut changed = false;
+    for name in names.iter() {
+        let child = struct_arr
+            .unmasked_field_by_name(name.as_ref())
+            .map_err(VortexRdfError::Vortex)?;
+        let decode = child.dtype().is_int()
+            && !child.dtype().is_nullable()
+            && child.clone().try_downcast::<Primitive>().is_err();
+        if !decode {
+            children.push(child.clone());
+            continue;
+        }
+        let sorted = column_is_sorted(child);
+        let canonical = child
+            .clone()
+            .execute::<PrimitiveArray>(&mut ctx)
+            .map_err(VortexRdfError::Vortex)?
+            .into_array();
+        if sorted {
+            stamp_is_sorted(&canonical);
+        }
+        children.push(canonical);
+        changed = true;
+    }
+    if !changed {
+        return Ok(struct_arr.into_array());
+    }
+    let len = struct_arr.len();
+    Ok(
+        StructArray::try_new(names, children, len, Validity::NonNullable)
+            .map_err(VortexRdfError::Vortex)?
+            .into_array(),
+    )
+}
+
 /// Convert a boolean ArrayRef into a `vortex_mask::Mask` for use with `ArrayRef::filter`.
 pub(crate) fn bool_array_to_mask(arr: ArrayRef) -> Result<Mask> {
     // Canonicalize to a concrete boolean array, then reinterpret its packed

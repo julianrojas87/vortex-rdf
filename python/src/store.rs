@@ -142,9 +142,9 @@ impl VortexRdfStore {
 impl VortexRdfStore {
     /// Open `path`. By default the store stays file-backed and lazy (only the
     /// footer is read up front). `in_memory=True` loads the whole store into
-    /// memory instead — every subsequent match skips the per-call file-scan
-    /// pipeline, which is worth ~1 ms per `triples()` call and decides join
-    /// performance under rdflib's per-binding probing. `max_resident_bytes`
+    /// memory instead, decoding its term-code columns to their canonical
+    /// resident form — every subsequent match skips the per-call file-scan
+    /// pipeline and binds the columns directly. `max_resident_bytes`
     /// overrides the Dictionary layout's term-dictionary residency budget
     /// (the dictionary child's compressed size in bytes).
     #[new]

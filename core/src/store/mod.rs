@@ -136,9 +136,51 @@ impl VortexRdfStore {
     /// Dictionary-layout quad array must arrive with its dictionary beside
     /// it: dict-less Dictionary parts are refused (bare code columns carry no
     /// way back to their terms).
+    ///
+    /// This is the bindings' explicit resident adoption, so the base's
+    /// integer children are decoded to canonical primitives here — a
+    /// serialized store's rows arrive wire-encoded, and canonical columns are
+    /// what the match fast paths read (see
+    /// [`with_canonical_int_children`](array::with_canonical_int_children)).
     pub fn from_parts(parts: StoreParts) -> Result<Self> {
         let layout = resolved_layout(parts.dict, parts.array.dtype())?;
-        Self::from_parts_internal(parts.array, parts.components, layout)
+        let base = array::with_canonical_int_children(parts.array)?;
+        Self::from_parts_internal(base, parts.components, layout)
+    }
+
+    /// Test-only hook: whether every non-nullable integer child of an
+    /// in-memory base is a canonical primitive — the property
+    /// [`array::with_canonical_int_children`] establishes and the match fast
+    /// paths bind against. Vacuously true for a file-backed store, whose base
+    /// is not held in memory at all.
+    #[cfg(all(test, feature = "file-io"))]
+    pub(crate) fn debug_base_int_children_canonical(&self) -> bool {
+        use vortex_array::arrays::struct_::StructArrayExt;
+        use vortex_array::arrays::{Primitive, Struct};
+        let QuadsSource::InMemory { base, .. } = &self.quads else {
+            return true;
+        };
+        let Ok(struct_arr) = base.clone().try_downcast::<Struct>() else {
+            return false;
+        };
+        struct_arr.names().iter().all(|name| {
+            let Ok(child) = struct_arr.unmasked_field_by_name(name.as_ref()) else {
+                return false;
+            };
+            let int = child.dtype().is_int() && !child.dtype().is_nullable();
+            !int || child.clone().try_downcast::<Primitive>().is_ok()
+        })
+    }
+
+    /// Test-only hook: whether an in-memory base's `s` column carries the
+    /// sorted stamp, so tests can assert the stamp survives adoption instead
+    /// of only observing (order-insensitive) match results.
+    #[cfg(all(test, feature = "file-io"))]
+    pub(crate) fn debug_base_subject_sorted(&self) -> bool {
+        match &self.quads {
+            QuadsSource::InMemory { base, .. } => Self::base_subject_sorted(base),
+            QuadsSource::File { .. } => false,
+        }
     }
 
     /// Build from a builder's output: the quad array plus whatever the

@@ -368,3 +368,76 @@ async fn test_from_bytes_defers_index_child_materialization() {
         "serialization output must not depend on the deferral state"
     );
 }
+
+/// `from_parts` decodes a wire-encoded base's integer children to canonical
+/// primitives — the form the match fast paths bind against — while carrying
+/// the subject sortedness provenance honestly in both directions: a sorted
+/// build's stamp survives the re-encoding, an unsorted build gains none.
+#[tokio::test]
+async fn test_from_parts_adopts_canonical_int_children() {
+    let quads = modular_quads(12, 3, 4);
+
+    // Sorted Dictionary build: code columns arrive wire-encoded after a
+    // bytes round-trip, and the s column carries the sorted stamp.
+    let arr = build_array::<SortedInMemoryBuilder>(
+        quad_stream(quads.clone()),
+        LayoutStrategy::Dictionary,
+        vec![IndexType::SecondaryByCopy],
+    )
+    .await
+    .unwrap();
+    let bytes = VortexRdfStore::from_built(arr)
+        .unwrap()
+        .to_bytes()
+        .await
+        .unwrap();
+    let adopted = VortexRdfStore::from_bytes(&bytes).await.unwrap();
+    let parts = adopted.to_serializable_parts().await.unwrap();
+    let store = VortexRdfStore::from_parts(parts).unwrap();
+    assert!(
+        store.debug_base_int_children_canonical(),
+        "from_parts must decode integer children to canonical primitives"
+    );
+    assert!(
+        store.debug_base_subject_sorted(),
+        "the sorted build's subject stamp must survive the re-encoding"
+    );
+
+    // The canonical base answers a fully-bound pattern: s01 p1 "object 1"
+    // is row 1 exactly.
+    let s = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/s01").unwrap());
+    let p = NamedNode::new("http://example.org/p1").unwrap();
+    let o = Term::Literal(Literal::new_simple_literal("object 1"));
+    assert_eq!(
+        store
+            .match_pattern(Some(&s), Some(&p), Some(&o), None)
+            .await
+            .unwrap()
+            .size()
+            .await
+            .unwrap(),
+        1
+    );
+
+    // Unsorted build: adoption must not invent a stamp the rows never earned.
+    let arr = build_array::<UnsortedStreamBuilder>(
+        quad_stream(quads),
+        LayoutStrategy::Dictionary,
+        vec![],
+    )
+    .await
+    .unwrap();
+    let bytes = VortexRdfStore::from_built(arr)
+        .unwrap()
+        .to_bytes()
+        .await
+        .unwrap();
+    let adopted = VortexRdfStore::from_bytes(&bytes).await.unwrap();
+    let parts = adopted.to_serializable_parts().await.unwrap();
+    let store = VortexRdfStore::from_parts(parts).unwrap();
+    assert!(store.debug_base_int_children_canonical());
+    assert!(
+        !store.debug_base_subject_sorted(),
+        "an unsorted build must stay unstamped through adoption"
+    );
+}
