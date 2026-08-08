@@ -176,21 +176,9 @@ def write_dataset(path: str, n: int, opts: Optional[DatasetOpts] = None) -> str:
     return path
 
 
-def write_fresh(path: str, n: int) -> str:
-    """A batch of fresh quads in a disjoint namespace, for the add phase."""
-    tmp = path + ".partial"
-    with open(tmp, "w", encoding="utf-8") as f:
-        for i in range(n):
-            f.write(
-                f"<{BASE}/fresh/2026/subject/{i:09d}> "
-                f"<{BASE}/fresh/2026/property/0000> "
-                f"<{BASE}/fresh/2026/object/{i:09d}> .\n"
-            )
-    os.replace(tmp, path)
-    return path
-
-
 def fresh_quads(n: int) -> list[tuple[str, str, str]]:
+    """A batch of quads in a namespace disjoint from `write_dataset`'s, so the
+    add phase inserts rows the store cannot already hold."""
     return [
         (
             f"<{BASE}/fresh/2026/subject/{i:09d}>",

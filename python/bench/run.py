@@ -251,7 +251,6 @@ def main() -> int:
         f"wall-clock (perf_counter_ns) · {lib_str} · one adapter per process and per virtualenv, isolated"
     )
 
-    probes = dataset_probes(N_TRIPLES)
     matched = {}
     for c in counts_by_slug.values():
         matched.update(c)
