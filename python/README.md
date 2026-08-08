@@ -6,7 +6,7 @@ modern, high-performance columnar RDF serialization format.
 
 Stores can be **opened lazily from `.vortex` files** and queried in place, without loading the dataset into memory.
 
-The [`vortex-rdflib`](https://pypi.org/project/vortex-rdflib/) package implements an rdflib `Store` (with SPARQL capabilities) on top of these bindings.
+A separate [`vortex-rdflib`](https://pypi.org/project/vortex-rdflib/) package builds an rdflib integration on these bindings; see its own documentation for what it supports.
 
 ## Install
 
@@ -45,28 +45,30 @@ serialize_rdf("data.nt", "data.vortex", layout="dictionary")
 
 store = VortexRdfStore("data.vortex")   # lazy open; file layout is auto-detected
 len(store)                              # number of quads
-store.get_quads(p="<http://xmlns.com/foaf/0.1/name>")     # [(s, p, o, g), ...]
-store.match_columns(p="<http://xmlns.com/foaf/0.1/name>")  # (subjects, predicates, objects, graphs)
-store.match_compact(p="<http://xmlns.com/foaf/0.1/name>")  # (term_table, rows)
+store.get_quads(p="<http://xmlns.com/foaf/0.1/name>")      # [(s, p, o, g), ...]
+store.match_columns(p="<http://xmlns.com/foaf/0.1/name>")   # (subjects, predicates, objects, graphs)
+store.match_compact(p="<http://xmlns.com/foaf/0.1/name>")   # (term_table, [(si, pi, oi, gi), ...])
 ```
 
 Terms cross the boundary as N-Triples strings (`<iri>`, `_:b0`, `"lit"@en`,
 `"3"^^<http://www.w3.org/2001/XMLSchema#integer>`). `match_compact` returns a
-de-duplicated term table plus index triples so callers parse each distinct
-term once.
+de-duplicated term table plus `(s, p, o, g)` indices into it, so a caller that
+converts terms into its own representation does so once per distinct term
+rather than once per occurrence.
 
 `get_quads` returns whole quads — the graph of a quad in the default graph is
 the empty string, which is also how a pattern selects it. `match_columns`
 returns the same rows transposed into four parallel columns, for callers that
 work a position at a time rather than row by row.
 
-Both are served from the term-code columns whenever the store can (Dictionary
-layout, resident dictionary, no append tail) — roughly 2x faster on a
-65,536-row match than re-serializing each quad, with a term repeated down a
-column becoming one shared Python string rather than an equal copy per row.
-Rows are identical either way, so this is a speed-up rather than a choice to
-make; the code API below is for callers who want to skip building strings
-altogether.
+All three are served from the term-code columns whenever the store can
+(Dictionary layout, resident dictionary, no append tail), which is roughly 2x
+faster on a 65,536-row match than re-serializing each matched quad. On that
+path `get_quads` and `match_columns` hand back one shared Python string for a
+term that repeats, rather than an equal copy per occurrence, and
+`match_compact` de-duplicates by term code instead of by string. Results are
+identical either way, so this is a speed-up rather than a choice to make; the
+code API below is for callers who want to skip building strings altogether.
 
 ### Code columns (Dictionary layout)
 
@@ -90,8 +92,8 @@ int conversion; any sequence of ints works too. Both `term_dict()` and
 layout, or a dictionary left file-backed by the residency budget).
 
 Consumers can join, count, and de-duplicate entirely in code space and decode
-each distinct term once — this is what powers `vortex-rdflib`'s SPARQL BGP
-pushdown.
+each distinct term once, never materializing a term string for a row they
+discard.
 
 ## Layouts
 
