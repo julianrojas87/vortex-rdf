@@ -394,3 +394,30 @@ fn bounds_domain_extremes() {
     let arr = PrimitiveArray::from_iter(data.iter().copied()).into_array();
     assert_probe(&arr, &data, &[NodeKind::Primitive]);
 }
+
+#[test]
+fn probes_slice_of_piecewise_sorted() {
+    // Sawtooth: each 1000-row run ascends, the column as a whole does not —
+    // the shape a prefix probe slices when it searches a second key inside a
+    // lead run. Only the window is sorted; the probe must never consult the
+    // child's out-of-window order.
+    let run_len = 1000usize;
+    let mut data: Vec<u32> = Vec::new();
+    for run in 0..24u32 {
+        data.extend((0..run_len as u32).map(|i| i / 3 + (run % 5) * 40));
+    }
+    let encodings = [
+        compress_with(&[&integer::RunEndScheme, &integer::BitPackingScheme], &data),
+        compress_with(&[&integer::BitPackingScheme], &data),
+    ];
+    for arr in &encodings {
+        for wstart in [0usize, 1000, 5000, 23_000] {
+            let window = wstart..wstart + run_len;
+            let wdata = &data[window.clone()];
+            let wrapper = SliceArray::new(arr.clone(), window.clone()).into_array();
+            assert_probe(&wrapper, wdata, &[NodeKind::Slice]);
+            let pushed = arr.slice(window).unwrap();
+            assert_probe(&pushed, wdata, &[]);
+        }
+    }
+}

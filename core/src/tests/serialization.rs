@@ -457,13 +457,15 @@ async fn test_from_parts_adopts_searchable_children() {
 #[tokio::test]
 async fn test_from_bytes_matches_equal_canonical_across_patterns() {
     // Repeated subjects (4 quads each) over enough rows that the sorted
-    // subject column keeps a compressed wire form worth probing.
+    // subject column keeps a compressed wire form worth probing; object
+    // cardinality high enough that code columns bit-pack rather than
+    // dict-encode, so index prefix probes exercise encoded sliced searches.
     let quads: Vec<Quad> = (0..20_000)
         .map(|i| {
             make_quad(
                 &format!("http://example.org/s{:05}", i / 4),
                 &format!("http://example.org/p{}", i % 7),
-                &format!("object {}", i % 11),
+                &format!("object {}", i % 4001),
                 GraphName::DefaultGraph,
             )
         })

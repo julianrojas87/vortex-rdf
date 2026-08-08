@@ -257,8 +257,9 @@ impl Node<'_> {
                 offset,
                 len,
             } => {
-                let run = partition(values.len(), |r| values.value_at(r) < needle);
-                run_start(ends, run, *offset, *len)
+                let (first, span) = window_runs(ends, *offset, *len);
+                let k = partition(span, |k| values.value_at(first + k) < needle);
+                run_start(ends, first + k, *offset, *len)
             }
             Node::FoR { reference, child } => {
                 // Every stored value is `reference + encoded >= reference`.
@@ -269,8 +270,12 @@ impl Node<'_> {
                 }
             }
             Node::BitPacked(p) => partition(p.len, |i| p.value_at(i) < needle),
+            // Sortedness is asserted for the window only — rows outside it
+            // are in unspecified order (a prefix probe slices the sorted run
+            // out of a piecewise-sorted column) — so the search reads
+            // through the window, never the child's own order.
             Node::Slice { child, start, len } => {
-                child.lower_bound(needle).clamp(*start, *start + *len) - *start
+                partition(*len, |i| child.value_at(*start + i) < needle)
             }
             Node::Chunked { chunks, len } => {
                 let c = chunks.partition_point(|c| c.last < needle);
@@ -313,8 +318,9 @@ impl Node<'_> {
                 offset,
                 len,
             } => {
-                let run = partition(values.len(), |r| values.value_at(r) <= needle);
-                run_start(ends, run, *offset, *len)
+                let (first, span) = window_runs(ends, *offset, *len);
+                let k = partition(span, |k| values.value_at(first + k) <= needle);
+                run_start(ends, first + k, *offset, *len)
             }
             Node::FoR { reference, child } => {
                 if needle < *reference {
@@ -324,8 +330,9 @@ impl Node<'_> {
                 }
             }
             Node::BitPacked(p) => partition(p.len, |i| p.value_at(i) <= needle),
+            // Window-only search; see `lower_bound`.
             Node::Slice { child, start, len } => {
-                child.upper_bound(needle).clamp(*start, *start + *len) - *start
+                partition(*len, |i| child.value_at(*start + i) <= needle)
             }
             Node::Chunked { chunks, .. } => {
                 let c = chunks.partition_point(|c| c.first <= needle);
@@ -373,6 +380,20 @@ impl Node<'_> {
             }
         }
     }
+}
+
+/// The runs overlapping the window `[offset, offset + len)`, as
+/// `(first_run, run_count)`. Sortedness is asserted for the window only, so
+/// run searches must stay inside these runs — a sliced RunEnd keeps its full
+/// children, whose out-of-window values are in unspecified order.
+fn window_runs(ends: &Node<'_>, offset: usize, len: usize) -> (usize, usize) {
+    if len == 0 {
+        return (0, 0);
+    }
+    let nruns = ends.len();
+    let first = partition(nruns, |r| ends.value_at(r) <= offset as u64);
+    let last = partition(nruns, |r| ends.value_at(r) <= (offset + len - 1) as u64);
+    (first, (last + 1).min(nruns) - first)
 }
 
 /// First row of run `run` in the sliced coordinate space: runs before it end at
