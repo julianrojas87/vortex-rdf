@@ -325,6 +325,35 @@ impl IndexComponent {
         })
     }
 
+    /// This component with its integer children compressed into
+    /// probe-supported encodings — the construction-side counterpart of
+    /// [`into_resident`](Self::into_resident): a builder's canonical
+    /// emission compresses here (see
+    /// [`array::with_compressed_int_children`]), without the base's payload
+    /// wrapper (components never serve code columns). The sorted probes bind
+    /// the compressed columns directly.
+    ///
+    /// [`array::with_compressed_int_children`]: crate::store::array::with_compressed_int_children
+    pub(crate) fn into_compressed(self) -> Result<Self> {
+        use vortex_array::arrays::Struct;
+        let rows = self.rows()?.clone().into_array();
+        let compressed = crate::store::array::with_compressed_int_children(rows, false)?;
+        let array = match compressed.try_downcast::<Struct>() {
+            Ok(array) => array,
+            Err(other) => {
+                let mut ctx = VORTEX_SESSION.create_execution_ctx();
+                other
+                    .execute::<StructArray>(&mut ctx)
+                    .map_err(VortexRdfError::Vortex)?
+            }
+        };
+        Ok(Self {
+            rows: ComponentRows::Built(array),
+            probes: crate::store::probes::BaseProbes::new(),
+            ..self
+        })
+    }
+
     /// The cached encoded-search probe over the component's `column`, or
     /// `None` when the column's encoding declines (callers fall back to the
     /// per-call search). Resolving materializes a deferred component, exactly

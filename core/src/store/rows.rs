@@ -176,14 +176,21 @@ impl VortexRdfStore {
     /// `None` whenever codes cannot be served both cheaply and correctly:
     /// a non-Dictionary layout, a non-empty append tail (its strings are not
     /// in the cached dictionary), a file-backed source, or base columns not
-    /// stored as canonical non-nullable u32 primitives (e.g. chunked or
-    /// compressed). Callers fall back to [`Self::get_quads_array`].
+    /// reachable as canonical non-nullable u32 primitives (e.g. chunked or
+    /// wire-compressed). Callers fall back to [`Self::get_quads_array`].
+    ///
+    /// A builder-compressed column behind a `vortex.shared` wrapper still
+    /// qualifies: its canonical primitive is materialized once into the
+    /// wrapper's one-way cache (`shared_u32_primitive`) and shared zero-copy
+    /// by every later call and every view over the base — the payload path
+    /// pays a first-touch decode instead of losing the buffer-sharing fast
+    /// path.
     ///
     /// This is the payload path behind the JS bindings' `match`/`getQuads`:
     /// serving codes off the base's buffers skips the per-call
     /// slice-gather-canonicalize pipeline those calls otherwise pay.
     pub fn code_columns(&self) -> Option<[Buffer<u32>; 4]> {
-        use vortex_array::arrays::{Primitive, Struct};
+        use vortex_array::arrays::Struct;
         if self.layout.strategy() != LayoutStrategy::Dictionary || self.tail_len() != 0 {
             return None;
         }
@@ -203,14 +210,7 @@ impl VortexRdfStore {
         let mut prims: Vec<PrimitiveArray> = Vec::with_capacity(4);
         for name in schema::PRIMARY_COLUMNS {
             let col = struct_arr.unmasked_field_by_name(name).ok()?;
-            if !col.dtype().is_unsigned_int() || col.dtype().is_nullable() {
-                return None;
-            }
-            let prim = col.clone().try_downcast::<Primitive>().ok()?;
-            if prim.ptype() != vortex_array::dtype::PType::U32 {
-                return None;
-            }
-            prims.push(prim);
+            prims.push(crate::store::array::shared_u32_primitive(col)?);
         }
         // Codes are gathered by row id — a read the serve plan cannot answer
         // — so a served match's pending selection materializes here (the

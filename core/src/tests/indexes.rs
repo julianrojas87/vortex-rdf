@@ -871,6 +871,72 @@ async fn test_in_memory_copy_index_serving() {
     assert_eq!(view_strings(&by_p_wiped).await, Vec::<String>::new());
 }
 
+/// A built store's resident form: construction compresses the base's code
+/// columns and every component's integer children into probe-supported
+/// encodings — no canonical primitives are retained — while every sorted
+/// column still binds an encoded search probe, and the payload path still
+/// serves codes (through the base's `vortex.shared` wrappers).
+#[cfg(feature = "file-io")]
+#[tokio::test]
+async fn test_built_store_compresses_resident_form() {
+    let quads = modular_quads(200, 4, 8);
+    let arr = build_array::<SortedInMemoryBuilder>(
+        quad_stream(quads.clone()),
+        LayoutStrategy::Dictionary,
+        vec![IndexType::SecondaryByCopy],
+    )
+    .await
+    .unwrap();
+    let store = VortexRdfStore::from_built(arr).unwrap();
+
+    assert!(
+        !store.debug_base_int_children_canonical(),
+        "construction must retain compressed code columns, not canonical primitives"
+    );
+    assert!(
+        store.debug_base_probe_resolvable(),
+        "every sorted column of the compressed base must bind an encoded search probe"
+    );
+    for name in ["index:posg", "index:ospg"] {
+        assert_eq!(
+            store.debug_index_component_int_children_canonical(name),
+            Some(false),
+            "{name}: component children must stay compressed too"
+        );
+    }
+
+    // The payload path still answers: codes decode to exactly the matched
+    // quads (first touch materializes the shared canonical, then zero-copy).
+    let p1 = NamedNode::new("http://example.org/p1").unwrap();
+    let matched = store
+        .match_pattern(None, Some(&p1), None, None)
+        .await
+        .unwrap();
+    let cols = matched
+        .code_columns()
+        .expect("compressed base still serves codes through its shared wrappers");
+    let dict = matched.code_read_snapshot().unwrap();
+    let mut got: Vec<String> = (0..cols[0].len())
+        .map(|i| {
+            format!(
+                "{} {} {}",
+                dict.decode(cols[0][i]).unwrap(),
+                dict.decode(cols[1][i]).unwrap(),
+                dict.decode(cols[2][i]).unwrap()
+            )
+        })
+        .collect();
+    got.sort();
+    let mut want: Vec<String> = quads
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| i % 4 == 1)
+        .map(|(_, q)| format!("{} {} {}", q.subject, q.predicate, q.object))
+        .collect();
+    want.sort();
+    assert_eq!(got, want);
+}
+
 /// The bindings' code-column read on a served in-memory match: `code_columns`
 /// cannot ride the serve plan (it gathers codes by row id), so it materializes
 /// the pending selection synchronously — and the codes it hands out must

@@ -204,6 +204,151 @@ pub(crate) fn with_searchable_int_children(rows: ArrayRef) -> Result<ArrayRef> {
     )
 }
 
+/// Compress a built struct's u32 code columns into probe-supported
+/// encodings, in place of the canonical primitives the builders emit —
+/// the construction half of the store's compressed-resident form (the
+/// adoption half is [`with_searchable_int_children`]).
+///
+/// The encoding is chosen from bounds the construction already knows —
+/// Constant for a single-valued column, RunEnd for a sorted column with few
+/// runs, BitPacked at the observed value width otherwise — never by a
+/// sampling compressor: an external selector is free to pick encodings
+/// outside the probe-supported set, which would put the column back on the
+/// per-call generic-kernel fallback this crate's fast paths exist to avoid.
+/// Sortedness stamps carry across; non-u32 and nullable children pass
+/// through untouched.
+///
+/// `payload_lazy` wraps each compressed column in a `vortex.shared` lazy
+/// wrapper: the match fast paths probe the compressed source through the
+/// wrapper, while the code-column payload path materializes the canonical
+/// primitive once into the wrapper's cache (`shared_u32_primitive`) and is
+/// zero-copy on every later call. Pass it for the primary base — the only
+/// array the payload path reads; components never serve payloads and skip
+/// the wrapper.
+pub(crate) fn with_compressed_int_children(rows: ArrayRef, payload_lazy: bool) -> Result<ArrayRef> {
+    use vortex_array::arrays::struct_::StructArrayExt;
+    use vortex_array::arrays::{Primitive, SharedArray, StructArray};
+    use vortex_array::validity::Validity;
+
+    if rows.dtype().is_nullable() {
+        return Ok(rows);
+    }
+    let mut ctx = VORTEX_SESSION.create_execution_ctx();
+    let struct_arr = rows
+        .execute::<StructArray>(&mut ctx)
+        .map_err(VortexRdfError::Vortex)?;
+    let names = struct_arr.names().clone();
+    let mut children = Vec::with_capacity(names.len());
+    for name in names.iter() {
+        let child = struct_arr
+            .unmasked_field_by_name(name.as_ref())
+            .map_err(VortexRdfError::Vortex)?;
+        let Ok(prim) = child.clone().try_downcast::<Primitive>() else {
+            children.push(child.clone());
+            continue;
+        };
+        if prim.ptype() != vortex_array::dtype::PType::U32 || child.dtype().is_nullable() {
+            children.push(child.clone());
+            continue;
+        }
+        let sorted = column_is_sorted(child);
+        let mut encoded = compress_u32_column(&prim, sorted, &mut ctx)?;
+        if payload_lazy && !encoded.is::<Primitive>() {
+            encoded = SharedArray::new(encoded).into_array();
+        }
+        if sorted {
+            stamp_is_sorted(&encoded);
+        }
+        children.push(encoded);
+    }
+    let len = struct_arr.len();
+    Ok(
+        StructArray::try_new(names, children, len, Validity::NonNullable)
+            .map_err(VortexRdfError::Vortex)?
+            .into_array(),
+    )
+}
+
+/// A base child as a canonical non-nullable u32 primitive, zero-copy where
+/// one exists: a canonical column directly, a `vortex.shared` wrapper via its
+/// one-way cache — the first call decodes the compressed source into the
+/// cache, every later call is a refcount bump shared by all views over the
+/// base. `None` for any other encoding (callers fall back to the gather
+/// pipeline).
+pub(crate) fn shared_u32_primitive(
+    child: &ArrayRef,
+) -> Option<vortex_array::arrays::PrimitiveArray> {
+    use vortex_array::Canonical;
+    use vortex_array::arrays::shared::SharedArrayExt as _;
+    use vortex_array::arrays::{Primitive, PrimitiveArray, Shared};
+
+    if !child.dtype().is_unsigned_int() || child.dtype().is_nullable() {
+        return None;
+    }
+    if let Ok(prim) = child.clone().try_downcast::<Primitive>() {
+        return (prim.ptype() == vortex_array::dtype::PType::U32).then_some(prim);
+    }
+    let shared = child.as_opt::<Shared>()?;
+    let cached = shared
+        .get_or_compute(|source| {
+            let mut ctx = VORTEX_SESSION.create_execution_ctx();
+            source
+                .clone()
+                .execute::<PrimitiveArray>(&mut ctx)
+                .map(Canonical::Primitive)
+        })
+        .ok()?;
+    let prim = cached.try_downcast::<Primitive>().ok()?;
+    (prim.ptype() == vortex_array::dtype::PType::U32).then_some(prim)
+}
+
+/// One column's encoding choice; see [`with_compressed_int_children`].
+fn compress_u32_column(
+    prim: &vortex_array::arrays::PrimitiveArray,
+    sorted: bool,
+    ctx: &mut vortex_array::ExecutionCtx,
+) -> Result<ArrayRef> {
+    use vortex_array::arrays::ConstantArray;
+    use vortex::encodings::fastlanes::BitPacked;
+    use vortex::encodings::runend::RunEnd;
+
+    let values = prim.as_slice::<u32>();
+    if values.is_empty() {
+        return Ok(prim.clone().into_array());
+    }
+    let mut max = values[0];
+    let mut min = values[0];
+    let mut runs = 1usize;
+    let mut prev = values[0];
+    for &v in &values[1..] {
+        if v > max {
+            max = v;
+        }
+        if v < min {
+            min = v;
+        }
+        if v != prev {
+            runs += 1;
+            prev = v;
+        }
+    }
+    if min == max {
+        return Ok(ConstantArray::new(min, values.len()).into_array());
+    }
+    if sorted && runs * 4 <= values.len() {
+        let re = RunEnd::encode(prim.clone().into_array(), ctx)
+            .map_err(VortexRdfError::Vortex)?;
+        return Ok(re.into_array());
+    }
+    let bit_width = (u32::BITS - max.leading_zeros()).max(1) as u8;
+    if bit_width >= 32 {
+        return Ok(prim.clone().into_array());
+    }
+    let packed = BitPacked::encode(&prim.clone().into_array(), bit_width, ctx)
+        .map_err(VortexRdfError::Vortex)?;
+    Ok(packed.into_array())
+}
+
 /// Convert a boolean ArrayRef into a `vortex_mask::Mask` for use with `ArrayRef::filter`.
 pub(crate) fn bool_array_to_mask(arr: ArrayRef) -> Result<Mask> {
     // Canonicalize to a concrete boolean array, then reinterpret its packed

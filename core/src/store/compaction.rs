@@ -184,8 +184,11 @@ impl VortexRdfStore {
             }
         };
         // The rebuild welds `_idx_*` columns (single-chunk, stamped when
-        // sorted); split them into components like every other adoption.
+        // sorted); split them into components and compress like every other
+        // construction — a compacted store carries the same resident form a
+        // freshly built one does.
         let (base, components) = crate::store::indexes::split_built_row_space(base)?;
+        let (base, components) = super::compress_built_parts(base, components)?;
         Self::from_parts_internal(base, components, layout)
     }
 

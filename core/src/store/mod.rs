@@ -129,6 +129,26 @@ fn resolved_layout(
     }
 }
 
+/// The compressed-resident form every in-memory construction produces: the
+/// base's u32 code columns and each component's integer children are
+/// re-encoded into probe-supported encodings (see
+/// [`with_compressed_int_children`](array::with_compressed_int_children)),
+/// with the base additionally payload-wrapped so the code-column read path
+/// keeps its zero-copy fast path. Shared by the builder adoption
+/// (`from_row_space`) and compaction's rebuild (`from_raw_quads`) — the two
+/// places canonical built columns become a store.
+fn compress_built_parts(
+    base: ArrayRef,
+    components: Vec<crate::store::indexes::IndexComponent>,
+) -> Result<(ArrayRef, Vec<crate::store::indexes::IndexComponent>)> {
+    let base = array::with_compressed_int_children(base, true)?;
+    let components = components
+        .into_iter()
+        .map(crate::store::indexes::IndexComponent::into_compressed)
+        .collect::<Result<Vec<_>>>()?;
+    Ok((base, components))
+}
+
 impl VortexRdfStore {
     // ── constructors ─────────────────────────────────────────────────────────
 
@@ -189,6 +209,20 @@ impl VortexRdfStore {
         let struct_arr = base.clone().try_downcast::<Struct>().ok()?;
         let child = struct_arr.unmasked_field_by_name(name).ok()?;
         child.dtype().is_int().then(|| child.is::<Primitive>())
+    }
+
+    /// Test-only hook: whether the named in-memory component's rows hold
+    /// canonical integer children — the component counterpart of
+    /// [`debug_base_int_children_canonical`](Self::debug_base_int_children_canonical),
+    /// so tests can pin that construction compresses components too. `None`
+    /// when this store holds no such in-memory component.
+    #[cfg(all(test, feature = "file-io"))]
+    pub(crate) fn debug_index_component_int_children_canonical(&self, name: &str) -> Option<bool> {
+        let QuadsSource::InMemory { components, .. } = &self.quads else {
+            return None;
+        };
+        let component = components.iter().find(|c| c.name == name)?;
+        Some(debug_int_children_canonical(component.rows().ok()?))
     }
 
     /// Test-only hook: whether every sorted-stamped child of an in-memory
@@ -258,11 +292,18 @@ impl VortexRdfStore {
         let (base, mut components) = crate::store::indexes::split_built_row_space(array)?;
         components.extend(pre_split);
         let layout = resolved_layout(dict, base.dtype())?;
+        let (base, components) = compress_built_parts(base, components)?;
         Self::from_parts_internal(base, components, layout)
     }
 
     /// Assemble a store from an already-split primary base plus its
     /// components — the shared tail of every in-memory construction path.
+    ///
+    /// Callers own the resident form of what they pass: construction sites
+    /// compress first ([`compress_built_parts`]), the adoption site keeps
+    /// wire encodings selectively
+    /// ([`with_searchable_int_children`](array::with_searchable_int_children));
+    /// this assembler transforms nothing.
     fn from_parts_internal(
         base: ArrayRef,
         components: Vec<crate::store::indexes::IndexComponent>,
