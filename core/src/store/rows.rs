@@ -146,7 +146,7 @@ impl VortexRdfStore {
         let Some(tail) = &self.tail else {
             return Ok(base);
         };
-        let tail_rows = gather_live(&tail.rows, &tail.selection, tail.deleted.as_ref())?;
+        let tail_rows = gather_live(&tail.rows, &tail.selection, tail.deleted.as_ref(), None)?;
         match &self.layout {
             ResolvedLayout::Dictionary(_) => {
                 let mut raws = self.base_raw_quads(&base).await?;
@@ -316,6 +316,7 @@ impl VortexRdfStore {
                 base,
                 selection,
                 deleted,
+                probes,
                 ..
             } => {
                 // A base-order gather needs exact row ids (a serve plan
@@ -334,7 +335,7 @@ impl VortexRdfStore {
                     // kernels do not propagate the stat, so restore it from
                     // the base's own provenance.
                     _ => {
-                        let rows = gather_live(base, &selection, deleted.as_ref())?;
+                        let rows = gather_live(base, &selection, deleted.as_ref(), Some(probes))?;
                         Self::with_subject_stamp(rows, Self::base_subject_sorted(base))
                     }
                 }
@@ -350,6 +351,20 @@ impl VortexRdfStore {
                 // Same materialization as above — the scan reads in file row
                 // order, which only the exact ids can restrict.
                 let selection = selection.materialized().await?;
+                // A tiny exact selection reads point-by-point through the
+                // file's cached chunk probes, skipping the scan machinery and
+                // its whole-leaf decodes; anything it declines scans below.
+                if let Some(rows) = file_scan::file_point_rows(
+                    file,
+                    &self.layout.primary_column_names(),
+                    filter.as_ref(),
+                    &selection,
+                    deleted.as_ref(),
+                )
+                .await?
+                {
+                    return Self::with_subject_stamp(rows, file.quads_sorted());
+                }
                 let scan =
                     self.restricted_file_scan(file, filter.as_ref(), &selection, deleted.as_ref())?;
                 // Execute the scan and materialize every matching row into a
@@ -446,7 +461,7 @@ impl VortexRdfStore {
             .base_raw_quads(&self.base_selected_rows().await?)
             .await?;
         if let Some(tail) = &self.tail {
-            let rows = gather_live(&tail.rows, &tail.selection, tail.deleted.as_ref())?;
+            let rows = gather_live(&tail.rows, &tail.selection, tail.deleted.as_ref(), None)?;
             raws.extend(self.tail_layout().raw_quads(&rows)?);
         }
         Ok(raws)

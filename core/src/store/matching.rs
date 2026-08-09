@@ -189,6 +189,7 @@ impl VortexRdfStore {
             selection,
             components,
             deleted,
+            probes,
             ..
         } = &self.quads
         else {
@@ -244,8 +245,14 @@ impl VortexRdfStore {
             && let Ok(scalar) = probe.cast(s_col.dtype())
         {
             // Left/right binary search bounds the run of rows equal to
-            // the probe value.
-            let (lo, hi) = search_sorted_bounds(s_col, &scalar)?;
+            // the probe value — through the store's cached probe when the
+            // column resolves (skipping the per-call encoding-tree walk),
+            // else the per-call search.
+            let cached = probes.by_name(base, schema::COL_S);
+            let (lo, hi) = match (cached, u64::try_from(&scalar)) {
+                (Some(owned), Ok(needle)) => owned.bounds(needle),
+                _ => search_sorted_bounds(s_col, &scalar)?,
+            };
             selection = selection.intersect_range(lo as u64..hi as u64);
             pat.subject = None;
             narrowed_elsewhere = true;
@@ -382,6 +389,7 @@ impl VortexRdfStore {
                 selection,
                 components: Arc::clone(components),
                 deleted: deleted.clone(),
+                probes: Arc::clone(probes),
                 serve,
             },
             tail: self.tail.clone(),

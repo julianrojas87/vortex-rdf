@@ -6,6 +6,7 @@ pub(crate) mod indexes;
 pub(crate) mod layouts;
 #[cfg(feature = "file-io")]
 pub(crate) mod native_file;
+pub(crate) mod probes;
 pub(crate) mod scan;
 pub(crate) mod schema;
 pub(crate) mod selection;
@@ -172,6 +173,24 @@ impl VortexRdfStore {
         debug_int_children_canonical(&struct_arr)
     }
 
+    /// Test-only hook: whether one named child of an in-memory base is a
+    /// canonical primitive — the per-child counterpart of
+    /// [`debug_base_int_children_canonical`](Self::debug_base_int_children_canonical),
+    /// so tests can pin retention of a specific encoding (e.g. a
+    /// dictionary-encoded object column). `None` when the base has no such
+    /// child or is not in memory.
+    #[cfg(all(test, feature = "file-io"))]
+    pub(crate) fn debug_base_child_int_canonical(&self, name: &str) -> Option<bool> {
+        use vortex_array::arrays::struct_::StructArrayExt;
+        use vortex_array::arrays::{Primitive, Struct};
+        let QuadsSource::InMemory { base, .. } = &self.quads else {
+            return None;
+        };
+        let struct_arr = base.clone().try_downcast::<Struct>().ok()?;
+        let child = struct_arr.unmasked_field_by_name(name).ok()?;
+        child.dtype().is_int().then(|| child.is::<Primitive>())
+    }
+
     /// Test-only hook: whether every sorted-stamped child of an in-memory
     /// base resolves an encoded search probe (see
     /// [`debug_sorted_children_probe_resolvable`]) — true for canonical and
@@ -249,6 +268,7 @@ impl VortexRdfStore {
                 selection: ViewSelection::all(),
                 components,
                 deleted: None,
+                probes: probes::BaseProbes::new(),
                 serve: None,
             },
             tail: None,
@@ -278,6 +298,7 @@ impl VortexRdfStore {
                 selection: ViewSelection::all(),
                 components: Arc::from(Vec::new()),
                 deleted: None,
+                probes: probes::BaseProbes::new(),
                 serve: None,
             },
             tail: None,
@@ -297,6 +318,7 @@ impl VortexRdfStore {
                 base,
                 components,
                 deleted,
+                probes,
                 ..
             } => QuadsSource::InMemory {
                 base: base.clone(),
@@ -305,6 +327,7 @@ impl VortexRdfStore {
                 // row ids, exactly what the components' `rid` columns address.
                 components: Arc::clone(components),
                 deleted: deleted.clone(),
+                probes: Arc::clone(probes),
                 // A re-selection breaks the serve plan's "row run is exactly the
                 // selection" invariant, so it never carries across (as for File).
                 serve: None,

@@ -28,6 +28,8 @@ use vortex_array::{ArrayRef, IntoArray};
 use vortex_buffer::Buffer;
 use vortex_mask::{AllOr, Mask};
 
+use crate::store::probes::BaseProbes;
+
 use crate::error::{Result, VortexRdfError};
 use crate::store::indexes::LazyRowIds;
 
@@ -316,8 +318,9 @@ pub(crate) fn gather_live(
     base: &ArrayRef,
     selection: &RowSelection,
     deleted: Option<&Mask>,
+    probes: Option<&BaseProbes>,
 ) -> Result<ArrayRef> {
-    if let Some(rows) = gather_by_point_reads(base, selection, deleted)? {
+    if let Some(rows) = gather_by_point_reads(base, selection, deleted, probes)? {
         return Ok(rows);
     }
     let rows = selection.apply(base)?;
@@ -337,7 +340,7 @@ pub(crate) fn gather_live(
 /// (optimizer pass, execution context, canonicalization) whatever the row
 /// count; point reads cost a fraction of a microsecond per row per column —
 /// the crossover sits in the hundreds of rows, and this stays under it.
-const POINT_GATHER_MAX_ROWS: usize = 256;
+pub(crate) const POINT_GATHER_MAX_ROWS: usize = 256;
 
 /// Rows of a small selection, read point-by-point through encoded search
 /// probes into canonical output columns — the read-side counterpart of the
@@ -352,6 +355,7 @@ pub(crate) fn gather_by_point_reads(
     base: &ArrayRef,
     selection: &RowSelection,
     deleted: Option<&Mask>,
+    probes: Option<&BaseProbes>,
 ) -> Result<Option<ArrayRef>> {
     use vortex_array::arrays::struct_::StructArrayExt;
     use vortex_array::arrays::{Struct, StructArray};
@@ -377,12 +381,24 @@ pub(crate) fn gather_by_point_reads(
     };
     let names = struct_arr.names().clone();
     let mut children = Vec::with_capacity(names.len());
-    for name in names.iter() {
+    for (idx, name) in names.iter().enumerate() {
         let Ok(child) = struct_arr.unmasked_field_by_name(name.as_ref()) else {
             return Ok(None);
         };
-        let Some(probe) = SortedProbe::resolve(child) else {
-            return Ok(None);
+        // The store's cached probe first (resolution walks the encoding tree
+        // — the fixed cost this path exists to avoid); a transient base
+        // (tail, served rows) resolves per call.
+        let cached = probes.and_then(|p| p.child(base, idx));
+        let local;
+        let probe = match cached {
+            Some(owned) => owned.probe(),
+            None => {
+                let Some(resolved) = SortedProbe::resolve(child) else {
+                    return Ok(None);
+                };
+                local = resolved;
+                &local
+            }
         };
         let reads = live.iter().map(|&i| probe.value_at(i));
         let gathered = match child.dtype().as_ptype() {

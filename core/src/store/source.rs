@@ -4,6 +4,7 @@ use vortex_array::ArrayRef;
 use vortex_mask::Mask;
 
 use crate::store::indexes::{InMemoryServePlan, IndexComponent};
+use crate::store::probes::BaseProbes;
 use crate::store::selection::{RowSelection, ViewSelection};
 
 #[cfg(feature = "file-io")]
@@ -55,6 +56,12 @@ pub(crate) enum QuadsSource {
         /// [`RowSelection::live_mask`]. The tombstoned rows are only reclaimed
         /// by compaction.
         deleted: Option<Mask>,
+        /// Lazily-resolved encoded-search probes over `base`'s columns,
+        /// shared by every view over this base (probe resolution walks the
+        /// encoding tree per call otherwise — the fixed cost of point reads
+        /// on a compressed-resident base). Carried wherever `base` itself
+        /// carries; a fresh base takes a fresh cache.
+        probes: Arc<BaseProbes>,
         /// When this view's selection came from an index resolution over an
         /// otherwise-unrefined base, and that index holds the matched rows as a
         /// contiguous run of its own columns, the plan for `quads()` to slice

@@ -19,6 +19,8 @@ use vortex_array::ArrayRef;
 #[cfg(feature = "file-io")]
 use vortex_array::expr::{root, select};
 #[cfg(feature = "file-io")]
+use vortex_array::stream::ArrayStreamExt as _;
+#[cfg(feature = "file-io")]
 use vortex_layout::scan::scan_builder::ScanBuilder;
 
 use super::VortexRdfStore;
@@ -66,6 +68,7 @@ impl VortexRdfStore {
                 &tail.rows,
                 &tail.selection,
                 tail.deleted.as_ref(),
+                None,
             )?),
         };
         match &self.quads {
@@ -73,6 +76,7 @@ impl VortexRdfStore {
                 base,
                 selection,
                 deleted,
+                probes,
                 serve,
                 ..
             } => {
@@ -91,6 +95,7 @@ impl VortexRdfStore {
                         base,
                         selection.expect_exact(),
                         deleted.as_ref(),
+                        Some(probes),
                     )?),
                 };
                 quads.extend(tail_quads);
@@ -142,6 +147,69 @@ impl VortexRdfStore {
                         tail_quads,
                     );
                 }
+                // A tiny exact selection materializes point-by-point through
+                // the file's cached chunk probes — one async item, no scan
+                // machinery. Candidacy (small selection, eq-shaped filter) is
+                // checked synchronously; the fallback scan moves into the
+                // future for the rare mid-fetch decline (an unprobeable
+                // chunk), which reads the same few rows through the scan.
+                let exact = selection.expect_exact();
+                let small = match exact {
+                    crate::store::selection::RowSelection::Range(r) => {
+                        (r.end - r.start) as usize <= crate::store::selection::POINT_GATHER_MAX_ROWS
+                    }
+                    crate::store::selection::RowSelection::Ids(ids) => {
+                        ids.len() <= crate::store::selection::POINT_GATHER_MAX_ROWS
+                    }
+                    crate::store::selection::RowSelection::All => false,
+                };
+                if small
+                    && filter
+                        .as_ref()
+                        .is_none_or(|f| crate::store::scan::file_scan::eq_code_pairs(f).is_some())
+                {
+                    let scan =
+                        self.restricted_file_scan(file, filter.as_ref(), exact, deleted.as_ref())?;
+                    let file = std::sync::Arc::clone(file);
+                    let columns = self.layout.primary_column_names();
+                    let filter = filter.clone();
+                    let selection = exact.clone();
+                    let deleted = deleted.clone();
+                    let chunk = async move {
+                        let rows = match crate::store::scan::file_scan::file_point_rows(
+                            &file,
+                            &columns,
+                            filter.as_ref(),
+                            &selection,
+                            deleted.as_ref(),
+                        )
+                        .await
+                        {
+                            Ok(Some(rows)) => rows,
+                            Ok(None) => {
+                                let scanned = async {
+                                    scan.into_array_stream()
+                                        .map_err(VortexRdfError::Vortex)?
+                                        .read_all()
+                                        .await
+                                        .map_err(VortexRdfError::Vortex)
+                                }
+                                .await;
+                                match scanned {
+                                    Ok(rows) => rows,
+                                    Err(e) => return vec![Err(e)],
+                                }
+                            }
+                            Err(e) => return vec![Err(e)],
+                        };
+                        layout.decode_chunk_async(&rows).await
+                    };
+                    return Ok(Box::new(
+                        stream::once(chunk)
+                            .chain(stream::iter([tail_quads]))
+                            .boxed(),
+                    ));
+                }
                 // Same restriction setup as `base_selected_rows`: primary
                 // columns only, with any pending filter/selection applied
                 // (tombstoned rows excluded). Without a serve plan the
@@ -192,7 +260,7 @@ impl VortexRdfStore {
             None => vec![],
             Some(tail) => raw_chunk(
                 &self.tail_layout(),
-                &gather_live(&tail.rows, &tail.selection, tail.deleted.as_ref())?,
+                &gather_live(&tail.rows, &tail.selection, tail.deleted.as_ref(), None)?,
             ),
         };
         match &self.quads {
@@ -200,12 +268,18 @@ impl VortexRdfStore {
                 base,
                 selection,
                 deleted,
+                probes,
                 ..
             } => {
                 // This stream reads in base row order, which only exact row
                 // ids can produce — a served match's pending selection
                 // materializes here.
-                let rows = gather_live(base, &selection.materialized_sync()?, deleted.as_ref())?;
+                let rows = gather_live(
+                    base,
+                    &selection.materialized_sync()?,
+                    deleted.as_ref(),
+                    Some(probes),
+                )?;
                 // `base_raw_quads` routes through the async decode when the
                 // dictionary is file-backed, exactly like the other
                 // raws-consuming paths (serialization, compaction).

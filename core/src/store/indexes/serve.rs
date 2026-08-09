@@ -120,6 +120,7 @@ impl ServeDecode {
             &rows,
             &crate::store::selection::RowSelection::Range(0..len as u64),
             None,
+            None,
         )? {
             Some(canonical) => canonical,
             None => rows,

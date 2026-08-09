@@ -1,6 +1,7 @@
 use super::*;
 use crate::io::container;
 use crate::store::builders::unsorted_stream::build_chunk_stream;
+use crate::store::schema;
 
 // ─── 8) The vortex-rdf.store.v1 wire contract ──────────────────────────
 //
@@ -548,4 +549,58 @@ async fn test_from_bytes_matches_equal_canonical_across_patterns() {
         .await
         .unwrap();
     assert_eq!(s_view.size().await.unwrap(), 4);
+}
+
+/// A low-cardinality object column dictionary-encodes on the wire; adoption
+/// must retain that form (the probe's dict node binds it) and every pattern
+/// over it must still answer exactly like the canonical store.
+#[tokio::test]
+async fn test_from_parts_retains_dict_children() {
+    let quads: Vec<Quad> = (0..20_000)
+        .map(|i| {
+            make_quad(
+                &format!("http://example.org/s{:05}", i / 4),
+                &format!("http://example.org/p{}", i % 7),
+                &format!("object {}", i % 13),
+                GraphName::DefaultGraph,
+            )
+        })
+        .collect();
+    let arr = build_array::<SortedInMemoryBuilder>(
+        quad_stream(quads),
+        LayoutStrategy::Dictionary,
+        vec![IndexType::SecondaryByCopy],
+    )
+    .await
+    .unwrap();
+    let canonical = VortexRdfStore::from_built(arr).unwrap();
+    let bytes = canonical.to_bytes().await.unwrap();
+    let lean = VortexRdfStore::from_bytes(&bytes).await.unwrap();
+    let resident = VortexRdfStore::from_parts(lean.to_serializable_parts().await.unwrap()).unwrap();
+
+    assert_eq!(
+        resident.debug_base_child_int_canonical(schema::COL_O),
+        Some(false),
+        "the dictionary-encoded object column must stay compressed through adoption"
+    );
+
+    let s = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/s02500").unwrap());
+    let p = NamedNode::new("http://example.org/p4").unwrap();
+    let o = Term::Literal(Literal::new_simple_literal("object 7"));
+    for (name, ps, pp, po) in [
+        ("O", None, None, Some(&o)),
+        ("PO", None, Some(&p), Some(&o)),
+        ("SPO", Some(&s), Some(&p), Some(&o)),
+        ("SO", Some(&s), None, Some(&o)),
+    ] {
+        let want = canonical.match_pattern(ps, pp, po, None).await.unwrap();
+        for (kind, store) in [("lean", &lean), ("resident", &resident)] {
+            let got = store.match_pattern(ps, pp, po, None).await.unwrap();
+            assert_eq!(
+                view_strings(&got).await,
+                view_strings(&want).await,
+                "results diverged on [{name}] ({kind})"
+            );
+        }
+    }
 }

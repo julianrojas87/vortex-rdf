@@ -87,6 +87,7 @@ impl VortexRdfStore {
                 &tail.rows,
                 &tail.selection,
                 tail.deleted.as_ref(),
+                None,
             )?),
             None => None,
         };

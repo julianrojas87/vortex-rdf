@@ -94,7 +94,7 @@ impl VortexRdfStore {
             Some(tail) => {
                 use vortex_array::arrays::Chunked;
                 use vortex_array::arrays::chunked::ChunkedArrayExt;
-                let old = gather_live(&tail.rows, &tail.selection, tail.deleted.as_ref())?;
+                let old = gather_live(&tail.rows, &tail.selection, tail.deleted.as_ref(), None)?;
                 let dtype = old.dtype().clone();
                 let mut chunks = match old.clone().try_downcast::<Chunked>() {
                     Ok(ch) => ch.chunks(),
@@ -213,6 +213,7 @@ impl VortexRdfStore {
                     selection,
                     components,
                     deleted,
+                    probes,
                     ..
                 },
                 QuadsSource::InMemory {
@@ -234,6 +235,7 @@ impl VortexRdfStore {
                         // components' rid currency survives the delete.
                         components: Arc::clone(components),
                         deleted: Some(union_deleted(deleted.as_ref(), doomed)),
+                        probes: Arc::clone(probes),
                         serve: None,
                     },
                     tail,

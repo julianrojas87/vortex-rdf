@@ -10,9 +10,9 @@ use std::sync::Arc;
 
 use futures::{StreamExt, stream};
 use oxrdf::{GraphName, NamedNode, NamedOrBlankNode, Term};
-use vortex_array::MaskFuture;
 use vortex_array::expr::forms::conjuncts;
 use vortex_array::expr::{Expression, and, eq, get_item, lit, root};
+use vortex_array::{ArrayRef, MaskFuture};
 use vortex_buffer::Buffer;
 use vortex_layout::LayoutReader;
 use vortex_layout::scan::scan_builder::ScanBuilder;
@@ -312,6 +312,144 @@ pub(crate) fn build_file_filter(
             }
         },
     )
+}
+
+/// Rows of a small exact file selection, read point-by-point through the
+/// file's cached wire-encoded chunk probes instead of a scan — the file
+/// analogue of the in-memory `gather_by_point_reads`. A pushed filter of
+/// equality conjuncts is applied per row during the read (an eq column's
+/// surviving value is its constant, so only residual columns read twice).
+/// `None` declines — a wide or non-exact selection, a filter that is not an
+/// eq conjunction, a column without a probeable chunk handle — and the
+/// caller keeps its scan path. Chunk fetches are cached on `file`, so warm
+/// repeats touch no segments.
+pub(crate) async fn file_point_rows(
+    file: &NativeStoreFile,
+    columns: &[&str],
+    filter: Option<&Expression>,
+    selection: &RowSelection,
+    deleted: Option<&Mask>,
+) -> Result<Option<ArrayRef>> {
+    use vortex_array::IntoArray;
+    use vortex_array::arrays::{PrimitiveArray, StructArray};
+    use vortex_array::dtype::{FieldName, PType};
+    use vortex_array::validity::Validity;
+
+    use crate::store::selection::POINT_GATHER_MAX_ROWS;
+
+    let rows: Vec<u64> = match selection {
+        RowSelection::Range(r) if (r.end - r.start) as usize <= POINT_GATHER_MAX_ROWS => (r.start
+            ..r.end)
+            .filter(|&i| deleted.is_none_or(|d| !d.value(i as usize)))
+            .collect(),
+        RowSelection::Ids(ids) if ids.len() <= POINT_GATHER_MAX_ROWS => ids
+            .iter()
+            .copied()
+            .filter(|&i| deleted.is_none_or(|d| !d.value(i as usize)))
+            .collect(),
+        _ => return Ok(None),
+    };
+    let eqs = match filter {
+        None => Vec::new(),
+        Some(f) => match eq_code_pairs(f) {
+            Some(pairs) => pairs,
+            None => return Ok(None),
+        },
+    };
+    let Some(handles) = columns
+        .iter()
+        .map(|c| file.column_chunks(c))
+        .collect::<Option<Vec<_>>>()
+    else {
+        return Ok(None);
+    };
+    let source = file.segment_source();
+    let session = file.session();
+
+    // Filter first: a row survives when every eq column reads its code.
+    let mut live = rows;
+    for (col, code) in &eqs {
+        let Some(idx) = columns.iter().position(|c| c == col) else {
+            return Ok(None);
+        };
+        let mut kept = Vec::with_capacity(live.len());
+        for &row in &live {
+            match handles[idx]
+                .value_at(row, &source, session)
+                .await
+                .map_err(VortexRdfError::Vortex)?
+            {
+                Some(v) if v == *code => kept.push(row),
+                Some(_) => {}
+                None => return Ok(None),
+            }
+        }
+        live = kept;
+        if live.is_empty() {
+            break;
+        }
+    }
+
+    let mut children = Vec::with_capacity(columns.len());
+    for (idx, col) in columns.iter().enumerate() {
+        let eq = eqs.iter().find(|(c, _)| c == col).map(|(_, v)| *v);
+        let mut values = Vec::with_capacity(live.len());
+        match eq {
+            Some(v) => values.extend(std::iter::repeat_n(v, live.len())),
+            None => {
+                for &row in &live {
+                    match handles[idx]
+                        .value_at(row, &source, session)
+                        .await
+                        .map_err(VortexRdfError::Vortex)?
+                    {
+                        Some(v) => values.push(v),
+                        None => return Ok(None),
+                    }
+                }
+            }
+        }
+        let reads = values.into_iter();
+        let child = match handles[idx].dtype().as_ptype() {
+            PType::U8 => PrimitiveArray::from_iter(reads.map(|v| v as u8)).into_array(),
+            PType::U16 => PrimitiveArray::from_iter(reads.map(|v| v as u16)).into_array(),
+            PType::U32 => PrimitiveArray::from_iter(reads.map(|v| v as u32)).into_array(),
+            PType::U64 => PrimitiveArray::from_iter(reads).into_array(),
+            _ => return Ok(None),
+        };
+        children.push(child);
+    }
+    let names: Vec<FieldName> = columns.iter().map(|c| FieldName::from(*c)).collect();
+    let rows_struct =
+        StructArray::try_new(names.into(), children, live.len(), Validity::NonNullable)
+            .map_err(VortexRdfError::Vortex)?
+            .into_array();
+    Ok(Some(rows_struct))
+}
+
+/// The `(column, code)` pairs of a filter built by [`build_file_filter`] —
+/// a conjunction of `column == literal` over root fields. `None` for any
+/// other shape (e.g. the `AlwaysFalse` literal), telling the caller the
+/// filter cannot be applied as per-row equality tests.
+pub(crate) fn eq_code_pairs(filter: &Expression) -> Option<Vec<(String, u64)>> {
+    use vortex_array::scalar_fn::fns::binary::Binary;
+    use vortex_array::scalar_fn::fns::get_item::GetItem;
+    use vortex_array::scalar_fn::fns::literal::Literal;
+    use vortex_array::scalar_fn::fns::operators::Operator;
+
+    conjuncts(filter)
+        .iter()
+        .map(|c| {
+            let op = c.as_opt::<Binary>()?;
+            if *op != Operator::Eq {
+                return None;
+            }
+            let field = c.child(0).as_opt::<GetItem>()?;
+            let scalar = c.child(1).as_opt::<Literal>()?;
+            let code = u64::try_from(scalar).ok()?;
+            Some((field.to_string(), code))
+        })
+        .collect()
 }
 
 /// Zone-map envelope of `filter`: the contiguous row range outside of which
