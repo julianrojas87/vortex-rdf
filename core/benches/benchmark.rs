@@ -48,6 +48,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::hint::black_box;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use futures::stream;
@@ -536,9 +537,11 @@ fn dict_open(bencher: divan::Bencher, residency: &DictResidency) {
 }
 
 /// Cold term→ID probes: a fully bound pattern (four dictionary probes) on a
-/// store opened fresh each iteration, so the file-backed probe cache never
-/// warms. Resident probes are in-memory binary searches; file-backed ones are
-/// zone-pruned column scans.
+/// store opened fresh each iteration, so neither the probe memo nor the
+/// file-backed dictionary's chunk cache carries anything over. Resident
+/// probes are in-memory binary searches; file-backed ones binary-search the
+/// term column through chunk leaves fetched on demand, so this cell prices
+/// those first fetches rather than the search over them.
 #[divan::bench(args = DICT_CONFIGS)]
 fn dict_probe_cold(bencher: divan::Bencher, residency: &DictResidency) {
     let residency = *residency;
@@ -559,9 +562,11 @@ fn dict_probe_cold(bencher: divan::Bencher, residency: &DictResidency) {
         });
 }
 
-/// The same fully bound pattern on one shared store: after the first
-/// iteration every file-backed probe hits the memoized probe cache — the
-/// steady state of repeated lookups for the same terms.
+/// The same fully bound pattern on one shared store — the steady state of
+/// repeated lookups for the *same* terms. After the first iteration the probe
+/// memo answers every term on both arms, so this cell prices the match
+/// machinery around the dictionary rather than the dictionary itself; the
+/// residency axis shows in [`dict_probe_distinct`], not here.
 #[divan::bench(args = DICT_CONFIGS)]
 fn dict_probe_warm(bencher: divan::Bencher, residency: &DictResidency) {
     let store = open_dict_store(*residency, bench_size());
@@ -580,10 +585,65 @@ fn dict_probe_warm(bencher: divan::Bencher, residency: &DictResidency) {
     });
 }
 
-/// Reconstruction of a matched subset (predicate-bound, 1% of rows at the
-/// default size): resident decodes codes against the in-memory dictionary;
-/// file-backed resolves each chunk's distinct codes with a row-index scan
-/// first.
+/// Term→ID probes that always miss the memo: one shared store, so its chunk
+/// cache stays warm, probed with a different subject every iteration. This is
+/// the steady state of a query workload over a large term set — distinct
+/// lookups against a store that has been open a while — and the regime where
+/// the residency axis actually separates, since the cold cell is dominated by
+/// first fetches and the warm one by the memo. The term is built outside the
+/// timed closure, as the other probe cells do.
+#[divan::bench(args = DICT_CONFIGS)]
+fn dict_probe_distinct(bencher: divan::Bencher, residency: &DictResidency) {
+    let store = open_dict_store(*residency, bench_size());
+    let subjects = bench_size();
+    let next = AtomicUsize::new(0);
+    bencher
+        .with_inputs(|| {
+            // One row per subject in the generated data, so cycling the
+            // counter walks distinct terms that all exist.
+            let i = next.fetch_add(1, Ordering::Relaxed) % subjects;
+            NamedOrBlankNode::NamedNode(NamedNode::new_unchecked(format!(
+                "http://example.org/subject/{i}"
+            )))
+        })
+        .bench_refs(|s| {
+            rt().block_on(async {
+                let matched = store
+                    .match_pattern(Some(s), None, None, None)
+                    .await
+                    .expect("match S");
+                black_box(matched)
+            })
+        });
+}
+
+/// Reconstruction of a point result (subject-bound, one row): the chunk's
+/// handful of distinct codes stays under the point-read cap, so a file-backed
+/// dictionary resolves them by reading exactly those rows out of its cached
+/// wire chunks instead of scanning. The bound term is memoized after the
+/// first iteration, so this cell prices the decode, not the probe.
+#[divan::bench(args = DICT_CONFIGS)]
+fn dict_decode_point(bencher: divan::Bencher, residency: &DictResidency) {
+    let store = open_dict_store(*residency, bench_size());
+    let s = NamedOrBlankNode::NamedNode(NamedNode::new_unchecked("http://example.org/subject/0"));
+    bencher.bench(|| {
+        rt().block_on(async {
+            let matched = store
+                .match_pattern(Some(&s), None, None, None)
+                .await
+                .expect("match S");
+            let quads = matched.quads_vec().await.expect("decode point");
+            black_box(quads.len())
+        })
+    });
+}
+
+/// Reconstruction of a wide matched subset (predicate-bound, 1% of rows at
+/// the default size): resident decodes codes against the in-memory
+/// dictionary. The matched chunk holds far more distinct codes than the
+/// point-read cap admits, so a file-backed dictionary resolves them with one
+/// row-index scan — the bulk path, whose whole-leaf decode is what wins at
+/// this width. [`dict_decode_point`] covers the other side of the cap.
 #[divan::bench(args = DICT_CONFIGS)]
 fn dict_decode_matched(bencher: divan::Bencher, residency: &DictResidency) {
     let store = open_dict_store(*residency, bench_size());
