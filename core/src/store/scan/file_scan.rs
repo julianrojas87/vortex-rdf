@@ -427,6 +427,63 @@ pub(crate) async fn file_point_rows(
     Ok(Some(rows_struct))
 }
 
+/// A located serve run's projected component columns, read point-by-point
+/// through the component's cached chunk probes into one canonical
+/// child-named chunk — the serve path's counterpart of [`file_point_rows`].
+/// `Ok(None)` declines (an unprobeable column or chunk); the caller keeps
+/// its filter scan.
+pub(crate) async fn component_point_chunk(
+    file: &NativeStoreFile,
+    component: &str,
+    columns: &[&'static str],
+    range: Range<u64>,
+) -> Result<Option<ArrayRef>> {
+    use vortex_array::IntoArray;
+    use vortex_array::arrays::{PrimitiveArray, StructArray};
+    use vortex_array::dtype::{FieldName, PType};
+    use vortex_array::validity::Validity;
+
+    let Some(handles) = columns
+        .iter()
+        .map(|c| file.component_column_chunks(component, c))
+        .collect::<Option<Vec<_>>>()
+    else {
+        return Ok(None);
+    };
+    let source = file.segment_source();
+    let session = file.session();
+    let len = (range.end - range.start) as usize;
+    let mut children = Vec::with_capacity(columns.len());
+    for handle in &handles {
+        let mut values = Vec::with_capacity(len);
+        for row in range.clone() {
+            match handle
+                .value_at(row, &source, session)
+                .await
+                .map_err(VortexRdfError::Vortex)?
+            {
+                Some(v) => values.push(v),
+                None => return Ok(None),
+            }
+        }
+        let reads = values.into_iter();
+        let child = match handle.dtype().as_ptype() {
+            PType::U8 => PrimitiveArray::from_iter(reads.map(|v| v as u8)).into_array(),
+            PType::U16 => PrimitiveArray::from_iter(reads.map(|v| v as u16)).into_array(),
+            PType::U32 => PrimitiveArray::from_iter(reads.map(|v| v as u32)).into_array(),
+            PType::U64 => PrimitiveArray::from_iter(reads).into_array(),
+            _ => return Ok(None),
+        };
+        children.push(child);
+    }
+    let names: Vec<FieldName> = columns.iter().map(|c| FieldName::from(*c)).collect();
+    Ok(Some(
+        StructArray::try_new(names.into(), children, len, Validity::NonNullable)
+            .map_err(VortexRdfError::Vortex)?
+            .into_array(),
+    ))
+}
+
 /// The `(column, code)` pairs of a filter built by [`build_file_filter`] —
 /// a conjunction of `column == literal` over root fields. `None` for any
 /// other shape (e.g. the `AlwaysFalse` literal), telling the caller the

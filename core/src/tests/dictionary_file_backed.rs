@@ -122,8 +122,9 @@ async fn test_file_backed_dictionary_serves_from_copy_index() {
     let p0 = NamedNode::new("http://example.org/p0").unwrap();
     let matched = fb.match_pattern(None, Some(&p0), None, None).await.unwrap();
     assert!(matched.debug_has_serve_plan());
-    // The served match defers its rid scan; the served stream never runs it.
-    assert!(matched.debug_selection_pending());
+    // The located run is small, so its ids resolved eagerly by rid point
+    // reads at match time — no deferred rid scan remains.
+    assert!(!matched.debug_selection_pending());
     let served: Vec<Quad> = matched.quads().unwrap().try_collect().await.unwrap();
     assert_eq!(served.len(), 4);
 }

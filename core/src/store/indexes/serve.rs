@@ -28,6 +28,7 @@
 //! instead of scanning for them at match time.
 
 use std::ops::Range;
+use std::sync::Arc;
 
 use oxrdf::Quad;
 use vortex_array::arrays::PrimitiveArray;
@@ -87,6 +88,65 @@ impl ServeDecode {
             Ok(rows) => self.decode_layout.decode_chunk_async(&rows).await,
             Err(e) => vec![Err(e)],
         }
+    }
+
+    /// A small run's live rows as a primary-named `(s, p, o, g)` canonical
+    /// struct, read point-by-point at the run's global positions through the
+    /// component's cached probes — no slice, no per-call probe resolution.
+    /// `Ok(None)` declines (a wide run, or a column — e.g. a string copy —
+    /// whose encoding resolves no probe); the caller keeps the slice path.
+    fn rows_via_probes(
+        &self,
+        array: &ArrayRef,
+        range: Range<usize>,
+        probes: &crate::store::probes::BaseProbes,
+        deleted: Option<&Mask>,
+    ) -> Result<Option<ArrayRef>> {
+        use vortex_array::dtype::PType;
+
+        use crate::store::selection::POINT_GATHER_MAX_ROWS;
+
+        if range.len() > POINT_GATHER_MAX_ROWS {
+            return Ok(None);
+        }
+        // Tombstones are defined over primary row ids; the rid column says
+        // which primary row each served row mirrors.
+        let live: Vec<usize> = match deleted {
+            None => range.collect(),
+            Some(deleted) => {
+                let Some(rid) = probes.by_name(array, self.rid_column) else {
+                    return Ok(None);
+                };
+                range
+                    .filter(|&pos| !deleted.value(rid.value_at(pos) as usize))
+                    .collect()
+            }
+        };
+        let mut children = Vec::with_capacity(4);
+        for name in self.primary_columns {
+            let Some(probe) = probes.by_name(array, name) else {
+                return Ok(None);
+            };
+            let reads = live.iter().map(|&pos| probe.value_at(pos));
+            let child = match probe.array().dtype().as_ptype() {
+                PType::U8 => PrimitiveArray::from_iter(reads.map(|v| v as u8)).into_array(),
+                PType::U16 => PrimitiveArray::from_iter(reads.map(|v| v as u16)).into_array(),
+                PType::U32 => PrimitiveArray::from_iter(reads.map(|v| v as u32)).into_array(),
+                PType::U64 => PrimitiveArray::from_iter(reads).into_array(),
+                _ => return Ok(None),
+            };
+            children.push(child);
+        }
+        Ok(Some(
+            StructArray::try_new(
+                FieldNames::from(crate::store::schema::PRIMARY_COLUMNS),
+                children,
+                live.len(),
+                Validity::NonNullable,
+            )
+            .map_err(VortexRdfError::Vortex)?
+            .into_array(),
+        ))
     }
 
     /// A chunk's live rows as a primary-named `(s, p, o, g)` struct: relabel the
@@ -165,6 +225,10 @@ pub(crate) struct InMemoryServePlan {
     /// The index component's rows, in child schema.
     array: ArrayRef,
     range: Range<usize>,
+    /// The component's shared probe cache, so a small run reads
+    /// point-by-point at its global positions instead of slicing (a slice's
+    /// probe would be re-resolved per call).
+    probes: Arc<crate::store::probes::BaseProbes>,
 }
 
 impl InMemoryServePlan {
@@ -176,6 +240,7 @@ impl InMemoryServePlan {
         decode_layout: ResolvedLayout,
         array: ArrayRef,
         range: Range<usize>,
+        probes: Arc<crate::store::probes::BaseProbes>,
     ) -> Self {
         Self {
             decode: ServeDecode {
@@ -185,14 +250,24 @@ impl InMemoryServePlan {
             },
             array,
             range,
+            probes,
         }
     }
 
     /// Decode the matched quads straight from the index component's rows:
-    /// slice the component to this plan's row run, then decode those columns
-    /// as the primary `(s, p, o, g)` — replacing the row-id gather over the
-    /// primaries.
+    /// point reads at the run's global positions through the component's
+    /// cached probes when the run is small, else slice the component to this
+    /// plan's row run — either way decoding those columns as the primary
+    /// `(s, p, o, g)`, replacing the row-id gather over the primaries.
     pub(crate) fn decode(&self, deleted: Option<&Mask>) -> Vec<Result<Quad>> {
+        match self
+            .decode
+            .rows_via_probes(&self.array, self.range.clone(), &self.probes, deleted)
+        {
+            Ok(Some(rows)) => return self.decode.decode_layout.decode_chunk(&rows),
+            Ok(None) => {}
+            Err(e) => return vec![Err(e)],
+        }
         match self.array.slice(self.range.clone()) {
             Ok(rows) => self.decode.decode_columns(&rows, deleted),
             Err(e) => vec![Err(VortexRdfError::Vortex(e))],
@@ -216,18 +291,31 @@ pub(crate) struct FileServePlan {
     /// The index component child's cached layout reader.
     reader: vortex_layout::LayoutReaderRef,
     constraints: Vec<(&'static str, Scalar)>,
+    /// The serving component's name, addressing its cached chunk probes on
+    /// the file handle for point-read serving.
+    component: &'static str,
+    /// The child rows the constraints select, when the resolution located
+    /// them by chunk probes — exactly the constrained rows, letting a small
+    /// run be point-read instead of scanned. `None` when unlocated (or when
+    /// a constraint the location didn't cover would make the range
+    /// over-approximate).
+    row_range: Option<Range<u64>>,
 }
 
 #[cfg(feature = "file-io")]
 impl FileServePlan {
     /// A plan serving a file's index columns by a pushed-down scan filtered to
-    /// the rows where every `constraints` equality holds.
+    /// the rows where every `constraints` equality holds — or, over a located
+    /// `row_range`, by point reads through the component's cached chunk
+    /// probes.
     pub(crate) fn new(
         primary_columns: [&'static str; 4],
         rid_column: &'static str,
         decode_layout: ResolvedLayout,
         reader: vortex_layout::LayoutReaderRef,
         constraints: Vec<(&'static str, Scalar)>,
+        component: &'static str,
+        row_range: Option<Range<u64>>,
     ) -> Self {
         Self {
             decode: ServeDecode {
@@ -237,7 +325,19 @@ impl FileServePlan {
             },
             reader,
             constraints,
+            component,
+            row_range,
         }
+    }
+
+    /// The serving component's name on the file handle.
+    pub(crate) fn component(&self) -> &'static str {
+        self.component
+    }
+
+    /// The located child-row range the constraints select, when known.
+    pub(crate) fn row_range(&self) -> Option<Range<u64>> {
+        self.row_range.clone()
     }
 
     /// The columns to project from the file to serve these rows: the four

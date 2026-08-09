@@ -552,6 +552,64 @@ pub(crate) fn sorted_probe_run(
     Ok(Some(within.start + lo..within.start + hi))
 }
 
+/// The row ids of a located index-child run, read point-by-point from the
+/// child's rid column through its cached chunk probes and re-sorted into
+/// base row order — the file counterpart of slicing an in-memory rid run.
+/// `Ok(None)` when the rid column's chunks decline (the caller keeps its
+/// scan); rids are unique by construction, so sorting alone suffices.
+#[cfg(feature = "file-io")]
+pub(crate) async fn rid_point_reads(
+    file: &crate::store::native_file::NativeStoreFile,
+    component: &str,
+    range: Range<u64>,
+) -> Result<Option<Buffer<u64>>> {
+    let Some(chunks) = file.component_column_chunks(component, secondary_by_copy::CHILD_RID_COL)
+    else {
+        return Ok(None);
+    };
+    let source = file.segment_source();
+    let session = file.session();
+    let mut ids = Vec::with_capacity((range.end - range.start) as usize);
+    for row in range {
+        match chunks
+            .value_at(row, &source, session)
+            .await
+            .map_err(VortexRdfError::Vortex)?
+        {
+            Some(rid) => ids.push(rid),
+            None => return Ok(None),
+        }
+    }
+    ids.sort_unstable();
+    Ok(Some(Buffer::from(ids)))
+}
+
+/// [`sorted_probe_run`] through a component's cached probe when its column
+/// resolves one (skipping the per-call slice + encoding-tree walk): a full
+/// search on the whole column, or a windowed search inside a lead run —
+/// window-only, exactly like the slice-then-search path. String-valued
+/// components (whose probe scalars are not integers) and probe-declined
+/// encodings fall back to the per-call search.
+pub(crate) fn component_probe_run(
+    component: &IndexComponent,
+    column: &'static str,
+    native: &Scalar,
+    within: Option<Range<usize>>,
+) -> Result<Option<Range<usize>>> {
+    if let Some(owned) = component.probe(column)
+        && let Ok(needle) = u64::try_from(native)
+    {
+        let (lo, hi) = match within {
+            None => owned.bounds(needle),
+            Some(range) => owned.bounds_in(range, needle),
+        };
+        return Ok(Some(lo..hi));
+    }
+    let rows = component.rows()?;
+    let within = within.unwrap_or(0..rows.len());
+    sorted_probe_run(rows, column, native, within)
+}
+
 /// Decode a row-id column into the ascending, unique `Buffer<u64>` every index
 /// resolution answers in.
 ///

@@ -119,6 +119,59 @@ impl VortexRdfStore {
                 // column. The store executes the plan without knowing which
                 // index produced it.
                 if let Some(serve) = serve {
+                    // A small located run reads point-by-point through the
+                    // component's cached chunk probes — one async item, no
+                    // scan machinery; the moved-in filter scan handles the
+                    // rare mid-fetch decline.
+                    if let Some(range) = serve.row_range()
+                        && (range.end - range.start) as usize
+                            <= crate::store::selection::POINT_GATHER_MAX_ROWS
+                    {
+                        let scan = serve
+                            .file_scan()
+                            .with_projection(select(serve.projection(), root()))
+                            .with_filter(serve.filter());
+                        let serve = serve.clone();
+                        let deleted = deleted.clone();
+                        let file = std::sync::Arc::clone(file);
+                        let chunk = async move {
+                            let projection = serve.projection();
+                            let chunk_arr =
+                                match crate::store::scan::file_scan::component_point_chunk(
+                                    &file,
+                                    serve.component(),
+                                    &projection,
+                                    range,
+                                )
+                                .await
+                                {
+                                    Ok(Some(rows)) => rows,
+                                    Ok(None) => {
+                                        let scanned = async {
+                                            scan.into_array_stream()
+                                                .map_err(VortexRdfError::Vortex)?
+                                                .read_all()
+                                                .await
+                                                .map_err(VortexRdfError::Vortex)
+                                        }
+                                        .await;
+                                        match scanned {
+                                            Ok(rows) => rows,
+                                            Err(e) => return vec![Err(e)],
+                                        }
+                                    }
+                                    Err(e) => return vec![Err(e)],
+                                };
+                            serve
+                                .decode_columns_async(&chunk_arr, deleted.as_ref())
+                                .await
+                        };
+                        return Ok(Box::new(
+                            stream::once(chunk)
+                                .chain(stream::iter([tail_quads]))
+                                .boxed(),
+                        ));
+                    }
                     let serve = serve.clone();
                     let deleted = deleted.clone();
                     let scan = serve

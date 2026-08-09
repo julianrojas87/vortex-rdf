@@ -393,13 +393,10 @@ pub(crate) fn resolve_in_memory(
     // deferred child canonicalizes.
     let rows = component.rows()?;
     // Binary search bounds the run of rows whose lead component equals the
-    // probe.
-    let Some(mut run) = super::sorted_probe_run(
-        rows,
-        probe.family.child_lead_col(),
-        &lead_native,
-        0..rows.len(),
-    )?
+    // probe — through the component's cached probe when the column resolves
+    // one.
+    let Some(mut run) =
+        super::component_probe_run(component, probe.family.child_lead_col(), &lead_native, None)?
     else {
         return Ok(IndexResolution::Declined);
     };
@@ -412,8 +409,12 @@ pub(crate) fn resolve_in_memory(
         let Some(second_native) = codes.probe_scalar(second_term)? else {
             return Ok(IndexResolution::Empty);
         };
-        let Some(narrowed) =
-            super::sorted_probe_run(rows, probe.family.child_second_col(), &second_native, run)?
+        let Some(narrowed) = super::component_probe_run(
+            component,
+            probe.family.child_second_col(),
+            &second_native,
+            Some(run),
+        )?
         else {
             return Ok(IndexResolution::Declined);
         };
@@ -445,6 +446,7 @@ pub(crate) fn resolve_in_memory(
             copy_decode_layout(layout),
             rows.clone().into_array(),
             run,
+            component.probes_arc(),
         )),
     })
 }
@@ -461,9 +463,13 @@ fn copy_decode_layout(layout: &ResolvedLayout) -> ResolvedLayout {
 }
 
 /// Resolve a pattern against this index's copy columns in a file-backed store
-/// — the file counterpart of [`resolve_in_memory`], reaching the columns
-/// through a pushed-down scan instead of an in-memory binary search. A prefix
-/// probe simply becomes two value constraints on the same scan.
+/// — the file counterpart of [`resolve_in_memory`]. On a globally sorted
+/// family the matched run is located first by binary search over the child's
+/// cached chunk probes (the in-memory search's file mirror, including the
+/// windowed second-key probe); a small run's row ids then come from rid point
+/// reads instead of a deferred child scan, and the serve plan carries the
+/// range so reads point-read it too. Anything the probes decline falls back
+/// to the pushed-down scan, whose filter answers regardless of sortedness.
 #[cfg(feature = "file-io")]
 pub(crate) async fn resolve_file(
     file: &crate::store::native_file::NativeStoreFile,
@@ -476,12 +482,13 @@ pub(crate) async fn resolve_file(
     };
     // The store's index set says this index exists, but be graceful when the
     // family's child is absent (a foreign writer could omit one family).
-    let Some((_, reader)) = file
+    let Some((descriptor, reader)) = file
         .component_reader(probe.family.component_name())
         .map_err(VortexRdfError::Vortex)?
     else {
         return Ok(IndexResolution::Declined);
     };
+    let sorted = descriptor.sorted;
     // Term absent from the dictionary ⇒ the pattern provably matches nothing.
     let Some(lead_native) = codes.probe_scalar(probe.lead)? else {
         return Ok(IndexResolution::Empty);
@@ -494,21 +501,76 @@ pub(crate) async fn resolve_file(
         };
         constraints.push((probe.family.child_second_col(), second_native));
     }
-    match build_serve_plan(reader.clone(), layout, pattern, codes)? {
-        // A serving resolution defers its rid scan entirely: the plan reads
-        // the matched quads straight from the copy columns, making the ids —
-        // a second pushed-down scan of the same child — redundant for the
-        // dominant match-then-iterate flow. The recipe rides along instead
-        // and runs only if a consumer needs the selection (a count, a chained
-        // match, a delete). The price is that a probe matching zero rows is
-        // no longer detected at match time — the view materializes to empty
-        // instead of short-circuiting.
+
+    // Locate the matched run through the child's cached chunk probes: the
+    // lead search over the whole child, then — for a prefix probe — the
+    // windowed second-key search inside the lead run. Integer probe values
+    // only (string copies decline through `u64::try_from`); any probe
+    // decline abandons the location wholesale.
+    let name = probe.family.component_name();
+    let mut located: Option<std::ops::Range<u64>> = None;
+    if sorted && let Ok(lead_needle) = u64::try_from(&constraints[0].1) {
+        let source = file.segment_source();
+        let session = file.session();
+        located = match file.component_column_chunks(name, probe.family.child_lead_col()) {
+            Some(chunks) => chunks
+                .bounds(lead_needle, &source, session)
+                .await
+                .map_err(VortexRdfError::Vortex)?,
+            None => None,
+        };
+        if let Some(range) = located.clone()
+            && !range.is_empty()
+            && let Some((_, second_native)) = constraints.get(1)
+        {
+            located = match (
+                file.component_column_chunks(name, probe.family.child_second_col()),
+                u64::try_from(second_native),
+            ) {
+                (Some(chunks), Ok(needle)) => chunks
+                    .bounds_in(range, needle, &source, session)
+                    .await
+                    .map_err(VortexRdfError::Vortex)?,
+                _ => None,
+            };
+        }
+    }
+    // A located empty run proves the combination absent — the short-circuit
+    // the deferred path gives up.
+    if let Some(range) = &located
+        && range.is_empty()
+    {
+        return Ok(IndexResolution::Empty);
+    }
+    // A small located run resolves its row ids NOW by rid point reads — a
+    // handful of cached-chunk accesses — instead of deferring a whole child
+    // scan (which a count or chained match would then pay).
+    let row_ids = match &located {
+        Some(range)
+            if (range.end - range.start) as usize
+                <= crate::store::selection::POINT_GATHER_MAX_ROWS =>
+        {
+            match super::rid_point_reads(file, name, range.clone()).await? {
+                Some(ids) => ResolvedRowIds::Eager(ids),
+                None => ResolvedRowIds::Lazy(LazyRowIds::from_index_child_scan(
+                    reader.clone(),
+                    constraints.clone(),
+                    CHILD_RID_COL,
+                )),
+            }
+        }
+        _ => ResolvedRowIds::Lazy(LazyRowIds::from_index_child_scan(
+            reader.clone(),
+            constraints.clone(),
+            CHILD_RID_COL,
+        )),
+    };
+    match build_serve_plan(reader.clone(), layout, pattern, codes, name, located)? {
+        // A serving resolution reads the matched quads straight from the
+        // copy columns — point reads over a located run, or the pushed-down
+        // filter scan.
         Some(plan) => Ok(IndexResolution::Resolved {
-            row_ids: ResolvedRowIds::Lazy(LazyRowIds::from_index_child_scan(
-                reader,
-                constraints,
-                CHILD_RID_COL,
-            )),
+            row_ids,
             resolves: probe.resolves,
             serve: Some(plan),
         }),
@@ -539,6 +601,8 @@ fn build_serve_plan(
     layout: &ResolvedLayout,
     pattern: QuadPattern<'_>,
     codes: &mut PatternCodes,
+    component: &'static str,
+    row_range: Option<std::ops::Range<u64>>,
 ) -> Result<Option<FileServePlan>> {
     let mut constraints: Vec<(&'static str, Scalar)> = Vec::new();
     for (column, term) in [
@@ -552,12 +616,23 @@ fn build_serve_plan(
         };
         constraints.push((column, scalar));
     }
+    // A located range is exactly the constrained rows only when the probes
+    // covered every constraint: the location searched the sort keys (lead,
+    // then second), so a bound graph — never a sort key here — demotes the
+    // range back to the filter scan.
+    let row_range = if pattern.graph.is_none() {
+        row_range
+    } else {
+        None
+    };
     Ok(Some(FileServePlan::new(
         ["s", "p", "o", "g"],
         CHILD_RID_COL,
         copy_decode_layout(layout),
         reader,
         constraints,
+        component,
+        row_range,
     )))
 }
 

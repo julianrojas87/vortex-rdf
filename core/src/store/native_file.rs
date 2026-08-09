@@ -121,6 +121,30 @@ impl NativeStoreFile {
             .clone()
     }
 
+    /// An index component column's chunk-probe handle, the auxiliary-child
+    /// counterpart of [`column_chunks`](Self::column_chunks) — for locating
+    /// matched runs and point-reading served rows through the component's
+    /// wire-encoded chunks. `None` (memoized) on any decline.
+    pub(crate) fn component_column_chunks(
+        &self,
+        component: &str,
+        column: &str,
+    ) -> Option<std::sync::Arc<vortex_encoded_search::ColumnChunks>> {
+        // The `/` separator cannot appear in a bare quad column name, so the
+        // composite keys share the quad columns' memo without collisions.
+        let key = format!("{component}/{column}");
+        let mut memo = self.column_chunks.lock().expect("column chunks lock");
+        memo.entry(key)
+            .or_insert_with(|| {
+                let index = self.components.iter().position(|c| c.name == component)?;
+                let typed = self.file.footer().layout().as_::<RdfStoreLayoutVTable>();
+                let child = typed.child(index + 1).ok()?;
+                vortex_encoded_search::ColumnChunks::from_struct_layout(&child, column)
+                    .map(std::sync::Arc::new)
+            })
+            .clone()
+    }
+
     /// The quad table's natural splits, memoized. Shadows the inner file's
     /// `splits()` (which recomputes from the layout tree per call).
     pub(crate) fn splits(&self) -> VortexResult<std::sync::Arc<[std::ops::Range<u64>]>> {

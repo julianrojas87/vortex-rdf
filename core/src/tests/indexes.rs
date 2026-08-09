@@ -933,7 +933,10 @@ async fn test_code_columns_materializes_served_match() {
 /// tombstoned rows filtered through the family's rid column), and chained
 /// matches falling back to row ids.
 #[cfg(feature = "file-io")]
-async fn run_copy_index_file_serving_test<B: VortexArrayBuilder>(layout: LayoutStrategy) {
+async fn run_copy_index_file_serving_test<B: VortexArrayBuilder>(
+    layout: LayoutStrategy,
+    located: bool,
+) {
     let graphs = [
         GraphName::NamedNode(NamedNode::new("http://example.org/g0").unwrap()),
         GraphName::NamedNode(NamedNode::new("http://example.org/g1").unwrap()),
@@ -965,17 +968,17 @@ async fn run_copy_index_file_serving_test<B: VortexArrayBuilder>(layout: LayoutS
     let store = VortexRdfStore::from_file(&path).await.unwrap();
     assert_eq!(store.indexes(), &[IndexType::SecondaryByCopy]);
 
-    // Predicate-bound: i ≡ 1 (mod 3), served from the POSG family. The
-    // match itself runs no rid scan — the resolution's exact ids stay
-    // pending until `size` (the first consumer to need them) materializes
-    // them; the served `quads()` never does.
+    // Predicate-bound: i ≡ 1 (mod 3), served from the POSG family. On a
+    // located resolution (sorted dictionary-code copies) the small run's
+    // ids resolve eagerly by rid point reads; otherwise the rid scan stays
+    // pending until `size` — the served `quads()` never runs it either way.
     let p1 = NamedNode::new("http://example.org/p1").unwrap();
     let by_p = store
         .match_pattern(None, Some(&p1), None, None)
         .await
         .unwrap();
     assert!(by_p.debug_has_serve_plan());
-    assert!(by_p.debug_selection_pending());
+    assert_eq!(by_p.debug_selection_pending(), !located);
     assert_eq!(by_p.size().await.unwrap(), 10);
     assert_eq!(view_strings(&by_p).await, expected(&|i| i % 3 == 1));
     // A base-order gather cannot ride the plan: it materializes the pending
@@ -989,7 +992,7 @@ async fn run_copy_index_file_serving_test<B: VortexArrayBuilder>(layout: LayoutS
         .await
         .unwrap();
     assert!(by_o.debug_has_serve_plan());
-    assert!(by_o.debug_selection_pending());
+    assert_eq!(by_o.debug_selection_pending(), !located);
     assert_eq!(by_o.size().await.unwrap(), 6);
     assert_eq!(view_strings(&by_o).await, expected(&|i| i % 5 == 2));
 
@@ -1004,15 +1007,16 @@ async fn run_copy_index_file_serving_test<B: VortexArrayBuilder>(layout: LayoutS
     assert_eq!(view_strings(&by_po).await, expected(&|i| i % 15 == 1));
 
     // A residual graph constraint rides the copy-served scan's filter; the
-    // selection stays pending (its ids cover the resolved predicate only —
-    // `size` materializes them and evaluates the residual on top).
+    // selection's ids cover the resolved predicate only — `size` evaluates
+    // the residual on top of them (eager on a located resolution, pending
+    // otherwise).
     let p2 = NamedNode::new("http://example.org/p2").unwrap();
     let by_pg = store
         .match_pattern(None, Some(&p2), None, Some(&graphs[0]))
         .await
         .unwrap();
     assert!(by_pg.debug_has_serve_plan());
-    assert!(by_pg.debug_selection_pending());
+    assert_eq!(by_pg.debug_selection_pending(), !located);
     assert_eq!(by_pg.size().await.unwrap(), 5);
     assert_eq!(
         view_strings(&by_pg).await,
@@ -1041,15 +1045,15 @@ async fn run_copy_index_file_serving_test<B: VortexArrayBuilder>(layout: LayoutS
     assert_eq!(none.size().await.unwrap(), 0);
 
     // A term the store knows — but never as a predicate — probes the index
-    // child and finds nothing. With the rid scan deferred, the emptiness is
-    // only discovered by whichever consumer materializes: the view comes
-    // back served-and-pending, then counts zero and streams nothing.
+    // child and finds nothing.
     let subject_as_p = NamedNode::new("http://example.org/s00").unwrap();
     let zero = store
         .match_pattern(None, Some(&subject_as_p), None, None)
         .await
         .unwrap();
-    assert!(zero.debug_selection_pending());
+    // A located resolution proves the emptiness at match time and
+    // short-circuits; an unlocated one only discovers it at the consumer.
+    assert_eq!(zero.debug_selection_pending(), !located);
     assert_eq!(view_strings(&zero).await, Vec::<String>::new());
     assert_eq!(zero.size().await.unwrap(), 0);
 
@@ -1081,32 +1085,79 @@ async fn run_copy_index_file_serving_test<B: VortexArrayBuilder>(layout: LayoutS
     assert_eq!(view_strings(&by_p_wiped).await, Vec::<String>::new());
 }
 
+/// A located run wider than the point-read cap keeps the deferred contract:
+/// the rid scan stays pending until a consumer needs the selection, and the
+/// served stream reads through the filter scan — both agreeing with the
+/// in-memory store.
+#[cfg(feature = "file-io")]
+#[tokio::test]
+async fn test_copy_index_file_serving_wide_located_run_stays_pending() {
+    let quads: Vec<Quad> = (0..900)
+        .map(|i| {
+            make_quad(
+                &format!("http://example.org/s{:04}", i),
+                &format!("http://example.org/p{}", i % 3),
+                &format!("o{}", i % 7),
+                GraphName::DefaultGraph,
+            )
+        })
+        .collect();
+    let (_dir, path) = write_store_file::<SortedStreamBuilder>(
+        quads.clone(),
+        LayoutStrategy::Dictionary,
+        vec![IndexType::SecondaryByCopy],
+    )
+    .await;
+    let store = VortexRdfStore::from_file(&path).await.unwrap();
+
+    let p1 = NamedNode::new("http://example.org/p1").unwrap();
+    let by_p = store
+        .match_pattern(None, Some(&p1), None, None)
+        .await
+        .unwrap();
+    assert!(by_p.debug_has_serve_plan());
+    assert!(
+        by_p.debug_selection_pending(),
+        "a 300-row run exceeds the point-read cap and must stay deferred"
+    );
+    assert_eq!(by_p.size().await.unwrap(), 300);
+    let mut want: Vec<String> = quads
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| i % 3 == 1)
+        .map(|(_, q)| q.to_string())
+        .collect();
+    want.sort();
+    assert_eq!(view_strings(&by_p).await, want);
+}
+
 #[cfg(feature = "file-io")]
 #[tokio::test]
 async fn test_copy_index_file_serving_default_sorted_stream() {
-    run_copy_index_file_serving_test::<SortedStreamBuilder>(LayoutStrategy::Default).await;
+    run_copy_index_file_serving_test::<SortedStreamBuilder>(LayoutStrategy::Default, false).await;
 }
 
 #[cfg(feature = "file-io")]
 #[tokio::test]
 async fn test_copy_index_file_serving_typed_sorted_stream() {
-    run_copy_index_file_serving_test::<SortedStreamBuilder>(LayoutStrategy::TypedObject).await;
+    run_copy_index_file_serving_test::<SortedStreamBuilder>(LayoutStrategy::TypedObject, false)
+        .await;
 }
 
 #[cfg(feature = "file-io")]
 #[tokio::test]
 async fn test_copy_index_file_serving_dictionary_sorted_stream() {
-    run_copy_index_file_serving_test::<SortedStreamBuilder>(LayoutStrategy::Dictionary).await;
+    run_copy_index_file_serving_test::<SortedStreamBuilder>(LayoutStrategy::Dictionary, true).await;
 }
 
 #[cfg(feature = "file-io")]
 #[tokio::test]
 async fn test_copy_index_file_serving_default_sorted_in_memory() {
-    run_copy_index_file_serving_test::<SortedInMemoryBuilder>(LayoutStrategy::Default).await;
+    run_copy_index_file_serving_test::<SortedInMemoryBuilder>(LayoutStrategy::Default, false).await;
 }
 
 #[cfg(feature = "file-io")]
 #[tokio::test]
 async fn test_copy_index_file_serving_default_unsorted_stream() {
-    run_copy_index_file_serving_test::<UnsortedStreamBuilder>(LayoutStrategy::Default).await;
+    run_copy_index_file_serving_test::<UnsortedStreamBuilder>(LayoutStrategy::Default, false).await;
 }

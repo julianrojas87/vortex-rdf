@@ -248,9 +248,10 @@ pub(crate) fn resolve_in_memory(
     // First genuine use of a `from_bytes`-adopted component: this is where a
     // deferred child canonicalizes.
     let rows = component.rows()?;
-    // Binary search bounds the run of rows equal to the probe; an empty run
+    // Binary search bounds the run of rows equal to the probe — through the
+    // component's cached probe when the column resolves one; an empty run
     // means the term is present in the schema but absent from the data.
-    let Some(run) = super::sorted_probe_run(rows, CHILD_VAL_COL, &native, 0..rows.len())? else {
+    let Some(run) = super::component_probe_run(component, CHILD_VAL_COL, &native, None)? else {
         return Ok(IndexResolution::Declined);
     };
     if run.is_empty() {

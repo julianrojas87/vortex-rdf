@@ -112,6 +112,7 @@ pub(crate) fn adopt_scanned_component(
             cell: OnceLock::new(),
         })),
         sorted,
+        probes: crate::store::probes::BaseProbes::new(),
     })
 }
 
@@ -138,6 +139,7 @@ pub(crate) fn adopt_component_reader(
             cell: OnceLock::new(),
         })),
         sorted,
+        probes: crate::store::probes::BaseProbes::new(),
     })
 }
 
@@ -167,6 +169,14 @@ pub(crate) struct IndexComponent {
     /// corrupts query results; see the `sorted` field on the wire
     /// descriptor).
     pub(crate) sorted: bool,
+    /// Lazily-resolved encoded-search probes over the component's columns,
+    /// shared by every clone (probe resolution walks the encoding tree per
+    /// call otherwise — the fixed cost of the resolvers' searches and the
+    /// serve path's point reads). The rows are immutable once materialized,
+    /// so the cache's array-identity guard holds for the component's
+    /// lifetime; `into_resident` rebuilds the component and takes a fresh
+    /// cache.
+    probes: Arc<crate::store::probes::BaseProbes>,
 }
 
 /// How an [`IndexComponent`] holds its rows.
@@ -216,6 +226,7 @@ impl IndexComponent {
             implementation,
             rows: ComponentRows::Built(array),
             sorted,
+            probes: crate::store::probes::BaseProbes::new(),
         }
     }
 
@@ -307,8 +318,29 @@ impl IndexComponent {
         };
         Ok(Self {
             rows: ComponentRows::Built(array),
+            // The rebuilt rows are a different array; the old cache's
+            // identity guard would only ever decline against them.
+            probes: crate::store::probes::BaseProbes::new(),
             ..self
         })
+    }
+
+    /// The cached encoded-search probe over the component's `column`, or
+    /// `None` when the column's encoding declines (callers fall back to the
+    /// per-call search). Resolving materializes a deferred component, exactly
+    /// like [`rows`](Self::rows).
+    pub(crate) fn probe(
+        &self,
+        column: &str,
+    ) -> Option<Arc<vortex_encoded_search::OwnedSortedProbe>> {
+        let rows = self.rows().ok()?.clone().into_array();
+        self.probes.by_name(&rows, column).cloned()
+    }
+
+    /// The component's shared probe cache, for a serve plan that outlives
+    /// this reference.
+    pub(crate) fn probes_arc(&self) -> Arc<crate::store::probes::BaseProbes> {
+        Arc::clone(&self.probes)
     }
 
     /// Look a component up by name, gated on its sortedness provenance — the
