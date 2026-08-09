@@ -63,21 +63,39 @@ def measure(
     dispose the store it just made before the next iteration, or the process
     accumulates one full store per iteration and the peak RSS attributed to
     this adapter becomes a multiple of what it actually needs.
+
+    Everything already alive is frozen into the permanent generation before
+    the loop, so the per-iteration collection walks only what an iteration
+    itself created. A full collection traverses the interpreter's entire
+    object graph; that traversal evicts the CPU caches and leaves the next
+    timed call running cold, a near-constant per-sample cost that swamps a
+    microsecond-scale query and, being constant, compresses the ratios
+    between fast and slow adapters. Freezing is scoped to this measurement:
+    objects the collector ignores are still reclaimed by reference counting,
+    but leaving them frozen would exempt later cyclic garbage for the rest of
+    the process.
     """
     samples: list[float] = []
-    for i in range(warmup + iters):
-        if setup:
-            setup()
-        gc.collect()
-        t0 = time.perf_counter_ns()
-        out = fn()
-        elapsed = time.perf_counter_ns() - t0
-        if teardown:
-            teardown(out)
-        else:
-            del out
-        if i >= warmup:
-            samples.append(float(elapsed))
+    gc.collect()
+    gc.freeze()
+    try:
+        for i in range(warmup + iters):
+            if setup:
+                setup()
+            # Keeps an automatic collection from firing inside a timed call.
+            # Cheap now: the frozen objects are out of the collector's reach.
+            gc.collect()
+            t0 = time.perf_counter_ns()
+            out = fn()
+            elapsed = time.perf_counter_ns() - t0
+            if teardown:
+                teardown(out)
+            else:
+                del out
+            if i >= warmup:
+                samples.append(float(elapsed))
+    finally:
+        gc.unfreeze()
 
     samples.sort()
     median = statistics.median(samples)
