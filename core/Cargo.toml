@@ -90,3 +90,9 @@ required-features = ["file-io"]
 name = "match_lazy"
 harness = false
 required-features = ["file-io"]
+
+# Warm-path layer-split instrumentation over a real serialized store; not a
+# bench target (no upload, no harness), just a measurement binary.
+[[example]]
+name = "warm_probe"
+required-features = ["file-io"]
