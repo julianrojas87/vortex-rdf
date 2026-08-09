@@ -359,7 +359,7 @@ fn declines_float_dtype() {
 }
 
 #[test]
-fn declines_dict_encoding() {
+fn probes_dict_encoding() {
     let data: Vec<u32> = (0..10_000u32).map(|i| (i / 500) * 10).collect();
     let arr = compress_with(&[&integer::IntDictScheme], &data);
     assert_eq!(
@@ -367,7 +367,23 @@ fn declines_dict_encoding() {
         "vortex.dict",
         "fixture must produce a dict array"
     );
-    assert!(SortedProbe::resolve(&arr).is_none());
+    assert_probe(&arr, &data, &[NodeKind::Dict]);
+}
+
+#[test]
+fn probes_dict_permuted_values() {
+    // Sorted logical sequence through an unsorted dictionary — the shape a
+    // non-order-preserving dict encoder produces on a sorted column.
+    let values: Vec<u32> = vec![50, 10, 70, 20, 40];
+    let codes: Vec<u16> = vec![1, 1, 1, 3, 3, 4, 4, 4, 0, 2];
+    let data: Vec<u32> = codes.iter().map(|&c| values[c as usize]).collect();
+    let arr = vortex_array::arrays::DictArray::try_new(
+        PrimitiveArray::from_iter(codes).into_array(),
+        PrimitiveArray::from_iter(values).into_array(),
+    )
+    .unwrap()
+    .into_array();
+    assert_probe(&arr, &data, &[NodeKind::Dict, NodeKind::Primitive]);
 }
 
 #[test]
@@ -409,6 +425,7 @@ fn probes_slice_of_piecewise_sorted() {
     let encodings = [
         compress_with(&[&integer::RunEndScheme, &integer::BitPackingScheme], &data),
         compress_with(&[&integer::BitPackingScheme], &data),
+        compress_with(&[&integer::IntDictScheme], &data),
     ];
     for arr in &encodings {
         for wstart in [0usize, 1000, 5000, 23_000] {

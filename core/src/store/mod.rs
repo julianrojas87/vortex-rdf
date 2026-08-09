@@ -172,22 +172,6 @@ impl VortexRdfStore {
         debug_int_children_canonical(&struct_arr)
     }
 
-    /// Test-only hook: whether the named in-memory index component's rows
-    /// hold canonical integer children — the resident form
-    /// [`IndexComponent::into_resident`] establishes. `None` when this store
-    /// holds no such component.
-    ///
-    /// [`IndexComponent::into_resident`]: indexes::IndexComponent::into_resident
-    #[cfg(all(test, feature = "file-io"))]
-    pub(crate) fn debug_index_component_int_children_canonical(&self, name: &str) -> Option<bool> {
-        let QuadsSource::InMemory { components, .. } = &self.quads else {
-            return None;
-        };
-        let component = components.iter().find(|c| c.name == name)?;
-        let rows = component.rows().ok()?;
-        Some(debug_int_children_canonical(rows))
-    }
-
     /// Test-only hook: whether every sorted-stamped child of an in-memory
     /// base resolves an encoded search probe (see
     /// [`debug_sorted_children_probe_resolvable`]) — true for canonical and

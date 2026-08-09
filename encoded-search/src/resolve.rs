@@ -7,8 +7,9 @@
 
 use vortex_array::ArrayRef;
 use vortex_array::arrays::chunked::ChunkedArrayExt as _;
+use vortex_array::arrays::dict::DictSlots;
 use vortex_array::arrays::slice::SliceSlots;
-use vortex_array::arrays::{Chunked, Constant, Primitive, Slice};
+use vortex_array::arrays::{Chunked, Constant, Dict, Primitive, Slice};
 use vortex_array::dtype::PType;
 use vortex_array::scalar::PValue;
 use vortex_fastlanes::{
@@ -132,6 +133,22 @@ pub(crate) fn resolve_node<'a>(arr: &'a ArrayRef) -> Option<Node<'a>> {
             child: Box::new(child),
             start: range.start,
             len: range.end - range.start,
+        });
+    }
+
+    if let Some(view) = arr.as_opt::<Dict>() {
+        let slots = view.slots();
+        // Codes resolve recursively (their own gate declines signed or
+        // nullable codes); the construction invariant pins every code below
+        // the values length.
+        let codes = resolve_node(slot(slots, DictSlots::CODES)?)?;
+        let values = resolve_node(slot(slots, DictSlots::VALUES)?)?;
+        if codes.len() != arr.len() {
+            return None;
+        }
+        return Some(Node::Dict {
+            codes: Box::new(codes),
+            values: Box::new(values),
         });
     }
 

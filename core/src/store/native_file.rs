@@ -43,13 +43,17 @@ pub(crate) struct NativeStoreFile {
     /// [`PRUNING_MEMO_MAX`].
     pruning_envelopes:
         std::sync::Mutex<std::collections::HashMap<Expression, Option<std::ops::Range<u64>>>>,
-    /// The subject column's chunk-probe handle (`None` when the layout shape
-    /// or dtype does not support it), resolved once per open file. The handle
-    /// caches fetched chunk arrays internally, so repeated bound-subject
-    /// queries probe without further segment reads.
-    s_chunks:
-        std::sync::OnceLock<Option<std::sync::Arc<vortex_encoded_search::SortedColumnChunks>>>,
+    /// Per-column chunk-probe handles keyed by column name (`None` memoizes
+    /// a column whose layout shape or dtype declines), resolved once per open
+    /// file. Each handle caches fetched chunk probes internally, so repeated
+    /// bound-subject queries and point reads touch segments once.
+    column_chunks: std::sync::Mutex<ColumnChunksMemo>,
 }
+
+/// Memoized per-column chunk-probe handles; see
+/// [`NativeStoreFile::column_chunks`].
+type ColumnChunksMemo =
+    std::collections::HashMap<String, Option<std::sync::Arc<vortex_encoded_search::ColumnChunks>>>;
 
 /// Entry cap on [`NativeStoreFile::pruning_envelopes`] — sized for a query
 /// workload's distinct filter shapes, not for arbitrary term churn.
@@ -86,7 +90,7 @@ impl NativeStoreFile {
             child_readers,
             splits: std::sync::OnceLock::new(),
             pruning_envelopes: std::sync::Mutex::new(std::collections::HashMap::new()),
-            s_chunks: std::sync::OnceLock::new(),
+            column_chunks: std::sync::Mutex::new(std::collections::HashMap::new()),
         })
     }
 
@@ -95,16 +99,24 @@ impl NativeStoreFile {
     /// child's layout shape declines — callers then keep the scan path.
     pub(crate) fn sorted_subject_chunks(
         &self,
-    ) -> Option<std::sync::Arc<vortex_encoded_search::SortedColumnChunks>> {
-        self.s_chunks
-            .get_or_init(|| {
+    ) -> Option<std::sync::Arc<vortex_encoded_search::ColumnChunks>> {
+        self.column_chunks(crate::store::schema::COL_S)
+    }
+
+    /// A quad column's chunk-probe handle by name, for point reads through
+    /// the wire-encoded chunks. `None` (memoized) when the quad child's
+    /// layout shape or that column's dtype declines.
+    pub(crate) fn column_chunks(
+        &self,
+        column: &str,
+    ) -> Option<std::sync::Arc<vortex_encoded_search::ColumnChunks>> {
+        let mut memo = self.column_chunks.lock().expect("column chunks lock");
+        memo.entry(column.to_owned())
+            .or_insert_with(|| {
                 let typed = self.file.footer().layout().as_::<RdfStoreLayoutVTable>();
                 let quads = typed.child(0).ok()?;
-                vortex_encoded_search::SortedColumnChunks::from_struct_layout(
-                    &quads,
-                    crate::store::schema::COL_S,
-                )
-                .map(std::sync::Arc::new)
+                vortex_encoded_search::ColumnChunks::from_struct_layout(&quads, column)
+                    .map(std::sync::Arc::new)
             })
             .clone()
     }

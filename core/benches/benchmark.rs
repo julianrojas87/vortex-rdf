@@ -55,6 +55,10 @@ use oxrdf::{GraphName, NamedNode, NamedOrBlankNode, Term};
 
 use vortex_rdf_core::{LayoutStrategy, SortedStreamBuilder, VortexRdfError, VortexRdfStore, io};
 
+// The module is shared with `match_lazy.rs` and compiled per-target; items
+// only the other target uses (the `Bytes` source axis) are dead here by
+// design.
+#[allow(dead_code)]
 mod support;
 use support::*;
 

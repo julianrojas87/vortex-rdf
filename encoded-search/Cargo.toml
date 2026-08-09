@@ -11,6 +11,7 @@ keywords = ["vortex", "columnar", "binary-search", "compression"]
 categories = ["encoding", "data-structures"]
 
 [dependencies]
+self_cell = { workspace = true }
 vortex-array = { workspace = true }
 vortex-buffer = { workspace = true }
 vortex-error = { workspace = true }

@@ -170,6 +170,13 @@ pub(crate) enum Node<'a> {
         chunks: Vec<Chunk<'a>>,
         len: usize,
     },
+    /// `value_at(i) = values.value_at(codes.value_at(i))`. Dictionary values
+    /// are not order-preserving, so bounds searches probe the composed
+    /// logical values rather than the values child.
+    Dict {
+        codes: Box<Node<'a>>,
+        values: Box<Node<'a>>,
+    },
 }
 
 /// `partition_point` over a virtual index range, probing through a closure.
@@ -197,6 +204,7 @@ impl Node<'_> {
             | Node::Chunked { len, .. } => *len,
             Node::FoR { child, .. } => child.len(),
             Node::BitPacked(p) => p.len,
+            Node::Dict { codes, .. } => codes.len(),
         }
     }
 
@@ -225,6 +233,7 @@ impl Node<'_> {
                 let c = partition(chunks.len(), |c| chunks[c].start <= i) - 1;
                 chunks[c].node.value_at(i - chunks[c].start)
             }
+            Node::Dict { codes, values } => values.value_at(codes.value_at(i) as usize),
         }
     }
 
@@ -289,6 +298,9 @@ impl Node<'_> {
                     chunks[c].start + chunks[c].node.lower_bound(needle)
                 }
             }
+            Node::Dict { codes, values } => partition(codes.len(), |i| {
+                values.value_at(codes.value_at(i) as usize) < needle
+            }),
         }
     }
 
@@ -346,6 +358,9 @@ impl Node<'_> {
                     chunks[c - 1].start + chunks[c - 1].node.upper_bound(needle)
                 }
             }
+            Node::Dict { codes, values } => partition(codes.len(), |i| {
+                values.value_at(codes.value_at(i) as usize) <= needle
+            }),
         }
     }
 
@@ -381,6 +396,11 @@ impl Node<'_> {
                 for c in chunks {
                     c.node.collect_kinds(out);
                 }
+            }
+            Node::Dict { codes, values } => {
+                out.push(K::Dict);
+                codes.collect_kinds(out);
+                values.collect_kinds(out);
             }
         }
     }
@@ -533,5 +553,27 @@ mod tests {
         let n = Node::Primitive(Words::U8(&[1, 2, 3]));
         assert_eq!(n.lower_bound(300), 3);
         assert_eq!(n.upper_bound(300), 3);
+    }
+
+    #[test]
+    fn dict_bounds_through_permuted_values() {
+        // codes [1, 1, 3, 3, 0, 2, 2] over values [5, 1, 7, 2]
+        // -> logical [1, 1, 2, 2, 5, 7, 7] (sorted; values are not)
+        let codes = Node::Primitive(Words::U8(&[1, 1, 3, 3, 0, 2, 2]));
+        let values = Node::Primitive(Words::U32(&[5, 1, 7, 2]));
+        let n = Node::Dict {
+            codes: Box::new(codes),
+            values: Box::new(values),
+        };
+        assert_eq!(n.len(), 7);
+        assert_eq!((n.lower_bound(0), n.upper_bound(0)), (0, 0));
+        assert_eq!((n.lower_bound(1), n.upper_bound(1)), (0, 2));
+        assert_eq!((n.lower_bound(2), n.upper_bound(2)), (2, 4));
+        assert_eq!((n.lower_bound(3), n.upper_bound(3)), (4, 4));
+        assert_eq!((n.lower_bound(5), n.upper_bound(5)), (4, 5));
+        assert_eq!((n.lower_bound(7), n.upper_bound(7)), (5, 7));
+        assert_eq!((n.lower_bound(8), n.upper_bound(8)), (7, 7));
+        assert_eq!(n.value_at(4), 5);
+        assert_eq!(n.value_at(6), 7);
     }
 }

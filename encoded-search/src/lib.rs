@@ -8,19 +8,22 @@
 //! bit-packed word extraction — no `ExecutionCtx`, no canonicalization.
 //!
 //! Supported encoding nodes: Primitive, Constant, Sequence, RunEnd, FoR,
-//! BitPacked (with patches), Slice, and Chunked, composed arbitrarily.
+//! BitPacked (with patches), Slice, Chunked, and Dict, composed arbitrarily.
 //! Anything else — including nullable or non-unsigned-integer dtypes and
 //! non-host buffers — declines, and the caller falls back to its generic
 //! search path.
 
 mod node;
+mod owned;
 mod patches;
 mod resolve;
+
+pub use owned::OwnedSortedProbe;
 
 #[cfg(feature = "layout")]
 mod layout;
 #[cfg(feature = "layout")]
-pub use layout::SortedColumnChunks;
+pub use layout::ColumnChunks;
 
 use vortex_array::ArrayRef;
 
@@ -88,14 +91,15 @@ impl<'a> SortedProbe<'a> {
     }
 }
 
-/// The closed set of probe-node shapes a [`SortedProbe`] resolves.
+/// The set of probe-node shapes a [`SortedProbe`] resolves.
 ///
 /// This is deliberately not a vortex type: vortex identifies encodings by an
 /// open, registry-backed string id, while probing supports a fixed set of
 /// node shapes (including [`NodeKind::Patches`], which is a component of
-/// bit-packed arrays rather than an encoding of its own). A closed enum lets
-/// tests match exhaustively.
+/// bit-packed arrays rather than an encoding of its own). Non-exhaustive so
+/// new probe nodes extend the set without breaking downstream matches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum NodeKind {
     Primitive,
     Constant,
@@ -106,4 +110,5 @@ pub enum NodeKind {
     Patches,
     Slice,
     Chunked,
+    Dict,
 }

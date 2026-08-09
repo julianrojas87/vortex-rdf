@@ -8,7 +8,7 @@ use vortex_array::session::ArraySession;
 use vortex_array::stream::ArrayStreamAdapter;
 use vortex_array::validity::Validity;
 use vortex_array::{ArrayRef, IntoArray};
-use vortex_encoded_search::SortedColumnChunks;
+use vortex_encoded_search::ColumnChunks;
 use vortex_file::{OpenOptionsSessionExt as _, WriteOptionsSessionExt as _};
 use vortex_io::session::RuntimeSession;
 use vortex_layout::session::LayoutSession;
@@ -57,8 +57,9 @@ async fn layout_chunks_probe_matches_canonical() {
     let root = file.footer().layout().clone();
 
     let column =
-        SortedColumnChunks::from_struct_layout(&root, "s").expect("the written shape must resolve");
-    assert!(SortedColumnChunks::from_struct_layout(&root, "absent").is_none());
+        ColumnChunks::from_struct_layout(&root, "s").expect("the written shape must resolve");
+    assert!(ColumnChunks::from_struct_layout(&root, "absent").is_none());
+    assert_eq!(column.row_count(), data.len() as u64);
 
     let source = file.segment_source();
     let canonical = |needle: u64| {
@@ -87,5 +88,18 @@ async fn layout_chunks_probe_matches_canonical() {
             .unwrap()
             .expect("all chunks are probeable");
         assert_eq!(got, canonical(needle), "needle {needle}");
+    }
+
+    // Point reads across chunk interiors and boundaries need no sort order
+    // and must agree with the source data exactly.
+    let mut rows: Vec<u64> = (0..data.len() as u64).step_by(9973).collect();
+    rows.extend([0, 199_999, 200_000, 399_999, 400_000, data.len() as u64 - 1]);
+    for row in rows {
+        let got = column
+            .value_at(row, &source, &session)
+            .await
+            .unwrap()
+            .expect("all chunks are probeable");
+        assert_eq!(got, u64::from(data[row as usize]), "row {row}");
     }
 }

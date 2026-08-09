@@ -1,16 +1,17 @@
-//! File-side probing behind the `layout` feature: locate one sorted column's
-//! flat chunk leaves inside a layout tree and answer global bounds queries by
-//! fetching and probing only the chunks a binary search touches.
+//! File-side probing behind the `layout` feature: locate one column's flat
+//! chunk leaves inside a layout tree, then answer global bounds queries and
+//! point reads by fetching and probing only the chunks a search touches.
 //!
 //! A chunk fetch reads the leaf's whole segment and reconstructs the array in
 //! its wire encoding (`SerializedArray::decode` rebuilds metadata over the
-//! segment buffers — it does not decompress); fetched arrays are cached, so
-//! repeated queries probe without further reads.
+//! segment buffers — it does not decompress); each fetched chunk is resolved
+//! into an [`OwnedSortedProbe`] once and cached, so repeated queries probe
+//! without further reads or resolution.
 
 use std::ops::Range;
 use std::sync::{Arc, OnceLock};
 
-use vortex_array::ArrayRef;
+use vortex_array::dtype::DType;
 use vortex_array::serde::SerializedArray;
 use vortex_error::{VortexExpect as _, VortexResult};
 use vortex_layout::layouts::chunked::Chunked as ChunkedLayout;
@@ -21,28 +22,32 @@ use vortex_layout::segments::SegmentSource;
 use vortex_layout::{LayoutChildType, LayoutRef};
 use vortex_session::VortexSession;
 
-use crate::SortedProbe;
+use crate::OwnedSortedProbe;
 
-/// One flat chunk leaf: its layout, logical position, and the fetched
-/// wire-encoded array (filled on first use).
+/// One flat chunk leaf: its layout, logical position, and the fetched,
+/// resolved probe (filled on first use; `None` when the chunk's encoding
+/// declines resolution).
 struct ChunkSpec {
     layout: LayoutRef,
     row_offset: u64,
     row_count: u64,
-    cell: OnceLock<ArrayRef>,
+    cell: OnceLock<Option<OwnedSortedProbe>>,
 }
 
-/// The flat chunk leaves of one sorted, non-nullable unsigned-integer column
-/// of a struct layout, addressable for global bounds queries.
+/// The flat chunk leaves of one non-nullable unsigned-integer column of a
+/// struct layout, addressable for global bounds queries and point reads.
 ///
-/// Sortedness across the whole column is the caller's contract, exactly as
-/// for [`SortedProbe`].
-pub struct SortedColumnChunks {
+/// [`Self::bounds`] requires the column to be sorted ascending across the
+/// whole file — a caller contract, exactly as for
+/// [`SortedProbe`](crate::SortedProbe). [`Self::value_at`] is exact
+/// regardless of sort order.
+pub struct ColumnChunks {
     chunks: Vec<ChunkSpec>,
     row_count: u64,
+    dtype: DType,
 }
 
-impl SortedColumnChunks {
+impl ColumnChunks {
     /// Walks `root` (a struct layout) to `field`'s chunk leaves: the field
     /// child, through any zoned wrappers, then either a chunked layout of
     /// flat leaves or a single flat leaf. Returns `None` when the shape or
@@ -54,7 +59,7 @@ impl SortedColumnChunks {
                 .then(|| root.child(i).ok())
                 .flatten()
         })?;
-        let dtype = column.dtype();
+        let dtype = column.dtype().clone();
         if !dtype.is_unsigned_int() || dtype.is_nullable() {
             return None;
         }
@@ -92,13 +97,28 @@ impl SortedColumnChunks {
         } else {
             return None;
         }
-        Some(Self { chunks, row_count })
+        Some(Self {
+            chunks,
+            row_count,
+            dtype,
+        })
+    }
+
+    /// Number of rows in the column.
+    pub fn row_count(&self) -> u64 {
+        self.row_count
+    }
+
+    /// The column's dtype (a non-nullable unsigned integer, by construction).
+    pub fn dtype(&self) -> &DType {
+        &self.dtype
     }
 
     /// Exact global `[lo, hi)` of `needle` in the column, fetching at most
     /// the chunks a binary search over chunk extremes touches (cached
-    /// thereafter). `Ok(None)` when a needed chunk's encoding declines the
-    /// probe — the caller falls back to its scan path.
+    /// thereafter). Requires the sorted contract. `Ok(None)` when a needed
+    /// chunk's encoding declines the probe — the caller falls back to its
+    /// scan path.
     pub async fn bounds(
         &self,
         needle: u64,
@@ -113,8 +133,7 @@ impl SortedColumnChunks {
         let (mut lo, mut hi) = (0usize, self.chunks.len());
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
-            let arr = self.chunk_array(mid, source, session).await?;
-            let Some(probe) = SortedProbe::resolve(arr) else {
+            let Some(probe) = self.chunk_probe(mid, source, session).await? else {
                 return Ok(None);
             };
             if probe.value_at(probe.len() - 1) < needle {
@@ -126,8 +145,7 @@ impl SortedColumnChunks {
         let lower = if lo == self.chunks.len() {
             self.row_count
         } else {
-            let arr = self.chunk_array(lo, source, session).await?;
-            let Some(probe) = SortedProbe::resolve(arr) else {
+            let Some(probe) = self.chunk_probe(lo, source, session).await? else {
                 return Ok(None);
             };
             self.chunks[lo].row_offset + probe.lower_bound(needle) as u64
@@ -137,8 +155,7 @@ impl SortedColumnChunks {
         let (mut lo2, mut hi2) = (0usize, self.chunks.len());
         while lo2 < hi2 {
             let mid = lo2 + (hi2 - lo2) / 2;
-            let arr = self.chunk_array(mid, source, session).await?;
-            let Some(probe) = SortedProbe::resolve(arr) else {
+            let Some(probe) = self.chunk_probe(mid, source, session).await? else {
                 return Ok(None);
             };
             if probe.value_at(0) <= needle {
@@ -150,8 +167,7 @@ impl SortedColumnChunks {
         let upper = if lo2 == 0 {
             0
         } else {
-            let arr = self.chunk_array(lo2 - 1, source, session).await?;
-            let Some(probe) = SortedProbe::resolve(arr) else {
+            let Some(probe) = self.chunk_probe(lo2 - 1, source, session).await? else {
                 return Ok(None);
             };
             self.chunks[lo2 - 1].row_offset + probe.upper_bound(needle) as u64
@@ -160,13 +176,39 @@ impl SortedColumnChunks {
         Ok(Some(lower..upper.max(lower)))
     }
 
-    /// The chunk's wire-encoded array, fetched through `source` on first use.
-    async fn chunk_array(
+    /// Exact value at global `row`, fetching (and caching) only the chunk
+    /// that holds it. Needs no sort order. `Ok(None)` when that chunk's
+    /// encoding declines the probe.
+    ///
+    /// # Panics
+    /// Panics if `row >= self.row_count()`.
+    pub async fn value_at(
+        &self,
+        row: u64,
+        source: &Arc<dyn SegmentSource>,
+        session: &VortexSession,
+    ) -> VortexResult<Option<u64>> {
+        assert!(row < self.row_count, "row {row} out of bounds");
+        let idx = self
+            .chunks
+            .partition_point(|c| c.row_offset + c.row_count <= row)
+            .min(self.chunks.len() - 1);
+        let Some(probe) = self.chunk_probe(idx, source, session).await? else {
+            return Ok(None);
+        };
+        Ok(Some(
+            probe.value_at((row - self.chunks[idx].row_offset) as usize),
+        ))
+    }
+
+    /// The chunk's resolved probe, fetched through `source` and resolved on
+    /// first use; `None` when its encoding declines.
+    async fn chunk_probe(
         &self,
         idx: usize,
         source: &Arc<dyn SegmentSource>,
         session: &VortexSession,
-    ) -> VortexResult<&ArrayRef> {
+    ) -> VortexResult<Option<&OwnedSortedProbe>> {
         let spec = &self.chunks[idx];
         if spec.cell.get().is_none() {
             let flat = spec
@@ -181,12 +223,13 @@ impl SortedColumnChunks {
             let row_count =
                 usize::try_from(spec.row_count).vortex_expect("chunk row count must fit in usize");
             let array = parts.decode(flat.dtype(), row_count, flat.array_ctx(), session)?;
-            let _ = spec.cell.set(array);
+            let _ = spec.cell.set(OwnedSortedProbe::resolve(array));
         }
         Ok(spec
             .cell
             .get()
-            .vortex_expect("chunk cell was just populated"))
+            .vortex_expect("chunk cell was just populated")
+            .as_ref())
     }
 }
 
