@@ -185,21 +185,18 @@ pub(crate) fn resolve_node<'a>(arr: &'a ArrayRef) -> Option<Node<'a>> {
                     range.end = next_range.end;
                     j += 1;
                 }
-                chunks.push(Chunk {
+                chunks.push(Chunk::new(
                     start,
-                    node: Node::Slice {
+                    Node::Slice {
                         child: Box::new(resolve_node(parent)?),
                         start: range.start,
                         len: range.end - range.start,
                     },
-                });
+                ));
                 i = j;
                 continue;
             }
-            chunks.push(Chunk {
-                start: offsets[i],
-                node: resolve_node(child)?,
-            });
+            chunks.push(Chunk::new(offsets[i], resolve_node(child)?));
             i += 1;
         }
         return Some(Node::Chunked {

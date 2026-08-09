@@ -68,11 +68,37 @@ impl Words<'_> {
 }
 
 /// One resolved chunk of a [`Node::Chunked`] tree, with its logical start
-/// row. Chunk extremes are read on demand during bounds searches — resolving
-/// stays downcast-only, which matters because a probe is resolved per call.
+/// row. Chunk extremes are read on demand during bounds searches and then
+/// memoized — resolving stays downcast-only (a borrowed probe is resolved
+/// per call), while a long-lived owned probe pays each extreme once.
 pub(crate) struct Chunk<'a> {
     pub(crate) start: usize,
     pub(crate) node: Node<'a>,
+    first: std::sync::OnceLock<u64>,
+    last: std::sync::OnceLock<u64>,
+}
+
+impl<'a> Chunk<'a> {
+    pub(crate) fn new(start: usize, node: Node<'a>) -> Self {
+        Self {
+            start,
+            node,
+            first: std::sync::OnceLock::new(),
+            last: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// The chunk's first value, read once.
+    fn first(&self) -> u64 {
+        *self.first.get_or_init(|| self.node.value_at(0))
+    }
+
+    /// The chunk's last value, read once.
+    fn last(&self) -> u64 {
+        *self
+            .last
+            .get_or_init(|| self.node.value_at(self.node.len() - 1))
+    }
 }
 
 /// Bit-packed words plus the packing parameters needed for point extraction.
@@ -286,12 +312,9 @@ impl Node<'_> {
                 partition(*len, |i| child.value_at(*start + i) < needle)
             }
             Node::Chunked { chunks, len } => {
-                // Chunk extremes read on demand: first chunk whose last
-                // value reaches the needle holds the boundary.
-                let c = partition(chunks.len(), |c| {
-                    let node = &chunks[c].node;
-                    node.value_at(node.len() - 1) < needle
-                });
+                // First chunk whose last value reaches the needle holds the
+                // boundary.
+                let c = partition(chunks.len(), |c| chunks[c].last() < needle);
                 if c == chunks.len() {
                     *len
                 } else {
@@ -351,7 +374,7 @@ impl Node<'_> {
                 partition(*len, |i| child.value_at(*start + i) <= needle)
             }
             Node::Chunked { chunks, .. } => {
-                let c = partition(chunks.len(), |c| chunks[c].node.value_at(0) <= needle);
+                let c = partition(chunks.len(), |c| chunks[c].first() <= needle);
                 if c == 0 {
                     0
                 } else {
@@ -537,7 +560,7 @@ mod tests {
         let a = Node::Primitive(Words::U32(&[1, 2, 2]));
         let b = Node::Primitive(Words::U32(&[2, 2, 3]));
         let n = Node::Chunked {
-            chunks: vec![Chunk { start: 0, node: a }, Chunk { start: 3, node: b }],
+            chunks: vec![Chunk::new(0, a), Chunk::new(3, b)],
             len: 6,
         };
         assert_eq!((n.lower_bound(2), n.upper_bound(2)), (1, 5));
