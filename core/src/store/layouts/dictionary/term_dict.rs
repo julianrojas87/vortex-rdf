@@ -78,9 +78,38 @@ pub(crate) struct ChunkedTerms {
 }
 
 #[derive(Clone)]
-enum TermChunk {
+pub(crate) enum TermChunk {
     Canonical(VarBinViewArray),
     Fsst(FsstTerms),
+}
+
+impl TermChunk {
+    /// Adopt one term chunk: kept FSST when it arrived FSST (reads decode
+    /// single rows), canonicalized otherwise (the write path compresses, but
+    /// nothing in the format obliges a producer to have done so).
+    pub(crate) fn from_wire(chunk: ArrayRef, ctx: &mut vortex_array::ExecutionCtx) -> Result<Self> {
+        match chunk.try_downcast::<FSST>() {
+            Ok(fsst) => Ok(TermChunk::Fsst(FsstTerms::new(fsst)?)),
+            Err(other) => Ok(TermChunk::Canonical(
+                other
+                    .execute::<VarBinViewArray>(ctx)
+                    .map_err(VortexRdfError::Vortex)?,
+            )),
+        }
+    }
+
+    /// A fresh cursor over this chunk's terms. Scratch is allocated lazily
+    /// inside `bytes_at`: one eager allocation per chunk would tax every
+    /// single-term decode with O(chunks) mallocs.
+    pub(crate) fn cursor(&self) -> ChunkCursor<'_> {
+        match self {
+            TermChunk::Canonical(a) => ChunkCursor::Canonical(StrColReader::new(a)),
+            TermChunk::Fsst(f) => ChunkCursor::Fsst {
+                terms: f,
+                scratch: Vec::new(),
+            },
+        }
+    }
 }
 
 impl ChunkedTerms {
@@ -185,9 +214,7 @@ impl TermDictionary {
         Self::from_term_chunks(flat, ctx)
     }
 
-    /// Adopt a term column's chunks, each kept FSST when it arrived FSST and
-    /// canonicalized otherwise (the write path compresses, but nothing in the
-    /// format obliges a producer to have done so).
+    /// Adopt a term column's chunks through [`TermChunk::from_wire`].
     fn from_term_chunks(
         chunks: Vec<ArrayRef>,
         ctx: &mut vortex_array::ExecutionCtx,
@@ -197,15 +224,7 @@ impl TermDictionary {
             if chunk.is_empty() {
                 continue;
             }
-            let chunk = match chunk.try_downcast::<FSST>() {
-                Ok(fsst) => TermChunk::Fsst(FsstTerms::new(fsst)?),
-                Err(other) => TermChunk::Canonical(
-                    other
-                        .execute::<VarBinViewArray>(ctx)
-                        .map_err(VortexRdfError::Vortex)?,
-                ),
-            };
-            adopted.push(chunk);
+            adopted.push(TermChunk::from_wire(chunk, ctx)?);
         }
         let store = match adopted.len() {
             0 => TermStore::Canonical(VarBinViewArray::from_iter_str(std::iter::empty::<&str>())),
@@ -383,20 +402,7 @@ impl TermDictionary {
             },
             TermStore::Chunked(c) => DictReader::Chunked {
                 store: c,
-                cursors: c
-                    .chunks
-                    .iter()
-                    .map(|chunk| match chunk {
-                        TermChunk::Canonical(a) => ChunkCursor::Canonical(StrColReader::new(a)),
-                        // Scratch is allocated lazily inside `bytes_at`: one
-                        // eager allocation per window would tax every
-                        // single-term decode with O(windows) mallocs.
-                        TermChunk::Fsst(f) => ChunkCursor::Fsst {
-                            terms: f,
-                            scratch: Vec::new(),
-                        },
-                    })
-                    .collect(),
+                cursors: c.chunks.iter().map(TermChunk::cursor).collect(),
             },
         }
     }
@@ -660,7 +666,7 @@ pub(crate) enum ChunkCursor<'a> {
 
 impl ChunkCursor<'_> {
     #[inline]
-    fn bytes_at(&mut self, local: usize) -> &[u8] {
+    pub(crate) fn bytes_at(&mut self, local: usize) -> &[u8] {
         match self {
             ChunkCursor::Canonical(r) => r.bytes_at(local),
             ChunkCursor::Fsst { terms, scratch } => {

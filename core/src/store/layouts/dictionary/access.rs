@@ -39,9 +39,9 @@ use super::term_dict::TermDictionary;
 pub(crate) enum DictAccess {
     /// The whole dictionary in memory (FSST-compressed or canonical).
     Resident(Arc<TermDictionary>),
-    /// The dictionary left in its file, probed and decoded by scans on
-    /// demand — chosen at open when the term count exceeds the residency
-    /// threshold (see `VortexRdfStore::from_file`).
+    /// The dictionary left in its file, read on demand (wire-chunk point
+    /// reads, with scan fallbacks) — chosen at open when the term count
+    /// exceeds the residency threshold (see `VortexRdfStore::from_file`).
     #[cfg(feature = "file-io")]
     FileBacked(FileBackedDict),
 }

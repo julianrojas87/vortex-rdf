@@ -12,9 +12,9 @@ use crate::store::QuadsSource;
 use crate::store::indexes::Indexes;
 use crate::store::indexes::KnownComponent;
 use crate::store::layouts::DictAccess;
-#[cfg(feature = "file-io")]
-use crate::store::layouts::dictionary::FileBackedDict;
 use crate::store::layouts::dictionary::dict_from_reader;
+#[cfg(feature = "file-io")]
+use crate::store::layouts::dictionary::{FileBackedDict, TermChunks};
 use crate::store::layouts::{LayoutStrategy, ResolvedLayout};
 #[cfg(feature = "file-io")]
 use crate::store::native_file::NativeStoreFile;
@@ -181,9 +181,12 @@ impl VortexRdfStore {
                     let dict = dict_from_reader(reader).await?;
                     DictAccess::Resident(Arc::new(dict))
                 } else {
-                    // File-backed: the child stays on disk; probes fetch
-                    // only the splits they touch.
-                    DictAccess::FileBacked(FileBackedDict::new(reader, dict_len))
+                    // File-backed: the child stays on disk; reads fetch only
+                    // the chunk leaves they touch.
+                    let chunks = container::store_component(typed, container::DICT_COMPONENT_NAME)
+                        .map_err(VortexRdfError::Vortex)?
+                        .and_then(|(_, child)| TermChunks::resolve(&child, file.segment_source()));
+                    DictAccess::FileBacked(FileBackedDict::new(reader, dict_len, chunks))
                 };
                 ResolvedLayout::Dictionary(access)
             }

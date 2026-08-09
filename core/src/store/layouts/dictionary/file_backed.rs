@@ -1,6 +1,9 @@
 //! The file-backed arm of the Dictionary layout's residency axis: a term
-//! dictionary left in its serialized child, probed and lifted by scans on
-//! demand. The policy enum choosing between this and the resident form is
+//! dictionary left in its serialized child, read on demand. The primary
+//! paths point-read the child's wire-encoded chunk leaves ([`TermChunks`]);
+//! when the child's layout shape declines that handle, probes fall back to a
+//! fence + filtered split evaluation and decodes to row-index scans. The
+//! policy enum choosing between this and the resident form is
 //! [`DictAccess`](super::access::DictAccess); the whole module only compiles
 //! with `file-io`, since without a file there is nothing to leave the terms
 //! in.
@@ -13,17 +16,210 @@ use vortex_array::VortexSessionExecute;
 use vortex_array::arrays::VarBinViewArray;
 use vortex_array::arrays::struct_::{StructArray, StructArrayExt};
 use vortex_array::expr::{eq, get_item, lit, root, select};
+use vortex_array::serde::SerializedArray;
 use vortex_array::stream::ArrayStreamExt as _;
+use vortex_layout::layouts::chunked::Chunked as ChunkedLayout;
+use vortex_layout::layouts::flat::Flat;
+use vortex_layout::layouts::struct_::Struct as StructLayout;
+use vortex_layout::layouts::zoned::Zoned;
+use vortex_layout::segments::SegmentSource;
+use vortex_layout::{LayoutChildType, LayoutRef};
 use vortex_mask::{AllOr, Mask};
 
 use crate::error::{Result, VortexRdfError};
 use crate::session::VORTEX_SESSION;
-use crate::store::array::StrColReader;
+use crate::store::array::{StrColReader, buf_as_str};
+use crate::store::selection::POINT_GATHER_MAX_ROWS;
 
-use super::term_dict::{ProbeCache, TERM_FIELD, TermDictionary, dict_from_reader};
+use super::term_dict::{
+    ChunkCursor, ProbeCache, TERM_FIELD, TermChunk, TermDictionary, dict_from_reader,
+};
 
-/// The in-memory fence over a file-backed dictionary's splits: the first
-/// term of every dictionary-bearing split, in file order. The term column is
+/// The dictionary child's flat chunk leaves, fetched on demand in their wire
+/// encoding and kept for the store's lifetime — the string sibling of the
+/// quad columns' chunk-probe handles on `NativeStoreFile`. A fetched leaf
+/// stays FSST when it arrived FSST (a row read decompresses one value) and
+/// is canonicalized once otherwise. The term column is globally sorted (wire
+/// contract), so term→ID probes binary-search rows through per-row reads,
+/// touching only the chunks the bisection crosses; ID→term reads decode
+/// exactly the probed rows.
+pub(crate) struct TermChunks {
+    specs: Vec<ChunkSpec>,
+    row_count: u64,
+    source: Arc<dyn SegmentSource>,
+}
+
+/// One flat term-chunk leaf and its fetched form (filled on first use).
+struct ChunkSpec {
+    layout: LayoutRef,
+    row_offset: u64,
+    rows: u64,
+    cell: OnceLock<TermChunk>,
+}
+
+/// Descend through zoned wrappers to their data child (child 0).
+fn unwrap_zoned(mut node: LayoutRef) -> Option<LayoutRef> {
+    while node.is::<Zoned>() {
+        node = node.child(0).ok()?;
+    }
+    Some(node)
+}
+
+impl TermChunks {
+    /// Walks the dictionary child's layout to its term column's chunk
+    /// leaves: the field child, through any zoned wrappers, then a chunked
+    /// layout of flat leaves or a single flat leaf. `None` when the shape is
+    /// anything else — the caller keeps the scan paths.
+    pub(crate) fn resolve(dict: &LayoutRef, source: Arc<dyn SegmentSource>) -> Option<Self> {
+        dict.as_opt::<StructLayout>()?;
+        let column = (0..dict.nchildren()).find_map(|i| {
+            matches!(dict.child_type(i), LayoutChildType::Field(ref n) if n.as_ref() == TERM_FIELD)
+                .then(|| dict.child(i).ok())
+                .flatten()
+        })?;
+        let data = unwrap_zoned(column)?;
+        let row_count = data.row_count();
+        // Codes are u32 by construction; an empty child has nothing to
+        // point-read and an oversized one cannot be a term column.
+        if row_count == 0 || row_count > u64::from(u32::MAX) {
+            return None;
+        }
+        let mut specs = Vec::new();
+        if data.is::<Flat>() {
+            specs.push(ChunkSpec {
+                layout: data,
+                row_offset: 0,
+                rows: row_count,
+                cell: OnceLock::new(),
+            });
+        } else if data.is::<ChunkedLayout>() {
+            for i in 0..data.nchildren() {
+                let LayoutChildType::Chunk((_, row_offset)) = data.child_type(i) else {
+                    return None;
+                };
+                let leaf = unwrap_zoned(data.child(i).ok()?)?;
+                let rows = leaf.row_count();
+                if rows == 0 {
+                    continue;
+                }
+                if !leaf.is::<Flat>() {
+                    return None;
+                }
+                specs.push(ChunkSpec {
+                    layout: leaf,
+                    row_offset,
+                    rows,
+                    cell: OnceLock::new(),
+                });
+            }
+        } else {
+            return None;
+        }
+        Some(Self {
+            specs,
+            row_count,
+            source,
+        })
+    }
+
+    /// The chunk holding global `row`, and the row local to it.
+    fn locate(&self, row: u64) -> (usize, usize) {
+        let idx = self
+            .specs
+            .partition_point(|s| s.row_offset + s.rows <= row)
+            .min(self.specs.len() - 1);
+        (idx, (row - self.specs[idx].row_offset) as usize)
+    }
+
+    /// The fetched form of chunk `idx`, read and adopted on first use. The
+    /// segment read reconstructs the wire encoding (no decompression);
+    /// concurrent first reads may race to build, and the loser's copy is
+    /// dropped.
+    async fn chunk(&self, idx: usize) -> Result<&TermChunk> {
+        let spec = &self.specs[idx];
+        if spec.cell.get().is_none() {
+            let flat = spec
+                .layout
+                .as_opt::<Flat>()
+                .expect("term chunk leaves are validated flat at construction");
+            let segment = self
+                .source
+                .request(flat.segment_id())
+                .await
+                .map_err(VortexRdfError::Vortex)?;
+            let parts = match flat.array_tree().cloned() {
+                Some(tree) => SerializedArray::from_flatbuffer_and_segment(tree, segment),
+                None => SerializedArray::try_from(segment),
+            }
+            .map_err(VortexRdfError::Vortex)?;
+            let rows = usize::try_from(spec.rows).expect("chunk row count must fit in usize");
+            let array = parts
+                .decode(flat.dtype(), rows, flat.array_ctx(), &VORTEX_SESSION)
+                .map_err(VortexRdfError::Vortex)?;
+            let mut ctx = VORTEX_SESSION.create_execution_ctx();
+            let _ = spec.cell.set(TermChunk::from_wire(array, &mut ctx)?);
+        }
+        Ok(spec
+            .cell
+            .get()
+            .expect("the chunk was just initialized above"))
+    }
+
+    /// The term bytes at `row`, read through `cursors` — one lazily built
+    /// cursor per touched chunk, so repeated reads in one call reuse the
+    /// cursor's decode scratch.
+    async fn term_bytes<'s, 'c>(
+        &'s self,
+        cursors: &'c mut [Option<ChunkCursor<'s>>],
+        row: u64,
+    ) -> Result<&'c [u8]> {
+        let (idx, local) = self.locate(row);
+        if cursors[idx].is_none() {
+            cursors[idx] = Some(self.chunk(idx).await?.cursor());
+        }
+        Ok(cursors[idx]
+            .as_mut()
+            .expect("the cursor was just initialized above")
+            .bytes_at(local))
+    }
+
+    /// Term→ID: a binary search over per-row reads.
+    pub(crate) async fn get_id(&self, term: &str) -> Result<Option<u32>> {
+        let needle = term.as_bytes();
+        let mut cursors: Vec<Option<ChunkCursor<'_>>> =
+            (0..self.specs.len()).map(|_| None).collect();
+        let (mut lo, mut hi) = (0u64, self.row_count);
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if self.term_bytes(&mut cursors, mid).await? < needle {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        if lo == self.row_count {
+            return Ok(None);
+        }
+        Ok((self.term_bytes(&mut cursors, lo).await? == needle).then_some(lo as u32))
+    }
+
+    /// ID→terms for `codes` (in-bounds, the caller's contract), reading
+    /// exactly the probed rows.
+    pub(crate) async fn resolve_terms(&self, codes: &[u32]) -> Result<Vec<String>> {
+        let mut cursors: Vec<Option<ChunkCursor<'_>>> =
+            (0..self.specs.len()).map(|_| None).collect();
+        let mut out = Vec::with_capacity(codes.len());
+        for &code in codes {
+            let bytes = self.term_bytes(&mut cursors, u64::from(code)).await?;
+            out.push(buf_as_str(bytes)?.to_owned());
+        }
+        Ok(out)
+    }
+}
+
+/// The fallback probe path's in-memory fence over a file-backed
+/// dictionary's splits: the first term of every dictionary-bearing split, in
+/// file order. The term column is
 /// sorted, so a probed term can only live in the last split whose first term
 /// is `<=` the probe — one in-RAM binary search replaces a per-split pruning
 /// loop, and a probe below the first fence term is absent without touching
@@ -40,14 +236,17 @@ struct Fence {
 }
 
 /// A term dictionary left in its layout child: term→ID probes and ID→term
-/// decodes scan the sorted `_dict_term` column on demand instead of holding
+/// decodes read the sorted `_dict_term` column on demand instead of holding
 /// all terms resident.
 ///
 /// `reader` is the dictionary child's layout reader (the native store root's
-/// `dictionary` component), so a term's code is its child row. A term probe
-/// binary-searches the in-memory [`Fence`] for the one split that can hold
-/// the term, evaluates an equality filter over just that split, and memoizes
-/// the answer in a [`ProbeCache`]. ID→term reads are row-index scans.
+/// `dictionary` component), so a term's code is its child row. With a
+/// [`TermChunks`] handle, probes and decodes point-read the wire-encoded
+/// chunk leaves; probe answers are memoized in a [`ProbeCache`]. Without one
+/// (the child's layout shape declined), a probe binary-searches the
+/// in-memory [`Fence`] for the one split that can hold the term and
+/// evaluates an equality filter over just that split, and decodes are
+/// row-index scans.
 #[derive(Clone)]
 pub(crate) struct FileBackedDict {
     /// The dictionary child's layout reader (child-local row coordinates).
@@ -57,18 +256,34 @@ pub(crate) struct FileBackedDict {
     /// term → code memo, shared across clones (every derived view of a store
     /// probes the same immutable dictionary).
     probes: Arc<ProbeCache>,
-    /// The probe fence, built on first use and shared across clones.
+    /// The fallback probe fence, built on first use and shared across
+    /// clones.
     fence: Arc<OnceLock<Fence>>,
+    /// Wire-chunk point-read handle, shared across clones (its fetched
+    /// chunks are the dictionary analogue of the quad columns' cached chunk
+    /// probes); `None` when the child's layout shape declined.
+    chunks: Option<Arc<TermChunks>>,
 }
 
 impl FileBackedDict {
-    pub(crate) fn new(reader: vortex_layout::LayoutReaderRef, len: u64) -> Self {
+    pub(crate) fn new(
+        reader: vortex_layout::LayoutReaderRef,
+        len: u64,
+        chunks: Option<TermChunks>,
+    ) -> Self {
         Self {
             reader,
             len,
             probes: Arc::new(ProbeCache::new()),
             fence: Arc::new(OnceLock::new()),
+            chunks: chunks.map(Arc::new),
         }
+    }
+
+    /// Whether the wire-chunk point-read handle engaged (test hook).
+    #[cfg(test)]
+    pub(crate) fn debug_has_chunks(&self) -> bool {
+        self.chunks.is_some()
     }
 
     /// A scan over the dictionary child — the reader-level equivalent of
@@ -122,13 +337,25 @@ impl FileBackedDict {
         })
     }
 
-    /// Term→ID: the fence's binary search picks the one split whose range
-    /// can hold the term (the column is sorted), a single equality-filtered
-    /// evaluation of that split decides, and the answer is memoized.
+    /// Term→ID: a point-read binary search of the chunk leaves when the
+    /// [`TermChunks`] handle resolved, the fence + filtered-split path
+    /// otherwise; either answer is memoized.
     pub(crate) async fn get_id(&self, term: &str) -> Result<Option<u32>> {
         if let Some(memo) = self.probes.get(term) {
             return Ok(memo);
         }
+        let code = match &self.chunks {
+            Some(chunks) => chunks.get_id(term).await?,
+            None => self.get_id_by_split_filter(term).await?,
+        };
+        self.probes.put(term, code);
+        Ok(code)
+    }
+
+    /// Term→ID without chunk leaves: the fence's binary search picks the one
+    /// split whose range can hold the term (the column is sorted), and a
+    /// single equality-filtered evaluation of that split decides.
+    async fn get_id_by_split_filter(&self, term: &str) -> Result<Option<u32>> {
         let fence = self.fence().await?;
         // The candidate is the last split whose first term is <= the probe;
         // index 0 means every dictionary term sorts above it — absent.
@@ -153,15 +380,17 @@ impl FileBackedDict {
                 row.map(|row| row as u32)
             }
         };
-        self.probes.put(term, code);
         Ok(code)
     }
 
     /// ID→terms for reconstruction: resolve `codes` (ascending, unique) to
-    /// their term strings with a single row-index scan — the dictionary's
-    /// code→string seam. The layout-side chunk decode
-    /// (`ResolvedLayout::decode_chunk_async`) resolves a chunk's distinct
-    /// codes through this, and the fence build resolves its split boundaries.
+    /// their term strings — the dictionary's code→string seam. The
+    /// layout-side chunk decode (`ResolvedLayout::decode_chunk_async`)
+    /// resolves a chunk's distinct codes through this, and the fence build
+    /// resolves its split boundaries. Small batches point-read the chunk
+    /// leaves; wide ones (and stores whose chunk handle declined) run a
+    /// single row-index scan, whose bulk decode wins once most of a leaf is
+    /// wanted anyway.
     pub(crate) async fn resolve_terms(&self, codes: &[u32]) -> Result<Vec<String>> {
         if codes.is_empty() {
             return Ok(Vec::new());
@@ -173,6 +402,11 @@ impl FileBackedDict {
                 "Term code {} out of dictionary bounds ({})",
                 max, self.len
             )));
+        }
+        if let Some(chunks) = &self.chunks
+            && codes.len() <= POINT_GATHER_MAX_ROWS
+        {
+            return chunks.resolve_terms(codes).await;
         }
         let rows: vortex_buffer::Buffer<u64> = codes.iter().map(|&code| code as u64).collect();
         let arr = self
@@ -276,7 +510,7 @@ mod tests {
             .component_reader(container::DICT_COMPONENT_NAME)
             .unwrap()
             .expect("the dictionary child must be present");
-        let fbd = FileBackedDict::new(reader, len);
+        let fbd = FileBackedDict::new(reader, len, None);
 
         // One split per compression window, none merged, none re-cut.
         let fence = fbd.fence().await.unwrap();

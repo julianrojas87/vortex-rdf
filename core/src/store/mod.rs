@@ -220,6 +220,18 @@ impl VortexRdfStore {
         }
     }
 
+    /// Test-only hook: whether a file-backed dictionary's wire-chunk
+    /// point-read handle engaged; `None` when the dictionary is resident or
+    /// the layout carries none.
+    #[cfg(all(test, feature = "file-io"))]
+    pub(crate) fn debug_dict_chunk_reads(&self) -> Option<bool> {
+        use crate::store::layouts::DictAccess;
+        match &self.layout {
+            ResolvedLayout::Dictionary(DictAccess::FileBacked(fbd)) => Some(fbd.debug_has_chunks()),
+            _ => None,
+        }
+    }
+
     /// Build from a builder's output: the quad array plus whatever the
     /// builder carries beside it — the Dictionary layout's term dictionary,
     /// and any index components emitted natively rather than as welded

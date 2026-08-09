@@ -49,7 +49,7 @@ pub(crate) mod ingest;
 pub(crate) mod term_dict;
 
 #[cfg(feature = "file-io")]
-pub(crate) use self::file_backed::FileBackedDict;
+pub(crate) use self::file_backed::{FileBackedDict, TermChunks};
 pub use self::ingest::DictionaryQuadSink;
 pub(crate) use self::ingest::{TermDictionaryBuilder, TermIdMap, ingest_interning};
 use self::term_dict::DictReader;

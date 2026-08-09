@@ -1,6 +1,6 @@
 use super::*;
-use crate::io::container::DICT_COMPONENT_NAME;
-use crate::store::layouts::dictionary::FileBackedDict;
+use crate::io::container::{DICT_COMPONENT_NAME, RdfStoreLayoutVTable, store_component};
+use crate::store::layouts::dictionary::{FileBackedDict, TermChunks};
 use crate::store::native_file::NativeStoreFile;
 
 // ─── 7b) File-backed dictionary ─────────────────────────────────────────
@@ -33,6 +33,9 @@ async fn assert_file_backed_matches_resident(indexes: Indexes, tag: &str) {
     // file-backed dictionary has no snapshot and no sync code translation.
     assert!(resident.dictionary_snapshot().is_some(), "{tag}");
     assert!(fb.dictionary_snapshot().is_none(), "{tag}");
+    // The wire-chunk point-read handle must engage on the real open path.
+    assert_eq!(fb.debug_dict_chunk_reads(), Some(true), "{tag}");
+    assert_eq!(resident.debug_dict_chunk_reads(), None, "{tag}");
     // The code-read gate includes residency: no snapshot, no code decoding.
     assert!(fb.code_read_snapshot().is_none(), "{tag}");
     // The resident open hands one out, and it translates codes both ways.
@@ -303,8 +306,10 @@ async fn test_file_backed_dictionary_fence_probe_parity() {
         .unwrap();
     let dict = resident.dictionary_snapshot().unwrap().0;
 
-    // The probe target, built exactly as `from_file` does file-backed: the
-    // dictionary child's cached layout reader.
+    // The probe targets, built exactly as `from_file` does file-backed: the
+    // dictionary child's cached layout reader — once with the wire-chunk
+    // handle (the primary path) and once without (the fence +
+    // filtered-split fallback).
     let outer = NativeStoreFile::try_new(
         crate::io::native_file::open_vortex_file(&path)
             .await
@@ -317,25 +322,47 @@ async fn test_file_backed_dictionary_fence_probe_parity() {
         .expect("dictionary child present");
     let len = dict.len() as u64;
     assert_eq!(reader.row_count(), len);
-    let fb = FileBackedDict::new(reader, len);
+    let typed = outer.footer().layout().as_::<RdfStoreLayoutVTable>();
+    let (_, dict_child) = store_component(typed, DICT_COMPONENT_NAME)
+        .unwrap()
+        .expect("dictionary child present");
+    let chunks = TermChunks::resolve(&dict_child, outer.segment_source())
+        .expect("the dictionary child's chunk shape must resolve");
+    let fb_chunks = FileBackedDict::new(reader.clone(), len, Some(chunks));
+    let fb_fence = FileBackedDict::new(reader, len, None);
 
-    // Every ~397th term plus both extremes, probed twice (cold + memo).
+    // Every ~397th term plus both extremes, probed twice (cold + memo), on
+    // both paths.
     let sample: Vec<u32> = (0..len as u32)
         .step_by(397)
         .chain([0, len as u32 - 1])
         .collect();
-    for &code in &sample {
-        let term = dict.term_at(code).unwrap();
-        assert_eq!(fb.get_id(&term).await.unwrap(), Some(code), "{term}");
-        assert_eq!(fb.get_id(&term).await.unwrap(), Some(code), "{term}");
+    for fb in [&fb_chunks, &fb_fence] {
+        for &code in &sample {
+            let term = dict.term_at(code).unwrap();
+            assert_eq!(fb.get_id(&term).await.unwrap(), Some(code), "{term}");
+            assert_eq!(fb.get_id(&term).await.unwrap(), Some(code), "{term}");
 
-        // A control character keeps the probe inside the same fence
-        // window but matches no stored term.
-        let absent = format!("{term}\u{1}");
-        assert_eq!(fb.get_id(&absent).await.unwrap(), None, "{absent}");
+            // A control character keeps the probe inside the same fence
+            // window but matches no stored term.
+            let absent = format!("{term}\u{1}");
+            assert_eq!(fb.get_id(&absent).await.unwrap(), None, "{absent}");
+        }
+        // Above every stored term: the probe misses on either path.
+        assert_eq!(fb.get_id("\u{10FFFF}").await.unwrap(), None);
     }
-    // Above every stored term: the last split is probed and misses.
-    assert_eq!(fb.get_id("\u{10FFFF}").await.unwrap(), None);
+
+    // ID→term parity on both paths, under and over the point-read cap (the
+    // wide batch exercises the chunk handle's scan fallback).
+    for k in [64usize, 300] {
+        let codes: Vec<u32> = (0..len as u32)
+            .step_by((len as usize / k).max(1))
+            .take(k)
+            .collect();
+        let want: Vec<String> = codes.iter().map(|&c| dict.term_at(c).unwrap()).collect();
+        assert_eq!(fb_chunks.resolve_terms(&codes).await.unwrap(), want);
+        assert_eq!(fb_fence.resolve_terms(&codes).await.unwrap(), want);
+    }
 }
 
 /// A probe sorting below the first dictionary term is answered absent by the
@@ -379,9 +406,18 @@ async fn test_file_backed_dictionary_fence_rejects_below_first_term() {
         .unwrap()
         .expect("dictionary child present");
     let dict_len = reader.row_count();
-    let fb = FileBackedDict::new(reader, dict_len);
+    let typed = outer.footer().layout().as_::<RdfStoreLayoutVTable>();
+    let (_, dict_child) = store_component(typed, DICT_COMPONENT_NAME)
+        .unwrap()
+        .expect("dictionary child present");
+    let chunks = TermChunks::resolve(&dict_child, outer.segment_source())
+        .expect("the dictionary child's chunk shape must resolve");
+    let fb_chunks = FileBackedDict::new(reader.clone(), dict_len, Some(chunks));
+    let fb_fence = FileBackedDict::new(reader, dict_len, None);
 
-    assert_eq!(fb.get_id("!").await.unwrap(), None);
-    // And the ordinary path still resolves through the same fence.
-    assert_eq!(fb.get_id(&first_term).await.unwrap(), Some(0));
+    for fb in [&fb_chunks, &fb_fence] {
+        assert_eq!(fb.get_id("!").await.unwrap(), None);
+        // And the ordinary path still resolves on both.
+        assert_eq!(fb.get_id(&first_term).await.unwrap(), Some(0));
+    }
 }
