@@ -8,10 +8,10 @@
 //! bit-packed word extraction — no `ExecutionCtx`, no canonicalization.
 //!
 //! Supported encoding nodes: Primitive, Constant, Sequence, RunEnd, FoR,
-//! BitPacked (with patches), Slice, Chunked, and Dict, composed arbitrarily.
-//! Anything else — including nullable or non-unsigned-integer dtypes and
-//! non-host buffers — declines, and the caller falls back to its generic
-//! search path.
+//! BitPacked (with patches), Slice, Chunked, and Dict, composed arbitrarily;
+//! the transparent Shared wrapper resolves to whatever it wraps. Anything
+//! else — including nullable or non-unsigned-integer dtypes and non-host
+//! buffers — declines, and the caller falls back to its generic search path.
 
 mod node;
 mod owned;

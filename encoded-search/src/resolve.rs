@@ -8,8 +8,9 @@
 use vortex_array::ArrayRef;
 use vortex_array::arrays::chunked::ChunkedArrayExt as _;
 use vortex_array::arrays::dict::DictSlots;
+use vortex_array::arrays::shared::SharedSlots;
 use vortex_array::arrays::slice::SliceSlots;
-use vortex_array::arrays::{Chunked, Constant, Dict, Primitive, Slice};
+use vortex_array::arrays::{Chunked, Constant, Dict, Primitive, Shared, Slice};
 use vortex_array::dtype::PType;
 use vortex_array::scalar::PValue;
 use vortex_fastlanes::{
@@ -150,6 +151,15 @@ pub(crate) fn resolve_node<'a>(arr: &'a ArrayRef) -> Option<Node<'a>> {
             codes: Box::new(codes),
             values: Box::new(values),
         });
+    }
+
+    if let Some(view) = arr.as_opt::<Shared>() {
+        // A transparent lazy wrapper, not an encoding: it delegates to its
+        // source until something materializes the cached canonical of the
+        // same logical values, so resolving the source answers either way.
+        // The writer emits one around values children shared between chunks,
+        // and declining it would decline the whole tree above it.
+        return resolve_node(slot(view.slots(), SharedSlots::SOURCE)?);
     }
 
     if let Some(view) = arr.as_opt::<Chunked>() {

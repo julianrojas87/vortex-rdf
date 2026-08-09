@@ -387,6 +387,25 @@ fn probes_dict_permuted_values() {
 }
 
 #[test]
+fn probes_through_shared_wrapper() {
+    // The writer wraps a values child shared between chunks in a `Shared`
+    // lazy wrapper; it is transparent, so the tree above it must still
+    // resolve rather than declining wholesale.
+    let values: Vec<u32> = vec![10, 20, 30, 40, 50];
+    let codes: Vec<u16> = vec![0, 0, 1, 2, 2, 2, 3, 4];
+    let data: Vec<u32> = codes.iter().map(|&c| values[c as usize]).collect();
+    let shared =
+        vortex_array::arrays::SharedArray::new(PrimitiveArray::from_iter(values).into_array())
+            .into_array();
+    assert_eq!(shared.encoding_id().as_str(), "vortex.shared");
+    let arr =
+        vortex_array::arrays::DictArray::try_new(PrimitiveArray::from_iter(codes).into_array(), shared)
+            .unwrap()
+            .into_array();
+    assert_probe(&arr, &data, &[NodeKind::Dict, NodeKind::Primitive]);
+}
+
+#[test]
 fn bounds_on_empty_array() {
     let arr = PrimitiveArray::from_iter(std::iter::empty::<u32>()).into_array();
     let probe = SortedProbe::resolve(&arr).unwrap();
