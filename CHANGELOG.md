@@ -29,6 +29,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Bind encoded columns in the typed residual filter (core) ([`2587853`](https://github.com/vortex-rdf/vortex-rdf/commit/2587853767dd128478f10942599b84602ef4ba20) by julianrojas87)
 - Bound-subject row bounds on sorted files via chunk probes (core) ([`bdfe2e3`](https://github.com/vortex-rdf/vortex-rdf/commit/bdfe2e32df0cd54fb70bd26e94cea0f8f8652680) by julianrojas87)
 - Retain compressed columns through resident adoption (core) ([`9742500`](https://github.com/vortex-rdf/vortex-rdf/commit/97425009c78f5393ce8097e063eed8b6ef81530d) by julianrojas87)
+- Dict probe nodes, owned probes, and chunk point reads (encoded-search) ([`1a5fb5f`](https://github.com/vortex-rdf/vortex-rdf/commit/1a5fb5f4c00574f7d785d9925ab6961e7bdfb267) by julianrojas87)
+- Cache base probes and point-read tiny file selections (core) ([`2cc274f`](https://github.com/vortex-rdf/vortex-rdf/commit/2cc274fe1d1734325d8cb601c14053a9b394e73c) by julianrojas87)
 
 ### Changed
 
@@ -38,6 +40,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Adopt resident bases with canonical integer columns (core) ([`5184c02`](https://github.com/vortex-rdf/vortex-rdf/commit/5184c02a8946a520b5644e61b3495b9796543bff) by @julianrojas87)
 - Adopt index components in resident form too (core) ([`74690e5`](https://github.com/vortex-rdf/vortex-rdf/commit/74690e5766db38506e8742cfc6178538c106849b) by @julianrojas87)
 - Point-read small gathers through encoded probes (core) ([`8b2afda`](https://github.com/vortex-rdf/vortex-rdf/commit/8b2afda4abbc0be479a91cd78f3e07cb378076be) by julianrojas87)
+- Memoize chunk extremes in chunked probes (encoded-search) ([`aeb022a`](https://github.com/vortex-rdf/vortex-rdf/commit/aeb022a855ae723b76da21358c205b02b28351f0) by julianrojas87)
 
 ### Removed
 
