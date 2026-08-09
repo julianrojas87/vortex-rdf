@@ -33,6 +33,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Cache base probes and point-read tiny file selections (core) ([`2cc274f`](https://github.com/vortex-rdf/vortex-rdf/commit/2cc274fe1d1734325d8cb601c14053a9b394e73c) by @julianrojas87)
 - Windowed bounds over sorted sub-ranges (encoded-search) ([`1192b78`](https://github.com/vortex-rdf/vortex-rdf/commit/1192b78f16e7083c5e895f02fdbc1208614e5f09) by @julianrojas87)
 - Point-read the file-backed dictionary through cached wire chunks (core) ([`1b3da12`](https://github.com/vortex-rdf/vortex-rdf/commit/1b3da1288f9b9c81d1c1692a669212360854cb53) by @julianrojas87)
+- Resolve through shared lazy wrappers (encoded-search) ([`562a2be`](https://github.com/vortex-rdf/vortex-rdf/commit/562a2be8a37fbdbbb26b519152e13282d7c41b8a) by julianrojas87)
 
 ### Changed
 
