@@ -69,6 +69,15 @@ impl OwnedSortedProbe {
         self.probe().bounds(needle)
     }
 
+    /// [`SortedProbe::bounds_in`]: bounds restricted to a window that is
+    /// itself sorted, in absolute indices.
+    ///
+    /// # Panics
+    /// Panics if `range.end > self.len()`.
+    pub fn bounds_in(&self, range: std::ops::Range<usize>, needle: u64) -> (usize, usize) {
+        self.probe().bounds_in(range, needle)
+    }
+
     /// Exact value at `index`, widened to `u64`.
     ///
     /// # Panics

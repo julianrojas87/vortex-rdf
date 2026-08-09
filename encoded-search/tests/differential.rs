@@ -433,8 +433,37 @@ fn probes_slice_of_piecewise_sorted() {
             let wdata = &data[window.clone()];
             let wrapper = SliceArray::new(arr.clone(), window.clone()).into_array();
             assert_probe(&wrapper, wdata, &[NodeKind::Slice]);
-            let pushed = arr.slice(window).unwrap();
+            let pushed = arr.slice(window.clone()).unwrap();
             assert_probe(&pushed, wdata, &[]);
+
+            // The windowed search over the WHOLE (unsorted) column must agree
+            // with slicing the window out first — window-only reads.
+            let probe = SortedProbe::resolve(arr).unwrap();
+            for needle in needles_for(wdata) {
+                let (lo, hi) = probe.bounds_in(window.clone(), needle);
+                let (clo, chi) = canonical_bounds(wdata, needle);
+                assert_eq!(
+                    (lo - wstart, hi - wstart),
+                    (clo, chi),
+                    "bounds_in vs canonical, window {wstart}, needle {needle}"
+                );
+            }
         }
     }
+}
+
+#[test]
+fn bounds_in_edge_windows() {
+    let data: Vec<u32> = (0..4096u32).map(|i| i / 7).collect();
+    let arr = compress_with(&[&integer::BitPackingScheme], &data);
+    let probe = SortedProbe::resolve(&arr).unwrap();
+    // Empty window, single-row window, and the full array.
+    assert_eq!(probe.bounds_in(100..100, 5), (100, 100));
+    assert_eq!(probe.bounds_in(70..71, 10), (70, 71));
+    assert_eq!(probe.bounds_in(70..71, 11), (71, 71));
+    assert_eq!(
+        probe.bounds_in(0..data.len(), 100),
+        probe.bounds(100),
+        "full-window bounds_in must equal bounds"
+    );
 }

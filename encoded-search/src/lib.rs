@@ -73,6 +73,26 @@ impl<'a> SortedProbe<'a> {
         (self.lower_bound(needle), self.upper_bound(needle))
     }
 
+    /// [`Self::bounds`] restricted to `range`, in absolute indices. Only the
+    /// window must be sorted ascending — rows outside it are never read (a
+    /// prefix probe searches a second key inside a lead run of a column that
+    /// is not sorted as a whole). Probes point-read through [`Self::value_at`]
+    /// rather than descending the encoding structure, so the window's order is
+    /// the only order consulted.
+    ///
+    /// # Panics
+    /// Panics if `range.end > self.len()`.
+    pub fn bounds_in(&self, range: std::ops::Range<usize>, needle: u64) -> (usize, usize) {
+        assert!(range.end <= self.len(), "window out of bounds");
+        let width = range.end.saturating_sub(range.start);
+        let lo = node::partition(width, |i| self.value_at(range.start + i) < needle);
+        let hi = lo
+            + node::partition(width - lo, |i| {
+                self.value_at(range.start + lo + i) <= needle
+            });
+        (range.start + lo, range.start + hi)
+    }
+
     /// Exact value at `index`, widened to `u64`.
     ///
     /// # Panics

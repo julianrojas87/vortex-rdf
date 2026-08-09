@@ -102,4 +102,24 @@ async fn layout_chunks_probe_matches_canonical() {
             .expect("all chunks are probeable");
         assert_eq!(got, u64::from(data[row as usize]), "row {row}");
     }
+
+    // Windowed bounds: search inside sub-ranges (including ones spanning a
+    // chunk boundary) and compare against the canonical floor of the window.
+    for window in [0u64..50_000, 150_000..250_000, 380_000..420_000, 5..6, 9..9] {
+        let wdata = &data[window.start as usize..window.end as usize];
+        for needle in [0u64, 3000, 13_600, 18_181, 36_363, u64::MAX] {
+            let got = column
+                .bounds_in(window.clone(), needle, &source, &session)
+                .await
+                .unwrap()
+                .expect("all chunks are probeable");
+            let lo = wdata.partition_point(|&v| u64::from(v) < needle) as u64;
+            let hi = wdata.partition_point(|&v| u64::from(v) <= needle) as u64;
+            assert_eq!(
+                got,
+                window.start + lo..window.start + hi,
+                "window {window:?} needle {needle}"
+            );
+        }
+    }
 }

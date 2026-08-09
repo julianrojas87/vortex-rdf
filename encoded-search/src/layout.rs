@@ -176,6 +176,49 @@ impl ColumnChunks {
         Ok(Some(lower..upper.max(lower)))
     }
 
+    /// [`Self::bounds`] restricted to `range`, in absolute rows. Only the
+    /// window must be sorted ascending — probes point-read through
+    /// [`Self::value_at`], so rows outside the window are never consulted (a
+    /// prefix probe searches a second key inside a lead run of a column that
+    /// is not sorted as a whole). Fetches only the chunks the bisection
+    /// touches (cached thereafter). `Ok(None)` when a needed chunk's encoding
+    /// declines.
+    ///
+    /// # Panics
+    /// Panics if `range.end > self.row_count()`.
+    pub async fn bounds_in(
+        &self,
+        range: Range<u64>,
+        needle: u64,
+        source: &Arc<dyn SegmentSource>,
+        session: &VortexSession,
+    ) -> VortexResult<Option<Range<u64>>> {
+        assert!(range.end <= self.row_count, "window out of bounds");
+        // partition_point over the window through async point reads.
+        let partition =
+            async |mut lo: u64, mut hi: u64, upper: bool| -> VortexResult<Option<u64>> {
+                while lo < hi {
+                    let mid = lo + (hi - lo) / 2;
+                    let Some(v) = self.value_at(mid, source, session).await? else {
+                        return Ok(None);
+                    };
+                    if v < needle || (upper && v == needle) {
+                        lo = mid + 1;
+                    } else {
+                        hi = mid;
+                    }
+                }
+                Ok(Some(lo))
+            };
+        let Some(lo) = partition(range.start, range.end, false).await? else {
+            return Ok(None);
+        };
+        let Some(hi) = partition(lo, range.end, true).await? else {
+            return Ok(None);
+        };
+        Ok(Some(lo..hi))
+    }
+
     /// Exact value at global `row`, fetching (and caching) only the chunk
     /// that holds it. Needs no sort order. `Ok(None)` when that chunk's
     /// encoding declines the probe.
