@@ -24,14 +24,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Compare the Python bindings against four RDF libraries (bench) ([`4e54368`](https://github.com/vortex-rdf/vortex-rdf/commit/4e54368f3b10635fc94001868e9dfd30612f6641) by @julianrojas87)
 - Carry the graph in match_compact and serve it from term codes (python) ([`6ef2a45`](https://github.com/vortex-rdf/vortex-rdf/commit/6ef2a4500e530c49de03bd578349ab8c995a0ec4) by @julianrojas87)
 - Cross residency with the secondary index in the Python tab (bench) ([`080201c`](https://github.com/vortex-rdf/vortex-rdf/commit/080201c5c177908e760438deb1a079ec4620afc1) by @julianrojas87)
-- Add workspace crate with encoded sorted-probe resolution (encoded-search) ([`ce3aef8`](https://github.com/vortex-rdf/vortex-rdf/commit/ce3aef8ce778b599d1ef0ad85cb761be02e9c58c) by julianrojas87)
-- Probe encoded columns in search_sorted_bounds (core) ([`a8c48e8`](https://github.com/vortex-rdf/vortex-rdf/commit/a8c48e8a2afa71f80100aee605a0dcd416bcba81) by julianrojas87)
-- Bind encoded columns in the typed residual filter (core) ([`2587853`](https://github.com/vortex-rdf/vortex-rdf/commit/2587853767dd128478f10942599b84602ef4ba20) by julianrojas87)
-- Bound-subject row bounds on sorted files via chunk probes (core) ([`bdfe2e3`](https://github.com/vortex-rdf/vortex-rdf/commit/bdfe2e32df0cd54fb70bd26e94cea0f8f8652680) by julianrojas87)
-- Retain compressed columns through resident adoption (core) ([`9742500`](https://github.com/vortex-rdf/vortex-rdf/commit/97425009c78f5393ce8097e063eed8b6ef81530d) by julianrojas87)
-- Dict probe nodes, owned probes, and chunk point reads (encoded-search) ([`1a5fb5f`](https://github.com/vortex-rdf/vortex-rdf/commit/1a5fb5f4c00574f7d785d9925ab6961e7bdfb267) by julianrojas87)
-- Cache base probes and point-read tiny file selections (core) ([`2cc274f`](https://github.com/vortex-rdf/vortex-rdf/commit/2cc274fe1d1734325d8cb601c14053a9b394e73c) by julianrojas87)
-- Windowed bounds over sorted sub-ranges (encoded-search) ([`1192b78`](https://github.com/vortex-rdf/vortex-rdf/commit/1192b78f16e7083c5e895f02fdbc1208614e5f09) by julianrojas87)
+- Add workspace crate with encoded sorted-probe resolution (encoded-search) ([`ce3aef8`](https://github.com/vortex-rdf/vortex-rdf/commit/ce3aef8ce778b599d1ef0ad85cb761be02e9c58c) by @julianrojas87)
+- Probe encoded columns in search_sorted_bounds (core) ([`a8c48e8`](https://github.com/vortex-rdf/vortex-rdf/commit/a8c48e8a2afa71f80100aee605a0dcd416bcba81) by @julianrojas87)
+- Bind encoded columns in the typed residual filter (core) ([`2587853`](https://github.com/vortex-rdf/vortex-rdf/commit/2587853767dd128478f10942599b84602ef4ba20) by @julianrojas87)
+- Bound-subject row bounds on sorted files via chunk probes (core) ([`bdfe2e3`](https://github.com/vortex-rdf/vortex-rdf/commit/bdfe2e32df0cd54fb70bd26e94cea0f8f8652680) by @julianrojas87)
+- Retain compressed columns through resident adoption (core) ([`9742500`](https://github.com/vortex-rdf/vortex-rdf/commit/97425009c78f5393ce8097e063eed8b6ef81530d) by @julianrojas87)
+- Dict probe nodes, owned probes, and chunk point reads (encoded-search) ([`1a5fb5f`](https://github.com/vortex-rdf/vortex-rdf/commit/1a5fb5f4c00574f7d785d9925ab6961e7bdfb267) by @julianrojas87)
+- Cache base probes and point-read tiny file selections (core) ([`2cc274f`](https://github.com/vortex-rdf/vortex-rdf/commit/2cc274fe1d1734325d8cb601c14053a9b394e73c) by @julianrojas87)
+- Windowed bounds over sorted sub-ranges (encoded-search) ([`1192b78`](https://github.com/vortex-rdf/vortex-rdf/commit/1192b78f16e7083c5e895f02fdbc1208614e5f09) by @julianrojas87)
+- Point-read the file-backed dictionary through cached wire chunks (core) ([`1b3da12`](https://github.com/vortex-rdf/vortex-rdf/commit/1b3da1288f9b9c81d1c1692a669212360854cb53) by @julianrojas87)
 
 ### Changed
 
@@ -40,9 +41,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Memoize per-role term decoding of a dictionary chunk (core) ([`6b3ebf8`](https://github.com/vortex-rdf/vortex-rdf/commit/6b3ebf8caefd31215b4090320b958c27584bd243) by @julianrojas87)
 - Adopt resident bases with canonical integer columns (core) ([`5184c02`](https://github.com/vortex-rdf/vortex-rdf/commit/5184c02a8946a520b5644e61b3495b9796543bff) by @julianrojas87)
 - Adopt index components in resident form too (core) ([`74690e5`](https://github.com/vortex-rdf/vortex-rdf/commit/74690e5766db38506e8742cfc6178538c106849b) by @julianrojas87)
-- Point-read small gathers through encoded probes (core) ([`8b2afda`](https://github.com/vortex-rdf/vortex-rdf/commit/8b2afda4abbc0be479a91cd78f3e07cb378076be) by julianrojas87)
-- Memoize chunk extremes in chunked probes (encoded-search) ([`aeb022a`](https://github.com/vortex-rdf/vortex-rdf/commit/aeb022a855ae723b76da21358c205b02b28351f0) by julianrojas87)
-- Locate and point-read index-served runs through cached probes (core) ([`ff1c724`](https://github.com/vortex-rdf/vortex-rdf/commit/ff1c7244604b285e6ceefb881fc9dc6c53c793ba) by julianrojas87)
+- Point-read small gathers through encoded probes (core) ([`8b2afda`](https://github.com/vortex-rdf/vortex-rdf/commit/8b2afda4abbc0be479a91cd78f3e07cb378076be) by @julianrojas87)
+- Memoize chunk extremes in chunked probes (encoded-search) ([`aeb022a`](https://github.com/vortex-rdf/vortex-rdf/commit/aeb022a855ae723b76da21358c205b02b28351f0) by @julianrojas87)
+- Locate and point-read index-served runs through cached probes (core) ([`ff1c724`](https://github.com/vortex-rdf/vortex-rdf/commit/ff1c7244604b285e6ceefb881fc9dc6c53c793ba) by @julianrojas87)
 
 ### Removed
 
@@ -57,7 +58,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Align feature gates with each item's real consumers (core) ([`aa91257`](https://github.com/vortex-rdf/vortex-rdf/commit/aa91257c9e6c7241a459f83fe4d7cce5b07b3939) by @julianrojas87)
 - Read the dashboard's BENCH_SIZE from its post-reorg home [skip ci] (bench) ([`c1a446a`](https://github.com/vortex-rdf/vortex-rdf/commit/c1a446a44f343051369271848ae4ecd02ea0a177) by @julianrojas87)
 - Drop the dead call that discarded a completed run (bench) ([`205df5e`](https://github.com/vortex-rdf/vortex-rdf/commit/205df5ede2750138e50d5c1537f3a0a15e248375) by @julianrojas87)
-- Search only the asserted window in sliced probes (encoded-search) ([`fca93f1`](https://github.com/vortex-rdf/vortex-rdf/commit/fca93f1504c431556b68f55c9b272972fd017ec5) by julianrojas87)
+- Search only the asserted window in sliced probes (encoded-search) ([`fca93f1`](https://github.com/vortex-rdf/vortex-rdf/commit/fca93f1504c431556b68f55c9b272972fd017ec5) by @julianrojas87)
 
 ## [0.5.0](https://github.com/vortex-rdf/vortex-rdf/compare/v0.4.0...v0.5.0) - 2026-07-29
 
