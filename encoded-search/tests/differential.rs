@@ -398,10 +398,12 @@ fn probes_through_shared_wrapper() {
         vortex_array::arrays::SharedArray::new(PrimitiveArray::from_iter(values).into_array())
             .into_array();
     assert_eq!(shared.encoding_id().as_str(), "vortex.shared");
-    let arr =
-        vortex_array::arrays::DictArray::try_new(PrimitiveArray::from_iter(codes).into_array(), shared)
-            .unwrap()
-            .into_array();
+    let arr = vortex_array::arrays::DictArray::try_new(
+        PrimitiveArray::from_iter(codes).into_array(),
+        shared,
+    )
+    .unwrap()
+    .into_array();
     assert_probe(&arr, &data, &[NodeKind::Dict, NodeKind::Primitive]);
 }
 

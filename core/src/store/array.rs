@@ -308,9 +308,9 @@ fn compress_u32_column(
     sorted: bool,
     ctx: &mut vortex_array::ExecutionCtx,
 ) -> Result<ArrayRef> {
-    use vortex_array::arrays::ConstantArray;
     use vortex::encodings::fastlanes::BitPacked;
     use vortex::encodings::runend::RunEnd;
+    use vortex_array::arrays::ConstantArray;
 
     let values = prim.as_slice::<u32>();
     if values.is_empty() {
@@ -336,8 +336,7 @@ fn compress_u32_column(
         return Ok(ConstantArray::new(min, values.len()).into_array());
     }
     if sorted && runs * 4 <= values.len() {
-        let re = RunEnd::encode(prim.clone().into_array(), ctx)
-            .map_err(VortexRdfError::Vortex)?;
+        let re = RunEnd::encode(prim.clone().into_array(), ctx).map_err(VortexRdfError::Vortex)?;
         return Ok(re.into_array());
     }
     let bit_width = (u32::BITS - max.leading_zeros()).max(1) as u8;
