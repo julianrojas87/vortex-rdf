@@ -37,6 +37,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Compress built stores into probe-supported resident form (core) ([`c3eb922`](https://github.com/vortex-rdf/vortex-rdf/commit/c3eb92200e89f8be6be3d2b48c4af1c1f95b877e) by @julianrojas87)
 - Measure the dictionary regimes the residency axis now turns on (bench) ([`876b4d5`](https://github.com/vortex-rdf/vortex-rdf/commit/876b4d5f878e5ff6ab97ca70c71c1664f285a164) by @julianrojas87)
 - Build every store sorted, chosen by the target (core) ([`1573187`](https://github.com/vortex-rdf/vortex-rdf/commit/1573187e65fde559f1468bc9badc76cb642329cd) by @julianrojas87)
+- Add a light/dark theme switch to the dashboard (bench) ([`9628229`](https://github.com/vortex-rdf/vortex-rdf/commit/96282293e211f63835db6ed4a15e3d356e1132b3) by julianrojas87)
 
 ### Changed
 
@@ -57,6 +58,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Size-gate the resident compression pass (core) ([`500ce7b`](https://github.com/vortex-rdf/vortex-rdf/commit/500ce7b8d72b549e5b1e94000bc0cfa51acac96e) by @julianrojas87)
 - Drop the resident compression size gate (core) ([`34fcd71`](https://github.com/vortex-rdf/vortex-rdf/commit/34fcd718aa6ae1f1fa9389abe8c7f0924713e803) by @julianrojas87)
 - Drop "sorted" from every benchmark name and label (bench) ([`dd2564b`](https://github.com/vortex-rdf/vortex-rdf/commit/dd2564b88072bef20767989394b387e408d274b5) by @julianrojas87)
+- Locate reference-index runs through cached chunk probes (core) ([`b4a1e4f`](https://github.com/vortex-rdf/vortex-rdf/commit/b4a1e4f9d96f2f5399265c52f78cbd0e97bd16b0) by julianrojas87)
 
 ### Removed
 
