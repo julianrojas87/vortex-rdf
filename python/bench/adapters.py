@@ -137,12 +137,11 @@ class VortexAdapter(Adapter):
         slug: str,
         label: str,
         layout: str,
-        builder: str,
         indexes: list[str],
         in_memory: bool = False,
     ):
         self.slug, self.label = slug, label
-        self.layout, self.builder, self.indexes = layout, builder, indexes
+        self.layout, self.indexes = layout, indexes
         #: File-backed (the default) reads columns from the .vortex file per
         #: query; in-memory loads the whole file up front. Both are shipped
         #: modes, and the Rust tab measures the same axis -- pyoxigraph and
@@ -160,9 +159,7 @@ class VortexAdapter(Adapter):
 
         if os.path.exists(artifact):
             os.remove(artifact)
-        native.serialize_rdf(
-            src, artifact, layout=self.layout, builder=self.builder, indexes=self.indexes
-        )
+        native.serialize_rdf(src, artifact, layout=self.layout, indexes=self.indexes)
         return native.VortexRdfStore(artifact, in_memory=self.in_memory)
 
     def open(self, artifact: str, src: str) -> Any:
@@ -394,7 +391,7 @@ class RdflibAdapter(Adapter):
 # ─── Registry ───────────────────────────────────────────────────────────────
 
 #: Vortex build variants, the same star design the Rust and JS tabs use:
-#: builder x layout x secondary index x residency. Every one of them is a row
+#: layout x secondary index x residency. Every one of them is a row
 #: in the cross-library panels.
 #:
 #: Residency and secondary indexes are crossed rather than varied one at a
@@ -403,21 +400,21 @@ class RdflibAdapter(Adapter):
 #: an index configuration. The in-memory indexed cells are the ones that match
 #: how pyoxigraph and rdflib are configured.
 VORTEX_VARIANTS = [
-    ("vortex_sorted_dict", "Vortex Sorted/Dict", "dictionary", "sorted-in-memory", [], False),
-    ("vortex_sorted_dict_mem", "Vortex Sorted/Dict (in-memory)", "dictionary", "sorted-in-memory", [], True),
-    ("vortex_sorted_default", "Vortex Sorted/Default", "default", "sorted-in-memory", [], False),
-    ("vortex_sorted_dict_bycopy", "Vortex Sorted/Dict+ByCopy", "dictionary", "sorted-in-memory", ["secondary-by-copy"], False),
-    ("vortex_sorted_dict_bycopy_mem", "Vortex Sorted/Dict+ByCopy (in-memory)", "dictionary", "sorted-in-memory", ["secondary-by-copy"], True),
-    ("vortex_sorted_dict_byref", "Vortex Sorted/Dict+ByRef", "dictionary", "sorted-in-memory", ["secondary-by-reference"], False),
-    ("vortex_sorted_dict_byref_mem", "Vortex Sorted/Dict+ByRef (in-memory)", "dictionary", "sorted-in-memory", ["secondary-by-reference"], True),
+    ("vortex_sorted_dict", "Vortex Sorted/Dict", "dictionary", [], False),
+    ("vortex_sorted_dict_mem", "Vortex Sorted/Dict (in-memory)", "dictionary", [], True),
+    ("vortex_sorted_default", "Vortex Sorted/Default", "default", [], False),
+    ("vortex_sorted_dict_bycopy", "Vortex Sorted/Dict+ByCopy", "dictionary", ["secondary-by-copy"], False),
+    ("vortex_sorted_dict_bycopy_mem", "Vortex Sorted/Dict+ByCopy (in-memory)", "dictionary", ["secondary-by-copy"], True),
+    ("vortex_sorted_dict_byref", "Vortex Sorted/Dict+ByRef", "dictionary", ["secondary-by-reference"], False),
+    ("vortex_sorted_dict_byref_mem", "Vortex Sorted/Dict+ByRef (in-memory)", "dictionary", ["secondary-by-reference"], True),
 ]
 
 
 def build_adapter(slug: str) -> Adapter:
     """Construct one adapter by slug, importing only that library."""
-    for vslug, label, layout, builder, indexes, in_memory in VORTEX_VARIANTS:
+    for vslug, label, layout, indexes, in_memory in VORTEX_VARIANTS:
         if slug == vslug:
-            return VortexAdapter(vslug, label, layout, builder, indexes, in_memory)
+            return VortexAdapter(vslug, label, layout, indexes, in_memory)
     if slug == "pyoxigraph":
         return PyoxigraphAdapter()
     if slug == "pycottas":
