@@ -304,8 +304,12 @@ impl VortexRdfStore {
 
     /// Materialize the quads matching a pattern into a `LazyQuad[]` — the
     /// array-returning counterpart of [`match`](Self::match_pattern).
+    ///
+    /// Returns synchronously: no wasm read path performs I/O, so there is
+    /// nothing to await (see [`resolve_now`]). The quads still decode their
+    /// term strings lazily on access.
     #[wasm_bindgen(js_name = getQuads, skip_typescript)]
-    pub async fn get_quads(
+    pub fn get_quads(
         &self,
         subject: JsValue,
         predicate: JsValue,
@@ -317,7 +321,7 @@ impl VortexRdfStore {
         let o = js_to_term(object);
         let g = js_to_graph(graph);
         let dict = self.code_path_dict();
-        let payload = match_columns(self.inner.clone(), dict, s, p, o, g).await?;
+        let payload = resolve_now(match_columns(self.inner.clone(), dict, s, p, o, g))??;
         Ok(build_lazy_quads(&payload))
     }
 
@@ -330,7 +334,7 @@ impl VortexRdfStore {
     /// against `getQuads`, which builds its own columnar payload rather than
     /// this one.
     #[wasm_bindgen(js_name = matchCodes, skip_typescript)]
-    pub async fn match_codes(
+    pub fn match_codes(
         &self,
         subject: JsValue,
         predicate: JsValue,
@@ -349,14 +353,16 @@ impl VortexRdfStore {
         let p = js_to_named_node(predicate);
         let o = js_to_term(object);
         let g = js_to_graph(graph);
-        let matched = self
-            .inner
-            .match_pattern(s.as_ref(), p.as_ref(), o.as_ref(), g.as_ref())
-            .await
-            .map_err(js_err)?;
+        let matched = resolve_now(self.inner.match_pattern(
+            s.as_ref(),
+            p.as_ref(),
+            o.as_ref(),
+            g.as_ref(),
+        ))?
+        .map_err(js_err)?;
 
         let result = Object::new();
-        let Some(n) = set_code_columns(&result, &matched).await? else {
+        let Some(n) = resolve_now(set_code_columns(&result, &matched))?? else {
             return Ok(JsValue::NULL);
         };
         Reflect::set(&result, &"length".into(), &JsValue::from_f64(n as f64))?;
@@ -376,6 +382,24 @@ impl VortexRdfStore {
         let snapshot = self.inner.code_read_snapshot()?;
         Some(TermDict { snapshot })
     }
+}
+
+/// Drive a read future to completion without suspending, or `Err` if it would
+/// have suspended.
+///
+/// The read paths are `async` because a file-backed store resolves its rows
+/// (and its dictionary) through I/O — but this crate builds core with
+/// `default-features = false`, so `file-io` is compiled out and no
+/// `QuadsSource::File` exists here. Every await in a wasm read is therefore
+/// already resolved, and wrapping one in a `Promise` only buys the caller a
+/// microtask turn. Polling once is exactly that reasoning made checkable: a
+/// future that did suspend surfaces as an error instead of a hang.
+fn resolve_now<F: std::future::Future>(future: F) -> Result<F::Output, JsValue> {
+    use futures::FutureExt;
+
+    future
+        .now_or_never()
+        .ok_or_else(|| js_err("read suspended: no wasm read path performs I/O"))
 }
 
 /// Resolve a pattern and pack the matched rows into the columnar payload the JS

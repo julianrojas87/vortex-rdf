@@ -66,7 +66,7 @@ describe('build variants', () => {
             test('matches every quad-position pattern', async () => {
                 const store = await VortexRdfStore.fromString(NQUADS, 'nquads', options);
                 const count = (s: Term | null, p: Term | null, o: Term | null, g: Term | null) =>
-                    store.getQuads(s, p, o, g).then((qs: Quad[]) => qs.length);
+                    store.getQuads(s, p, o, g).length;
 
                 // Subject-only: exercises the sorted binary-search path.
                 expect(await count(df.namedNode('http://example.org/s1'), null, null, null)).toBe(2);

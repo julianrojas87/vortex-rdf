@@ -95,11 +95,11 @@ export class VortexRdfStore {
     match(subject?: Term | null, predicate?: Term | null, object?: Term | null, graph?: Term | null): Stream<Quad>;
     /**
      * Materialize the quads matching a pattern into an array of lazy `Quad`s —
-     * the array-returning counterpart of `match`. `async` (returns a `Promise`)
-     * because resolving the match crosses the WebAssembly boundary; the returned
+     * the array-returning counterpart of `match`. Returns synchronously: no
+     * read path performs I/O, so there is nothing to await. The returned
      * `Quad`s still decode their term strings lazily on access.
      */
-    getQuads(subject?: Term | null, predicate?: Term | null, object?: Term | null, graph?: Term | null): Promise<Quad[]>;
+    getQuads(subject?: Term | null, predicate?: Term | null, object?: Term | null, graph?: Term | null): Quad[];
     /**
      * Low-level prototype: an alternative read path to `match`/`getQuads`,
      * which build their own columnar payload rather than going through this.
@@ -109,7 +109,7 @@ export class VortexRdfStore {
      * store is Dictionary layout with no pending appends (appended quads are
      * encoded against a fresh dictionary, so their codes would not decode).
      */
-    matchCodes(subject?: Term | null, predicate?: Term | null, object?: Term | null, graph?: Term | null): Promise<{ s: Uint32Array; p: Uint32Array; o: Uint32Array; g: Uint32Array; length: number } | null>;
+    matchCodes(subject?: Term | null, predicate?: Term | null, object?: Term | null, graph?: Term | null): { s: Uint32Array; p: Uint32Array; o: Uint32Array; g: Uint32Array; length: number } | null;
     /**
      * Low-level. An immutable handle on this store's term dictionary — the one
      * door to code↔term translation. `undefined` unless the store's rows are
