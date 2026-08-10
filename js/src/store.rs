@@ -9,7 +9,7 @@ use js_sys::{Object, Reflect};
 use oxrdf::{GraphName, NamedNode, NamedOrBlankNode, Term};
 use vortex_rdf_core::common::export::export_rdf;
 use vortex_rdf_core::common::terms::parse_quads_from_reader;
-use vortex_rdf_core::{BuilderStrategy, DictSnapshot, LayoutStrategy, VortexRdfStore as CoreStore};
+use vortex_rdf_core::{DictSnapshot, LayoutStrategy, VortexRdfStore as CoreStore};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::future_to_promise;
 
@@ -165,9 +165,7 @@ impl VortexRdfStore {
         // (a `'static` stream cannot borrow from the decode loop), putting
         // four owned Strings per quad on the ingest high-water mark.
         if config.layout == LayoutStrategy::Dictionary && js_sys::Array::is_array(&quads) {
-            let sorted = config.builder == BuilderStrategy::SortedInMemory;
-            let built =
-                js_array_to_dictionary_array(js_sys::Array::from(&quads), sorted, config.indexes)?;
+            let built = js_array_to_dictionary_array(js_sys::Array::from(&quads), config.indexes)?;
             let inner = CoreStore::from_built(built).map_err(js_err)?;
             return Ok(VortexRdfStore::wrap(inner));
         }

@@ -76,6 +76,5 @@ def serialize_rdf(
     output_path: StrPath,
     layout: str = "default",
     format: Optional[str] = None,
-    builder: str = "unsorted-stream",
     indexes: List[str] = [],
 ) -> None: ...

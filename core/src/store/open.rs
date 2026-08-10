@@ -228,8 +228,8 @@ impl VortexRdfStore {
     /// Sortedness is restored from the file's own provenance, never assumed:
     /// the subject binary-search stamp only when the root metadata records a
     /// sorted build, and each component's binary-searchability from its
-    /// descriptor's `sorted` flag (an unsorted build's per-chunk-sorted
-    /// children stay unsearchable — scanning them is correct, searching them
+    /// descriptor's `sorted` flag (children whose chunks carry only local
+    /// sorts stay unsearchable — scanning them is correct, searching them
     /// would not be).
     ///
     /// Runs handle-free end to end (buffer-backed segment reads resolve

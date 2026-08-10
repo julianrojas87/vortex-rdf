@@ -3,7 +3,7 @@
 
 use super::*;
 #[cfg(feature = "file-io")]
-use crate::io::quads_stream_to_vortex_writer_with_builder;
+use crate::io::quads_stream_to_vortex_writer;
 use crate::store::VortexArrayBuilder;
 use futures::{StreamExt, TryStreamExt, stream};
 use oxrdf::{GraphName, Literal, NamedNode, NamedOrBlankNode, Quad, Term};
@@ -57,21 +57,16 @@ fn modular_quads(n: usize, p_mod: usize, o_mod: usize) -> Vec<Quad> {
 /// assertion panics, which the old hand-rolled `temp_dir() + uuid` pattern
 /// never did.
 #[cfg(feature = "file-io")]
-async fn write_store_file<B: VortexArrayBuilder>(
+async fn write_store_file(
     quads: Vec<Quad>,
     layout: LayoutStrategy,
     indexes: Indexes,
 ) -> (tempfile::TempDir, std::path::PathBuf) {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("store.vortex");
-    crate::io::quads_stream_to_vortex_file_with_builder::<B, _>(
-        quad_stream(quads),
-        &path,
-        layout,
-        indexes,
-    )
-    .await
-    .unwrap();
+    crate::io::quads_stream_to_vortex_file(quad_stream(quads), &path, layout, indexes)
+        .await
+        .unwrap();
     (dir, path)
 }
 
@@ -121,20 +116,14 @@ async fn build_array<B: VortexArrayBuilder>(
 }
 
 /// A quad stream serialized to native store bytes with the suite's default
-/// configuration (UnsortedStream builder, Default layout, no indexes).
+/// configuration (Default layout, no indexes).
 #[cfg(feature = "file-io")]
 async fn quads_stream_to_vortex<S>(quads: S) -> crate::error::Result<Vec<u8>>
 where
     S: futures::Stream<Item = crate::error::Result<crate::store::RawQuad>> + Unpin + Send + 'static,
 {
     let mut buffer = Vec::new();
-    quads_stream_to_vortex_writer_with_builder::<crate::store::UnsortedStreamBuilder, _, _>(
-        quads,
-        &mut buffer,
-        LayoutStrategy::Default,
-        Vec::new(),
-    )
-    .await?;
+    quads_stream_to_vortex_writer(quads, &mut buffer, LayoutStrategy::Default, Vec::new()).await?;
     Ok(buffer)
 }
 

@@ -11,7 +11,7 @@ async fn test_roundtrip() {
         GraphName::NamedNode(NamedNode::new("http://example.org/g").unwrap()),
     );
 
-    let arr = build_array::<UnsortedStreamBuilder>(
+    let arr = build_array::<SortedInMemoryBuilder>(
         quad_stream(vec![quad.clone()]),
         LayoutStrategy::Default,
         vec![],
@@ -67,10 +67,6 @@ async fn test_sorted_in_memory() {
 async fn test_sorted_stream() {
     run_builder_roundtrip::<SortedStreamBuilder>().await;
 }
-#[tokio::test]
-async fn test_unsorted_stream() {
-    run_builder_roundtrip::<UnsortedStreamBuilder>().await;
-}
 
 // ─── textual export ────────────────────────────────────────────────────
 
@@ -119,7 +115,7 @@ fn oxrdf_reference(quads: &[Quad], format: oxrdfio::RdfFormat) -> String {
 #[tokio::test]
 async fn test_export_nquads_fast_path_matches_oxrdf() {
     let quads = export_test_quads();
-    let arr = build_array::<UnsortedStreamBuilder>(
+    let arr = build_array::<SortedInMemoryBuilder>(
         quad_stream(quads.clone()),
         LayoutStrategy::Default,
         vec![],
@@ -128,13 +124,16 @@ async fn test_export_nquads_fast_path_matches_oxrdf() {
     .unwrap();
     let store = VortexRdfStore::from_built(arr).unwrap();
 
+    let stored: Vec<Quad> = store.quads().unwrap().try_collect().await.unwrap();
     let mut exported = Vec::new();
     crate::common::export::export_rdf(store, &mut exported, oxrdfio::RdfFormat::NQuads)
         .await
         .unwrap();
+    // The reference follows the store's own row order, so what this pins is
+    // the byte-level escaping rather than the build's ordering.
     assert_eq!(
         String::from_utf8(exported).unwrap(),
-        oxrdf_reference(&quads, oxrdfio::RdfFormat::NQuads)
+        oxrdf_reference(&stored, oxrdfio::RdfFormat::NQuads)
     );
 }
 
@@ -148,7 +147,7 @@ async fn test_export_ntriples_fast_path_and_named_graph_refusal() {
         .filter(|q| q.graph_name == GraphName::DefaultGraph)
         .cloned()
         .collect();
-    let arr = build_array::<UnsortedStreamBuilder>(
+    let arr = build_array::<SortedInMemoryBuilder>(
         quad_stream(default_graph_only.clone()),
         LayoutStrategy::Default,
         vec![],
@@ -156,19 +155,20 @@ async fn test_export_ntriples_fast_path_and_named_graph_refusal() {
     .await
     .unwrap();
     let store = VortexRdfStore::from_built(arr).unwrap();
+    let stored: Vec<Quad> = store.quads().unwrap().try_collect().await.unwrap();
     let mut exported = Vec::new();
     crate::common::export::export_rdf(store, &mut exported, oxrdfio::RdfFormat::NTriples)
         .await
         .unwrap();
     assert_eq!(
         String::from_utf8(exported).unwrap(),
-        oxrdf_reference(&default_graph_only, oxrdfio::RdfFormat::NTriples)
+        oxrdf_reference(&stored, oxrdfio::RdfFormat::NTriples)
     );
 
     // A named graph cannot be represented in N-Triples: refuse, as the
     // structured path would.
     let arr =
-        build_array::<UnsortedStreamBuilder>(quad_stream(quads), LayoutStrategy::Default, vec![])
+        build_array::<SortedInMemoryBuilder>(quad_stream(quads), LayoutStrategy::Default, vec![])
             .await
             .unwrap();
     let store = VortexRdfStore::from_built(arr).unwrap();
@@ -186,20 +186,17 @@ async fn test_export_ntriples_fast_path_and_named_graph_refusal() {
 #[tokio::test]
 async fn test_export_nquads_fast_path_file_backed() {
     let quads = export_test_quads();
-    let (_dir, path) =
-        write_store_file::<UnsortedStreamBuilder>(quads.clone(), LayoutStrategy::Default, vec![])
-            .await;
+    let (_dir, path) = write_store_file(quads.clone(), LayoutStrategy::Default, vec![]).await;
 
     let store = VortexRdfStore::from_file(&path).await.unwrap();
+    let stored: Vec<Quad> = store.quads().unwrap().try_collect().await.unwrap();
     let mut exported = Vec::new();
     crate::common::export::export_rdf(store, &mut exported, oxrdfio::RdfFormat::NQuads)
         .await
         .unwrap();
-    // The unsorted-stream write keeps input order, so the reference is the
-    // input's own serialization.
     assert_eq!(
         String::from_utf8(exported).unwrap(),
-        oxrdf_reference(&quads, oxrdfio::RdfFormat::NQuads)
+        oxrdf_reference(&stored, oxrdfio::RdfFormat::NQuads)
     );
 }
 
@@ -237,7 +234,7 @@ async fn test_export_reparses_to_the_same_quads() {
     ];
 
     for format in [oxrdfio::RdfFormat::NQuads, oxrdfio::RdfFormat::TriG] {
-        let arr = build_array::<UnsortedStreamBuilder>(
+        let arr = build_array::<SortedInMemoryBuilder>(
             quad_stream(quads.clone()),
             LayoutStrategy::Default,
             vec![],

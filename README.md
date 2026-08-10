@@ -36,11 +36,12 @@ Every file is **self-describing**: its root is a native Vortex layout (`vortex-r
 
 ## Architecture
 
-RDF quads are stored as a Vortex [`StructArray`](https://docs.rs/vortex/latest/vortex/array/arrays/struct_/type.StructArray.html) (or a [`ChunkedArray`](https://docs.rs/vortex/latest/vortex/array/arrays/chunked/type.ChunkedArray.html) of StructArrays for chunked/streamed builds). How that array is shaped and built is controlled by three **orthogonal, build-time choices**:
+RDF quads are stored as a Vortex [`StructArray`](https://docs.rs/vortex/latest/vortex/array/arrays/struct_/type.StructArray.html) (or a [`ChunkedArray`](https://docs.rs/vortex/latest/vortex/array/arrays/chunked/type.ChunkedArray.html) of StructArrays for chunked/streamed builds). How that array is shaped is controlled by two **orthogonal, build-time choices**:
 
 1. A **column layout** (`LayoutStrategy`) — the columnar schema used for the quad terms.
 2. An optional set of **secondary indexes** (`IndexType`) — persisted as their own layout children beside the quads (extra columns of the in-memory array) to accelerate pattern matching.
-3. An **ingestion builder** (`BuilderStrategy`) — how the incoming quad stream is turned into that array (sorting and memory model).
+
+How the incoming quad stream is turned into that array is not a choice: rows are always sorted globally by `(s, p, o, g)`, through the out-of-core pipeline where a filesystem exists and the in-memory one where none does (see [Ingestion](#3-ingestion)).
 
 A single store type, `VortexRdfStore`, works over any resulting array: it auto-detects the layout by inspecting the schema (a `u32` subject column marks Dictionary, the `o_kind` field marks TypedObject) and routes queries accordingly.
 
@@ -112,21 +113,21 @@ Predicate-bound patterns binary-search `_idx_posg_p`; a bound predicate **and** 
 
 Compared to `SecondaryByReference`, this costs roughly 2× the primary columns in extra storage (before compression; the sorted copies compress well) in exchange for contiguous reads on predicate/object patterns.
 
-### 3. Ingestion Builders
+### 3. Ingestion
 
-| Builder | Memory model | Sorting | Disk spill | Result |
-|---|---|---|---|---|
-| **`UnsortedStream`** (default) | Streaming / bounded by chunk size | None (insertion order) | Only for the Dictionary layout* | Chunks of ≤100K quads |
-| **`SortedInMemory`** | Full dataset in memory | Global `S → P → O → G` | No | Globally sorted array + globally sorted index columns |
-| **`SortedStream`** | Out-of-core, bounded by chunk size | Global `S → P → O → G` | Yes | Globally sorted chunks + globally sorted index columns |
+Every build sorts globally by `(s, p, o, g)`. An unsorted base loses the subject binary search, index routing, and the sorted-run locality every read path is written against, and wins nothing back on any pattern — so ordering is not a knob.
 
-- **`UnsortedStreamBuilder`**: The simplest and fastest pipeline. It preserves the exact ordering of the incoming RDF stream and emits fixed-size chunks lazily; when serializing to a file, the Vortex writer compresses and flushes each chunk as it arrives, so peak memory is bounded by the chunk size instead of the dataset size. It cannot leverage subject ordering for binary-search pruning.
-- **`SortedInMemoryBuilder`**: Loads all quads in memory and performs a global sort by `(s, p, o, g)`. Requested secondary index columns are built once over the whole dataset and emitted in global order (stamped `IsSorted`), so `match_pattern` can binary-search subjects, predicates, and objects.
+Which pipeline runs is a property of the target, not a caller's choice:
+
+| Target | Builder | Memory model | Disk spill |
+|---|---|---|---|
+| Anywhere a filesystem exists (native: Rust, CLI, Python) | **`SortedStreamBuilder`** | Out-of-core, bounded by chunk size | Yes |
+| `wasm32-unknown-unknown` (the JS bindings) | **`SortedInMemoryBuilder`** | Full dataset in memory | No — there is nothing to spill to |
+
+- **`SortedInMemoryBuilder`**: Loads all quads in memory and performs a global sort by `(s, p, o, g)`. Requested secondary index columns are built once over the whole dataset and emitted in global order (stamped `IsSorted`), so `match_pattern` can binary-search subjects, predicates, and objects. This is the wasm pipeline, and the only one compiled into that target.
 - **`SortedStreamBuilder`**: External [merge-sort](https://en.wikipedia.org/wiki/Merge_sort) for datasets larger than memory. Quads are ingested in bounded batches, sorted locally, and spilled to disk as sorted runs; a K-way heap merge then emits globally sorted, fixed-size chunks. When secondary indexes are requested, a second external sort over `(value, row ID)` pairs produces globally sorted index columns as well. Spill files are internal, length-prefixed [`rkyv` records](https://github.com/rkyv/rkyv) in a per-build temp directory — under the OS temp dir by default, overridable via the `VORTEX_RDF_SPILL_DIR` environment variable (compaction instead spills beside the store file, so the runs share the output's volume) — and are cleaned up automatically.
 
-\* The Dictionary layout always needs two passes (the global dictionary is only complete after ingesting the whole stream), so even the unsorted builder's streaming build buffers the quads — in memory up to one chunk, spilling to disk only when the dataset outgrows it — and re-reads them for encoding. Its in-memory build (`build_vortex_array`, the JS/WASM path) instead interns terms as the stream drains and never spills.
-
-The JS/WASM bindings only expose `'unsorted-stream'` and `'sorted-in-memory'` — the out-of-core `sorted-stream` builder spills sorted runs to disk, which WebAssembly has no access to, so it is absent from `VortexRdfStore`'s `BuildOptions` (requesting it on wasm is an explicit error).
+The Dictionary layout always needs two passes (the global dictionary is only complete after ingesting the whole stream). The in-memory build (`build_vortex_array`, the JS/WASM path) interns terms as the stream drains, so the sort runs over 16-byte coded rows and nothing spills.
 
 ## The Store & Query Routing
 
@@ -309,8 +310,8 @@ use std::fs::File;
 use oxrdf::NamedNode;
 use oxrdfio::RdfFormat;
 use vortex_rdf_core::{
-    VortexRdfStore, SortedInMemoryBuilder, LayoutStrategy, IndexType,
-    io::quads_stream_to_vortex_writer_with_builder,
+    VortexRdfStore, LayoutStrategy, IndexType,
+    io::quads_stream_to_vortex_writer,
     common::export::export_rdf,
     common::terms::parse_quads_from_reader,
 };
@@ -319,11 +320,11 @@ use vortex_rdf_core::{
 let input = File::open("data.ttl")?;
 let quads = parse_quads_from_reader(input, RdfFormat::Turtle);
 
-// 2. Stream the quads into a Vortex file, choosing a builder (type parameter),
-//    a column layout, and optional secondary indexes. Streaming-capable
-//    builders never materialize the full dataset in memory.
+// 2. Stream the quads into a Vortex file, choosing a column layout and any
+//    secondary indexes. The out-of-core sort behind it never materializes
+//    the full dataset in memory.
 let writer = tokio::fs::File::create("data.vortex").await?;
-quads_stream_to_vortex_writer_with_builder::<SortedInMemoryBuilder, _, _>(
+quads_stream_to_vortex_writer(
     quads,
     writer,
     LayoutStrategy::Default,
@@ -346,19 +347,19 @@ export_rdf(filtered, output, RdfFormat::NQuads).await?;
 - **Building an in-memory store and mutating it**:
 
 ```rust
-use vortex_rdf_core::{UnsortedStreamBuilder, VortexArrayBuilder};
+use vortex_rdf_core::{SortedStreamBuilder, VortexArrayBuilder};
 
-// In-memory build: run the quad stream through a builder (the
+// In-memory build: run the quad stream through this target's builder (the
 // `VortexArrayBuilder` trait), then adopt its output as a queryable store
-// (here: UnsortedStream builder, Default layout, no indexes)
+// (here: Default layout, no indexes)
 let quads = parse_quads_from_reader(File::open("data.ttl")?, RdfFormat::Turtle);
-let built = UnsortedStreamBuilder::build_vortex_array(
+let built = SortedStreamBuilder::build_vortex_array(
     Box::new(quads), LayoutStrategy::Default, vec![],
 ).await?;
 let store = VortexRdfStore::from_built(built)?;
 
-// Or with a different builder / layout / indexes:
-let built = SortedInMemoryBuilder::build_vortex_array(
+// Or with a different layout / indexes:
+let built = SortedStreamBuilder::build_vortex_array(
     Box::new(quads), LayoutStrategy::Dictionary, vec![IndexType::SecondaryByReference],
 ).await?;
 
@@ -376,17 +377,15 @@ let cleaned = mutated.delete_quad(&new_quad).await?;
 ### Command Line Interface
 ```bash
 # Convert Turtle to Vortex
-# (defaults: unsorted-stream builder, default layout, no indexes)
+# (defaults: default layout, no indexes)
 vortex-rdf-cli serialize --input test.ttl --output test.vortex
 
-# Out-of-core globally sorted build with dictionary layout and secondary indexes
+# Dictionary layout with secondary indexes
 vortex-rdf-cli serialize --input big.nq --output big.vortex \
-  --builder-strategy sorted-stream \
   --layout dictionary \
   --indexes secondary-by-reference
 
 # Available options:
-#   --builder-strategy  unsorted-stream | sorted-in-memory | sorted-stream
 #   --layout            default | typed-object | dictionary
 #   --indexes           secondary-by-copy | secondary-by-reference (repeatable)
 

@@ -9,8 +9,6 @@ export {
 } from '../pkg/web/vortex_rdf.js';
 export type {
     BuildOptions,
-    BuildOptionsInput,
-    BuilderStrategy,
     LayoutStrategy,
     IndexType,
     RdfFormatName,

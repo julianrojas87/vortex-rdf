@@ -19,7 +19,6 @@ pub async fn run(args: SerializeArgs) -> Result<()> {
         input,
         output,
         format,
-        builder_strategy,
     } = args;
 
     let start = Instant::now();
@@ -33,9 +32,9 @@ pub async fn run(args: SerializeArgs) -> Result<()> {
     };
     let quads_stream = parse_quads_from_reader(reader, format);
 
-    // Chunks are streamed into the Vortex writer as they are built;
-    // streaming-capable builders never materialize the full dataset.
-    quads_stream_to_vortex_file(quads_stream, &output, layout, indexes, builder_strategy)
+    // Chunks are streamed into the Vortex writer as they are built: the
+    // out-of-core sort never materializes the full dataset.
+    quads_stream_to_vortex_file(quads_stream, &output, layout, indexes)
         .await
         .context("Failed to serialize to Vortex")?;
     info!("Fully serialized to Vortex-RDF in {:?}", start.elapsed());

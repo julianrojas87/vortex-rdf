@@ -66,10 +66,9 @@ fn js_array_to_raw_quads(quads: js_sys::Array) -> Result<Vec<RawQuad>, JsValue> 
 /// instead of four owned Strings per quad.
 pub(crate) fn js_array_to_dictionary_array(
     quads: js_sys::Array,
-    sorted: bool,
     indexes: Indexes,
 ) -> Result<BuiltArray, JsValue> {
-    let mut sink = DictionaryQuadSink::new(sorted, indexes);
+    let mut sink = DictionaryQuadSink::new(indexes);
     // `push` returns `()`, so the decode loop's collected results are a ZST
     // vector: nothing per quad is allocated.
     js_array_decode(&quads, |q| sink.push(RawQuad::from_quad(&q)))?;

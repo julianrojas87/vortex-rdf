@@ -18,7 +18,7 @@ async fn test_multiple_indexes_deduplicated() {
     );
 
     // The same index requested twice must not produce duplicate columns.
-    let arr = build_array::<UnsortedStreamBuilder>(
+    let arr = build_array::<SortedInMemoryBuilder>(
         quad_stream(vec![q1.clone(), q2.clone()]),
         LayoutStrategy::Default,
         vec![
@@ -346,7 +346,7 @@ async fn test_delete_keeps_indexes_usable() {
 #[cfg(feature = "file-io")]
 #[tokio::test]
 async fn test_file_backed_delete_keeps_indexes() {
-    let (_dir, path) = write_store_file::<SortedInMemoryBuilder>(
+    let (_dir, path) = write_store_file(
         modular_quads(12, 2, 3),
         LayoutStrategy::Default,
         vec![IndexType::SecondaryByReference],
@@ -427,7 +427,7 @@ async fn test_file_backed_delete_keeps_indexes() {
 #[cfg(feature = "file-io")]
 #[tokio::test]
 async fn test_file_backed_compaction_rewrites_source_file() {
-    let (_dir, path) = write_store_file::<SortedInMemoryBuilder>(
+    let (_dir, path) = write_store_file(
         modular_quads(12, 2, 3),
         LayoutStrategy::Default,
         vec![IndexType::SecondaryByReference],
@@ -660,11 +660,6 @@ async fn test_index_matrix_sorted_in_memory() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_index_matrix_sorted_stream() {
     run_index_matrix_test::<SortedStreamBuilder>("SortedStreamBuilder").await;
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn test_index_matrix_unsorted_stream() {
-    run_index_matrix_test::<UnsortedStreamBuilder>("UnsortedStreamBuilder").await;
 }
 
 // ─── 4b) SecondaryByCopy: sorted full-copy index ────────────────────────
@@ -1047,10 +1042,7 @@ async fn test_code_columns_serves_from_the_answering_index() {
 /// tombstoned rows filtered through the family's rid column), and chained
 /// matches falling back to row ids.
 #[cfg(feature = "file-io")]
-async fn run_copy_index_file_serving_test<B: VortexArrayBuilder>(
-    layout: LayoutStrategy,
-    located: bool,
-) {
+async fn run_copy_index_file_serving_test(layout: LayoutStrategy, located: bool) {
     let graphs = [
         GraphName::NamedNode(NamedNode::new("http://example.org/g0").unwrap()),
         GraphName::NamedNode(NamedNode::new("http://example.org/g1").unwrap()),
@@ -1077,7 +1069,7 @@ async fn run_copy_index_file_serving_test<B: VortexArrayBuilder>(
     };
 
     let (_dir, path) =
-        write_store_file::<B>(quads.clone(), layout, vec![IndexType::SecondaryByCopy]).await;
+        write_store_file(quads.clone(), layout, vec![IndexType::SecondaryByCopy]).await;
 
     let store = VortexRdfStore::from_file(&path).await.unwrap();
     assert_eq!(store.indexes(), &[IndexType::SecondaryByCopy]);
@@ -1216,7 +1208,7 @@ async fn test_copy_index_file_serving_wide_located_run_stays_pending() {
             )
         })
         .collect();
-    let (_dir, path) = write_store_file::<SortedStreamBuilder>(
+    let (_dir, path) = write_store_file(
         quads.clone(),
         LayoutStrategy::Dictionary,
         vec![IndexType::SecondaryByCopy],
@@ -1247,31 +1239,18 @@ async fn test_copy_index_file_serving_wide_located_run_stays_pending() {
 
 #[cfg(feature = "file-io")]
 #[tokio::test]
-async fn test_copy_index_file_serving_default_sorted_stream() {
-    run_copy_index_file_serving_test::<SortedStreamBuilder>(LayoutStrategy::Default, false).await;
+async fn test_copy_index_file_serving_default() {
+    run_copy_index_file_serving_test(LayoutStrategy::Default, false).await;
 }
 
 #[cfg(feature = "file-io")]
 #[tokio::test]
-async fn test_copy_index_file_serving_typed_sorted_stream() {
-    run_copy_index_file_serving_test::<SortedStreamBuilder>(LayoutStrategy::TypedObject, false)
-        .await;
+async fn test_copy_index_file_serving_typed() {
+    run_copy_index_file_serving_test(LayoutStrategy::TypedObject, false).await;
 }
 
 #[cfg(feature = "file-io")]
 #[tokio::test]
-async fn test_copy_index_file_serving_dictionary_sorted_stream() {
-    run_copy_index_file_serving_test::<SortedStreamBuilder>(LayoutStrategy::Dictionary, true).await;
-}
-
-#[cfg(feature = "file-io")]
-#[tokio::test]
-async fn test_copy_index_file_serving_default_sorted_in_memory() {
-    run_copy_index_file_serving_test::<SortedInMemoryBuilder>(LayoutStrategy::Default, false).await;
-}
-
-#[cfg(feature = "file-io")]
-#[tokio::test]
-async fn test_copy_index_file_serving_default_unsorted_stream() {
-    run_copy_index_file_serving_test::<UnsortedStreamBuilder>(LayoutStrategy::Default, false).await;
+async fn test_copy_index_file_serving_dictionary() {
+    run_copy_index_file_serving_test(LayoutStrategy::Dictionary, true).await;
 }

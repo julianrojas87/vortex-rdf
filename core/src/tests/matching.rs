@@ -51,10 +51,6 @@ async fn test_match_sorted_in_memory() {
 async fn test_match_sorted_stream() {
     run_match_pattern_test::<SortedStreamBuilder>().await;
 }
-#[tokio::test]
-async fn test_match_unsorted_stream() {
-    run_match_pattern_test::<UnsortedStreamBuilder>().await;
-}
 
 #[tokio::test]
 async fn test_match_typed_object_layout() {
@@ -71,7 +67,7 @@ async fn test_match_typed_object_layout() {
         GraphName::DefaultGraph,
     );
 
-    let arr = build_array::<UnsortedStreamBuilder>(
+    let arr = build_array::<SortedInMemoryBuilder>(
         quad_stream(vec![q1.clone(), q2.clone()]),
         LayoutStrategy::TypedObject,
         vec![],
@@ -170,7 +166,7 @@ async fn test_derived_view_does_not_lose_base_rows() {
         })
         .collect();
 
-    let arr = build_array::<UnsortedStreamBuilder>(
+    let arr = build_array::<SortedInMemoryBuilder>(
         quad_stream(quads.clone()),
         LayoutStrategy::Default,
         vec![],
@@ -194,20 +190,18 @@ async fn test_derived_view_does_not_lose_base_rows() {
     assert_eq!(store.size().await.unwrap(), 10);
 }
 
-// ─── 2b) File-backed matching matrix (by layout/builder) ───────────────
+// ─── 2b) File-backed matching matrix (by layout) ───────────────────────
 
-/// One cell of the 3-builder × 3-layout matrix: write the layout's dataset
-/// through builder `B`, open the file, and hand the store to the layout's
-/// `probe` — the probes below each bind the term family their layout
-/// represents differently on disk.
+/// One cell of the 3-layout matrix: write the layout's dataset to a file,
+/// open it, and hand the store to the layout's `probe` — the probes below
+/// each bind the term family their layout represents differently on disk.
 #[cfg(feature = "file-io")]
-async fn run_match_pattern_file_test<B, F, Fut>(layout: LayoutStrategy, quads: Vec<Quad>, probe: F)
+async fn run_match_pattern_file_test<F, Fut>(layout: LayoutStrategy, quads: Vec<Quad>, probe: F)
 where
-    B: VortexArrayBuilder,
     F: FnOnce(VortexRdfStore) -> Fut,
     Fut: std::future::Future<Output = ()>,
 {
-    let (_dir, path) = write_store_file::<B>(quads, layout, vec![]).await;
+    let (_dir, path) = write_store_file(quads, layout, vec![]).await;
     let store = VortexRdfStore::from_file(&path).await.unwrap();
     probe(store).await;
 }
@@ -293,88 +287,18 @@ async fn probe_dictionary(store: VortexRdfStore) {
 
 #[cfg(feature = "file-io")]
 #[tokio::test]
-async fn test_match_file_sorted_in_memory() {
-    run_match_pattern_file_test::<SortedInMemoryBuilder, _, _>(
-        LayoutStrategy::Default,
-        two_quads(),
-        probe_default,
-    )
-    .await;
+async fn test_match_file_default() {
+    run_match_pattern_file_test(LayoutStrategy::Default, two_quads(), probe_default).await;
 }
 #[cfg(feature = "file-io")]
 #[tokio::test]
-async fn test_match_file_sorted_stream() {
-    run_match_pattern_file_test::<SortedStreamBuilder, _, _>(
-        LayoutStrategy::Default,
-        two_quads(),
-        probe_default,
-    )
-    .await;
+async fn test_match_file_typed_object() {
+    run_match_pattern_file_test(LayoutStrategy::TypedObject, two_quads(), probe_typed_object).await;
 }
 #[cfg(feature = "file-io")]
 #[tokio::test]
-async fn test_match_file_unsorted_stream() {
-    run_match_pattern_file_test::<UnsortedStreamBuilder, _, _>(
-        LayoutStrategy::Default,
-        two_quads(),
-        probe_default,
-    )
-    .await;
-}
-#[cfg(feature = "file-io")]
-#[tokio::test]
-async fn test_match_file_typed_sorted_in_memory() {
-    run_match_pattern_file_test::<SortedInMemoryBuilder, _, _>(
-        LayoutStrategy::TypedObject,
-        two_quads(),
-        probe_typed_object,
-    )
-    .await;
-}
-#[cfg(feature = "file-io")]
-#[tokio::test]
-async fn test_match_file_typed_sorted_stream() {
-    run_match_pattern_file_test::<SortedStreamBuilder, _, _>(
-        LayoutStrategy::TypedObject,
-        two_quads(),
-        probe_typed_object,
-    )
-    .await;
-}
-#[cfg(feature = "file-io")]
-#[tokio::test]
-async fn test_match_file_typed_unsorted_stream() {
-    run_match_pattern_file_test::<UnsortedStreamBuilder, _, _>(
-        LayoutStrategy::TypedObject,
-        two_quads(),
-        probe_typed_object,
-    )
-    .await;
-}
-#[cfg(feature = "file-io")]
-#[tokio::test]
-async fn test_match_file_dictionary_sorted_in_memory() {
-    run_match_pattern_file_test::<SortedInMemoryBuilder, _, _>(
-        LayoutStrategy::Dictionary,
-        dictionary_test_quads(),
-        probe_dictionary,
-    )
-    .await;
-}
-#[cfg(feature = "file-io")]
-#[tokio::test]
-async fn test_match_file_dictionary_sorted_stream() {
-    run_match_pattern_file_test::<SortedStreamBuilder, _, _>(
-        LayoutStrategy::Dictionary,
-        dictionary_test_quads(),
-        probe_dictionary,
-    )
-    .await;
-}
-#[cfg(feature = "file-io")]
-#[tokio::test]
-async fn test_match_file_dictionary_unsorted_stream() {
-    run_match_pattern_file_test::<UnsortedStreamBuilder, _, _>(
+async fn test_match_file_dictionary() {
+    run_match_pattern_file_test(
         LayoutStrategy::Dictionary,
         dictionary_test_quads(),
         probe_dictionary,

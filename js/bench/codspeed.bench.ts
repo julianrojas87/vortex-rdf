@@ -74,25 +74,23 @@ const QUAD_PATTERNS: Pat[] = [
 // ─── Store variants (mirror the Rust star-design axes) ───────────────────────
 type Variant = { slug: string; options: BuildOptions };
 
-// Build (write) path: sweep builder × layout × index one factor at a time
-// around an Unsorted/Dictionary baseline (the JS default), matching the Rust
-// serialize group's axes.
+// Build (write) path: sweep layout × index one factor at a time around a
+// Dictionary baseline (the JS default), matching the Rust serialize group's
+// axes.
 const BUILD_VARIANTS: Variant[] = [
-    { slug: 'unsorted_dict', options: { builder: 'unsorted-stream', layout: 'dictionary' } }, // baseline / JS default
-    { slug: 'unsorted_default', options: { builder: 'unsorted-stream', layout: 'default' } },
-    { slug: 'sorted_dict', options: { builder: 'sorted-in-memory', layout: 'dictionary' } },
-    { slug: 'sorted_default', options: { builder: 'sorted-in-memory', layout: 'default' } },
-    { slug: 'sorted_typedobject', options: { builder: 'sorted-in-memory', layout: 'typed-object' } },
-    { slug: 'sorted_dict_byref', options: { builder: 'sorted-in-memory', layout: 'dictionary', indexes: ['secondary-by-reference'] } },
-    { slug: 'sorted_dict_bycopy', options: { builder: 'sorted-in-memory', layout: 'dictionary', indexes: ['secondary-by-copy'] } },
+    { slug: 'sorted_dict', options: { layout: 'dictionary' } },
+    { slug: 'sorted_default', options: { layout: 'default' } },
+    { slug: 'sorted_typedobject', options: { layout: 'typed-object' } },
+    { slug: 'sorted_dict_byref', options: { layout: 'dictionary', indexes: ['secondary-by-reference'] } },
+    { slug: 'sorted_dict_bycopy', options: { layout: 'dictionary', indexes: ['secondary-by-copy'] } },
 ];
 
-// Query (read) path: two representative configs — the JS default (no sorted
-// access path, the optimization target js_read_path.rs was chasing) and the
-// fully-indexed fast path (where a bound predicate/object binary-searches).
+// Query (read) path: two representative configs — the JS default (subject
+// binary search only, no secondary index) and the fully-indexed fast path
+// (where a bound predicate/object binary-searches too).
 const QUERY_VARIANTS: Variant[] = [
-    { slug: 'unsorted_dict', options: { builder: 'unsorted-stream', layout: 'dictionary' } },
-    { slug: 'sorted_dict_bycopy', options: { builder: 'sorted-in-memory', layout: 'dictionary', indexes: ['secondary-by-copy'] } },
+    { slug: 'sorted_dict', options: { layout: 'dictionary' } },
+    { slug: 'sorted_dict_bycopy', options: { layout: 'dictionary', indexes: ['secondary-by-copy'] } },
 ];
 
 async function drain(stream: unknown): Promise<number> {
@@ -152,11 +150,11 @@ async function benchBuild(triples: Quad[], realistic: Quad[], literals: Quad[]):
         }
         let hs: VortexRdfStore | undefined;
         b.add('build::fromString_nquads', async () => {
-            hs = await VortexRdfStore.fromString(nquads, 'nquads', { builder: 'sorted-in-memory', layout: 'dictionary' });
+            hs = await VortexRdfStore.fromString(nquads, 'nquads', { layout: 'dictionary' });
         }, { afterEach: () => { if (hs) freeWasm(hs); hs = undefined; } });
         let hl: VortexRdfStore | undefined;
         b.add('build::sorted_dict_literals', async () => {
-            hl = await VortexRdfStore.fromQuads(literals, { builder: 'sorted-in-memory', layout: 'dictionary' });
+            hl = await VortexRdfStore.fromQuads(literals, { layout: 'dictionary' });
         }, { afterEach: () => { if (hl) freeWasm(hl); hl = undefined; } });
     });
 }
@@ -165,7 +163,7 @@ async function benchBuild(triples: Quad[], realistic: Quad[], literals: Quad[]):
  * genLiteralTriples' dataset: toRdf re-escapes every literal on export, and
  * the decoded read parses every literal's serialized form on the JS side. */
 async function benchLiterals(literals: Quad[]): Promise<void> {
-    const store = await VortexRdfStore.fromQuads(literals, { builder: 'sorted-in-memory', layout: 'dictionary' });
+    const store = await VortexRdfStore.fromQuads(literals, { layout: 'dictionary' });
     await runGroup(READ_OPTS, (b) => {
         b.add('readback::toRdf_nquads_literals', async () => { await store.toRdf('nquads'); });
         b.add('readpath::full_decoded_literals', async () => {
@@ -198,7 +196,7 @@ async function benchQuery(triples: Quad[], quads: Quad[]): Promise<void> {
     }
 }
 
-/** readpath::<variant> — the read entry points on the JS-default store for one
+/** readpath::<variant> — the read entry points on the default store for one
  * selective pattern (S), isolating the boundary cost each carries: getQuads
  * (materialized array), match (lazy stream drain), matchCodes (zero-copy u32
  * columns, no term strings). Directly supports read-path tuning.
@@ -209,13 +207,13 @@ async function benchQuery(triples: Quad[], quads: Quad[]): Promise<void> {
  * per-lookup cost against regressions. `full_decoded` is the worst case: every
  * row, every term, i.e. every distinct code resolved once. */
 async function benchReadPath(triples: Quad[], realistic: Quad[]): Promise<void> {
-    const store = await VortexRdfStore.fromQuads(triples, { builder: 'unsorted-stream', layout: 'dictionary' });
+    const store = await VortexRdfStore.fromQuads(triples, { layout: 'dictionary' });
     // full_decoded resolves every distinct code once, so it runs over the
     // cardinality-realistic dataset: on the dense cube it would resolve ~48
     // codes and the per-distinct-term dictionary cost it exists to guard
     // would be invisible. Same store config, different data — do not compare
     // it row-for-row with the selective dense-cube tasks beside it.
-    const storeReal = await VortexRdfStore.fromQuads(realistic, { builder: 'unsorted-stream', layout: 'dictionary' });
+    const storeReal = await VortexRdfStore.fromQuads(realistic, { layout: 'dictionary' });
     const p = TRIPLE_PATTERNS[0]; // S
     const f = FULL_SCAN_PATTERN;
     await runGroup(READ_OPTS, (b) => {
@@ -236,7 +234,7 @@ async function benchReadPath(triples: Quad[], realistic: Quad[]): Promise<void> 
 /** readback::<op> — serialize/deserialize the store across the boundary:
  * toBytes (IPC out), fromBytes (IPC in), toRdf (N-Quads out). */
 async function benchReadback(triples: Quad[]): Promise<void> {
-    const store = await VortexRdfStore.fromQuads(triples, { builder: 'sorted-in-memory', layout: 'dictionary' });
+    const store = await VortexRdfStore.fromQuads(triples, { layout: 'dictionary' });
     const bytes = await store.toBytes();
     await runGroup(READ_OPTS, (b) => {
         b.add('readback::toBytes', async () => { await store.toBytes(); });

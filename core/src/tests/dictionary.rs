@@ -100,10 +100,6 @@ async fn test_dictionary_sorted_in_memory() {
 async fn test_dictionary_sorted_stream() {
     run_dictionary_roundtrip::<SortedStreamBuilder>().await;
 }
-#[tokio::test]
-async fn test_dictionary_unsorted_stream() {
-    run_dictionary_roundtrip::<UnsortedStreamBuilder>().await;
-}
 
 #[tokio::test]
 async fn test_dictionary_match_and_mutations() {
@@ -180,7 +176,7 @@ async fn test_dictionary_layout_secondary_index_compatibility() {
     let quads = dictionary_test_quads();
 
     // Dictionary layout composes with secondary reference indexes.
-    let arr = build_array::<UnsortedStreamBuilder>(
+    let arr = build_array::<SortedInMemoryBuilder>(
         quad_stream(quads.clone()),
         LayoutStrategy::Dictionary,
         vec![
@@ -335,7 +331,7 @@ async fn test_dictionary_sorted_with_secondary_index() {
 
 #[tokio::test]
 async fn test_dictionary_empty_dataset() {
-    let arr = build_array::<UnsortedStreamBuilder>(
+    let arr = build_array::<SortedInMemoryBuilder>(
         quad_stream(vec![]),
         LayoutStrategy::Dictionary,
         vec![],
@@ -427,13 +423,13 @@ async fn test_dictionary_terms_are_fsst_through_bytes() {
 #[cfg(feature = "file-io")]
 #[tokio::test]
 async fn test_dictionary_file_roundtrip() {
-    use crate::io::ser::quads_stream_to_vortex_writer_with_builder;
+    use crate::io::ser::quads_stream_to_vortex_writer;
 
     let quads = dictionary_test_quads();
 
-    // Streaming write (two-pass spill pipeline) to an in-memory buffer...
+    // Streaming write to an in-memory buffer...
     let mut bytes: Vec<u8> = Vec::new();
-    quads_stream_to_vortex_writer_with_builder::<UnsortedStreamBuilder, _, _>(
+    quads_stream_to_vortex_writer(
         quad_stream(quads.clone()),
         &mut bytes,
         LayoutStrategy::Dictionary,
@@ -485,12 +481,7 @@ async fn test_dictionary_file_roundtrip() {
 #[tokio::test]
 async fn test_dictionary_native_file_roundtrip() {
     let quads = dictionary_test_quads();
-    let (_dir, path) = write_store_file::<SortedInMemoryBuilder>(
-        quads.clone(),
-        LayoutStrategy::Dictionary,
-        vec![],
-    )
-    .await;
+    let (_dir, path) = write_store_file(quads.clone(), LayoutStrategy::Dictionary, vec![]).await;
 
     // One self-contained file: the native root with the quad-source child
     // and the dictionary as an auxiliary child.
@@ -522,9 +513,7 @@ async fn test_dictionary_native_file_roundtrip() {
 #[cfg(feature = "file-io")]
 #[tokio::test]
 async fn test_dictionary_empty_store_roundtrip() {
-    let (_dir, path) =
-        write_store_file::<SortedInMemoryBuilder>(Vec::new(), LayoutStrategy::Dictionary, vec![])
-            .await;
+    let (_dir, path) = write_store_file(Vec::new(), LayoutStrategy::Dictionary, vec![]).await;
 
     let store = VortexRdfStore::from_file(&path).await.unwrap();
     assert_eq!(store.layout(), LayoutStrategy::Dictionary);
@@ -681,7 +670,7 @@ async fn test_large_dictionary_child_lift_keeps_fsst() {
 #[tokio::test]
 async fn test_code_read_snapshot_gate() {
     let quads = dictionary_test_quads();
-    let arr = build_array::<UnsortedStreamBuilder>(
+    let arr = build_array::<SortedInMemoryBuilder>(
         quad_stream(quads.clone()),
         LayoutStrategy::Dictionary,
         vec![],
@@ -715,7 +704,7 @@ async fn test_code_read_snapshot_gate() {
 
     // Non-Dictionary layouts have no codes at all.
     let arr =
-        build_array::<UnsortedStreamBuilder>(quad_stream(quads), LayoutStrategy::Default, vec![])
+        build_array::<SortedInMemoryBuilder>(quad_stream(quads), LayoutStrategy::Default, vec![])
             .await
             .unwrap();
     let string_store = VortexRdfStore::from_built(arr).unwrap();

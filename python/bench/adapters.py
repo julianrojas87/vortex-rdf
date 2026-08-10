@@ -405,7 +405,6 @@ class RdflibAdapter(Adapter):
 VORTEX_VARIANTS = [
     ("vortex_sorted_dict", "Vortex Sorted/Dict", "dictionary", "sorted-in-memory", [], False),
     ("vortex_sorted_dict_mem", "Vortex Sorted/Dict (in-memory)", "dictionary", "sorted-in-memory", [], True),
-    ("vortex_unsorted_default", "Vortex Unsorted/Default", "default", "unsorted-stream", [], False),
     ("vortex_sorted_default", "Vortex Sorted/Default", "default", "sorted-in-memory", [], False),
     ("vortex_sorted_dict_bycopy", "Vortex Sorted/Dict+ByCopy", "dictionary", "sorted-in-memory", ["secondary-by-copy"], False),
     ("vortex_sorted_dict_bycopy_mem", "Vortex Sorted/Dict+ByCopy (in-memory)", "dictionary", "sorted-in-memory", ["secondary-by-copy"], True),

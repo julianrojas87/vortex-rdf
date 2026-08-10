@@ -81,11 +81,9 @@ QUAD_PATTERNS = [
 ]
 
 # ─── Store variants (mirror the Rust and JS star-design axes) ───────────────
-#: Build (write) path, one factor at a time around an Unsorted/Dictionary
-#: baseline. Same set and same slugs as the JS suite's BUILD_VARIANTS.
+#: Build (write) path, one factor at a time around a Dictionary baseline.
+#: Same set and same slugs as the JS suite's BUILD_VARIANTS.
 BUILD_VARIANTS = {
-    "unsorted_dict": dict(builder="unsorted-stream", layout="dictionary"),
-    "unsorted_default": dict(builder="unsorted-stream", layout="default"),
     "sorted_dict": dict(builder="sorted-in-memory", layout="dictionary"),
     "sorted_default": dict(builder="sorted-in-memory", layout="default"),
     "sorted_typedobject": dict(builder="sorted-in-memory", layout="typed-object"),
@@ -99,7 +97,7 @@ BUILD_VARIANTS = {
 
 #: Query (read) path: the two representative configs the JS suite uses — the
 #: unindexed default and the fully-indexed fast path.
-QUERY_VARIANTS = ("unsorted_dict", "sorted_dict_bycopy")
+QUERY_VARIANTS = ("sorted_dict", "sorted_dict_bycopy")
 
 
 def _build(source: Path, out: Path, variant: str) -> str:
@@ -140,7 +138,7 @@ def stores(tmp_path_factory, data) -> dict[str, VortexRdfStore]:
             _build(data["quads"], root / f"q-{variant}.vortex", variant)
         )
     built["realistic"] = VortexRdfStore(
-        _build(data["realistic"], root / "realistic.vortex", "unsorted_dict")
+        _build(data["realistic"], root / "realistic.vortex", "sorted_dict")
     )
     built["literals"] = VortexRdfStore(
         _build(data["literals"], root / "literals.vortex", "sorted_dict")
@@ -208,7 +206,7 @@ def test_readpath(benchmark, stores, op):
     materialize terms, which in JS is `readpath::getQuads_decoded`; the
     bindings have no lazy quad object, so there is no undecoded `get_quads`.
     """
-    store = stores["triples::unsorted_dict"]
+    store = stores["triples::sorted_dict"]
     p = TRIPLE_PATTERNS[0]  # S
     call = getattr(store, op)
     benchmark(lambda: call(p.s, p.p, p.o, p.g))

@@ -21,10 +21,7 @@ mod rows;
 mod serialize;
 mod streaming;
 
-pub use builders::{
-    BuilderStrategy, BuiltArray, BuiltStream, SortedInMemoryBuilder, UnsortedStreamBuilder,
-    VortexArrayBuilder,
-};
+pub use builders::{BuiltArray, BuiltStream, SortedInMemoryBuilder, VortexArrayBuilder};
 // Compiled out on wasm along with the rest of the external-sort pipeline
 // (see the module gate in `builders`).
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]

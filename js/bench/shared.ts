@@ -86,14 +86,12 @@ export function reclaim(a: StoreAdapter, h: unknown): void {
 
 // Vortex: one adapter per curated build variant (mirrors the Rust star design axes).
 export const VORTEX_VARIANTS: { slug: string; label: string; options: BuildOptions }[] = [
-    { slug: 'vortex_unsorted_dict', label: 'Vortex Unsorted/Dict', options: { builder: 'unsorted-stream', layout: 'dictionary' } },
-    { slug: 'vortex_unsorted_default', label: 'Vortex Unsorted/Default', options: { builder: 'unsorted-stream', layout: 'default' } },
-    { slug: 'vortex_sorted_dict', label: 'Vortex Sorted/Dict', options: { builder: 'sorted-in-memory', layout: 'dictionary' } },
-    { slug: 'vortex_sorted_dict_byref', label: 'Vortex Sorted/Dict+ByRef', options: { builder: 'sorted-in-memory', layout: 'dictionary', indexes: ['secondary-by-reference'] } },
-    { slug: 'vortex_sorted_dict_bycopy', label: 'Vortex Sorted/Dict+ByCopy', options: { builder: 'sorted-in-memory', layout: 'dictionary', indexes: ['secondary-by-copy'] } },
-    { slug: 'vortex_sorted_default', label: 'Vortex Sorted/Default', options: { builder: 'sorted-in-memory', layout: 'default' } },
-    { slug: 'vortex_sorted_default_byref', label: 'Vortex Sorted/Default+ByRef', options: { builder: 'sorted-in-memory', layout: 'default', indexes: ['secondary-by-reference'] } },
-    { slug: 'vortex_sorted_default_bycopy', label: 'Vortex Sorted/Default+ByCopy', options: { builder: 'sorted-in-memory', layout: 'default', indexes: ['secondary-by-copy'] } },
+    { slug: 'vortex_sorted_dict', label: 'Vortex Sorted/Dict', options: { layout: 'dictionary' } },
+    { slug: 'vortex_sorted_dict_byref', label: 'Vortex Sorted/Dict+ByRef', options: { layout: 'dictionary', indexes: ['secondary-by-reference'] } },
+    { slug: 'vortex_sorted_dict_bycopy', label: 'Vortex Sorted/Dict+ByCopy', options: { layout: 'dictionary', indexes: ['secondary-by-copy'] } },
+    { slug: 'vortex_sorted_default', label: 'Vortex Sorted/Default', options: { layout: 'default' } },
+    { slug: 'vortex_sorted_default_byref', label: 'Vortex Sorted/Default+ByRef', options: { layout: 'default', indexes: ['secondary-by-reference'] } },
+    { slug: 'vortex_sorted_default_bycopy', label: 'Vortex Sorted/Default+ByCopy', options: { layout: 'default', indexes: ['secondary-by-copy'] } },
 ];
 
 export function vortexAdapter(variant: { slug: string; label: string; options: BuildOptions }): StoreAdapter<VortexRdfStore> {

@@ -15,7 +15,7 @@
 //! use futures::{executor::block_on, stream};
 //! use oxrdf::{GraphName, Literal, NamedNode, NamedOrBlankNode, Quad, Term};
 //! use vortex_rdf_core::{
-//!     LayoutStrategy, RawQuad, UnsortedStreamBuilder, VortexArrayBuilder, VortexRdfError,
+//!     LayoutStrategy, RawQuad, SortedInMemoryBuilder, VortexArrayBuilder, VortexRdfError,
 //!     VortexRdfStore,
 //! };
 //!
@@ -30,10 +30,10 @@
 //!     // columns store. `parse_quads_from_reader` yields these directly.
 //!     let quads = stream::iter(vec![Ok::<_, VortexRdfError>(RawQuad::from_quad(&quad))]);
 //!
-//!     // Run the quad stream through a builder (here: insertion order, plain
-//!     // string columns, no secondary indexes), then adopt its output as a
-//!     // queryable store.
-//!     let built = UnsortedStreamBuilder::build_vortex_array(
+//!     // Run the quad stream through a builder (here: sorted in memory by
+//!     // (s, p, o, g), plain string columns, no secondary indexes), then adopt
+//!     // its output as a queryable store.
+//!     let built = SortedInMemoryBuilder::build_vortex_array(
 //!         Box::new(quads),
 //!         LayoutStrategy::Default,
 //!         vec![],
@@ -61,9 +61,8 @@ pub mod store;
 pub use error::VortexRdfError;
 
 pub use store::{
-    BuilderStrategy, BuiltArray, DictSnapshot, DictionaryQuadSink, IndexType, Indexes,
-    LayoutStrategy, RawQuad, SortedInMemoryBuilder, StoreParts, UnsortedStreamBuilder,
-    VortexArrayBuilder, VortexRdfStore,
+    BuiltArray, DictSnapshot, DictionaryQuadSink, IndexType, Indexes, LayoutStrategy, RawQuad,
+    SortedInMemoryBuilder, StoreParts, VortexArrayBuilder, VortexRdfStore,
 };
 // Compiled out on wasm along with the rest of the external-sort pipeline
 // (see the module gate in `store::builders`).

@@ -2,11 +2,11 @@
 //! row-space chunk stream into the primary quad stream plus one
 //! channel-backed native component per index family.
 //!
-//! Permanent bridge, not scaffolding: the unsorted builder emits row-space
-//! chunks by design (its per-chunk local sorts), so this is its component
-//! adapter for as long as that builder exists. It lives with the indexes
-//! because everything it splits by — specs, column rosters, the strip — is
-//! index vocabulary; the serializer just drives it.
+//! Permanent bridge, not scaffolding: a builder that slices one global index
+//! emission into its chunks emits row-space chunks by design, so this is its
+//! component adapter. It lives with the indexes because everything it splits
+//! by — specs, column rosters, the strip — is index vocabulary; the
+//! serializer just drives it.
 //!
 //! [`split_built_row_space`]: super::split_built_row_space
 

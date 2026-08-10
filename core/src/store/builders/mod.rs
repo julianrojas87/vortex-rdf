@@ -1,14 +1,19 @@
 //! Emission orchestration: turning a quad stream into the row space a store
 //! is built or serialized from.
 //!
-//! This hub owns everything the three strategies share — the
+//! This hub owns everything the two pipelines share — the
 //! [`VortexArrayBuilder`] contract and its two products ([`BuiltArray`],
 //! [`BuiltStream`]), chunk assembly, the sortedness stamps a build is allowed
-//! to claim, and the globally-sorted index emission the sorted strategies
-//! slice their chunks out of. A strategy leaf
-//! (`sorted_in_memory`, `sorted_stream`, `unsorted_stream`) contributes only
-//! its ordering discipline and memory profile; `spill` backs the out-of-core
-//! one.
+//! to claim, and the globally-sorted index emission they slice their chunks
+//! out of. A leaf (`sorted_in_memory`, `sorted_stream`) contributes only its
+//! memory profile; `spill` backs the out-of-core one.
+//!
+//! Which pipeline runs is a property of the target, never a caller's choice:
+//! where a filesystem exists the rows go through the out-of-core global sort
+//! ([`SortedStreamBuilder`]), whose peak memory does not scale with the
+//! dataset; `wasm32-unknown-unknown` has no filesystem to spill to, so there
+//! the in-memory global sort ([`SortedInMemoryBuilder`]) is the pipeline —
+//! and the only one compiled in.
 //!
 //! Builders carry index data in one of two forms: the *welded* row space —
 //! primary columns plus every requested index's `_idx_*` columns in one
@@ -29,7 +34,7 @@ use crate::store::indexes::{
 };
 use crate::store::layouts::LayoutStrategy;
 use crate::store::layouts::dictionary::{QuadCodes, TermDictionary};
-use futures::{Stream, StreamExt, stream};
+use futures::{Stream, stream};
 use std::future::Future;
 use std::sync::Arc;
 use vortex_array::arrays::StructArray;
@@ -101,53 +106,11 @@ pub struct BuiltStream {
     /// subject binary-search stamp truthfully.
     #[cfg_attr(not(feature = "file-io"), allow(dead_code))]
     pub(crate) quads_sorted: bool,
+    /// The Dictionary layout's terms, for the serializer to place as the
+    /// `dictionary` child. (Read by the serializer, so dead in builds that
+    /// compile none in.)
+    #[cfg_attr(not(feature = "file-io"), allow(dead_code))]
     pub(crate) dict: Option<Arc<TermDictionary>>,
-}
-
-#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
-#[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
-pub enum BuilderStrategy {
-    /// Natural insertion order, no sorting. Chunks stream directly to the
-    /// writer during serialization, bounding memory by the chunk size.
-    UnsortedStream,
-    /// Global sort of quads by Subject -> Predicate -> Object -> Graph in memory.
-    SortedInMemory,
-    /// External-memory out-of-core global sort using merge runs.
-    SortedStream,
-}
-
-/// The canonical strategy name: kebab-case (`"unsorted-stream"`,
-/// `"sorted-in-memory"`, `"sorted-stream"`), the same spelling the `clap`
-/// derive exposes on the CLI — so every frontend reports one vocabulary and a
-/// value printed by one can be parsed by another.
-impl std::fmt::Display for BuilderStrategy {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            BuilderStrategy::UnsortedStream => "unsorted-stream",
-            BuilderStrategy::SortedInMemory => "sorted-in-memory",
-            BuilderStrategy::SortedStream => "sorted-stream",
-        })
-    }
-}
-
-/// Accepts exactly the canonical kebab-case names
-/// [`Display`](std::fmt::Display) emits — `"unsorted-stream"`,
-/// `"sorted-in-memory"`, `"sorted-stream"` — the one vocabulary every
-/// frontend shares.
-impl std::str::FromStr for BuilderStrategy {
-    type Err = VortexRdfError;
-
-    fn from_str(s: &str) -> Result<Self> {
-        match s {
-            "unsorted-stream" => Ok(BuilderStrategy::UnsortedStream),
-            "sorted-in-memory" => Ok(BuilderStrategy::SortedInMemory),
-            "sorted-stream" => Ok(BuilderStrategy::SortedStream),
-            _ => Err(VortexRdfError::Deserialization(format!(
-                "unknown builder strategy {s:?}; expected \"unsorted-stream\", \
-                 \"sorted-in-memory\" or \"sorted-stream\""
-            ))),
-        }
-    }
 }
 
 pub(crate) mod sorted_in_memory;
@@ -159,88 +122,10 @@ pub(crate) mod sorted_in_memory;
 pub(crate) mod sorted_stream;
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub(crate) mod spill;
-pub(crate) mod unsorted_stream;
 
 pub use sorted_in_memory::SortedInMemoryBuilder;
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub use sorted_stream::SortedStreamBuilder;
-pub use unsorted_stream::UnsortedStreamBuilder;
-
-impl BuilderStrategy {
-    /// [`VortexArrayBuilder::build_vortex_array`] driven by a *value* strategy
-    /// instead of a builder type parameter. Together with
-    /// [`build_vortex_stream`](Self::build_vortex_stream) — the same dispatch
-    /// over the trait's streaming product — these are the only places the
-    /// enum is interpreted, so callers choosing a builder at runtime (the
-    /// CLI, the bindings, the benches) do not each re-write the dispatch.
-    ///
-    /// On `wasm32-unknown-unknown` the [`SortedStream`](Self::SortedStream)
-    /// arm errors instead: its external sort spills to a filesystem wasm does
-    /// not have, so the whole pipeline is compiled out there.
-    pub async fn build_vortex_array(
-        self,
-        quad_stream: Box<dyn Stream<Item = Result<RawQuad>> + Unpin + Send + 'static>,
-        layout: LayoutStrategy,
-        indexes: Indexes,
-    ) -> Result<BuiltArray> {
-        match self {
-            BuilderStrategy::UnsortedStream => {
-                UnsortedStreamBuilder::build_vortex_array(quad_stream, layout, indexes).await
-            }
-            BuilderStrategy::SortedInMemory => {
-                SortedInMemoryBuilder::build_vortex_array(quad_stream, layout, indexes).await
-            }
-            #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-            BuilderStrategy::SortedStream => {
-                SortedStreamBuilder::build_vortex_array(quad_stream, layout, indexes).await
-            }
-            #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-            BuilderStrategy::SortedStream => {
-                let _ = (quad_stream, layout, indexes);
-                Err(sorted_stream_unavailable_on_wasm())
-            }
-        }
-    }
-
-    /// [`VortexArrayBuilder::build_vortex_stream`] driven by a *value*
-    /// strategy — the streaming twin of
-    /// [`build_vortex_array`](Self::build_vortex_array), and the other of the
-    /// two places the enum is interpreted.
-    pub async fn build_vortex_stream(
-        self,
-        quad_stream: Box<dyn Stream<Item = Result<RawQuad>> + Unpin + Send + 'static>,
-        layout: LayoutStrategy,
-        indexes: Indexes,
-    ) -> Result<BuiltStream> {
-        match self {
-            BuilderStrategy::UnsortedStream => {
-                UnsortedStreamBuilder::build_vortex_stream(quad_stream, layout, indexes).await
-            }
-            BuilderStrategy::SortedInMemory => {
-                SortedInMemoryBuilder::build_vortex_stream(quad_stream, layout, indexes).await
-            }
-            #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-            BuilderStrategy::SortedStream => {
-                SortedStreamBuilder::build_vortex_stream(quad_stream, layout, indexes).await
-            }
-            #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-            BuilderStrategy::SortedStream => {
-                let _ = (quad_stream, layout, indexes);
-                Err(sorted_stream_unavailable_on_wasm())
-            }
-        }
-    }
-}
-
-/// The wasm arms' refusal — the same wording the JS binding's own guard uses
-/// (`js/src/options.rs`), so the message is identical whichever layer catches
-/// the strategy first.
-#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-fn sorted_stream_unavailable_on_wasm() -> VortexRdfError {
-    VortexRdfError::Serialization(
-        "The sorted-stream builder strategy is not available in WebAssembly.".to_string(),
-    )
-}
 
 pub trait VortexArrayBuilder {
     /// Build the complete dataset as a single (possibly chunked) in-memory
@@ -253,45 +138,14 @@ pub trait VortexArrayBuilder {
     ) -> impl Future<Output = Result<BuiltArray>> + Send;
 
     /// Produce the schema dtype and a lazily-evaluated stream of StructArray
-    /// chunks, for feeding directly into the Vortex file writer.
-    ///
-    /// The default implementation materializes the full array via
-    /// [`Self::build_vortex_array`] and yields it as a single chunk. Builders
-    /// that can emit chunks incrementally should override this so that writing
-    /// a file needs only O(chunk) memory instead of O(dataset).
+    /// chunks, for feeding directly into the Vortex file writer, so that
+    /// writing a file needs only O(chunk) memory for the column arrays
+    /// instead of O(dataset).
     fn build_vortex_stream(
         quad_stream: Box<dyn Stream<Item = Result<RawQuad>> + Unpin + Send + 'static>,
         layout: LayoutStrategy,
         indexes: Indexes,
-    ) -> impl Future<Output = Result<BuiltStream>> + Send {
-        async move {
-            let built = Self::build_vortex_array(quad_stream, layout, indexes).await?;
-            let dtype = built.array.dtype().clone();
-            let array = built.array;
-            let (quads_sorted, components_sorted) = row_space_sortedness(&array);
-            // A builder that hands over native components (rather than welded
-            // `_idx_*` columns) keeps them riding beside the single chunk.
-            // The conversion shares `io::ser`'s gate: without a serializer
-            // compiled in, nothing can consume a BuiltStream at all.
-            #[cfg(any(feature = "file-io", target_arch = "wasm32"))]
-            let components = built
-                .components
-                .iter()
-                .map(crate::io::ser::component_write)
-                .collect::<Result<Vec<_>>>()?;
-            #[cfg(not(any(feature = "file-io", target_arch = "wasm32")))]
-            let components = Vec::new();
-            let chunks: ChunkStream = futures::stream::once(async move { Ok(array) }).boxed();
-            Ok(BuiltStream {
-                components,
-                components_sorted,
-                quads_sorted,
-                dtype,
-                chunks,
-                dict: built.dict,
-            })
-        }
-    }
+    ) -> impl Future<Output = Result<BuiltStream>> + Send;
 }
 
 /// Build a complete StructArray chunk: primary columns for the given layout,
@@ -479,6 +333,9 @@ pub(crate) fn canonicalize_sorted(arr: ArrayRef) -> Result<ArrayRef> {
 /// `(s globally sorted, index sort-key columns globally sorted)`. Only the
 /// global-emission paths stamp these, so a multi-chunk assembly (whose
 /// canonicalization dropped the per-chunk stats) correctly lands on `false`.
+// Read only by the write driver, which is compiled only where a store can be
+// written (the same gate `io::ser` carries).
+#[cfg(any(feature = "file-io", target_arch = "wasm32"))]
 pub(crate) fn row_space_sortedness(array: &ArrayRef) -> (bool, bool) {
     use crate::store::array::column_is_sorted;
     let mut ctx = VORTEX_SESSION.create_execution_ctx();
@@ -502,6 +359,8 @@ pub(crate) fn row_space_sortedness(array: &ArrayRef) -> (bool, bool) {
 
 /// Assemble a list of per-chunk StructArrays into a single ArrayRef.
 /// Returns an empty StructArray with the correct schema when `chunks` is empty.
+// Only the (wasm-gated) external-sort builder materializes chunk streams.
+#[cfg_attr(all(target_arch = "wasm32", target_os = "unknown"), allow(dead_code))]
 pub(crate) fn assemble_chunks(
     mut chunks: Vec<ArrayRef>,
     layout: LayoutStrategy,

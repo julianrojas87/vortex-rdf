@@ -117,24 +117,18 @@ const bytes = await store.toBytes();
 
 ### Build options
 
-Ingestion accepts an optional `BuildOptions` object that trades build cost against query speed and size. All fields are optional; a bare builder-strategy string is accepted as shorthand for `{ builder }`.
+Ingestion accepts an optional `BuildOptions` object that trades build cost against query speed and size. All fields are optional.
+
+Quads are always sorted by subject → predicate → object → graph while the columnar array is built — that global order is what gives subject lookups their binary search and what every secondary index routes against.
 
 ```javascript
 const store = await VortexRdfStore.fromString(data, 'nquads', {
-  builder: 'sorted-in-memory',            // 'unsorted-stream' (default) | 'sorted-in-memory'
   layout: 'dictionary',                   // 'dictionary' (default) | 'default' | 'typed-object'
   indexes: ['secondary-by-reference'],    // default: []
 });
 ```
 
-**`builder`** — how quads are ordered while building:
-
-| Value | Build cost | Effect on queries |
-| --- | --- | --- |
-| `'unsorted-stream'` (default) | Cheapest; natural insertion order | Every `match` is a full column scan |
-| `'sorted-in-memory'` | Global in-memory sort by subject → predicate → object → graph | Subject lookups use a binary search |
-
-Core's third builder, `'sorted-stream'`, spills sorted runs to disk — a filesystem WebAssembly does not have — so it is not available here: passing it throws an explicit error.
+Core's out-of-core builder spills sorted runs to disk — a filesystem WebAssembly does not have — so the wasm build always sorts in memory and takes no builder option.
 
 **`layout`** — how terms are encoded into columns:
 
@@ -147,20 +141,16 @@ Core's third builder, `'sorted-stream'`, spills sorted runs to disk — a filesy
 **`indexes`** 
 
 - `'secondary-by-reference'` adds sorted predicate/object columns plus row-id back-references, so predicate-only and object-only patterns use a binary search instead of a full scan. 
-- `'secondary-by-copy'` embeds two complete extra copies of the quad columns — one sorted by `(p, o, s, g)`, one by `(o, s, p, g)` — giving predicate- and object-bound patterns (including combined predicate+object lookups, resolved in one prefix search) the same sorted access path subjects have, at roughly 2× the storage. Both cost extra space and are only effective alongside `builder: 'sorted-in-memory'`.
+- `'secondary-by-copy'` embeds two complete extra copies of the quad columns — one sorted by `(p, o, s, g)`, one by `(o, s, p, g)` — giving predicate- and object-bound patterns (including combined predicate+object lookups, resolved in one prefix search) the same sorted access path subjects have, at roughly 2× the storage. Both cost extra space.
 
-A good query-optimized configuration is 
+The default `{ layout: 'dictionary' }` already gives compact, code-based lazy reads and a binary-searchable subject column. Adding an index on top is what a predicate- or object-heavy workload wants:
 
 ```javascript
 { 
-    builder: 'sorted-in-memory', 
     layout: 'dictionary', 
     indexes: ['secondary-by-reference'] 
 };
 ```
-
-
-The default `{ builder: 'unsorted-stream', layout: 'dictionary' }` already gives compact, code-based lazy reads and is cheap to build.
 
 ### Term codes (low-level)
 
@@ -194,7 +184,7 @@ For one-shot conversions without holding a store:
 ```javascript
 import { rdf_to_vortex, vortex_to_rdf } from '@vortex-rdf/vortex-rdf-store';
 
-const bytes = await rdf_to_vortex(turtleText, 'turtle', { builder: 'sorted-in-memory' });
+const bytes = await rdf_to_vortex(turtleText, 'turtle', { layout: 'dictionary' });
 const text  = await vortex_to_rdf(bytes, 'nquads');
 
 // N-Quads is just another format
@@ -212,7 +202,7 @@ import { DataFactory } from 'rdf-data-factory';
 
 const df = new DataFactory();
 
-const options: BuildOptions = { builder: 'sorted-in-memory', layout: 'dictionary' };
+const options: BuildOptions = { layout: 'dictionary' };
 const store = await VortexRdfStore.fromString(data, 'nquads', options);
 
 console.log(store.layout()); // 'dictionary'

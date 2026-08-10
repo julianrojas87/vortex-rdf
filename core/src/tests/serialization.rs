@@ -1,12 +1,11 @@
 use super::*;
 use crate::io::container;
-use crate::store::builders::unsorted_stream::build_chunk_stream;
 use crate::store::schema;
 
 // ─── 8) The vortex-rdf.store.v1 wire contract ──────────────────────────
 //
 // Every test here asserts the same contract from a different starting
-// state (tailed, tombstoned, file-backed, dictionary, unsorted
+// state (tailed, tombstoned, file-backed, dictionary, locally-sorted
 // multi-chunk): `to_bytes`/`from_bytes` must carry the store's index
 // components and its sortedness provenance faithfully — rebuilt where a
 // mutation invalidated them, never silently dropped, never over-claimed.
@@ -127,7 +126,7 @@ async fn test_tombstoned_store_serialization_keeps_indexes_and_sortedness() {
 /// were silently dropped on the file→bytes path).
 #[tokio::test]
 async fn test_file_backed_to_bytes_keeps_indexes() {
-    let (_dir, path) = write_store_file::<SortedStreamBuilder>(
+    let (_dir, path) = write_store_file(
         modular_quads(12, 3, 4),
         LayoutStrategy::Default,
         vec![IndexType::SecondaryByCopy],
@@ -172,8 +171,7 @@ async fn test_file_backed_to_bytes_keeps_quads_sorted() {
             )
         })
         .collect();
-    let (_dir, path) =
-        write_store_file::<SortedStreamBuilder>(quads, LayoutStrategy::Default, vec![]).await;
+    let (_dir, path) = write_store_file(quads, LayoutStrategy::Default, vec![]).await;
     let store = VortexRdfStore::from_file(&path).await.unwrap();
     let bytes = store.to_bytes().await.unwrap();
     let (quads_sorted, _) = container::store_metadata_of_bytes(&bytes);
@@ -209,14 +207,14 @@ async fn test_to_bytes_is_byte_stable() {
     assert_eq!(bytes_a, bytes_b);
 }
 
-/// An unsorted multi-chunk build's index children are per-chunk sorted, not
-/// globally sorted. Reading them back must NOT restore binary-search
-/// routing: the descriptors carry `sorted: false`, in-memory resolution
-/// declines, and the mask scan answers correctly. (Regression: an earlier
-/// `from_bytes` unconditionally re-stamped these columns sorted, making this
-/// match return 5 rows instead of 4.)
+/// Index children whose chunks carry only local sorts are not globally
+/// sorted. Reading them back must NOT restore binary-search routing: the
+/// descriptors carry `sorted: false`, in-memory resolution declines, and the
+/// mask scan answers correctly. (Regression: an earlier `from_bytes`
+/// unconditionally re-stamped these columns sorted, making this match return
+/// 5 rows instead of 4.)
 #[tokio::test]
-async fn test_unsorted_multichunk_from_bytes_matches_correctly() {
+async fn test_locally_sorted_children_from_bytes_match_correctly() {
     // Predicates interleave across chunks so per-chunk sorted != global.
     let quads: Vec<Quad> = (0..12)
         .map(|i| {
@@ -230,22 +228,29 @@ async fn test_unsorted_multichunk_from_bytes_matches_correctly() {
         .collect();
     let raws: Vec<crate::store::RawQuad> =
         quads.iter().map(crate::store::RawQuad::from_quad).collect();
-    let built = build_chunk_stream(
-        Box::new(futures::stream::iter(raws.into_iter().map(Ok))),
-        LayoutStrategy::Default,
-        vec![IndexType::SecondaryByCopy],
-        4,
-    )
-    .await
-    .unwrap();
-    let split = crate::store::indexes::tee::split_row_space(
-        built.dtype,
-        built.chunks,
-        built.components_sorted,
-    )
-    .unwrap();
-    let mut components = split.components;
-    components.extend(built.components);
+    // Cut the rows into three chunks, each with its own locally-sorted index
+    // columns and no global emission behind them — the shape a chunked write
+    // must not claim sortedness for.
+    let dtype;
+    let mut chunk_arrays = Vec::new();
+    for (n, rows) in raws.chunks(4).enumerate() {
+        chunk_arrays.push(
+            crate::store::builders::build_struct_array(
+                rows,
+                LayoutStrategy::Default,
+                &[IndexType::SecondaryByCopy],
+                (n * 4) as u32,
+                false,
+                false,
+            )
+            .unwrap(),
+        );
+    }
+    dtype = chunk_arrays[0].dtype().clone();
+    let chunks: crate::store::builders::ChunkStream =
+        Box::pin(futures::stream::iter(chunk_arrays.into_iter().map(Ok)));
+    let split = crate::store::indexes::tee::split_row_space(dtype, chunks, false).unwrap();
+    let components = split.components;
     let mut bytes: Vec<u8> = Vec::new();
     container::write_store(
         &crate::session::VORTEX_SESSION,
@@ -278,36 +283,26 @@ async fn test_unsorted_multichunk_from_bytes_matches_correctly() {
     );
 }
 
-/// The streaming twin of the runtime builder dispatch: writing through
-/// `quads_stream_to_vortex_writer_with_strategy` must record each variant's
-/// sortedness provenance on the wire — both sorted strategies stamp
-/// `quads_sorted`, the unsorted one must not. A swapped arm in
-/// `BuilderStrategy::build_vortex_stream` would pass every
-/// compile-time-generic test and only surface downstream.
+/// The file writer records its build's sortedness provenance on the wire:
+/// the out-of-core sort it runs emits rows in global order, so `quads_sorted`
+/// must come back true even for a stream fed in reverse — the stamp a
+/// materialized read restores the subject binary search from.
 #[tokio::test]
-async fn test_strategy_writer_dispatch_records_sortedness() {
-    for (strategy, expect_sorted) in [
-        (BuilderStrategy::UnsortedStream, false),
-        (BuilderStrategy::SortedInMemory, true),
-        (BuilderStrategy::SortedStream, true),
-    ] {
-        // Reverse subject order, so only a genuinely sorting builder may
-        // claim sortedness.
-        let mut quads = modular_quads(10, 3, 4);
-        quads.reverse();
-        let mut bytes: Vec<u8> = Vec::new();
-        crate::io::quads_stream_to_vortex_writer_with_strategy(
-            quad_stream(quads),
-            &mut bytes,
-            LayoutStrategy::Default,
-            vec![],
-            strategy,
-        )
-        .await
-        .unwrap();
-        let (quads_sorted, _) = container::store_metadata_of_bytes(&bytes);
-        assert_eq!(quads_sorted, expect_sorted, "{strategy}");
-    }
+async fn test_writer_records_sortedness() {
+    // Reverse subject order, so only a genuinely sorting build may claim it.
+    let mut quads = modular_quads(10, 3, 4);
+    quads.reverse();
+    let mut bytes: Vec<u8> = Vec::new();
+    crate::io::quads_stream_to_vortex_writer(
+        quad_stream(quads),
+        &mut bytes,
+        LayoutStrategy::Default,
+        vec![],
+    )
+    .await
+    .unwrap();
+    let (quads_sorted, _) = container::store_metadata_of_bytes(&bytes);
+    assert!(quads_sorted);
 }
 
 /// `from_bytes` adopts index children *without* canonicalizing them: a
@@ -374,7 +369,7 @@ async fn test_from_bytes_defers_index_child_materialization() {
 /// every sorted column binds an encoded search probe, with children outside
 /// the probe's set decoded — while carrying the subject sortedness
 /// provenance honestly in both directions: a sorted build's stamp survives
-/// the re-encoding, an unsorted build gains none.
+/// the re-encoding, rows written without one gain none.
 #[tokio::test]
 async fn test_from_parts_adopts_searchable_children() {
     let quads = modular_quads(12, 3, 4);
@@ -428,8 +423,10 @@ async fn test_from_parts_adopts_searchable_children() {
         1
     );
 
-    // Unsorted build: adoption must not invent a stamp the rows never earned.
-    let arr = build_array::<UnsortedStreamBuilder>(
+    // Rows with no sorted provenance: adoption must not invent a stamp they
+    // never earned. Serializing a store that still carries an append tail
+    // interleaves the tail into the written order, so the wire records none.
+    let arr = build_array::<SortedInMemoryBuilder>(
         quad_stream(quads),
         LayoutStrategy::Dictionary,
         vec![],
@@ -437,6 +434,14 @@ async fn test_from_parts_adopts_searchable_children() {
     .await
     .unwrap();
     let bytes = VortexRdfStore::from_built(arr)
+        .unwrap()
+        .add_quad(make_quad(
+            "http://example.org/s00",
+            "http://example.org/p9",
+            "object 9",
+            GraphName::DefaultGraph,
+        ))
+        .await
         .unwrap()
         .to_bytes()
         .await
@@ -447,7 +452,7 @@ async fn test_from_parts_adopts_searchable_children() {
     assert!(store.debug_base_probe_resolvable());
     assert!(
         !store.debug_base_subject_sorted(),
-        "an unsorted build must stay unstamped through adoption"
+        "rows with no sorted provenance must stay unstamped through adoption"
     );
 }
 

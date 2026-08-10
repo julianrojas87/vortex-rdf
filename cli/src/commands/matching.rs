@@ -11,7 +11,7 @@ use std::time::Instant;
 use vortex_rdf_core::common::export::export_rdf;
 use vortex_rdf_core::common::formats::detect_format;
 use vortex_rdf_core::common::terms::{parse_pattern_checked, parse_quads_from_reader};
-use vortex_rdf_core::{LayoutStrategy, UnsortedStreamBuilder, VortexArrayBuilder, VortexRdfStore};
+use vortex_rdf_core::{LayoutStrategy, SortedStreamBuilder, VortexArrayBuilder, VortexRdfStore};
 
 use crate::MatchArgs;
 
@@ -72,7 +72,7 @@ pub async fn run(args: MatchArgs) -> Result<()> {
         let reader = Box::new(File::open(&input).context("Failed to open input file")?);
         let quads_stream = parse_quads_from_reader(reader, input_format);
 
-        let built = UnsortedStreamBuilder::build_vortex_array(
+        let built = SortedStreamBuilder::build_vortex_array(
             Box::new(quads_stream),
             LayoutStrategy::Default,
             vec![],

@@ -3,7 +3,11 @@
 //! either together with the coded quads (the interning ingest) or beside the
 //! owned term→ID map the streaming builders encode through.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+// Only [`TermDictionaryBuilder`] collects terms as a set, and it is compiled
+// out with the external-sort builder that drives it.
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+use std::collections::HashSet;
 use std::sync::Arc;
 use web_time::Instant;
 
@@ -36,10 +40,12 @@ pub(crate) type BorrowedTermIdMap<'a> = HashMap<&'a str, u32>;
 
 /// Incrementally collects the unique term strings of a dataset during the
 /// ingestion pass of a build. Owned strings exist only for the build's lifetime.
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub(crate) struct TermDictionaryBuilder {
     set: HashSet<String>,
 }
 
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 impl TermDictionaryBuilder {
     pub(crate) fn new() -> Self {
         Self {
@@ -97,8 +103,8 @@ impl TermDictionaryBuilder {
 /// Drain a quad stream into an [`InterningQuadBuilder`]: each quad's Strings
 /// die here, leaving one copy of every distinct term plus 16 bytes per quad.
 ///
-/// The Dictionary-layout in-memory ingest for both the sorted and unsorted
-/// builders; `finish(sort)` then yields the dictionary and the coded quads.
+/// The Dictionary-layout in-memory ingest; `finish` then yields the
+/// dictionary and the coded quads in global (s, p, o, g) order.
 pub(crate) async fn ingest_interning(
     mut quads_in: Box<dyn Stream<Item = Result<RawQuad>> + Unpin + Send + 'static>,
 ) -> Result<InterningQuadBuilder> {
@@ -118,26 +124,20 @@ pub(crate) async fn ingest_interning(
 /// from the decode loop), resurrecting exactly the four-Strings-per-quad
 /// ingest high-water the interning ingest removes. Pushing into the sink
 /// instead lets each quad's Strings die on arrival; `finish` builds the same
-/// single-chunk array `SortedInMemoryBuilder`/`UnsortedStreamBuilder`
-/// produce for the Dictionary layout.
+/// single-chunk array [`SortedInMemoryBuilder`] produces for the Dictionary
+/// layout.
+///
+/// [`SortedInMemoryBuilder`]: crate::SortedInMemoryBuilder
 pub struct DictionaryQuadSink {
     interner: InterningQuadBuilder,
     indexes: Indexes,
-    /// Sort the coded quads by (s, p, o, g) in `finish` —
-    /// [`BuilderStrategy::SortedInMemory`]'s semantics; `false` keeps arrival
-    /// order ([`BuilderStrategy::UnsortedStream`]).
-    ///
-    /// [`BuilderStrategy::SortedInMemory`]: crate::store::BuilderStrategy::SortedInMemory
-    /// [`BuilderStrategy::UnsortedStream`]: crate::store::BuilderStrategy::UnsortedStream
-    sorted: bool,
 }
 
 impl DictionaryQuadSink {
-    pub fn new(sorted: bool, indexes: Indexes) -> Self {
+    pub fn new(indexes: Indexes) -> Self {
         Self {
             interner: InterningQuadBuilder::new(),
             indexes,
-            sorted,
         }
     }
 
@@ -149,8 +149,8 @@ impl DictionaryQuadSink {
     /// Freeze the dictionary and build the single-chunk Dictionary-layout
     /// array, exactly as the corresponding stream builder would.
     pub fn finish(self) -> Result<BuiltArray> {
-        let (dict, codes) = self.interner.finish(self.sorted)?;
-        let array = build_array(&codes, &self.indexes, self.sorted)?;
+        let (dict, codes) = self.interner.finish()?;
+        let array = build_array(&codes, &self.indexes)?;
         Ok(BuiltArray {
             array,
             components: Vec::new(),
@@ -211,9 +211,9 @@ impl InterningQuadBuilder {
         self.quads.push(quad);
     }
 
-    /// Freeze the dictionary and produce the dataset's codes, sorted by
-    /// (s, p, o, g) when `sort` is set.
-    pub(crate) fn finish(mut self, sort: bool) -> Result<(TermDictionary, QuadCodes)> {
+    /// Freeze the dictionary and produce the dataset's codes in global
+    /// (s, p, o, g) order.
+    pub(crate) fn finish(mut self) -> Result<(TermDictionary, QuadCodes)> {
         let total_start = Instant::now();
         let n = self.quads.len();
 
@@ -243,9 +243,7 @@ impl InterningQuadBuilder {
                 *id = rank_of[*id as usize];
             }
         }
-        if sort {
-            self.quads.sort_unstable();
-        }
+        self.quads.sort_unstable();
         let remap_elapsed = remap_start.elapsed();
 
         let mut codes = QuadCodes {

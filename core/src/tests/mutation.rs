@@ -44,10 +44,6 @@ async fn test_add_delete_sorted_in_memory() {
 async fn test_add_delete_sorted_stream() {
     run_add_delete_test::<SortedStreamBuilder>().await;
 }
-#[tokio::test]
-async fn test_add_delete_unsorted_stream() {
-    run_add_delete_test::<UnsortedStreamBuilder>().await;
-}
 
 #[tokio::test]
 async fn test_multiple_append() {
@@ -220,7 +216,7 @@ async fn test_add_quads_set_semantics() {
         GraphName::DefaultGraph,
     );
 
-    let arr = build_array::<UnsortedStreamBuilder>(
+    let arr = build_array::<SortedInMemoryBuilder>(
         quad_stream(vec![q1.clone(), q2.clone()]),
         LayoutStrategy::Default,
         vec![],
@@ -256,7 +252,7 @@ async fn test_add_quads_set_semantics() {
 async fn test_delete_matching_pattern() {
     let quads = modular_quads(12, 2, 3);
 
-    let arr = build_array::<UnsortedStreamBuilder>(
+    let arr = build_array::<SortedInMemoryBuilder>(
         quad_stream(quads.clone()),
         LayoutStrategy::Default,
         vec![],
@@ -384,7 +380,7 @@ async fn test_file_backed_add_auto_compacts_past_threshold() {
         })
         .collect();
 
-    let (_dir, path) = write_store_file::<SortedInMemoryBuilder>(
+    let (_dir, path) = write_store_file(
         quads.clone(),
         LayoutStrategy::Default,
         vec![IndexType::SecondaryByReference],
@@ -569,9 +565,10 @@ async fn test_dictionary_add_probes_tail_by_string() {
 /// the rebuilt indexes.
 #[tokio::test]
 async fn test_compaction_folds_tail_and_sorts() {
-    // Built unsorted (reverse subject order), so nothing is sorted going in.
-    let quads: Vec<Quad> = (0..6)
-        .rev()
+    // The base leaves gaps at s0 and s3 so the appended rows have to be
+    // interleaved into it, not merely appended after it.
+    let quads: Vec<Quad> = [1, 2, 4, 5, 6, 7]
+        .iter()
         .map(|i| {
             make_quad(
                 &format!("http://example.org/s{}", i),
@@ -582,7 +579,7 @@ async fn test_compaction_folds_tail_and_sorts() {
         })
         .collect();
 
-    let arr = build_array::<UnsortedStreamBuilder>(
+    let arr = build_array::<SortedInMemoryBuilder>(
         quad_stream(quads.clone()),
         LayoutStrategy::Default,
         vec![],
@@ -594,13 +591,13 @@ async fn test_compaction_folds_tail_and_sorts() {
     let added = store
         .add_quads([
             make_quad(
-                "http://example.org/s9",
+                "http://example.org/s0",
                 "http://example.org/p0",
                 "object 0",
                 GraphName::DefaultGraph,
             ),
             make_quad(
-                "http://example.org/s8",
+                "http://example.org/s3",
                 "http://example.org/p0",
                 "object 1",
                 GraphName::DefaultGraph,
@@ -608,7 +605,7 @@ async fn test_compaction_folds_tail_and_sorts() {
         ])
         .await
         .unwrap();
-    let deleted = added.delete_quad(&quads[0]).await.unwrap(); // drops s5
+    let deleted = added.delete_quad(&quads[3]).await.unwrap(); // drops s5
     assert_eq!(deleted.size().await.unwrap(), 7);
 
     let compacted = deleted
@@ -618,8 +615,8 @@ async fn test_compaction_folds_tail_and_sorts() {
     assert_eq!(compacted.size().await.unwrap(), 7);
     assert_eq!(compacted.indexes(), &[IndexType::SecondaryByReference]);
 
-    // The rows come back in global SPOG order (tail rows interleaved, the
-    // tombstoned s5 gone) — not in the unsorted insertion order.
+    // The rows come back in global SPOG order, with the appended s0 and s3
+    // interleaved into the base's run and the tombstoned s5 gone.
     assert_eq!(
         subjects_of(&compacted).await,
         vec![
@@ -628,16 +625,16 @@ async fn test_compaction_folds_tail_and_sorts() {
             "<http://example.org/s2>".to_string(),
             "<http://example.org/s3>".to_string(),
             "<http://example.org/s4>".to_string(),
-            "<http://example.org/s8>".to_string(),
-            "<http://example.org/s9>".to_string(),
+            "<http://example.org/s6>".to_string(),
+            "<http://example.org/s7>".to_string(),
         ]
     );
 
     // Subject lookups and the rebuilt object index both answer.
-    let s9 = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/s9").unwrap());
+    let s0 = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/s0").unwrap());
     assert_eq!(
         compacted
-            .match_pattern(Some(&s9), None, None, None)
+            .match_pattern(Some(&s0), None, None, None)
             .await
             .unwrap()
             .size()
@@ -660,7 +657,7 @@ async fn test_compaction_folds_tail_and_sorts() {
     // The compacted store owns its rows: it mutates freely.
     let again = compacted
         .add_quad(make_quad(
-            "http://example.org/s7",
+            "http://example.org/s5",
             "http://example.org/p0",
             "object 0",
             GraphName::DefaultGraph,
@@ -678,7 +675,7 @@ async fn test_compaction_folds_tail_and_sorts() {
 async fn test_file_backed_add_quads() {
     let quads = modular_quads(12, 2, 3);
 
-    let (_dir, path) = write_store_file::<SortedInMemoryBuilder>(
+    let (_dir, path) = write_store_file(
         quads.clone(),
         LayoutStrategy::Default,
         vec![IndexType::SecondaryByReference],
@@ -766,9 +763,7 @@ async fn test_file_backed_add_quads() {
 #[tokio::test]
 async fn test_owned_file_view_leaves_source_file_intact() {
     let quads = modular_quads(12, 3, 4);
-    let (_dir, path) =
-        write_store_file::<SortedStreamBuilder>(quads.clone(), LayoutStrategy::Default, vec![])
-            .await;
+    let (_dir, path) = write_store_file(quads.clone(), LayoutStrategy::Default, vec![]).await;
 
     let store = VortexRdfStore::from_file(&path).await.unwrap();
     let p1 = NamedNode::new("http://example.org/p1").unwrap();
@@ -818,7 +813,7 @@ async fn test_derived_view_rejects_mutations() {
         })
         .collect();
 
-    let arr = build_array::<UnsortedStreamBuilder>(
+    let arr = build_array::<SortedInMemoryBuilder>(
         quad_stream(quads.clone()),
         LayoutStrategy::Default,
         vec![],

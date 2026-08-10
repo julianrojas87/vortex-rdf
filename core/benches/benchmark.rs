@@ -13,8 +13,8 @@
 //!   change behaviour (e.g. Dictionary × index, where the index columns hold
 //!   u32 codes rather than term strings).
 //! * **Match (Group 2)** is a full 18-cell layout × index × source factorial
-//!   (× 6 routing patterns), plus a two-cell unsorted-builder axis and a
-//!   chained-view pair. Some cells are redundant on paper — a bound subject
+//!   (× 6 routing patterns), plus a chained-view pair. Some cells are
+//!   redundant on paper — a bound subject
 //!   declines every secondary index in favour of the primary sorted `s`
 //!   column, and a bound graph never routes through an index at all — but
 //!   index-decline routing is exactly where regressions have hidden, and the
@@ -54,7 +54,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use futures::stream;
 use oxrdf::{GraphName, NamedNode, NamedOrBlankNode, Term};
 
-use vortex_rdf_core::{LayoutStrategy, SortedStreamBuilder, VortexRdfError, VortexRdfStore, io};
+use vortex_rdf_core::{LayoutStrategy, VortexRdfError, VortexRdfStore, io};
 
 // The module is shared with `match_lazy.rs` and compiled per-target; items
 // only the other target uses (the `Bytes` source axis) are dead here by
@@ -71,13 +71,13 @@ fn main() {
 // multi-MB buffer copy per `with_inputs` call around the measured region.
 static BYTES_CACHE: OnceLock<Mutex<HashMap<CacheKey, Arc<Vec<u8>>>>> = OnceLock::new();
 
-fn cached_store_bytes(builder: Builder, layout: Layout, index: Index, size: usize) -> Arc<Vec<u8>> {
+fn cached_store_bytes(layout: Layout, index: Index, size: usize) -> Arc<Vec<u8>> {
     let cache = BYTES_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    let key = (builder, layout, index, size);
+    let key = (layout, index, size);
     if let Some(bytes) = cache.lock().unwrap().get(&key) {
         return Arc::clone(bytes);
     }
-    let store = cached_store(builder, layout, index, size);
+    let store = cached_store(layout, index, size);
     let buf = Arc::new(rt().block_on(store.to_bytes()).expect("store bytes"));
     cache.lock().unwrap().insert(key, Arc::clone(&buf));
     buf
@@ -88,78 +88,47 @@ fn cached_store_bytes(builder: Builder, layout: Layout, index: Index, size: usiz
 //
 // The write path is the one place all three axes genuinely differ, so we vary
 // them one at a time around a `sorted_stream / default / no_index` baseline and
-// add the two real interactions (Dictionary encodes the index as codes; an
-// unsorted builder leaves the index columns unstamped, unlike a sorted one).
+// add the one real interaction (Dictionary encodes the index as codes).
 // ══════════════════════════════════════════════════════════════════════════
 
 #[derive(Copy, Clone)]
 struct SerCfg {
-    builder: Builder,
     layout: Layout,
     index: Index,
 }
 
 impl fmt::Debug for SerCfg {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "{}_{}_{}",
-            self.builder.short(),
-            self.layout.short(),
-            self.index.short()
-        )
+        write!(f, "{}_{}", self.layout.short(), self.index.short())
     }
 }
 
 const SERIALIZE_CONFIGS: &[SerCfg] = &[
-    // Builder axis (Default layout, no index).
     SerCfg {
-        builder: Builder::Unsorted,
-        layout: Layout::Default,
-        index: Index::None,
-    },
-    SerCfg {
-        builder: Builder::SortedInMemory,
-        layout: Layout::Default,
-        index: Index::None,
-    },
-    SerCfg {
-        builder: Builder::SortedStream,
         layout: Layout::Default,
         index: Index::None,
     }, // baseline
-    // Layout axis (SortedStream, no index).
+    // Layout axis (no index).
     SerCfg {
-        builder: Builder::SortedStream,
         layout: Layout::TypedObject,
         index: Index::None,
     },
     SerCfg {
-        builder: Builder::SortedStream,
         layout: Layout::Dictionary,
         index: Index::None,
     },
-    // Index axis (SortedStream, Default layout).
+    // Index axis (Default layout).
     SerCfg {
-        builder: Builder::SortedStream,
         layout: Layout::Default,
         index: Index::ByReference,
     },
     SerCfg {
-        builder: Builder::SortedStream,
         layout: Layout::Default,
         index: Index::ByCopy,
     },
-    // Interactions worth keeping: index columns as dictionary codes, and an
-    // unsorted (per-chunk, unstamped) index vs the sorted global one above.
+    // Interaction worth keeping: index columns as dictionary codes.
     SerCfg {
-        builder: Builder::SortedStream,
         layout: Layout::Dictionary,
-        index: Index::ByCopy,
-    },
-    SerCfg {
-        builder: Builder::Unsorted,
-        layout: Layout::Default,
         index: Index::ByCopy,
     },
 ];
@@ -173,12 +142,11 @@ fn serialize(bencher: divan::Bencher, cfg: &SerCfg) {
             rt().block_on(async move {
                 let mut buf = Vec::new();
                 let stream = stream::iter(quads.into_iter().map(Ok::<_, VortexRdfError>));
-                io::quads_stream_to_vortex_writer_with_strategy(
+                io::quads_stream_to_vortex_writer(
                     stream,
                     &mut buf,
                     cfg.layout.strategy(),
                     cfg.index.types(),
-                    cfg.builder.strategy(),
                 )
                 .await
                 .expect("serialize failed");
@@ -191,8 +159,7 @@ fn serialize(bencher: divan::Bencher, cfg: &SerCfg) {
 // Group 2 — MATCH (query path)
 //
 // Baseline: sorted_stream / default / by_copy / file. Each config sweeps the
-// six routing patterns. We use SortedStream as the "sorted" representative and
-// UnsortedStream as the "unsorted" one; SortedInMemory is omitted because it is
+// six routing patterns. SortedInMemory is omitted because it is
 // query-indistinguishable from SortedStream (identical stamped columns).
 // ══════════════════════════════════════════════════════════════════════════
 
@@ -201,7 +168,6 @@ fn serialize(bencher: divan::Bencher, cfg: &SerCfg) {
 /// derived view is actually executed).
 fn run_match(
     bencher: divan::Bencher,
-    builder: Builder,
     layout: Layout,
     index: Index,
     source: Source,
@@ -212,7 +178,7 @@ fn run_match(
     // the lazy suite's ~31 µs match floor they are visible noise.
     let (s, p, o, g) = terms_for(pattern);
     bencher
-        .with_inputs(|| make_store(source, builder, layout, index, bench_size()))
+        .with_inputs(|| make_store(source, layout, index, bench_size()))
         .bench_refs(|store| {
             rt().block_on(async {
                 let matched = store
@@ -226,20 +192,20 @@ fn run_match(
 }
 
 macro_rules! match_bench {
-    ($name:ident, $builder:expr, $layout:expr, $index:expr, $source:expr) => {
+    ($name:ident, $layout:expr, $index:expr, $source:expr) => {
         #[divan::bench(args = PATTERNS)]
         fn $name(bencher: divan::Bencher, pattern: &Pattern) {
-            run_match(bencher, $builder, $layout, $index, $source, *pattern);
+            run_match(bencher, $layout, $index, $source, *pattern);
         }
     };
 }
 
 /// The full layout × source × index match matrix (sorted-stream builder
-/// throughout; the unsorted builder is its own axis below). One group per
-/// cell, named `match_sorted_{layout}_{index}_{source}`.
+/// throughout). One group per cell, named
+/// `match_sorted_{layout}_{index}_{source}`.
 macro_rules! match_matrix {
     ($(($layout:expr, $index:expr, $source:expr) => $name:ident,)*) => {
-        $(match_bench!($name, Builder::SortedStream, $layout, $index, $source);)*
+        $(match_bench!($name, $layout, $index, $source);)*
     };
 }
 match_matrix!(
@@ -265,24 +231,6 @@ match_matrix!(
     (Layout::Dictionary, Index::ByCopy, Source::InMemory) => match_sorted_dict_bycopy_mem,
     (Layout::Dictionary, Index::ByCopy, Source::File) => match_sorted_dict_bycopy_file,
 );
-// Sortedness axis: unsorted builder leaves nothing stamped, so indexes decline
-// and everything falls to the mask scan — the worst case, and the typical
-// in-memory (JS bindings) case.
-match_bench!(
-    match_unsorted_default_bycopy_file,
-    Builder::Unsorted,
-    Layout::Default,
-    Index::ByCopy,
-    Source::File
-);
-match_bench!(
-    match_unsorted_default_bycopy_mem,
-    Builder::Unsorted,
-    Layout::Default,
-    Index::ByCopy,
-    Source::InMemory
-);
-
 /// Chained refinement: `match_pattern(P)` then `match_pattern(O)` on the
 /// resulting view — the headline "views narrow the same coordinate space"
 /// feature, which no single-pattern benchmark exercises.
@@ -292,15 +240,7 @@ fn match_chained(bencher: divan::Bencher, source: &Source) {
     let p = NamedNode::new_unchecked("http://example.org/predicate/0");
     let o = Term::NamedNode(NamedNode::new_unchecked("http://example.org/object/0"));
     bencher
-        .with_inputs(|| {
-            make_store(
-                source,
-                Builder::SortedStream,
-                Layout::Default,
-                Index::ByCopy,
-                bench_size(),
-            )
-        })
+        .with_inputs(|| make_store(source, Layout::Default, Index::ByCopy, bench_size()))
         .bench_refs(|store| {
             rt().block_on(async {
                 let after_p = store
@@ -371,15 +311,7 @@ const DECODE_CONFIGS: &[DecodeCfg] = &[
 fn decode_all(bencher: divan::Bencher, cfg: &DecodeCfg) {
     let cfg = *cfg;
     bencher
-        .with_inputs(|| {
-            make_store(
-                cfg.source,
-                Builder::SortedStream,
-                cfg.layout,
-                Index::None,
-                bench_size(),
-            )
-        })
+        .with_inputs(|| make_store(cfg.source, cfg.layout, Index::None, bench_size()))
         .bench_refs(|store| {
             rt().block_on(async {
                 let quads = store.quads_vec().await.expect("decode all");
@@ -411,7 +343,7 @@ fn decode_all_literals(bencher: divan::Bencher) {
 fn open_file(bencher: divan::Bencher, layout: &Layout) {
     let layout = *layout;
     bencher
-        .with_inputs(|| cached_file(Builder::SortedStream, layout, Index::None, bench_size()))
+        .with_inputs(|| cached_file(layout, Index::None, bench_size()))
         .bench_refs(|path| {
             rt().block_on(async {
                 let store = VortexRdfStore::from_file(path).await.expect("open file");
@@ -425,14 +357,7 @@ fn open_file(bencher: divan::Bencher, layout: &Layout) {
 #[divan::bench]
 fn from_bytes(bencher: divan::Bencher) {
     bencher
-        .with_inputs(|| {
-            cached_store_bytes(
-                Builder::SortedStream,
-                Layout::Default,
-                Index::None,
-                bench_size(),
-            )
-        })
+        .with_inputs(|| cached_store_bytes(Layout::Default, Index::None, bench_size()))
         .bench_refs(|bytes| {
             rt().block_on(async {
                 let store = VortexRdfStore::from_bytes(bytes).await.expect("from_bytes");
@@ -497,7 +422,7 @@ fn cached_dict_file(size: usize) -> PathBuf {
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join(format!("dict_{size}.vortex"));
     rt().block_on(async {
-        io::quads_stream_to_vortex_file_with_builder::<SortedStreamBuilder, _>(
+        io::quads_stream_to_vortex_file(
             generate_rdf_data_stream(size),
             &path,
             LayoutStrategy::Dictionary,

@@ -94,9 +94,8 @@ discard.
 ## Layouts
 
 `serialize_rdf(..., layout=...)` accepts `"default"`, `"typed-object"` and
-`"dictionary"`; `store.layout()` reports the same names. `builder=` picks the
-build pipeline (`"unsorted-stream"`, `"sorted-in-memory"`, `"sorted-stream"`)
-and `indexes=[...]` lists secondary index components to build into the file
+`"dictionary"`; `store.layout()` reports the same names. `indexes=[...]`
+lists secondary index components to build into the file
 (`"secondary-by-copy"`, `"secondary-by-reference"`). `format=` is an RDF
 format name (`"ntriples"`, `"nquads"`, `"turtle"`, `"trig"`, `"n3"`,
 `"rdfxml"`, `"jsonld"`, or their short aliases), detected from the input file

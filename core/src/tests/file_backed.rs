@@ -17,8 +17,7 @@ async fn test_file_backed_filtered_size() {
         })
         .collect();
 
-    let (_dir, path) =
-        write_store_file::<UnsortedStreamBuilder>(quads, LayoutStrategy::Default, vec![]).await;
+    let (_dir, path) = write_store_file(quads, LayoutStrategy::Default, vec![]).await;
 
     let store = VortexRdfStore::from_file(&path).await.unwrap();
     assert_eq!(store.size().await.unwrap(), 20);
@@ -46,7 +45,7 @@ async fn test_file_backed_secondary_index_object_predicate() {
         })
         .collect();
 
-    let (_dir, path) = write_store_file::<UnsortedStreamBuilder>(
+    let (_dir, path) = write_store_file(
         quads,
         LayoutStrategy::Default,
         vec![IndexType::SecondaryByReference],
@@ -109,7 +108,7 @@ async fn test_file_backed_non_contiguous_predicate_matches() {
             })
             .collect();
         let mut bytes: Vec<u8> = Vec::new();
-        quads_stream_to_vortex_writer_with_builder::<SortedInMemoryBuilder, _, _>(
+        quads_stream_to_vortex_writer(
             quad_stream(quads),
             &mut bytes,
             LayoutStrategy::Default,
@@ -171,7 +170,7 @@ async fn test_file_backed_chained_subject_then_object_index() {
             })
             .collect();
         let mut bytes: Vec<u8> = Vec::new();
-        quads_stream_to_vortex_writer_with_builder::<SortedInMemoryBuilder, _, _>(
+        quads_stream_to_vortex_writer(
             quad_stream(quads),
             &mut bytes,
             LayoutStrategy::Default,
@@ -253,8 +252,7 @@ async fn test_file_backed_subject_metadata_range_for_missing_subject() {
     let mut quads = modular_quads(25, 1, 1);
     quads.reverse();
 
-    let (_dir, path) =
-        write_store_file::<SortedInMemoryBuilder>(quads, LayoutStrategy::Default, vec![]).await;
+    let (_dir, path) = write_store_file(quads, LayoutStrategy::Default, vec![]).await;
 
     let store = VortexRdfStore::from_file(&path).await.unwrap();
     let missing = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/s99").unwrap());
@@ -300,7 +298,7 @@ fn subject(i: usize) -> NamedOrBlankNode {
 #[tokio::test]
 async fn test_file_subject_probe_matches_memory() {
     let quads = probe_path_quads(2000);
-    let (_dir, path) = write_store_file::<SortedInMemoryBuilder>(
+    let (_dir, path) = write_store_file(
         quads.clone(),
         LayoutStrategy::Dictionary,
         vec![IndexType::SecondaryByCopy],
@@ -355,12 +353,7 @@ async fn test_file_subject_probe_matches_memory() {
 #[tokio::test]
 async fn test_file_subject_probe_with_mutation() {
     let quads = probe_path_quads(100);
-    let (_dir, path) = write_store_file::<SortedInMemoryBuilder>(
-        quads.clone(),
-        LayoutStrategy::Dictionary,
-        vec![],
-    )
-    .await;
+    let (_dir, path) = write_store_file(quads.clone(), LayoutStrategy::Dictionary, vec![]).await;
     let store = VortexRdfStore::from_file(&path).await.unwrap();
 
     let s50 = subject(50);
@@ -400,7 +393,7 @@ async fn test_file_subject_probe_with_mutation() {
 #[tokio::test]
 async fn test_file_subject_probe_chained() {
     let quads = probe_path_quads(500);
-    let (_dir, path) = write_store_file::<SortedInMemoryBuilder>(
+    let (_dir, path) = write_store_file(
         quads.clone(),
         LayoutStrategy::Dictionary,
         vec![IndexType::SecondaryByCopy],
@@ -437,17 +430,39 @@ async fn test_file_subject_probe_chained() {
     assert_eq!(view_strings(&got).await, view_strings(&want).await);
 }
 
-/// An unsorted build must NOT engage the fast path — no sortedness, no
-/// binary search — while subject matches stay correct through the scan path.
+/// A file whose rows are not globally sorted must NOT engage the fast path —
+/// no sortedness, no binary search — while subject matches stay correct
+/// through the scan path.
+///
+/// The unsorted file comes from serializing a store that still carries an
+/// append tail: the tail's rows are interleaved into the written order, so
+/// the wire records no sorted provenance and the reread store's `s` column
+/// carries no stamp.
 #[tokio::test]
 async fn test_file_subject_probe_requires_sorted() {
     let quads = probe_path_quads(50);
-    let (_dir, path) = write_store_file::<UnsortedStreamBuilder>(
-        quads.clone(),
+    let arr = build_array::<SortedInMemoryBuilder>(
+        quad_stream(quads.clone()),
         LayoutStrategy::Dictionary,
         vec![],
     )
-    .await;
+    .await
+    .unwrap();
+    let tailed = VortexRdfStore::from_built(arr)
+        .unwrap()
+        .add_quad(make_quad(
+            "http://example.org/fresh",
+            "http://example.org/p0",
+            "object 0",
+            GraphName::DefaultGraph,
+        ))
+        .await
+        .unwrap();
+    let bytes = tailed.to_bytes().await.unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("unsorted.vortex");
+    std::fs::write(&path, &bytes).unwrap();
+
     let store = VortexRdfStore::from_file(&path).await.unwrap();
     let s = subject(10);
     assert_eq!(store.debug_subject_bounds_range(&s).await.unwrap(), None);

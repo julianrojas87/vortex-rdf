@@ -12,7 +12,7 @@
 use std::hint::black_box;
 
 // The module is shared with `benchmark.rs` and compiled per-target; items
-// only the other target uses (unsorted builders, serialize helpers) are dead
+// only the other target uses (the serialize helpers) are dead
 // here by design.
 #[allow(dead_code)]
 mod support;
@@ -27,7 +27,6 @@ fn main() {
 /// executed.
 fn run_lazy_match(
     bencher: divan::Bencher,
-    builder: Builder,
     layout: Layout,
     index: Index,
     source: Source,
@@ -38,7 +37,7 @@ fn run_lazy_match(
     // iteration would be a visible fraction of the measurement.
     let (s, p, o, g) = terms_for(pattern);
     bencher
-        .with_inputs(|| make_store(source, builder, layout, index, bench_size()))
+        .with_inputs(|| make_store(source, layout, index, bench_size()))
         .bench_refs(|store| {
             rt().block_on(async {
                 let matched = store
@@ -54,14 +53,7 @@ macro_rules! lazy_match_bench {
     ($name:ident, $layout:expr, $index:expr, $source:expr) => {
         #[divan::bench(args = PATTERNS)]
         fn $name(bencher: divan::Bencher, pattern: &Pattern) {
-            run_lazy_match(
-                bencher,
-                Builder::SortedStream,
-                $layout,
-                $index,
-                $source,
-                *pattern,
-            );
+            run_lazy_match(bencher, $layout, $index, $source, *pattern);
         }
     };
 }

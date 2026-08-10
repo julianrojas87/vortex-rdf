@@ -49,11 +49,11 @@ impl VortexArrayBuilder for SortedInMemoryBuilder {
         // Strings per quad) ever accumulates.
         let (n, build_start, built);
         if layout == LayoutStrategy::Dictionary {
-            let (dict, codes) = ingest_interning(quad_stream).await?.finish(true)?;
+            let (dict, codes) = ingest_interning(quad_stream).await?.finish()?;
             n = codes.s.len();
             build_start = Instant::now();
             built = BuiltArray {
-                array: dictionary::build_array(&codes, &indexes, true)?,
+                array: dictionary::build_array(&codes, &indexes)?,
                 components: Vec::new(),
                 dict: Some(Arc::new(dict)),
             };
@@ -127,7 +127,7 @@ pub(crate) async fn build_sorted_chunk_stream(
     chunk_size: usize,
 ) -> Result<BuiltStream> {
     if layout == LayoutStrategy::Dictionary {
-        let (dict, codes) = ingest_interning(quad_stream).await?.finish(true)?;
+        let (dict, codes) = ingest_interning(quad_stream).await?.finish()?;
         return emit_dict_chunks(codes, Arc::new(dict), indexes, chunk_size);
     }
 

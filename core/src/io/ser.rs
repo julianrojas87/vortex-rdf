@@ -29,7 +29,7 @@ use web_time::Instant;
 #[cfg(feature = "file-io")]
 use crate::error;
 #[cfg(feature = "file-io")]
-use crate::store::builders::{BuilderStrategy, BuiltStream, VortexArrayBuilder};
+use crate::store::builders::{BuiltStream, SortedStreamBuilder, VortexArrayBuilder};
 #[cfg(feature = "file-io")]
 use crate::store::{Indexes, RawQuad};
 #[cfg(feature = "file-io")]
@@ -143,11 +143,19 @@ pub(crate) fn component_write(
 
 /// Stream quads directly into a native store file as compressed chunks.
 ///
-/// The builder's [`VortexArrayBuilder::build_vortex_stream`] produces
-/// row-space chunks lazily; the splitter tees each one into the quad child's
+/// The build pipeline is the target's, not the caller's: writing a file means
+/// a filesystem exists, so the rows go through the out-of-core global sort
+/// ([`SortedStreamBuilder`]) — the one pipeline whose peak memory does not
+/// scale with the dataset. (The in-memory sort is what targets without a
+/// filesystem use; see [`SortedInMemoryBuilder`].)
+///
+/// [`SortedInMemoryBuilder`]: crate::SortedInMemoryBuilder
+///
+/// [`VortexArrayBuilder::build_vortex_stream`] produces row-space chunks
+/// lazily; the splitter tees each one into the quad child's
 /// stream and the index children's channels, and the layout writer
 /// compresses all children concurrently through one segment sink. For
-/// streaming-capable builders WITHOUT index children, peak memory is bounded
+/// a build WITHOUT index children, peak memory is bounded
 /// by the chunk size instead of the dataset size. With index children the
 /// bound is looser: the sequenced segment sink assigns the quad subtree's
 /// segment ids ahead of every auxiliary child's, so a component's compressed
@@ -156,31 +164,30 @@ pub(crate) fn component_write(
 /// below the raw dataset, but not O(chunk)). The dictionary is complete
 /// before any chunk flows, and becomes the required `dictionary` child.
 #[cfg(feature = "file-io")]
-pub async fn quads_stream_to_vortex_writer_with_builder<B, S, W>(
+pub async fn quads_stream_to_vortex_writer<S, W>(
     quads: S,
     writer: W,
     layout: LayoutStrategy,
     indexes: Indexes,
 ) -> Result<()>
 where
-    B: VortexArrayBuilder,
     S: Stream<Item = error::Result<RawQuad>> + Unpin + Send + 'static,
     W: VortexWrite + Unpin + Send,
 {
     let start = Instant::now();
 
-    let built = B::build_vortex_stream(Box::new(quads), layout, indexes).await?;
+    let built = SortedStreamBuilder::build_vortex_stream(Box::new(quads), layout, indexes).await?;
     built_stream_to_vortex_writer(built, writer).await?;
 
     log::debug!(
-        "[ser::quads_stream_to_vortex_writer_with_builder] Streaming write took {:?}",
+        "[ser::quads_stream_to_vortex_writer] Streaming write took {:?}",
         start.elapsed()
     );
     Ok(())
 }
 
 /// Drive an already-built chunk stream into `writer` — the back half of
-/// [`quads_stream_to_vortex_writer_with_builder`] (whose docs describe the
+/// [`quads_stream_to_vortex_writer`] (whose docs describe the
 /// whole pipeline and its memory bounds), split out so compaction can hand in
 /// a stream it built with its own spill-directory placement.
 #[cfg(feature = "file-io")]
@@ -221,66 +228,13 @@ where
 }
 
 /// Serialize a quad stream to a native store file at `path` — the path-based
-/// convenience over [`quads_stream_to_vortex_writer_with_builder`].
-#[cfg(feature = "file-io")]
-pub async fn quads_stream_to_vortex_file_with_builder<B, S>(
-    quads: S,
-    path: &std::path::Path,
-    layout: LayoutStrategy,
-    indexes: Indexes,
-) -> Result<()>
-where
-    B: VortexArrayBuilder,
-    S: Stream<Item = error::Result<RawQuad>> + Unpin + Send + 'static,
-{
-    let writer = tokio::fs::File::create(path)
-        .await
-        .map_err(|e| VortexRdfError::Serialization(format!("create {:?}: {}", path, e)))?;
-    quads_stream_to_vortex_writer_with_builder::<B, _, _>(quads, writer, layout, indexes).await
-}
-
-/// [`quads_stream_to_vortex_writer_with_builder`] driven by a *value*
-/// [`BuilderStrategy`] instead of a builder type parameter. The dispatch
-/// itself lives on [`BuilderStrategy::build_vortex_stream`] — beside the
-/// enum, so callers choosing a builder at runtime (the CLI, the bindings,
-/// the benches) do not each re-write it; everything after the build is
-/// builder-independent and shared with the generic form through
-/// [`built_stream_to_vortex_writer`].
-#[cfg(feature = "file-io")]
-pub async fn quads_stream_to_vortex_writer_with_strategy<S, W>(
-    quads: S,
-    writer: W,
-    layout: LayoutStrategy,
-    indexes: Indexes,
-    strategy: BuilderStrategy,
-) -> Result<()>
-where
-    S: Stream<Item = error::Result<RawQuad>> + Unpin + Send + 'static,
-    W: VortexWrite + Unpin + Send,
-{
-    let start = Instant::now();
-
-    let built = strategy
-        .build_vortex_stream(Box::new(quads), layout, indexes)
-        .await?;
-    built_stream_to_vortex_writer(built, writer).await?;
-
-    log::debug!(
-        "[ser::quads_stream_to_vortex_writer_with_strategy] Streaming write took {:?}",
-        start.elapsed()
-    );
-    Ok(())
-}
-
-/// Serialize a quad stream to a native store file at `path` — the path-based
-/// convenience over [`quads_stream_to_vortex_writer_with_strategy`].
+/// convenience over [`quads_stream_to_vortex_writer`].
 #[cfg(feature = "file-io")]
 pub async fn quads_stream_to_vortex_file<S>(
     quads: S,
     path: &std::path::Path,
     layout: LayoutStrategy,
     indexes: Indexes,
-    strategy: BuilderStrategy,
 ) -> Result<()>
 where
     S: Stream<Item = error::Result<RawQuad>> + Unpin + Send + 'static,
@@ -288,5 +242,5 @@ where
     let writer = tokio::fs::File::create(path)
         .await
         .map_err(|e| VortexRdfError::Serialization(format!("create {:?}: {}", path, e)))?;
-    quads_stream_to_vortex_writer_with_strategy(quads, writer, layout, indexes, strategy).await
+    quads_stream_to_vortex_writer(quads, writer, layout, indexes).await
 }

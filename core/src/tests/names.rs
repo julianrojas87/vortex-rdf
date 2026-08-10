@@ -3,7 +3,7 @@
 //! `Display` impls and the clap derive.
 
 use crate::common::formats::{format_from_name, supported_format_names};
-use crate::{BuilderStrategy, IndexType, LayoutStrategy};
+use crate::{IndexType, LayoutStrategy};
 
 #[test]
 fn canonical_names_round_trip() {
@@ -15,14 +15,6 @@ fn canonical_names_round_trip() {
     ] {
         assert_eq!(layout.to_string(), name);
         assert_eq!(name.parse::<LayoutStrategy>().unwrap(), layout);
-    }
-    for (builder, name) in [
-        (BuilderStrategy::UnsortedStream, "unsorted-stream"),
-        (BuilderStrategy::SortedInMemory, "sorted-in-memory"),
-        (BuilderStrategy::SortedStream, "sorted-stream"),
-    ] {
-        assert_eq!(builder.to_string(), name);
-        assert_eq!(name.parse::<BuilderStrategy>().unwrap(), builder);
     }
     for (index, name) in [
         (IndexType::SecondaryByCopy, "secondary-by-copy"),
@@ -41,15 +33,11 @@ fn non_canonical_spellings_are_rejected() {
     // Retired JS PascalCase.
     assert!("TypedObject".parse::<LayoutStrategy>().is_err());
     assert!("Dictionary".parse::<LayoutStrategy>().is_err());
-    assert!("Unsorted".parse::<BuilderStrategy>().is_err());
-    assert!("Sorted".parse::<BuilderStrategy>().is_err());
     assert!("SecondaryByCopy".parse::<IndexType>().is_err());
     assert!("SecondaryByReference".parse::<IndexType>().is_err());
 
     // Retired Python underscore and short forms.
     assert!("typed_object".parse::<LayoutStrategy>().is_err());
-    assert!("unsorted".parse::<BuilderStrategy>().is_err());
-    assert!("sorted".parse::<BuilderStrategy>().is_err());
 
     // The error names the canonical vocabulary.
     let err = "Dictionary".parse::<LayoutStrategy>().unwrap_err();
@@ -61,7 +49,6 @@ fn non_canonical_spellings_are_rejected() {
 #[test]
 fn unknown_names_error() {
     assert!("columnar".parse::<LayoutStrategy>().is_err());
-    assert!("bogosort".parse::<BuilderStrategy>().is_err());
     assert!("btree".parse::<IndexType>().is_err());
 }
 
@@ -77,12 +64,6 @@ fn display_matches_clap_value_names() {
         assert_eq!(
             layout.to_string(),
             layout.to_possible_value().unwrap().get_name()
-        );
-    }
-    for builder in BuilderStrategy::value_variants() {
-        assert_eq!(
-            builder.to_string(),
-            builder.to_possible_value().unwrap().get_name()
         );
     }
     for index in IndexType::value_variants() {

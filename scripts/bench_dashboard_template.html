@@ -405,7 +405,7 @@
       <span class="chan-tag mono">VARIANTS</span>
       <h2>Vortex config variants</h2>
     </div>
-    <p class="group-desc">The same star design as the Rust tab, over the axes reachable from JS: builder (Unsorted / Sorted), column layout (Default / Dictionary), and secondary index (none / ByReference / ByCopy).</p>
+    <p class="group-desc">The same star design as the Rust tab, over the axes reachable from JS: column layout (Default / Dictionary) and secondary index (none / ByReference / ByCopy).</p>
     <div class="panel-grid" id="js-variant-panels"></div>
   </section>
 
@@ -482,7 +482,7 @@
     </p>
     <p class="lede">
       Vortex appears once per build configuration rather than as a single row, because its
-      knobs — builder, column layout, secondary index, and whether the store is read from the
+      knobs — column layout, secondary index, and whether the store is read from the
       file or loaded up front — move these numbers as much as the choice of library does.
       Residency is crossed with the secondary index, so each <em>(file, memory)</em> pair
       shares a build: the difference between the two is residency alone, and it can be read
@@ -650,18 +650,16 @@ function serRow(builder, layout, index, id, brk){
 }
 const serializePanel = {
   title:"Serialize: builder × layout × index",
-  note:"Median time to build and write the dataset, fastest first. Each configuration varies one axis around the sorted-stream / Default / no-index baseline, except the last two, which combine a layout or builder with an index.",
+  note:"Median time to build and write the dataset, fastest first. Each configuration varies one axis around the sorted-stream / Default / no-index baseline, except the last, which combines a layout with an index.",
   rowHeaders:["Builder","Layout","Index"], columns:["Serialize"], sortByColumn:0,
   rows:[
     serRow("Sorted stream","Default","none","sorted_stream_default_no_index"),
     serRow("Sorted in-memory","Default","none","sorted_in_memory_default_no_index"),
-    serRow("Unsorted","Default","none","unsorted_default_no_index"),
     serRow("Sorted stream","Typed-object","none","sorted_stream_typed_object_no_index", true),
     serRow("Sorted stream","Dictionary","none","sorted_stream_dictionary_no_index"),
     serRow("Sorted stream","Default","by-reference","sorted_stream_default_by_reference", true),
     serRow("Sorted stream","Default","by-copy","sorted_stream_default_by_copy"),
     serRow("Sorted stream","Dictionary","by-copy","sorted_stream_dictionary_by_copy", true),
-    serRow("Unsorted","Default","by-copy","unsorted_default_by_copy"),
   ],
 };
 
@@ -909,12 +907,10 @@ function renderRust(){
   // serialize interaction effects, folded into the write section as a table
   const panel = document.createElement("div");
   panel.className = "panel";
-  panel.innerHTML = `<h3>Interaction effects</h3><p class="note">Two combinations that don't reduce to a single axis: a dictionary layout's index holds codes rather than term strings, and an unsorted builder never stamps a sortedness marker.</p>`;
+  panel.innerHTML = `<h3>Interaction effects</h3><p class="note">One combination that doesn't reduce to a single axis: a dictionary layout's index holds codes rather than term strings.</p>`;
   const irows = [
     { name:"Dictionary + by-copy index", id:"serialize::sorted_stream_dictionary_by_copy",
       refs:[["dictionary alone","serialize::sorted_stream_dictionary_no_index"], ["by-copy alone","serialize::sorted_stream_default_by_copy"]] },
-    { name:"Unsorted + by-copy index", id:"serialize::unsorted_default_by_copy",
-      refs:[["unsorted alone","serialize::unsorted_default_no_index"], ["by-copy alone","serialize::sorted_stream_default_by_copy"]] },
   ];
   const itable = document.createElement("table");
   itable.className = "interact-table";
@@ -976,8 +972,6 @@ function renderRust(){
 
 // ---- JavaScript tab ----
 const JS_ADAPTERS = [
-  { slug:"vortex_unsorted_dict",       label:"Vortex Unsorted/Dict" },
-  { slug:"vortex_unsorted_default",    label:"Vortex Unsorted/Default" },
   { slug:"vortex_sorted_dict",         label:"Vortex Sorted/Dict" },
   { slug:"vortex_sorted_dict_byref",   label:"Vortex Sorted/Dict+ByRef" },
   { slug:"vortex_sorted_dict_bycopy",  label:"Vortex Sorted/Dict+ByCopy" },
@@ -988,14 +982,12 @@ const JS_ADAPTERS = [
   { slug:"rdfstores_single",           label:"rdf-stores (1 index)" },
   { slug:"oxigraph",                   label:"oxigraph" },
 ];
-const JS_VORTEX = JS_ADAPTERS.slice(0, 8);
+const JS_VORTEX = JS_ADAPTERS.slice(0, 6);
 const CROSS_LIB_SERIES = [
   { slug:"vortex_sorted_dict_byref",    label:"Vortex Sorted/Dict+ByRef" },
-  { slug:"vortex_unsorted_dict",        label:"Vortex Unsorted/Dict" },
   { slug:"vortex_sorted_dict_bycopy",   label:"Vortex Sorted/Dict+ByCopy" },
   { slug:"vortex_sorted_default_byref", label:"Vortex Sorted/Default+ByRef" },
   { slug:"vortex_sorted_default_bycopy",label:"Vortex Sorted/Default+ByCopy" },
-  { slug:"vortex_unsorted_default",     label:"Vortex Unsorted/Default" },
   { slug:"rdfstores_default",           label:"rdf-stores (default)" },
   { slug:"rdfstores_single",            label:"rdf-stores (1 index)" },
   { slug:"oxigraph",                    label:"oxigraph" },
@@ -1019,7 +1011,7 @@ function renderJs(){
   // Query — cross-library, per routing shape
   renderMatrixPanel(document.getElementById("js-query-panels"), {
     title:"Cross-library match, by routing shape",
-    note:"Six Vortex build variants vs rdf-stores (both index configs) vs oxigraph. Green = fastest store in each pattern column; the grey multiplier is the slowdown vs that column's best.",
+    note:"Four Vortex build variants vs rdf-stores (both index configs) vs oxigraph. Green = fastest store in each pattern column; the grey multiplier is the slowdown vs that column's best.",
     wide:true, rowHeaders:["Store"], columns:JS_PATTERNS,
     rows: CROSS_LIB_SERIES.map(a => ({ labels:[a.label], ids: patternIds(a.slug, JS_PATTERNS),
       break: a.slug === "rdfstores_default" })),
@@ -1068,7 +1060,7 @@ function renderJs(){
 
   renderKpis("#js-kpi-row", [
     { label:"Libraries", value:"3", sub:"vortex · rdf-stores · oxigraph" },
-    { label:"Vortex variants", value:String(JS_VORTEX.length), sub:"builder × layout × index" },
+    { label:"Vortex variants", value:String(JS_VORTEX.length), sub:"layout × index" },
     { label:"Benchmarks", value:String(JS_DATA.length), sub:"leaf measurements" },
     { label:"Quads", value:(JS_CONFIG.triplesCount||0).toLocaleString(), sub:(JS_CONFIG.quadsCount||0).toLocaleString()+" named-graph quads" },
     // Distinct terms is the dimension this dataset exists to exercise; without
@@ -1091,7 +1083,6 @@ function renderJs(){
 const PY_VORTEX = [
   { slug:"vortex_sorted_dict",            label:"vortex-rdf Sorted/Dict (file)" },
   { slug:"vortex_sorted_dict_mem",        label:"vortex-rdf Sorted/Dict (memory)" },
-  { slug:"vortex_unsorted_default",       label:"vortex-rdf Unsorted/Default (file)" },
   { slug:"vortex_sorted_default",         label:"vortex-rdf Sorted/Default (file)" },
   { slug:"vortex_sorted_dict_bycopy",     label:"vortex-rdf Sorted/Dict+ByCopy (file)" },
   { slug:"vortex_sorted_dict_bycopy_mem", label:"vortex-rdf Sorted/Dict+ByCopy (memory)" },
@@ -1199,7 +1190,7 @@ function renderPy(){
   }).length;
   renderKpis("#py-kpi-row", [
     { label:"Libraries", value:String(PY_LIBRARIES.length), sub:"vortex · pyoxigraph · pycottas · rdflib · lightrdf" },
-    { label:"Vortex variants", value:String(PY_VORTEX.length), sub:"builder × layout × index × residency" },
+    { label:"Vortex variants", value:String(PY_VORTEX.length), sub:"layout × index × residency" },
     { label:"Benchmarks", value:String(PY_DATA.length), sub:"leaf measurements" },
     { label:"Quads", value:(PY_CONFIG.triplesCount||0).toLocaleString(), sub:(PY_CONFIG.quadsCount||0).toLocaleString()+" named-graph quads" },
     { label:"Distinct terms", value:(PY_CONFIG.cardinality?.triples?.terms||0).toLocaleString(),

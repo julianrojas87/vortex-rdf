@@ -1,14 +1,13 @@
 use super::*;
 use crate::store::builders::sorted_in_memory::build_sorted_chunk_stream;
 use crate::store::builders::sorted_stream::build_sorted_stream_chunk_stream;
-use crate::store::builders::unsorted_stream::build_chunk_stream;
 use vortex_array::VortexSessionExecute;
 use vortex_array::arrays::struct_::{StructArray, StructArrayExt};
 
 // ─── 3) Streaming/chunking behavior ─────────────────────────────────────
 
 /// The chunk-boundary harness every builder shares: chunk_size 3 over the 10
-/// given quads must split as [3, 3, 3, 1] from all three builders, whatever
+/// given quads must split as [3, 3, 3, 1] from both builders, whatever
 /// the `layout`. Hands back each builder's collected chunks — plus the
 /// dictionary the stream carried beside them, for the Dictionary layout —
 /// for the callers' layout-specific follow-up assertions.
@@ -22,10 +21,6 @@ async fn run_chunk_boundary_builders(
 )> {
     let mut out = Vec::new();
     for (name, result) in [
-        (
-            "unsorted_stream",
-            build_chunk_stream(Box::new(quad_stream(quads.to_vec())), layout, vec![], 3).await,
-        ),
         (
             "sorted_in_memory",
             build_sorted_chunk_stream(Box::new(quad_stream(quads.to_vec())), layout, vec![], 3)
@@ -85,10 +80,12 @@ async fn test_streaming_chunk_boundaries() {
 #[cfg(feature = "file-io")]
 #[tokio::test]
 async fn test_streaming_write_read_roundtrip() {
+    // Zero-padded so the build's (s, p, o, g) order is the input order, which
+    // is what the positional assertions below read.
     let quads: Vec<Quad> = (0..25)
         .map(|i| {
             make_quad(
-                &format!("http://example.org/s{}", i),
+                &format!("http://example.org/s{:02}", i),
                 "http://example.org/p",
                 &format!("object value {}", i),
                 GraphName::DefaultGraph,
@@ -127,10 +124,6 @@ async fn test_sorted_streaming_chunk_boundaries() {
         .collect();
 
     for (name, chunks, _) in run_chunk_boundary_builders(LayoutStrategy::Default, &quads).await {
-        if name == "unsorted_stream" {
-            // Emits arrival order by contract; only the split is shared.
-            continue;
-        }
         // Decode all chunks in order and verify global subject sort.
         let subjects: Vec<String> = chunks
             .iter()
@@ -274,7 +267,7 @@ async fn test_sorted_streaming_spilled_indexes_match_in_memory() {
 }
 
 #[cfg(feature = "file-io")]
-async fn run_sorted_streaming_write_test<B: VortexArrayBuilder>() {
+async fn run_sorted_streaming_write_test() {
     let quads: Vec<Quad> = (0..25)
         .rev()
         .map(|i| {
@@ -288,7 +281,7 @@ async fn run_sorted_streaming_write_test<B: VortexArrayBuilder>() {
         .collect();
 
     let mut buffer = Vec::new();
-    quads_stream_to_vortex_writer_with_builder::<B, _, _>(
+    quads_stream_to_vortex_writer(
         quad_stream(quads),
         &mut buffer,
         LayoutStrategy::Default,
@@ -307,13 +300,8 @@ async fn run_sorted_streaming_write_test<B: VortexArrayBuilder>() {
 
 #[cfg(feature = "file-io")]
 #[tokio::test]
-async fn test_sorted_in_memory_streaming_write() {
-    run_sorted_streaming_write_test::<SortedInMemoryBuilder>().await;
-}
-#[cfg(feature = "file-io")]
-#[tokio::test]
-async fn test_sorted_stream_streaming_write() {
-    run_sorted_streaming_write_test::<SortedStreamBuilder>().await;
+async fn test_streaming_write() {
+    run_sorted_streaming_write_test().await;
 }
 
 /// Whether a built array's `s` column carries the IsSorted stamp — the
@@ -352,143 +340,6 @@ async fn test_sorted_builder_stamps_is_sorted() {
     .await
     .unwrap();
     assert_subject_stamp(sorted.array, true, "sorted_in_memory");
-
-    let unsorted =
-        build_array::<UnsortedStreamBuilder>(quad_stream(quads), LayoutStrategy::Default, vec![])
-            .await
-            .unwrap();
-    assert_subject_stamp(unsorted.array, false, "unsorted");
-}
-
-/// The runtime `BuilderStrategy` dispatch — the entry point the bindings
-/// actually call — routes each variant to its builder: both sorted
-/// strategies stamp the subject column IsSorted, the unsorted one must not.
-/// A swapped match arm would pass every compile-time-generic test above and
-/// only surface downstream as silently-unstamped columns.
-#[tokio::test]
-async fn test_builder_strategy_dispatch_stamps_is_sorted() {
-    for (strategy, expect_sorted) in [
-        (BuilderStrategy::UnsortedStream, false),
-        (BuilderStrategy::SortedInMemory, true),
-        (BuilderStrategy::SortedStream, true),
-    ] {
-        let built = strategy
-            .build_vortex_array(
-                Box::new(quad_stream(reverse_order_quads())),
-                LayoutStrategy::Default,
-                vec![],
-            )
-            .await
-            .unwrap();
-        assert_subject_stamp(built.array, expect_sorted, &strategy.to_string());
-    }
-}
-
-/// An unsorted stream of *exactly* chunk_size quads is still a single-chunk,
-/// whole-dataset build: its index lead columns are globally sorted by
-/// construction and must be stamped so the ByCopy index serves the match
-/// instead of declining to the mask scan (the lookahead past a full first
-/// chunk decides this). One quad more spills into a second chunk, whose
-/// chunk-local sorts are not global order — then nothing may be stamped.
-#[tokio::test]
-async fn test_unsorted_exact_chunk_boundary_stamps_index_leads() {
-    use crate::store::array::column_is_sorted;
-
-    let indexes = vec![IndexType::SecondaryByCopy];
-    let make = |n: usize| -> Vec<Quad> {
-        (0..n)
-            .rev()
-            .map(|i| {
-                make_quad(
-                    &format!("http://example.org/s{i:02}"),
-                    &format!("http://example.org/p{}", i % 3),
-                    &format!("object {}", i % 4),
-                    GraphName::DefaultGraph,
-                )
-            })
-            .collect()
-    };
-    let collect_chunks = |built: crate::store::builders::BuiltStream| async {
-        built
-            .chunks
-            .collect::<Vec<_>>()
-            .await
-            .into_iter()
-            .map(|c| c.expect("chunk"))
-            .collect::<Vec<_>>()
-    };
-    let lead_sorted = |chunk: &vortex_array::ArrayRef, name: &str| {
-        let mut ctx = crate::session::VORTEX_SESSION.create_execution_ctx();
-        let sa = chunk.clone().execute::<StructArray>(&mut ctx).unwrap();
-        column_is_sorted(sa.unmasked_field_by_name(name).unwrap())
-    };
-
-    // Exactly one full chunk: both family leads stamped.
-    let quads = make(8);
-    let built = build_chunk_stream(
-        Box::new(quad_stream(quads.clone())),
-        LayoutStrategy::Default,
-        indexes.clone(),
-        8,
-    )
-    .await
-    .unwrap();
-    let chunks = collect_chunks(built).await;
-    assert_eq!(chunks.iter().map(|c| c.len()).collect::<Vec<_>>(), [8]);
-    assert!(
-        lead_sorted(&chunks[0], "_idx_posg_p"),
-        "posg lead unstamped"
-    );
-    assert!(
-        lead_sorted(&chunks[0], "_idx_ospg_o"),
-        "ospg lead unstamped"
-    );
-
-    // And the stamped index routes correctly: identical results to a
-    // no-index (mask scan) store over the same data. The assembled chunks are
-    // a builder's welded row space, so adopt them as one dict-less BuiltArray.
-    let store = VortexRdfStore::from_built(crate::store::builders::BuiltArray {
-        array: crate::store::builders::assemble_chunks(chunks, LayoutStrategy::Default, &indexes)
-            .unwrap(),
-        components: Vec::new(),
-        dict: None,
-    })
-    .unwrap();
-    let baseline = VortexRdfStore::from_built(
-        build_array::<UnsortedStreamBuilder>(quad_stream(quads), LayoutStrategy::Default, vec![])
-            .await
-            .unwrap(),
-    )
-    .unwrap();
-    let p1 = NamedNode::new("http://example.org/p1").unwrap();
-    let o1 = Term::Literal(Literal::new_simple_literal("object 1"));
-    for (p, o) in [(Some(&p1), None), (None, Some(&o1)), (Some(&p1), Some(&o1))] {
-        let via_index = store.match_pattern(None, p, o, None).await.unwrap();
-        let via_scan = baseline.match_pattern(None, p, o, None).await.unwrap();
-        let mut got = quad_strings(&via_index.quads_vec().await.unwrap());
-        let mut want = quad_strings(&via_scan.quads_vec().await.unwrap());
-        got.sort();
-        want.sort();
-        assert!(!want.is_empty(), "degenerate pattern");
-        assert_eq!(got, want, "index-served match diverged for {p:?}/{o:?}");
-    }
-
-    // One quad past the boundary: two chunks, chunk-local sorts only —
-    // no lead may claim sortedness.
-    let built = build_chunk_stream(
-        Box::new(quad_stream(make(9))),
-        LayoutStrategy::Default,
-        indexes,
-        8,
-    )
-    .await
-    .unwrap();
-    let chunks = collect_chunks(built).await;
-    assert_eq!(chunks.iter().map(|c| c.len()).collect::<Vec<_>>(), [8, 1]);
-    for chunk in &chunks {
-        assert!(!lead_sorted(chunk, "_idx_posg_p"), "multi-chunk stamped");
-        assert!(!lead_sorted(chunk, "_idx_ospg_o"), "multi-chunk stamped");
-    }
 }
 
 /// `quads_vec` (the exact-size materialization) must yield the same quads,
@@ -498,12 +349,7 @@ async fn test_unsorted_exact_chunk_boundary_stamps_index_leads() {
 #[tokio::test]
 async fn test_quads_vec_matches_stream_collection() {
     let quads = dictionary_test_quads();
-    let (_dir, path) = write_store_file::<SortedInMemoryBuilder>(
-        quads.clone(),
-        LayoutStrategy::Dictionary,
-        vec![],
-    )
-    .await;
+    let (_dir, path) = write_store_file(quads.clone(), LayoutStrategy::Dictionary, vec![]).await;
     let store = VortexRdfStore::from_file(&path).await.unwrap();
 
     let p0 = NamedNode::new("http://example.org/p0").unwrap();

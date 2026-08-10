@@ -13,11 +13,4 @@ pub(crate) mod native_file;
 pub(crate) mod ser;
 
 #[cfg(feature = "file-io")]
-pub use ser::{
-    quads_stream_to_vortex_file_with_builder, quads_stream_to_vortex_writer_with_builder,
-};
-
-/// The value-level [`BuilderStrategy`](crate::store::BuilderStrategy) twins of
-/// the `*_with_builder` entry points above.
-#[cfg(feature = "file-io")]
-pub use ser::{quads_stream_to_vortex_file, quads_stream_to_vortex_writer_with_strategy};
+pub use ser::{quads_stream_to_vortex_file, quads_stream_to_vortex_writer};

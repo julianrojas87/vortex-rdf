@@ -20,9 +20,7 @@ async fn matched_strings(
 /// pattern family identically to the resident open of the same file.
 async fn assert_file_backed_matches_resident(indexes: Indexes, tag: &str) {
     let quads = dictionary_test_quads();
-    let (_dir, path) =
-        write_store_file::<SortedStreamBuilder>(quads.clone(), LayoutStrategy::Dictionary, indexes)
-            .await;
+    let (_dir, path) = write_store_file(quads.clone(), LayoutStrategy::Dictionary, indexes).await;
 
     let resident = VortexRdfStore::from_file(&path).await.unwrap();
     let fb = VortexRdfStore::from_file_with_dict_residency(&path, 0)
@@ -115,7 +113,7 @@ async fn test_file_backed_dictionary_serves_from_copy_index() {
 
     // And explicitly confirm the serving plan engages on the file-backed
     // store (the equality above would hold even off the fallback path).
-    let (_dir, path) = write_store_file::<SortedStreamBuilder>(
+    let (_dir, path) = write_store_file(
         dictionary_test_quads(),
         LayoutStrategy::Dictionary,
         vec![IndexType::SecondaryByCopy],
@@ -140,8 +138,7 @@ async fn test_file_backed_dictionary_serves_from_copy_index() {
 #[tokio::test]
 async fn test_file_backed_dictionary_threshold_boundary() {
     let quads = dictionary_test_quads();
-    let (_dir, path) =
-        write_store_file::<SortedInMemoryBuilder>(quads, LayoutStrategy::Dictionary, vec![]).await;
+    let (_dir, path) = write_store_file(quads, LayoutStrategy::Dictionary, vec![]).await;
 
     let file = NativeStoreFile::try_new(
         crate::io::native_file::open_vortex_file(&path)
@@ -171,12 +168,7 @@ async fn test_file_backed_dictionary_threshold_boundary() {
 #[tokio::test]
 async fn test_file_backed_dictionary_serializes_and_mutates() {
     let quads = dictionary_test_quads();
-    let (_dir, path) = write_store_file::<SortedInMemoryBuilder>(
-        quads.clone(),
-        LayoutStrategy::Dictionary,
-        vec![],
-    )
-    .await;
+    let (_dir, path) = write_store_file(quads.clone(), LayoutStrategy::Dictionary, vec![]).await;
     let fb = VortexRdfStore::from_file_with_dict_residency(&path, 0)
         .await
         .unwrap();
@@ -223,7 +215,7 @@ async fn test_file_backed_dictionary_serializes_and_mutates() {
 #[tokio::test]
 async fn test_tombstoned_indexed_codes_address_cached_dictionary() {
     let quads = dictionary_test_quads();
-    let (_dir, path) = write_store_file::<SortedInMemoryBuilder>(
+    let (_dir, path) = write_store_file(
         quads.clone(),
         LayoutStrategy::Dictionary,
         vec![IndexType::SecondaryByCopy],
@@ -287,7 +279,7 @@ async fn test_file_backed_dictionary_probe_parity() {
             })
             .collect();
         let mut bytes: Vec<u8> = Vec::new();
-        quads_stream_to_vortex_writer_with_builder::<SortedStreamBuilder, _, _>(
+        quads_stream_to_vortex_writer(
             quad_stream(quads),
             &mut bytes,
             LayoutStrategy::Dictionary,
@@ -380,8 +372,7 @@ async fn test_file_backed_dictionary_rejects_below_first_term() {
         })
         .collect();
 
-    let (_dir, path) =
-        write_store_file::<SortedInMemoryBuilder>(quads, LayoutStrategy::Dictionary, vec![]).await;
+    let (_dir, path) = write_store_file(quads, LayoutStrategy::Dictionary, vec![]).await;
 
     let resident = VortexRdfStore::from_file_with_dict_residency(&path, u64::MAX)
         .await

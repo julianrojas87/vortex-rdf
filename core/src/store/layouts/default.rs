@@ -8,10 +8,7 @@ use std::sync::Arc;
 use oxrdf::Quad;
 use vortex_array::arrays::VarBinViewArray;
 use vortex_array::arrays::struct_::{StructArray, StructArrayExt};
-use vortex_array::builders::VarBinViewBuilder;
-use vortex_array::dtype::{DType, Nullability};
-use vortex_array::validity::Validity;
-use vortex_array::{ArrayRef, IntoArray, VortexSessionExecute};
+use vortex_array::{ArrayRef, VortexSessionExecute};
 
 use crate::common::terms::{get_as_term, parse_graph_name, parse_named_node, parse_subject};
 use crate::error::{Result, VortexRdfError};
@@ -89,64 +86,4 @@ fn decode_spog(s: &str, p: &str, o: &str, g: &str) -> Result<Quad> {
         .ok_or_else(|| VortexRdfError::Deserialization(format!("Invalid object: {}", o)))?;
     let graph_name = parse_graph_name(g)?;
     Ok(Quad::new(subject, predicate, object, graph_name))
-}
-
-/// Column builders for the Default layout, filled directly from quads.
-///
-/// The quad's terms are already in the N-Triples form the columns store, so
-/// they are appended straight into the column builders: steady-state ingestion
-/// performs no per-quad heap allocations and no formatting at all.
-pub(crate) struct DirectChunkBuilder {
-    s: VarBinViewBuilder,
-    p: VarBinViewBuilder,
-    o: VarBinViewBuilder,
-    g: VarBinViewBuilder,
-    len: usize,
-}
-
-impl DirectChunkBuilder {
-    pub(crate) fn new(capacity: usize) -> Self {
-        let col =
-            || VarBinViewBuilder::with_capacity(DType::Utf8(Nullability::NonNullable), capacity);
-        Self {
-            s: col(),
-            p: col(),
-            o: col(),
-            g: col(),
-            len: 0,
-        }
-    }
-
-    pub(crate) fn len(&self) -> usize {
-        self.len
-    }
-
-    pub(crate) fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-
-    pub(crate) fn push(&mut self, q: &RawQuad) {
-        self.s.append_value(&q.s);
-        self.p.append_value(&q.p);
-        self.o.append_value(&q.o);
-        // The default graph is already the empty string in `RawQuad`.
-        self.g.append_value(&q.g);
-        self.len += 1;
-    }
-
-    pub(crate) fn finish(mut self) -> Result<ArrayRef> {
-        StructArray::try_new(
-            field_names().into(),
-            vec![
-                self.s.finish_into_varbinview().into_array(),
-                self.p.finish_into_varbinview().into_array(),
-                self.o.finish_into_varbinview().into_array(),
-                self.g.finish_into_varbinview().into_array(),
-            ],
-            self.len,
-            Validity::NonNullable,
-        )
-        .map_err(VortexRdfError::Vortex)
-        .map(|a| a.into_array())
-    }
 }

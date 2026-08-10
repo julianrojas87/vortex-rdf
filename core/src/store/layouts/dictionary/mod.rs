@@ -51,7 +51,11 @@ pub(crate) mod term_dict;
 #[cfg(feature = "file-io")]
 pub(crate) use self::file_backed::{FileBackedDict, TermChunks};
 pub use self::ingest::DictionaryQuadSink;
-pub(crate) use self::ingest::{TermDictionaryBuilder, TermIdMap, ingest_interning};
+pub(crate) use self::ingest::{TermIdMap, ingest_interning};
+// Only the (wasm-gated) external-sort builder collects terms ahead of the
+// encoding pass.
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+pub(crate) use self::ingest::TermDictionaryBuilder;
 use self::term_dict::DictReader;
 pub use self::term_dict::DictSnapshot;
 #[cfg(any(feature = "file-io", target_arch = "wasm32"))]
@@ -212,22 +216,18 @@ where
 /// codes — the in-memory builders' construction path, fed by the interning
 /// ingest ([`InterningQuadBuilder`]) so no owned quad strings are involved.
 ///
-/// `s_sorted` follows the builder: the sorted builder passes codes in global
-/// (s, p, o, g) order, the unsorted builder in arrival order. Index columns
-/// are globally sorted either way (`GlobalIndexes::from_codes` sorts pairs).
+/// The codes arrive in global (s, p, o, g) order, so the `s` column is
+/// stamped sorted; index columns are globally sorted too
+/// (`GlobalIndexes::from_codes` sorts pairs).
 ///
 /// [`InterningQuadBuilder`]: self::ingest::InterningQuadBuilder
-pub(crate) fn build_array(
-    codes: &QuadCodes,
-    indexes: &[IndexType],
-    s_sorted: bool,
-) -> Result<ArrayRef> {
+pub(crate) fn build_array(codes: &QuadCodes, indexes: &[IndexType]) -> Result<ArrayRef> {
     if codes.s.is_empty() {
         return empty_struct(indexes);
     }
     let n = codes.s.len();
     let global_idx = GlobalIndexes::from_codes(indexes, codes);
-    build_chunk_global(codes, 0..n, &global_idx, s_sorted)
+    build_chunk_global(codes, 0..n, &global_idx, true)
 }
 
 /// Build a Dictionary-layout chunk for rows `range` of a fully encoded

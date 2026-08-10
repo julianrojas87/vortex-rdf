@@ -1,21 +1,6 @@
 import { Quad, Term, Stream } from '@rdfjs/types';
 
 /**
- * How quads are ordered while the columnar array is built.
- * - 'unsorted-stream': natural insertion order. Cheapest to build, but every
- *   `match` falls back to a full column scan.
- * - 'sorted-in-memory': global in-memory sort by subject -> predicate ->
- *   object -> graph. Costs a sort at build time, but unlocks binary-search
- *   lookups on subject.
- *
- * These kebab-case names are the canonical vocabulary shared by every
- * vortex-rdf frontend. The core's out-of-core 'sorted-stream' builder is not
- * available here: it spills sorted runs to disk, which WebAssembly has no
- * access to.
- */
-export type BuilderStrategy = 'unsorted-stream' | 'sorted-in-memory';
-
-/**
  * How quad terms are encoded into columns.
  * - 'default': all four terms as N-Triples strings natively optimised by Vortex.
  * - 'typed-object': the object is split into kind/value/datatype/language columns.
@@ -37,7 +22,6 @@ export type LayoutStrategy = 'default' | 'typed-object' | 'dictionary';
  * one sorted by (p, o, s, g), one by (o, s, p, g) — so predicate- and
  * object-bound patterns (including predicate+object prefix lookups) get the
  * same sorted access path subjects have, at ~2x the storage.
- * Both are only effective with a sorted builder.
  */
 export type IndexType = 'secondary-by-reference' | 'secondary-by-copy';
 
@@ -51,25 +35,26 @@ export type RdfFormatName =
     | 'rdf' | 'rdfxml' | 'xml'
     | 'jsonld';
 
-/** Build-time configuration. Any omitted field keeps its default. */
+/**
+ * Build-time configuration. Any omitted field keeps its default.
+ *
+ * Quads are always sorted by subject -> predicate -> object -> graph as the
+ * columnar array is built, which is what gives `match` its binary-search
+ * lookups.
+ */
 export interface BuildOptions {
-    /** @default 'unsorted-stream' */
-    builder?: BuilderStrategy;
     /** @default 'dictionary' */
     layout?: LayoutStrategy;
     /** @default [] */
     indexes?: IndexType[];
 }
 
-/** A bare builder-strategy string is accepted as shorthand for `{ builder }`. */
-export type BuildOptionsInput = BuildOptions | BuilderStrategy;
-
 export class VortexRdfStore {
     static empty(): VortexRdfStore;
     static fromBytes(bytes: Uint8Array): Promise<VortexRdfStore>;
-    static fromString(input: string, format: RdfFormatName, options?: BuildOptionsInput): Promise<VortexRdfStore>;
+    static fromString(input: string, format: RdfFormatName, options?: BuildOptions): Promise<VortexRdfStore>;
     /** `quads` may be an array, or an RDF/JS `Stream<Quad>` (a Node-style event emitter). */
-    static fromQuads(quads: Quad[] | Stream<Quad>, options?: BuildOptionsInput): Promise<VortexRdfStore>;
+    static fromQuads(quads: Quad[] | Stream<Quad>, options?: BuildOptions): Promise<VortexRdfStore>;
 
     /** The layout this store's columns are encoded with (canonical kebab-case name). */
     layout(): LayoutStrategy;
@@ -139,5 +124,5 @@ export class TermDict {
     free(): void;
 }
 
-export function rdf_to_vortex(input: string, format: RdfFormatName, options?: BuildOptionsInput): Promise<Uint8Array>;
+export function rdf_to_vortex(input: string, format: RdfFormatName, options?: BuildOptions): Promise<Uint8Array>;
 export function vortex_to_rdf(vortex_bytes: Uint8Array, format: RdfFormatName): Promise<string>;

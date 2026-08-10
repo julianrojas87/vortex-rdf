@@ -4,7 +4,7 @@ use oxrdfio::RdfFormat;
 use std::path::PathBuf;
 
 use vortex_rdf_core::common::formats::{format_from_name, supported_format_names};
-use vortex_rdf_core::{BuilderStrategy, IndexType, LayoutStrategy};
+use vortex_rdf_core::{IndexType, LayoutStrategy};
 
 mod commands;
 
@@ -51,10 +51,6 @@ struct SerializeArgs {
     /// file extension if not provided)
     #[arg(short, long, value_parser = parse_format)]
     format: Option<RdfFormat>,
-
-    /// Builder strategy to use when serializing (defaults to unsorted-stream)
-    #[arg(short, long, value_enum, default_value = "unsorted-stream")]
-    builder_strategy: BuilderStrategy,
 }
 
 #[derive(Args)]
