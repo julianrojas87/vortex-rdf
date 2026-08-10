@@ -35,6 +35,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Point-read the file-backed dictionary through cached wire chunks (core) ([`1b3da12`](https://github.com/vortex-rdf/vortex-rdf/commit/1b3da1288f9b9c81d1c1692a669212360854cb53) by @julianrojas87)
 - Resolve through shared lazy wrappers (encoded-search) ([`562a2be`](https://github.com/vortex-rdf/vortex-rdf/commit/562a2be8a37fbdbbb26b519152e13282d7c41b8a) by julianrojas87)
 - Compress built stores into probe-supported resident form (core) ([`c3eb922`](https://github.com/vortex-rdf/vortex-rdf/commit/c3eb92200e89f8be6be3d2b48c4af1c1f95b877e) by julianrojas87)
+- Measure the dictionary regimes the residency axis now turns on (bench) ([`876b4d5`](https://github.com/vortex-rdf/vortex-rdf/commit/876b4d5f878e5ff6ab97ca70c71c1664f285a164) by julianrojas87)
 
 ### Changed
 
@@ -46,6 +47,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Point-read small gathers through encoded probes (core) ([`8b2afda`](https://github.com/vortex-rdf/vortex-rdf/commit/8b2afda4abbc0be479a91cd78f3e07cb378076be) by @julianrojas87)
 - Memoize chunk extremes in chunked probes (encoded-search) ([`aeb022a`](https://github.com/vortex-rdf/vortex-rdf/commit/aeb022a855ae723b76da21358c205b02b28351f0) by @julianrojas87)
 - Locate and point-read index-served runs through cached probes (core) ([`ff1c724`](https://github.com/vortex-rdf/vortex-rdf/commit/ff1c7244604b285e6ceefb881fc9dc6c53c793ba) by @julianrojas87)
+- Freeze live objects out of the python timing loop (bench) ([`6307d4e`](https://github.com/vortex-rdf/vortex-rdf/commit/6307d4e6ad3d581e0726d7d422f4800257cd97c5) by julianrojas87)
+- Drop the file-backed dictionary's fence fallback (core) ([`cff8998`](https://github.com/vortex-rdf/vortex-rdf/commit/cff899866b94f6b888d6a929f6e05de4ee18957e) by julianrojas87)
 
 ### Removed
 
