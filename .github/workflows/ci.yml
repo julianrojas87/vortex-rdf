@@ -86,9 +86,15 @@ jobs:
       - name: Build bindings and install environment
         working-directory: python
         run: uv sync --locked
+      # `bench/test_codspeed.py` runs here too, without `--codspeed`: the plugin
+      # then calls each task once instead of instrumenting it, which is a ~1s
+      # smoke test of every benchmark against the current bindings. The
+      # CodSpeed workflow is otherwise the only thing that ever imports it, so
+      # a signature change lands as a red benchmark job on the PR that renames
+      # nothing rather than as a test failure on the PR that did.
       - name: Run tests
         working-directory: python
-        run: uv run pytest tests -q
+        run: uv run pytest tests bench/test_codspeed.py -q
 
   js-tests:
     name: JS Tests

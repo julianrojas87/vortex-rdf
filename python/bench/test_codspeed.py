@@ -2,8 +2,8 @@
 
 The Python counterpart of `js/bench/codspeed.bench.ts`, which is itself the
 counterpart of the Rust suite (`core/benches/benchmark.rs`): the same "star"
-(one-factor-at-a-time) design over builder x layout x secondary index, swept
-across the query routing patterns, plus the build and read-back paths. Task
+(one-factor-at-a-time) design over layout x secondary index, swept across the
+query routing patterns, plus the build and read-back paths. Task
 names and dataset shapes match the JavaScript suite wherever the binding
 surfaces line up, so the two are read side by side on CodSpeed.
 
@@ -84,15 +84,11 @@ QUAD_PATTERNS = [
 #: Build (write) path, one factor at a time around a Dictionary baseline.
 #: Same set and same slugs as the JS suite's BUILD_VARIANTS.
 BUILD_VARIANTS = {
-    "dict": dict(builder="sorted-in-memory", layout="dictionary"),
-    "default": dict(builder="sorted-in-memory", layout="default"),
-    "typedobject": dict(builder="sorted-in-memory", layout="typed-object"),
-    "dict_byref": dict(
-        builder="sorted-in-memory", layout="dictionary", indexes=["secondary-by-reference"]
-    ),
-    "dict_bycopy": dict(
-        builder="sorted-in-memory", layout="dictionary", indexes=["secondary-by-copy"]
-    ),
+    "dict": dict(layout="dictionary"),
+    "default": dict(layout="default"),
+    "typedobject": dict(layout="typed-object"),
+    "dict_byref": dict(layout="dictionary", indexes=["secondary-by-reference"]),
+    "dict_bycopy": dict(layout="dictionary", indexes=["secondary-by-copy"]),
 }
 
 #: Query (read) path: the two representative configs the JS suite uses — the
@@ -285,7 +281,7 @@ def scattered_store(tmp_path_factory) -> VortexRdfStore:
         encoding="utf-8",
     )
     out = root / "typed.vortex"
-    serialize_rdf(str(source), str(out), layout="dictionary", builder="sorted-in-memory")
+    serialize_rdf(str(source), str(out), layout="dictionary")
     return VortexRdfStore(str(out))
 
 

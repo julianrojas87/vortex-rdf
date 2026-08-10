@@ -1,8 +1,8 @@
 // CodSpeed benchmark for the JS/WASM bindings — library-only (no rdf-stores /
 // oxigraph comparison). This is the JavaScript counterpart of the Rust suite
 // (core/benches/benchmark.rs): same "star" (one-factor-at-a-time) design over
-// the store's real axes — builder × layout × secondary index — swept across the
-// query routing patterns, plus the build, read-back and mutation paths.
+// the store's real axes — layout × secondary index — swept across the query
+// routing patterns, plus the build, read-back and mutation paths.
 //
 // Unlike js/bench/compare.bench.ts (wall-clock, comparative, feeds the Pages
 // dashboard, NEVER uploaded), THIS file IS uploaded to CodSpeed: it runs under

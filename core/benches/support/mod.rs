@@ -356,10 +356,10 @@ pub fn generate_literal_rdf_data_stream(size: usize) -> impl Stream<Item = Resul
     }))
 }
 
-/// The literal-bearing store for `decode_all_literals`: SortedStream builder,
-/// Dictionary layout, no index — the config whose full decode term-decodes
-/// every row. Cached and handed out like the star stores: only the ingest
-/// product is cached, and each call rebuilds a fresh store from it (see
+/// The literal-bearing store for `decode_all_literals`: Dictionary layout, no
+/// index — the config whose full decode term-decodes every row. Cached and
+/// handed out like the star stores: only the ingest product is cached, and
+/// each call rebuilds a fresh store from it (see
 /// [`cached_store`] for why shared clones are a contamination hazard).
 pub fn cached_literal_store(size: usize) -> VortexRdfStore {
     static CACHE: OnceLock<Mutex<HashMap<usize, BuiltArray>>> = OnceLock::new();

@@ -2,10 +2,10 @@
 //!
 //! # Design: a star write path, a deliberately factorial match matrix
 //!
-//! The library exposes four independent axes — builder strategy, layout,
-//! secondary index, and source (file vs in-memory) — plus a query pattern with
-//! 15 shapes. Their full cross product is ~2,400 match instances; the suite
-//! spends its upload budget differently per group:
+//! The library exposes three independent axes — layout, secondary index, and
+//! source (file vs in-memory) — plus a query pattern with 15 shapes. Their
+//! full cross product is ~360 match instances; the suite spends its upload
+//! budget differently per group:
 //!
 //! * **Serialize (Group 1)** is a star (one-factor-at-a-time) sweep: most
 //!   write-path cross-products measure the same code, so we fix a baseline and
@@ -19,9 +19,7 @@
 //!   column, and a bound graph never routes through an index at all — but
 //!   index-decline routing is exactly where regressions have hidden, and the
 //!   cell names are long-lived CodSpeed baselines, so the matrix is kept
-//!   whole. The one collapse it does make: `SortedInMemory` is omitted
-//!   because it is query-indistinguishable from `SortedStream` (both emit
-//!   identically stamped columns; the store reads only the `IsSorted` stat).
+//!   whole.
 //! * **Decode/load (Group 3) and dictionary residency (Group 4)** sweep only
 //!   the axis each path actually branches on.
 //!
@@ -410,8 +408,7 @@ const DICT_CONFIGS: &[DictResidency] = &[DictResidency::Resident, DictResidency:
 
 static DICT_FILE_CACHE: OnceLock<Mutex<HashMap<usize, PathBuf>>> = OnceLock::new();
 
-/// A Dictionary-layout file (sorted-stream builder, no indexes), built once
-/// per size.
+/// A Dictionary-layout file (no indexes), built once per size.
 fn cached_dict_file(size: usize) -> PathBuf {
     let cache = DICT_FILE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     if let Some(path) = cache.lock().unwrap().get(&size) {
