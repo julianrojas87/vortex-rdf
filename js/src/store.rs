@@ -353,13 +353,12 @@ impl VortexRdfStore {
         let p = js_to_named_node(predicate);
         let o = js_to_term(object);
         let g = js_to_graph(graph);
-        let matched = resolve_now(self.inner.match_pattern(
-            s.as_ref(),
-            p.as_ref(),
-            o.as_ref(),
-            g.as_ref(),
-        ))?
-        .map_err(js_err)?;
+        let matched =
+            resolve_now(
+                self.inner
+                    .match_pattern(s.as_ref(), p.as_ref(), o.as_ref(), g.as_ref()),
+            )?
+            .map_err(js_err)?;
 
         let result = Object::new();
         let Some(n) = resolve_now(set_code_columns(&result, &matched))?? else {

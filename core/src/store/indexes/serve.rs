@@ -306,12 +306,8 @@ impl InMemoryServePlan {
         for name in self.decode.primary_columns {
             let probe = self.probes.by_name(&self.array, name)?;
             columns.push(match &live {
-                None => Buffer::from_iter(
-                    self.range.clone().map(|pos| probe.value_at(pos) as u32),
-                ),
-                Some(live) => {
-                    Buffer::from_iter(live.iter().map(|&pos| probe.value_at(pos) as u32))
-                }
+                None => Buffer::from_iter(self.range.clone().map(|pos| probe.value_at(pos) as u32)),
+                Some(live) => Buffer::from_iter(live.iter().map(|&pos| probe.value_at(pos) as u32)),
             });
         }
         let mut columns = columns.into_iter();
