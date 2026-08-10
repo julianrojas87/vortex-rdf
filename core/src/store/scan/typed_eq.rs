@@ -9,7 +9,7 @@
 
 use vortex_array::ArrayRef;
 use vortex_array::arrays::struct_::StructArrayExt;
-use vortex_array::arrays::{Primitive, PrimitiveArray, StructArray, VarBinView, VarBinViewArray};
+use vortex_array::arrays::{PrimitiveArray, StructArray, VarBinView, VarBinViewArray};
 use vortex_array::scalar::Scalar;
 
 use crate::store::selection::RowSelection;
@@ -42,7 +42,8 @@ impl Needle {
 /// One equality constraint bound to a concrete typed column view, for the
 /// typed residual-filter fast paths. Three column shapes qualify: canonical
 /// non-nullable u32 primitives (the Dictionary layout's code columns,
-/// compared as slice loads), non-nullable unsigned-integer columns whose
+/// reached directly or through a payload wrapper's canonical cache, compared
+/// as slice loads), non-nullable unsigned-integer columns whose
 /// encoding resolves an encoded search probe (wire-encoded adoptions and
 /// non-u32 widths like TypedObject's kind column, compared through per-row
 /// point reads), and canonical non-nullable Utf8 `VarBinView`s (the Default /
@@ -84,11 +85,14 @@ impl StrEq<'_> {
 
 impl<'a> TypedEq<'a> {
     /// Bind one constraint to its column, or decline. A canonical u32 column
-    /// binds by slice; any other non-nullable unsigned-integer column binds
-    /// through an encoded search probe when its encoding resolves — never by
-    /// decoding, which would cost O(column) on every match call. The mask
+    /// binds by slice, as does a payload-wrapped one whose canonical form is
+    /// already materialized; `canonicalize` additionally materializes one that
+    /// is not, which costs a pass over the whole column and is the caller's
+    /// call to make. Any other non-nullable unsigned-integer column binds
+    /// through an encoded search probe when its encoding resolves. The mask
     /// scan covers what declines, at selection cost.
-    fn bind_col(col: &'a ArrayRef, needle: &'a Needle) -> Option<TypedEq<'a>> {
+    fn bind_col(col: &'a ArrayRef, needle: &'a Needle, canonicalize: bool) -> Option<TypedEq<'a>> {
+        use crate::store::array::{cached_u32_primitive, shared_u32_primitive};
         use vortex_array::dtype::DType;
         if col.dtype().is_nullable() {
             return None;
@@ -98,9 +102,11 @@ impl<'a> TypedEq<'a> {
                 if !col.dtype().is_unsigned_int() {
                     return None;
                 }
-                if let Ok(prim) = col.clone().try_downcast::<Primitive>()
-                    && prim.ptype() == vortex_array::dtype::PType::U32
-                {
+                let canonical = match canonicalize {
+                    true => shared_u32_primitive(col),
+                    false => cached_u32_primitive(col),
+                };
+                if let Some(prim) = canonical {
                     return Some(TypedEq::Code(prim, *code));
                 }
                 let probe = vortex_encoded_search::SortedProbe::resolve(col)?;
@@ -124,11 +130,12 @@ impl<'a> TypedEq<'a> {
         struct_arr: &'a StructArray,
         eqs: &[(&'static str, Scalar)],
         needles: &'a [Needle],
+        canonicalize: bool,
     ) -> Option<Vec<TypedEq<'a>>> {
         let mut cols = Vec::with_capacity(eqs.len());
         for ((field, _), needle) in eqs.iter().zip(needles) {
             let col = struct_arr.unmasked_field_by_name(field).ok()?;
-            cols.push(TypedEq::bind_col(col, needle)?);
+            cols.push(TypedEq::bind_col(col, needle, canonicalize)?);
         }
         Some(cols)
     }
@@ -207,15 +214,27 @@ pub(crate) fn typed_residual_ids(
     //
     // So the rule is about selection size, not column count: keep the mask
     // scan while there are enough rows for SIMD to pay for the setup, take
-    // the typed loop below that. A probe-bound (encoded) column pays a
-    // per-row point read tens of times a slice load, so its short-circuit
-    // never outruns the vectorized compare on wide selections — the same
-    // size gate applies to it regardless of constraint count. Binding is
-    // downcasts only, so it is safe to bind before gating.
+    // the typed loop below that.
     let needles = Needle::extract(eqs)?;
-    let cols = TypedEq::bind(struct_arr, eqs, &needles)?;
-    let any_probe = cols.iter().any(|c| matches!(c, TypedEq::CodeProbe(..)));
-    if (eqs.len() < 2 || any_probe) && selection.len(base_len) > TYPED_SINGLE_EQ_MAX_ROWS {
+    let selected = selection.len(base_len);
+    let wide = selected > TYPED_SINGLE_EQ_MAX_ROWS;
+    if eqs.len() < 2 && wide {
+        return None;
+    }
+    // Reading a compressed column row-at-a-time costs a point read where a
+    // canonical one costs a load, and materializing the payload wrapper's
+    // canonical form costs one pass over the whole column. Take that pass
+    // when this scan alone already reads as many values as the pass decodes:
+    // it repays within the call, and the wrapper's cache — shared by every
+    // view and clone of the base — makes every later scan a slice loop. A
+    // narrow selection stays on point reads, so a store queried only through
+    // its fast paths never materializes a second copy of its columns.
+    let canonicalize = selected.saturating_mul(eqs.len()) >= base_len;
+    let cols = TypedEq::bind(struct_arr, eqs, &needles, canonicalize)?;
+    // What still binds through a probe is an encoding with no canonical form
+    // to reach for — a wire-encoded adoption. Its per-row point read never
+    // outruns the vectorized compare over a wide selection.
+    if cols.iter().any(|c| matches!(c, TypedEq::CodeProbe(..))) && wide {
         return None;
     }
     fn collect_ids(
@@ -269,7 +288,9 @@ pub(crate) fn typed_positions(
         offset: usize,
         out: &mut Vec<usize>,
     ) -> Option<()> {
-        let cols = TypedEq::bind(sa, eqs, needles)?;
+        // Every row of the chunk is tested, so a compressed column is always
+        // worth reading through its canonical form.
+        let cols = TypedEq::bind(sa, eqs, needles, true)?;
         if let Some(codes) = TypedEq::code_views(&cols) {
             out.extend(
                 (0..sa.len())
@@ -306,6 +327,7 @@ pub(crate) fn typed_positions(
 mod tests {
     use super::*;
     use crate::store::selection::RowSelection;
+    use vortex_array::arrays::{Primitive, SharedArray};
     use vortex_array::validity::Validity;
     use vortex_array::{IntoArray, VortexSessionExecute};
     use vortex_buffer::Buffer;
@@ -331,6 +353,21 @@ mod tests {
         StructArray::try_new(
             ["p", "o"].into(),
             vec![p, o],
+            n as usize,
+            Validity::NonNullable,
+        )
+        .unwrap()
+    }
+
+    /// The same struct with its encoded column payload-wrapped — the resident
+    /// form a built store's base carries.
+    fn wrapped_struct(n: u32) -> StructArray {
+        let plain = mixed_struct(n);
+        let p = plain.unmasked_field_by_name("p").unwrap().clone();
+        let o = plain.unmasked_field_by_name("o").unwrap().clone();
+        StructArray::try_new(
+            ["p", "o"].into(),
+            vec![p, SharedArray::new(o).into_array()],
             n as usize,
             Validity::NonNullable,
         )
@@ -366,6 +403,41 @@ mod tests {
         let ids = typed_residual_ids(&sa, &narrow, n as usize, &eqs).unwrap();
         let want: Vec<u64> = (10..90u64).filter(|i| i % 7 == 3 && i % 11 == 10).collect();
         assert_eq!(ids.as_slice(), &want[..]);
+    }
+
+    /// A wide scan over a payload-wrapped column materializes the wrapper's
+    /// canonical form, binds it as a slice, and is served rather than
+    /// declined to the mask pipeline.
+    #[test]
+    fn wrapped_column_materializes_for_wide_scan() {
+        let n = (TYPED_SINGLE_EQ_MAX_ROWS as u32) * 2;
+        let sa = wrapped_struct(n);
+        let o = sa.unmasked_field_by_name("o").unwrap().clone();
+        assert!(crate::store::array::cached_u32_primitive(&o).is_none());
+
+        let eqs = eqs(&[("p", 3), ("o", 10)]);
+        let ids = typed_residual_ids(&sa, &RowSelection::All, n as usize, &eqs).unwrap();
+        let want: Vec<u64> = (0..n as u64)
+            .filter(|i| i % 7 == 3 && i % 11 == 10)
+            .collect();
+        assert_eq!(ids.as_slice(), &want[..]);
+        assert!(crate::store::array::cached_u32_primitive(&o).is_some());
+    }
+
+    /// A scan reading far fewer values than materializing would decode stays
+    /// on point reads, leaving the wrapper holding only its compressed form.
+    #[test]
+    fn wrapped_column_stays_compressed_for_narrow_scan() {
+        let n = (TYPED_SINGLE_EQ_MAX_ROWS as u32) * 2;
+        let sa = wrapped_struct(n);
+        let o = sa.unmasked_field_by_name("o").unwrap().clone();
+
+        let eqs = eqs(&[("p", 3), ("o", 10)]);
+        let narrow = RowSelection::Range(10..90);
+        let ids = typed_residual_ids(&sa, &narrow, n as usize, &eqs).unwrap();
+        let want: Vec<u64> = (10..90u64).filter(|i| i % 7 == 3 && i % 11 == 10).collect();
+        assert_eq!(ids.as_slice(), &want[..]);
+        assert!(crate::store::array::cached_u32_primitive(&o).is_none());
     }
 
     /// A canonical non-u32 unsigned column (TypedObject's kind byte) now

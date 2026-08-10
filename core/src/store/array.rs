@@ -275,6 +275,9 @@ pub(crate) fn with_compressed_int_children(rows: ArrayRef, payload_lazy: bool) -
 /// cache, every later call is a refcount bump shared by all views over the
 /// base. `None` for any other encoding (callers fall back to the gather
 /// pipeline).
+///
+/// Decoding into the cache is one pass over the whole column, so callers that
+/// only read a few rows take [`cached_u32_primitive`] instead.
 pub(crate) fn shared_u32_primitive(
     child: &ArrayRef,
 ) -> Option<vortex_array::arrays::PrimitiveArray> {
@@ -282,11 +285,8 @@ pub(crate) fn shared_u32_primitive(
     use vortex_array::arrays::shared::SharedArrayExt as _;
     use vortex_array::arrays::{Primitive, PrimitiveArray, Shared};
 
-    if !child.dtype().is_unsigned_int() || child.dtype().is_nullable() {
-        return None;
-    }
-    if let Ok(prim) = child.clone().try_downcast::<Primitive>() {
-        return (prim.ptype() == vortex_array::dtype::PType::U32).then_some(prim);
+    if let Some(prim) = canonical_u32(child) {
+        return Some(prim);
     }
     let shared = child.as_opt::<Shared>()?;
     let cached = shared
@@ -299,6 +299,37 @@ pub(crate) fn shared_u32_primitive(
         })
         .ok()?;
     let prim = cached.try_downcast::<Primitive>().ok()?;
+    (prim.ptype() == vortex_array::dtype::PType::U32).then_some(prim)
+}
+
+/// The non-decoding half of [`shared_u32_primitive`]: a base child's canonical
+/// non-nullable u32 primitive when one already exists — the column itself, or
+/// a `vortex.shared` wrapper whose one-way cache some earlier read already
+/// filled. `None` when producing one would mean decoding the compressed
+/// source, so a caller reading a handful of rows can prefer per-row point
+/// reads over a whole-column pass.
+pub(crate) fn cached_u32_primitive(
+    child: &ArrayRef,
+) -> Option<vortex_array::arrays::PrimitiveArray> {
+    use vortex_array::arrays::Shared;
+    use vortex_array::arrays::shared::SharedArrayExt as _;
+
+    if let Some(prim) = canonical_u32(child) {
+        return Some(prim);
+    }
+    let shared = child.as_opt::<Shared>()?;
+    canonical_u32(shared.current_array_ref())
+}
+
+/// A non-nullable canonical u32 primitive, or `None` for anything else — the
+/// shape both `*_u32_primitive` accessors hand back.
+fn canonical_u32(arr: &ArrayRef) -> Option<vortex_array::arrays::PrimitiveArray> {
+    use vortex_array::arrays::Primitive;
+
+    if !arr.dtype().is_unsigned_int() || arr.dtype().is_nullable() {
+        return None;
+    }
+    let prim = arr.clone().try_downcast::<Primitive>().ok()?;
     (prim.ptype() == vortex_array::dtype::PType::U32).then_some(prim)
 }
 
