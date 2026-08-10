@@ -454,6 +454,13 @@ enum LazyRowIdSource {
 }
 
 impl LazyRowIds {
+    /// Test-only hook: whether the ids have actually been computed — so a
+    /// test can pin that a read was answered without them.
+    #[cfg(test)]
+    pub(crate) fn debug_materialized(&self) -> bool {
+        self.cell.get().is_some()
+    }
+
     /// Lazy ids over an in-memory component's matched rid run.
     pub(crate) fn from_component_run(rids: ArrayRef) -> Self {
         Self {

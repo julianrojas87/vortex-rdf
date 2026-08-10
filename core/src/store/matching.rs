@@ -689,6 +689,23 @@ impl VortexRdfStore {
         }
     }
 
+    /// Test-only hook: whether a pending selection's row ids have actually
+    /// been computed. `false` for a still-deferred resolution, so a test can
+    /// pin that a read was answered off the serve plan alone. `None` when the
+    /// selection is not pending at all.
+    #[cfg(test)]
+    pub(crate) fn debug_row_ids_materialized(&self) -> Option<bool> {
+        let selection = match &self.quads {
+            QuadsSource::InMemory { selection, .. } => selection,
+            #[cfg(feature = "file-io")]
+            QuadsSource::File { selection, .. } => selection,
+        };
+        match selection {
+            ViewSelection::Exact(_) => None,
+            ViewSelection::Pending(lazy) => Some(lazy.debug_materialized()),
+        }
+    }
+
     /// Test-only hook exposing the zone-map row-range envelope computed for a
     /// bound subject, so tests can assert on it directly instead of only on
     /// final match results.

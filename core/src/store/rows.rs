@@ -201,20 +201,30 @@ impl VortexRdfStore {
             base,
             selection,
             deleted,
+            serve,
             ..
         } = &self.quads
         else {
             return None;
         };
+        // Served fast path: the answering index's own columns already hold
+        // this view's codes as one contiguous run, so reading them there
+        // costs neither the row-id materialization this view deferred at
+        // match time nor a scattered gather over the primaries.
+        if let Some(plan) = serve
+            && let Some(columns) = plan.code_columns(deleted.as_ref())
+        {
+            return Some(columns);
+        }
         let struct_arr = base.clone().try_downcast::<Struct>().ok()?;
         let mut prims: Vec<PrimitiveArray> = Vec::with_capacity(4);
         for name in schema::PRIMARY_COLUMNS {
             let col = struct_arr.unmasked_field_by_name(name).ok()?;
             prims.push(crate::store::array::shared_u32_primitive(col)?);
         }
-        // Codes are gathered by row id — a read the serve plan cannot answer
-        // — so a served match's pending selection materializes here (the
-        // in-memory decode+sort it deferred at match time).
+        // No plan (or a plan that declined): codes are gathered by row id, so
+        // a served match's pending selection materializes here (the in-memory
+        // decode+sort it deferred at match time).
         let selection = selection.materialized_sync().ok()?;
         // Contiguous, tombstone-free selections share the base's buffers
         // zero-copy (a `Buffer` slice is a refcount bump); a tombstone-free id

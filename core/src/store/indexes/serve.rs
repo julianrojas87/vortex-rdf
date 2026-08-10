@@ -40,6 +40,7 @@ use vortex_array::expr::{Expression, and, eq, get_item, lit, root};
 use vortex_array::scalar::Scalar;
 use vortex_array::validity::Validity;
 use vortex_array::{ArrayRef, IntoArray, VortexSessionExecute};
+use vortex_buffer::Buffer;
 use vortex_mask::Mask;
 
 use crate::error::{Result, VortexRdfError};
@@ -252,6 +253,74 @@ impl InMemoryServePlan {
             range,
             probes,
         }
+    }
+
+    /// The served rows' four `u32` term codes, read straight off the index
+    /// component's own columns — the code-payload counterpart of
+    /// [`decode`](Self::decode).
+    ///
+    /// A permutation index under the Dictionary layout already holds this
+    /// view's codes, contiguously, in its own order; reading them here
+    /// replaces materializing the resolution's row ids and gathering the
+    /// primary columns at each one. Rows come back in the index's order, as
+    /// [`decode`](Self::decode) already serves them.
+    ///
+    /// `None` declines to the caller's gather path: a run wider than
+    /// [`POINT_GATHER_MAX_ROWS`], a non-Dictionary decode layout (the columns
+    /// hold terms, not codes), or any column whose encoding resolves no
+    /// probe.
+    ///
+    /// The width gate is the same trade [`rows_via_probes`] makes, and
+    /// measurement puts it in the same place: a point read through the probe
+    /// beats materializing row ids for the run, but per-element reads over a
+    /// compressed column lose to a bulk gather over the base's canonical
+    /// buffers once the run is large — reading a wide run here measured ~3x
+    /// the gather it replaced.
+    ///
+    /// [`POINT_GATHER_MAX_ROWS`]: crate::store::selection::POINT_GATHER_MAX_ROWS
+    /// [`rows_via_probes`]: ServeDecode::rows_via_probes
+    pub(crate) fn code_columns(&self, deleted: Option<&Mask>) -> Option<[Buffer<u32>; 4]> {
+        use crate::store::selection::POINT_GATHER_MAX_ROWS;
+
+        if self.range.len() > POINT_GATHER_MAX_ROWS
+            || !matches!(self.decode.decode_layout, ResolvedLayout::Dictionary(_))
+        {
+            return None;
+        }
+        // Tombstones are defined over primary row ids; the rid column says
+        // which primary row each served row mirrors. Only a tombstoned view
+        // pays for the liveness pass.
+        let live: Option<Vec<usize>> = match deleted {
+            None => None,
+            Some(deleted) => {
+                let rid = self.probes.by_name(&self.array, self.decode.rid_column)?;
+                Some(
+                    self.range
+                        .clone()
+                        .filter(|&pos| !deleted.value(rid.value_at(pos) as usize))
+                        .collect(),
+                )
+            }
+        };
+        let mut columns = Vec::with_capacity(4);
+        for name in self.decode.primary_columns {
+            let probe = self.probes.by_name(&self.array, name)?;
+            columns.push(match &live {
+                None => Buffer::from_iter(
+                    self.range.clone().map(|pos| probe.value_at(pos) as u32),
+                ),
+                Some(live) => {
+                    Buffer::from_iter(live.iter().map(|&pos| probe.value_at(pos) as u32))
+                }
+            });
+        }
+        let mut columns = columns.into_iter();
+        Some([
+            columns.next()?,
+            columns.next()?,
+            columns.next()?,
+            columns.next()?,
+        ])
     }
 
     /// Decode the matched quads straight from the index component's rows:

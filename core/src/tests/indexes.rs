@@ -938,11 +938,12 @@ async fn test_built_store_compresses_resident_form() {
 }
 
 /// The bindings' code-column read on a served in-memory match: `code_columns`
-/// cannot ride the serve plan (it gathers codes by row id), so it materializes
-/// the pending selection synchronously — and the codes it hands out must
-/// address the cached dictionary and name exactly the matched quads.
+/// rides the serve plan, reading the codes off the answering index's own
+/// columns — so the resolution's row ids stay unmaterialized — and the codes
+/// it hands out address the cached dictionary and name exactly the matched
+/// quads.
 #[tokio::test]
-async fn test_code_columns_materializes_served_match() {
+async fn test_code_columns_serves_from_the_answering_index() {
     let quads: Vec<Quad> = (0..30)
         .map(|i| {
             make_quad(
@@ -972,6 +973,11 @@ async fn test_code_columns_materializes_served_match() {
     let cols = matched
         .code_columns()
         .expect("an in-memory Dictionary view answers codes");
+    assert_eq!(
+        matched.debug_row_ids_materialized(),
+        Some(false),
+        "a served code read must not materialize the resolution's row ids"
+    );
     let dict = matched.code_read_snapshot().unwrap();
     let mut got: Vec<String> = (0..cols[0].len())
         .map(|i| {
