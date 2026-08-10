@@ -214,8 +214,8 @@ where
 /// sampling, no re-encoding. The dictionary is FSST-compressed at the source
 /// in self-contained windows (`TermDictionary::compress`), so the default
 /// strategy's compressor would only re-do work it cannot improve on, and the
-/// window boundaries become the child's splits — the granularity at which
-/// `FileBackedDict` fences, probes, and lifts it.
+/// window boundaries become the child's chunk leaves — the granularity at
+/// which `FileBackedDict` point-reads and lifts it.
 pub(crate) fn dict_child_strategy() -> Arc<dyn vortex_layout::LayoutStrategy> {
     use vortex_layout::layouts::chunked::writer::ChunkedLayoutStrategy;
     use vortex_layout::layouts::flat::writer::FlatLayoutStrategy;

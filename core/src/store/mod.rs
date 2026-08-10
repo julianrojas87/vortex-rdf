@@ -254,16 +254,18 @@ impl VortexRdfStore {
         }
     }
 
-    /// Test-only hook: whether a file-backed dictionary's wire-chunk
-    /// point-read handle engaged; `None` when the dictionary is resident or
-    /// the layout carries none.
+    /// Test-only hook: whether the dictionary was left in its child. A
+    /// file-backed dictionary is only ever built around a resolved
+    /// wire-chunk handle, so this is also the assertion that the child's
+    /// layout shape was point-readable — a shape that declined opens
+    /// resident instead.
     #[cfg(all(test, feature = "file-io"))]
-    pub(crate) fn debug_dict_chunk_reads(&self) -> Option<bool> {
+    pub(crate) fn debug_dict_file_backed(&self) -> bool {
         use crate::store::layouts::DictAccess;
-        match &self.layout {
-            ResolvedLayout::Dictionary(DictAccess::FileBacked(fbd)) => Some(fbd.debug_has_chunks()),
-            _ => None,
-        }
+        matches!(
+            &self.layout,
+            ResolvedLayout::Dictionary(DictAccess::FileBacked(_))
+        )
     }
 
     /// Build from a builder's output: the quad array plus whatever the

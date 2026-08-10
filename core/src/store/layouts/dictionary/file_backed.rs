@@ -1,21 +1,20 @@
 //! The file-backed arm of the Dictionary layout's residency axis: a term
-//! dictionary left in its serialized child, read on demand. The primary
-//! paths point-read the child's wire-encoded chunk leaves ([`TermChunks`]);
-//! when the child's layout shape declines that handle, probes fall back to a
-//! fence + filtered split evaluation and decodes to row-index scans. The
-//! policy enum choosing between this and the resident form is
-//! [`DictAccess`](super::access::DictAccess); the whole module only compiles
-//! with `file-io`, since without a file there is nothing to leave the terms
-//! in.
+//! dictionary left in its serialized child, read on demand. Probes and
+//! decodes point-read the child's wire-encoded chunk leaves
+//! ([`TermChunks`]), so a dictionary whose child cannot be point-read is not
+//! file-backed at all — [`store::open`](crate::store::open) hands that shape
+//! to the resident arm instead. The policy enum choosing between this and
+//! the resident form is [`DictAccess`](super::access::DictAccess); the whole
+//! module only compiles with `file-io`, since without a file there is
+//! nothing to leave the terms in.
 
-use std::ops::Range;
 use std::sync::{Arc, OnceLock};
 
 use vortex_array::ArrayRef;
 use vortex_array::VortexSessionExecute;
 use vortex_array::arrays::VarBinViewArray;
 use vortex_array::arrays::struct_::{StructArray, StructArrayExt};
-use vortex_array::expr::{eq, get_item, lit, root, select};
+use vortex_array::expr::{root, select};
 use vortex_array::serde::SerializedArray;
 use vortex_array::stream::ArrayStreamExt as _;
 use vortex_layout::layouts::chunked::Chunked as ChunkedLayout;
@@ -24,7 +23,6 @@ use vortex_layout::layouts::struct_::Struct as StructLayout;
 use vortex_layout::layouts::zoned::Zoned;
 use vortex_layout::segments::SegmentSource;
 use vortex_layout::{LayoutChildType, LayoutRef};
-use vortex_mask::{AllOr, Mask};
 
 use crate::error::{Result, VortexRdfError};
 use crate::session::VORTEX_SESSION;
@@ -217,36 +215,15 @@ impl TermChunks {
     }
 }
 
-/// The fallback probe path's in-memory fence over a file-backed
-/// dictionary's splits: the first term of every dictionary-bearing split, in
-/// file order. The term column is
-/// sorted, so a probed term can only live in the last split whose first term
-/// is `<=` the probe — one in-RAM binary search replaces a per-split pruning
-/// loop, and a probe below the first fence term is absent without touching
-/// the file.
-///
-/// Built lazily on the first probe (one row-index scan of the per-split
-/// boundary rows), shared across clones, never persisted. It retains one
-/// term string per dictionary split — a few KB per file.
-struct Fence {
-    /// First dictionary term of each split in `splits`, ascending.
-    first_terms: Vec<String>,
-    /// The dictionary-bearing splits, clamped to the dictionary rows.
-    splits: Vec<Range<u64>>,
-}
-
 /// A term dictionary left in its layout child: term→ID probes and ID→term
 /// decodes read the sorted `_dict_term` column on demand instead of holding
 /// all terms resident.
 ///
 /// `reader` is the dictionary child's layout reader (the native store root's
-/// `dictionary` component), so a term's code is its child row. With a
-/// [`TermChunks`] handle, probes and decodes point-read the wire-encoded
-/// chunk leaves; probe answers are memoized in a [`ProbeCache`]. Without one
-/// (the child's layout shape declined), a probe binary-searches the
-/// in-memory [`Fence`] for the one split that can hold the term and
-/// evaluates an equality filter over just that split, and decodes are
-/// row-index scans.
+/// `dictionary` component), so a term's code is its child row. Probes and
+/// small decodes point-read the wire-encoded chunk leaves through
+/// [`TermChunks`], with probe answers memoized in a [`ProbeCache`]; a wide
+/// decode instead scans the row indices it wants through `reader`.
 #[derive(Clone)]
 pub(crate) struct FileBackedDict {
     /// The dictionary child's layout reader (child-local row coordinates).
@@ -256,34 +233,23 @@ pub(crate) struct FileBackedDict {
     /// term → code memo, shared across clones (every derived view of a store
     /// probes the same immutable dictionary).
     probes: Arc<ProbeCache>,
-    /// The fallback probe fence, built on first use and shared across
-    /// clones.
-    fence: Arc<OnceLock<Fence>>,
-    /// Wire-chunk point-read handle, shared across clones (its fetched
-    /// chunks are the dictionary analogue of the quad columns' cached chunk
-    /// probes); `None` when the child's layout shape declined.
-    chunks: Option<Arc<TermChunks>>,
+    /// Wire-chunk point-read handle, shared across clones — the dictionary
+    /// analogue of the quad columns' cached chunk probes.
+    chunks: Arc<TermChunks>,
 }
 
 impl FileBackedDict {
     pub(crate) fn new(
         reader: vortex_layout::LayoutReaderRef,
         len: u64,
-        chunks: Option<TermChunks>,
+        chunks: TermChunks,
     ) -> Self {
         Self {
             reader,
             len,
             probes: Arc::new(ProbeCache::new()),
-            fence: Arc::new(OnceLock::new()),
-            chunks: chunks.map(Arc::new),
+            chunks: Arc::new(chunks),
         }
-    }
-
-    /// Whether the wire-chunk point-read handle engaged (test hook).
-    #[cfg(test)]
-    pub(crate) fn debug_has_chunks(&self) -> bool {
-        self.chunks.is_some()
     }
 
     /// A scan over the dictionary child — the reader-level equivalent of
@@ -295,102 +261,22 @@ impl FileBackedDict {
         )
     }
 
-    /// The fence, building it on first use. Concurrent first probes may race
-    /// to build; the loser's copy is dropped — the fence is derived
-    /// deterministically from the immutable file, so any winner is right.
-    async fn fence(&self) -> Result<&Fence> {
-        if self.fence.get().is_none() {
-            let built = self.build_fence().await?;
-            let _ = self.fence.set(built);
-        }
-        Ok(self
-            .fence
-            .get()
-            .expect("the fence was just initialized above"))
-    }
-
-    /// Collect the dictionary's splits (clamped to its rows, defensively) and
-    /// resolve each one's first term with a single row-index scan.
-    async fn build_fence(&self) -> Result<Fence> {
-        use itertools::Itertools as _;
-        use vortex_array::dtype::FieldMask;
-        use vortex_layout::scan::split_by::SplitBy;
-        let bounds = SplitBy::Layout
-            .splits(
-                self.reader.as_ref(),
-                &(0..self.reader.row_count()),
-                &[FieldMask::All],
-            )
-            .map_err(VortexRdfError::Vortex)?;
-        let mut splits = Vec::new();
-        for (start, end) in bounds.into_iter().tuple_windows() {
-            let stop = end.min(self.len);
-            if start < stop {
-                splits.push(start..stop);
-            }
-        }
-        let codes: Vec<u32> = splits.iter().map(|range| range.start as u32).collect();
-        let first_terms = self.resolve_terms(&codes).await?;
-        Ok(Fence {
-            first_terms,
-            splits,
-        })
-    }
-
-    /// Term→ID: a point-read binary search of the chunk leaves when the
-    /// [`TermChunks`] handle resolved, the fence + filtered-split path
-    /// otherwise; either answer is memoized.
+    /// Term→ID: a point-read binary search of the chunk leaves, memoized.
     pub(crate) async fn get_id(&self, term: &str) -> Result<Option<u32>> {
         if let Some(memo) = self.probes.get(term) {
             return Ok(memo);
         }
-        let code = match &self.chunks {
-            Some(chunks) => chunks.get_id(term).await?,
-            None => self.get_id_by_split_filter(term).await?,
-        };
+        let code = self.chunks.get_id(term).await?;
         self.probes.put(term, code);
-        Ok(code)
-    }
-
-    /// Term→ID without chunk leaves: the fence's binary search picks the one
-    /// split whose range can hold the term (the column is sorted), and a
-    /// single equality-filtered evaluation of that split decides.
-    async fn get_id_by_split_filter(&self, term: &str) -> Result<Option<u32>> {
-        let fence = self.fence().await?;
-        // The candidate is the last split whose first term is <= the probe;
-        // index 0 means every dictionary term sorts above it — absent.
-        let idx = fence.first_terms.partition_point(|t| t.as_str() <= term);
-        let candidate = idx.checked_sub(1).map(|i| fence.splits[i].clone());
-        let code = match candidate {
-            None => None,
-            Some(range) => {
-                let filter = [eq(get_item(TERM_FIELD, root()), lit(term))];
-                let mask = crate::store::scan::file_scan::evaluate_filter_split(
-                    self.reader.clone(),
-                    &filter,
-                    &range,
-                    Mask::new_true((range.end - range.start) as usize),
-                )
-                .await?;
-                let row = match mask.indices() {
-                    AllOr::All => Some(range.start),
-                    AllOr::None => None,
-                    AllOr::Some(indices) => indices.first().map(|&i| range.start + i as u64),
-                };
-                row.map(|row| row as u32)
-            }
-        };
         Ok(code)
     }
 
     /// ID→terms for reconstruction: resolve `codes` (ascending, unique) to
     /// their term strings — the dictionary's code→string seam. The
     /// layout-side chunk decode (`ResolvedLayout::decode_chunk_async`)
-    /// resolves a chunk's distinct codes through this, and the fence build
-    /// resolves its split boundaries. Small batches point-read the chunk
-    /// leaves; wide ones (and stores whose chunk handle declined) run a
-    /// single row-index scan, whose bulk decode wins once most of a leaf is
-    /// wanted anyway.
+    /// resolves a chunk's distinct codes through this. Small batches
+    /// point-read the chunk leaves; wide ones run a single row-index scan,
+    /// whose bulk decode wins once most of a leaf is wanted anyway.
     pub(crate) async fn resolve_terms(&self, codes: &[u32]) -> Result<Vec<String>> {
         if codes.is_empty() {
             return Ok(Vec::new());
@@ -403,10 +289,8 @@ impl FileBackedDict {
                 max, self.len
             )));
         }
-        if let Some(chunks) = &self.chunks
-            && codes.len() <= POINT_GATHER_MAX_ROWS
-        {
-            return chunks.resolve_terms(codes).await;
+        if codes.len() <= POINT_GATHER_MAX_ROWS {
+            return self.chunks.resolve_terms(codes).await;
         }
         let rows: vortex_buffer::Buffer<u64> = codes.iter().map(|&code| code as u64).collect();
         let arr = self
@@ -456,18 +340,19 @@ mod tests {
     use vortex_array::IntoArray;
     use vortex_array::validity::Validity;
 
-    /// The compression windows survive serialization as the child's splits:
-    /// a `FileBackedDict` over a windowed dictionary's written child fences
-    /// one split per window and probes correctly across all of them.
+    /// The compression windows survive serialization as the child's chunk
+    /// leaves: a windowed dictionary's written child resolves one leaf per
+    /// window, and a `FileBackedDict` over it probes correctly across all of
+    /// them.
     #[tokio::test]
-    async fn windowed_dict_child_fence_splits() {
+    async fn windowed_dict_child_chunk_leaves() {
         use crate::io::container;
         use vortex_array::stream::ArrayStreamAdapter;
         use vortex_buffer::ByteBuffer;
         use vortex_file::OpenOptionsSessionExt as _;
 
         let terms: Vec<String> = (0..600)
-            .map(|i| format!("<http://example.org/fence/{i:04}>"))
+            .map(|i| format!("<http://example.org/term/{i:04}>"))
             .collect();
         let plain = VarBinViewArray::from_iter_str(terms.iter().map(String::as_str));
         let d = TermDictionary::compress_windowed(plain, 100).unwrap();
@@ -510,11 +395,19 @@ mod tests {
             .component_reader(container::DICT_COMPONENT_NAME)
             .unwrap()
             .expect("the dictionary child must be present");
-        let fbd = FileBackedDict::new(reader, len, None);
+        let typed = native
+            .footer()
+            .layout()
+            .as_::<container::RdfStoreLayoutVTable>();
+        let (_, dict_child) = container::store_component(typed, container::DICT_COMPONENT_NAME)
+            .unwrap()
+            .expect("the dictionary child must be present");
+        let chunks = TermChunks::resolve(&dict_child, native.segment_source())
+            .expect("the written dictionary child must be point-readable");
 
-        // One split per compression window, none merged, none re-cut.
-        let fence = fbd.fence().await.unwrap();
-        assert_eq!(fence.splits.len(), 6);
+        // One chunk leaf per compression window, none merged, none re-cut.
+        assert_eq!(chunks.specs.len(), 6);
+        let fbd = FileBackedDict::new(reader, len, chunks);
 
         // Probes across every window: interior, first-of-window,
         // last-of-window, and absent.

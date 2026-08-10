@@ -33,9 +33,11 @@ async fn assert_file_backed_matches_resident(indexes: Indexes, tag: &str) {
     // file-backed dictionary has no snapshot and no sync code translation.
     assert!(resident.dictionary_snapshot().is_some(), "{tag}");
     assert!(fb.dictionary_snapshot().is_none(), "{tag}");
-    // The wire-chunk point-read handle must engage on the real open path.
-    assert_eq!(fb.debug_dict_chunk_reads(), Some(true), "{tag}");
-    assert_eq!(resident.debug_dict_chunk_reads(), None, "{tag}");
+    // A forced-file-backed open must actually stay file-backed: the written
+    // child's shape resolves a wire-chunk handle, so it never falls back to
+    // the resident arm.
+    assert!(fb.debug_dict_file_backed(), "{tag}");
+    assert!(!resident.debug_dict_file_backed(), "{tag}");
     // The code-read gate includes residency: no snapshot, no code decoding.
     assert!(fb.code_read_snapshot().is_none(), "{tag}");
     // The resident open hands one out, and it translates codes both ways.
@@ -263,14 +265,14 @@ async fn test_tombstoned_indexed_codes_address_cached_dictionary() {
     assert_eq!(got, expected);
 }
 
-/// Direct probe parity at multi-split scale: every sampled term must resolve
-/// to the same code through the fence-guided child probe as through the
+/// Direct probe parity at multi-chunk scale: every sampled term must resolve
+/// to the same code through the child's point-read probe as through the
 /// resident dictionary, and mutated absent terms must come back `None`.
 #[tokio::test]
-async fn test_file_backed_dictionary_fence_probe_parity() {
-    // Enough unique terms to spread the dictionary across several splits, so
-    // the fence's binary search genuinely selects between candidates. The
-    // 20k-quad serialize dominates this test's runtime, so the fixture's
+async fn test_file_backed_dictionary_probe_parity() {
+    // Enough unique terms to spread the dictionary across several chunk
+    // leaves, so the probe's binary search genuinely crosses between them.
+    // The 20k-quad serialize dominates this test's runtime, so the fixture's
     // bytes are built once per process.
     static BYTES: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
     let bytes = cached_store_bytes(&BYTES, || async {
@@ -297,7 +299,7 @@ async fn test_file_backed_dictionary_fence_probe_parity() {
     })
     .await;
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("fence.vortex");
+    let path = dir.path().join("probe.vortex");
     std::fs::write(&path, bytes).unwrap();
 
     // The reference answers, from a resident open of the same file.
@@ -306,10 +308,9 @@ async fn test_file_backed_dictionary_fence_probe_parity() {
         .unwrap();
     let dict = resident.dictionary_snapshot().unwrap().0;
 
-    // The probe targets, built exactly as `from_file` does file-backed: the
-    // dictionary child's cached layout reader — once with the wire-chunk
-    // handle (the primary path) and once without (the fence +
-    // filtered-split fallback).
+    // The probe target, built exactly as `from_file` does file-backed: the
+    // dictionary child's cached layout reader plus the wire-chunk handle
+    // resolved off the same child.
     let outer = NativeStoreFile::try_new(
         crate::io::native_file::open_vortex_file(&path)
             .await
@@ -328,48 +329,45 @@ async fn test_file_backed_dictionary_fence_probe_parity() {
         .expect("dictionary child present");
     let chunks = TermChunks::resolve(&dict_child, outer.segment_source())
         .expect("the dictionary child's chunk shape must resolve");
-    let fb_chunks = FileBackedDict::new(reader.clone(), len, Some(chunks));
-    let fb_fence = FileBackedDict::new(reader, len, None);
+    let fb = FileBackedDict::new(reader, len, chunks);
 
-    // Every ~397th term plus both extremes, probed twice (cold + memo), on
-    // both paths.
+    // Every ~397th term plus both extremes, probed twice (cold + memo).
     let sample: Vec<u32> = (0..len as u32)
         .step_by(397)
         .chain([0, len as u32 - 1])
         .collect();
-    for fb in [&fb_chunks, &fb_fence] {
-        for &code in &sample {
-            let term = dict.term_at(code).unwrap();
-            assert_eq!(fb.get_id(&term).await.unwrap(), Some(code), "{term}");
-            assert_eq!(fb.get_id(&term).await.unwrap(), Some(code), "{term}");
+    for &code in &sample {
+        let term = dict.term_at(code).unwrap();
+        assert_eq!(fb.get_id(&term).await.unwrap(), Some(code), "{term}");
+        assert_eq!(fb.get_id(&term).await.unwrap(), Some(code), "{term}");
 
-            // A control character keeps the probe inside the same fence
-            // window but matches no stored term.
-            let absent = format!("{term}\u{1}");
-            assert_eq!(fb.get_id(&absent).await.unwrap(), None, "{absent}");
-        }
-        // Above every stored term: the probe misses on either path.
-        assert_eq!(fb.get_id("\u{10FFFF}").await.unwrap(), None);
+        // A control character sorts immediately after the stored term, so
+        // the search lands on it and must still report absent.
+        let absent = format!("{term}\u{1}");
+        assert_eq!(fb.get_id(&absent).await.unwrap(), None, "{absent}");
     }
+    // Above every stored term: the search runs off the end.
+    assert_eq!(fb.get_id("\u{10FFFF}").await.unwrap(), None);
 
-    // ID→term parity on both paths, under and over the point-read cap (the
-    // wide batch exercises the chunk handle's scan fallback).
+    // ID→term parity under and over the point-read cap (the wide batch
+    // exercises the row-index scan).
     for k in [64usize, 300] {
         let codes: Vec<u32> = (0..len as u32)
             .step_by((len as usize / k).max(1))
             .take(k)
             .collect();
         let want: Vec<String> = codes.iter().map(|&c| dict.term_at(c).unwrap()).collect();
-        assert_eq!(fb_chunks.resolve_terms(&codes).await.unwrap(), want);
-        assert_eq!(fb_fence.resolve_terms(&codes).await.unwrap(), want);
+        assert_eq!(fb.resolve_terms(&codes).await.unwrap(), want);
     }
 }
 
-/// A probe sorting below the first dictionary term is answered absent by the
-/// fence alone (the `partition_point == 0` edge): a dataset whose lowest
-/// term is a literal (`"…`) probed with `!`, which sorts before `"`.
+/// A probe sorting below every dictionary term must come back absent rather
+/// than matching row 0 — the binary search's `lo == 0` edge, where the
+/// bisection never moves and the final equality check is the only thing
+/// rejecting it. The fixture's lowest term is a literal (`"…`), probed with
+/// `!`, which sorts before `"`.
 #[tokio::test]
-async fn test_file_backed_dictionary_fence_rejects_below_first_term() {
+async fn test_file_backed_dictionary_rejects_below_first_term() {
     let g = GraphName::NamedNode(NamedNode::new("http://example.org/g").unwrap());
     let quads: Vec<Quad> = (0..3)
         .map(|i| {
@@ -412,12 +410,9 @@ async fn test_file_backed_dictionary_fence_rejects_below_first_term() {
         .expect("dictionary child present");
     let chunks = TermChunks::resolve(&dict_child, outer.segment_source())
         .expect("the dictionary child's chunk shape must resolve");
-    let fb_chunks = FileBackedDict::new(reader.clone(), dict_len, Some(chunks));
-    let fb_fence = FileBackedDict::new(reader, dict_len, None);
+    let fb = FileBackedDict::new(reader, dict_len, chunks);
 
-    for fb in [&fb_chunks, &fb_fence] {
-        assert_eq!(fb.get_id("!").await.unwrap(), None);
-        // And the ordinary path still resolves on both.
-        assert_eq!(fb.get_id(&first_term).await.unwrap(), Some(0));
-    }
+    assert_eq!(fb.get_id("!").await.unwrap(), None);
+    // And row 0 itself still resolves.
+    assert_eq!(fb.get_id(&first_term).await.unwrap(), Some(0));
 }

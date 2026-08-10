@@ -565,8 +565,9 @@ fn dict_probe_cold(bencher: divan::Bencher, residency: &DictResidency) {
 /// The same fully bound pattern on one shared store — the steady state of
 /// repeated lookups for the *same* terms. After the first iteration the probe
 /// memo answers every term on both arms, so this cell prices the match
-/// machinery around the dictionary rather than the dictionary itself; the
-/// residency axis shows in [`dict_probe_distinct`], not here.
+/// machinery around the dictionary rather than the dictionary itself. The
+/// residency axis shows in [`dict_probe_cold`], which pays the chunk fetches,
+/// and to a much smaller degree in [`dict_probe_distinct`] — not here.
 #[divan::bench(args = DICT_CONFIGS)]
 fn dict_probe_warm(bencher: divan::Bencher, residency: &DictResidency) {
     let store = open_dict_store(*residency, bench_size());
@@ -588,10 +589,11 @@ fn dict_probe_warm(bencher: divan::Bencher, residency: &DictResidency) {
 /// Term→ID probes that always miss the memo: one shared store, so its chunk
 /// cache stays warm, probed with a different subject every iteration. This is
 /// the steady state of a query workload over a large term set — distinct
-/// lookups against a store that has been open a while — and the regime where
-/// the residency axis actually separates, since the cold cell is dominated by
-/// first fetches and the warm one by the memo. The term is built outside the
-/// timed closure, as the other probe cells do.
+/// lookups against a store that has been open a while — and the cell that
+/// prices the search itself: the memo cannot answer it and the chunk fetches
+/// are already paid, so what is left is what residency costs a warm binary
+/// search. The term is built outside the timed closure, as the other probe
+/// cells do.
 #[divan::bench(args = DICT_CONFIGS)]
 fn dict_probe_distinct(bencher: divan::Bencher, residency: &DictResidency) {
     let store = open_dict_store(*residency, bench_size());

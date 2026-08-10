@@ -175,18 +175,25 @@ impl VortexRdfStore {
                     .map_err(VortexRdfError::Vortex)?
                     .expect("the dictionary component resolved above");
                 let dict_len = reader.row_count();
-                let access = if dict_bytes <= max_resident_bytes {
-                    // Resident: one full scan of the dictionary child —
-                    // chunks keep their FSST.
-                    let dict = dict_from_reader(reader).await?;
-                    DictAccess::Resident(Arc::new(dict))
+                // A dictionary that fits the residency budget is held whole.
+                // A larger one stays in its child, read through the chunk
+                // leaves a probe or decode touches — unless the child's
+                // layout shape declines that handle, and holding it whole is
+                // then the only way to read it at all.
+                let chunks = if dict_bytes <= max_resident_bytes {
+                    None
                 } else {
-                    // File-backed: the child stays on disk; reads fetch only
-                    // the chunk leaves they touch.
-                    let chunks = container::store_component(typed, container::DICT_COMPONENT_NAME)
+                    container::store_component(typed, container::DICT_COMPONENT_NAME)
                         .map_err(VortexRdfError::Vortex)?
-                        .and_then(|(_, child)| TermChunks::resolve(&child, file.segment_source()));
-                    DictAccess::FileBacked(FileBackedDict::new(reader, dict_len, chunks))
+                        .and_then(|(_, child)| TermChunks::resolve(&child, file.segment_source()))
+                };
+                let access = match chunks {
+                    Some(chunks) => {
+                        DictAccess::FileBacked(FileBackedDict::new(reader, dict_len, chunks))
+                    }
+                    // One full scan of the dictionary child — chunks keep
+                    // their FSST.
+                    None => DictAccess::Resident(Arc::new(dict_from_reader(reader).await?)),
                 };
                 ResolvedLayout::Dictionary(access)
             }

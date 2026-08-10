@@ -39,9 +39,10 @@ use super::term_dict::TermDictionary;
 pub(crate) enum DictAccess {
     /// The whole dictionary in memory (FSST-compressed or canonical).
     Resident(Arc<TermDictionary>),
-    /// The dictionary left in its file, read on demand (wire-chunk point
-    /// reads, with scan fallbacks) — chosen at open when the term count
-    /// exceeds the residency threshold (see `VortexRdfStore::from_file`).
+    /// The dictionary left in its file, read on demand through wire-chunk
+    /// point reads — chosen at open when the dictionary child outweighs the
+    /// residency threshold *and* its layout shape is point-readable (see
+    /// `VortexRdfStore::from_file`).
     #[cfg(feature = "file-io")]
     FileBacked(FileBackedDict),
 }
@@ -74,17 +75,17 @@ impl DictAccess {
                 }
                 Ok(codes)
             }
-            // Each bound role costs one filtered probe of the term column
-            // (memoized in the probe cache); the resolved code is then seeded
-            // into the witness so the sync match core never reaches back here.
+            // Each bound role costs one point-read binary search of the term
+            // column (memoized in the probe cache); the resolved code is then
+            // seeded into the witness so the sync match core never reaches
+            // back here.
             //
-            // The four probes are independent filtered split scans, so they
-            // run overlapped rather than one await after another — a
-            // fully-bound pattern on a cold probe cache pays ~1 scan latency
-            // instead of 4. Concurrency is why each term is rendered into its
-            // own String here instead of the pattern's shared scratch buffer,
-            // and a first-probe race on the fence is already handled by its
-            // drop-the-loser `OnceLock`.
+            // The four searches are independent, so they run overlapped
+            // rather than one await after another: whatever chunk fetches
+            // they miss on overlap instead of serializing. Concurrency is why
+            // each term is rendered into its own String here instead of the
+            // pattern's shared scratch buffer, and a race to fetch the same
+            // chunk is already handled by its drop-the-loser `OnceLock`.
             #[cfg(feature = "file-io")]
             DictAccess::FileBacked(fb) => {
                 let render = |term: Option<TermRef<'_>>| term.map(|t| t.to_string());

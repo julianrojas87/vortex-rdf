@@ -2,8 +2,7 @@
 //! machinery behind the store's file-backed counting, deletion, and pruning
 //! paths, plus the translation of a [`RowSelection`] onto vortex's scan
 //! knobs. Everything here is a pure function of a [`NativeStoreFile`] and a
-//! filter expression — no store state — which is what lets the dictionary's
-//! file-backed probe reuse [`evaluate_filter_split`] directly.
+//! filter expression — no store state.
 
 use std::ops::{BitAnd, Range};
 use std::sync::Arc;

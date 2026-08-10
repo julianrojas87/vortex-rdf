@@ -39,10 +39,10 @@ pub(crate) const TERM_FIELD: &str = "_dict_term";
 
 /// Terms per FSST window when compressing at the source (see
 /// [`TermDictionary::compress`]): the granularity at which a large
-/// dictionary's serialized child can be read back, fenced, and lifted
-/// chunk-by-chunk. Small enough that a file-backed probe scans one window in
-/// tens of microseconds; large enough that the per-window symbol-table copy
-/// (~2 KiB) stays noise.
+/// dictionary's serialized child is read back, point-read, and lifted
+/// chunk-by-chunk. Small enough that touching one leaf fetches and adopts a
+/// bounded slice of the column; large enough that the per-window
+/// symbol-table copy (~2 KiB) stays noise.
 const DICT_CHUNK_ROWS: usize = 64 * 1024;
 
 /// How a dictionary's sorted terms are held in memory.
@@ -264,7 +264,7 @@ impl TermDictionary {
     /// FSST array, so the serializer can write the chunks verbatim — no
     /// re-encoding, no slicing a parent array whose buffers every written
     /// chunk would then drag along — and the chunk boundaries become the
-    /// file child's splits (the `FileBackedDict` fence granularity).
+    /// file child's leaves, the granularity `FileBackedDict` point-reads.
     fn compress(plain: VarBinViewArray) -> Result<Self> {
         Self::compress_windowed(plain, DICT_CHUNK_ROWS)
     }
@@ -472,8 +472,8 @@ const PROBE_CACHE_SLOTS: usize = 256;
 /// hash bucket, overwritten on collision.
 ///
 /// A miss costs a binary search over the sorted terms, decoding a term at every
-/// probe under FSST — ~1.6 µs at 3M terms, which is a third of a fully-bound
-/// match. Repeats are common enough across matches to be worth catching.
+/// step under FSST. Repeats are common enough across matches to be worth
+/// catching.
 ///
 /// Direct-mapped rather than an LRU because the memory matters more than the
 /// hit rate here: a few KB per dictionary that never grows, against a structure
@@ -486,8 +486,8 @@ const PROBE_CACHE_SLOTS: usize = 256;
 /// *new* dictionary, and with it a new cache.
 ///
 /// Shared by the resident dictionary above and the file-backed form
-/// ([`FileBackedDict`](super::file_backed::FileBackedDict)), whose misses are
-/// whole filtered scans rather than binary searches.
+/// ([`FileBackedDict`](super::file_backed::FileBackedDict)), whose miss is the
+/// same binary search run over cached wire chunks rather than resident terms.
 pub(super) struct ProbeCache {
     slots: RwLock<Box<[Option<ProbeEntry>]>>,
 }
