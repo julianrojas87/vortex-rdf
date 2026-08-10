@@ -78,19 +78,19 @@ type Variant = { slug: string; options: BuildOptions };
 // Dictionary baseline (the JS default), matching the Rust serialize group's
 // axes.
 const BUILD_VARIANTS: Variant[] = [
-    { slug: 'sorted_dict', options: { layout: 'dictionary' } },
-    { slug: 'sorted_default', options: { layout: 'default' } },
-    { slug: 'sorted_typedobject', options: { layout: 'typed-object' } },
-    { slug: 'sorted_dict_byref', options: { layout: 'dictionary', indexes: ['secondary-by-reference'] } },
-    { slug: 'sorted_dict_bycopy', options: { layout: 'dictionary', indexes: ['secondary-by-copy'] } },
+    { slug: 'dict', options: { layout: 'dictionary' } },
+    { slug: 'default', options: { layout: 'default' } },
+    { slug: 'typedobject', options: { layout: 'typed-object' } },
+    { slug: 'dict_byref', options: { layout: 'dictionary', indexes: ['secondary-by-reference'] } },
+    { slug: 'dict_bycopy', options: { layout: 'dictionary', indexes: ['secondary-by-copy'] } },
 ];
 
 // Query (read) path: two representative configs — the JS default (subject
 // binary search only, no secondary index) and the fully-indexed fast path
 // (where a bound predicate/object binary-searches too).
 const QUERY_VARIANTS: Variant[] = [
-    { slug: 'sorted_dict', options: { layout: 'dictionary' } },
-    { slug: 'sorted_dict_bycopy', options: { layout: 'dictionary', indexes: ['secondary-by-copy'] } },
+    { slug: 'dict', options: { layout: 'dictionary' } },
+    { slug: 'dict_bycopy', options: { layout: 'dictionary', indexes: ['secondary-by-copy'] } },
 ];
 
 async function drain(stream: unknown): Promise<number> {
@@ -137,12 +137,12 @@ async function benchBuild(triples: Quad[], realistic: Quad[], literals: Quad[]):
         .join('\n');
     await runGroup(HEAVY_OPTS, (b) => {
         for (const v of BUILD_VARIANTS) {
-            // build::sorted_dict is the guard on dictionary construction, so it
+            // build::dict is the guard on dictionary construction, so it
             // runs over the cardinality-realistic dataset — on the dense cube
             // the dictionary is ~48 terms and its build cost invisible. Its
             // numbers are therefore NOT comparable with the dense-cube
             // variants beside it.
-            const data = v.slug === 'sorted_dict' ? realistic : triples;
+            const data = v.slug === 'dict' ? realistic : triples;
             let h: VortexRdfStore | undefined;
             b.add(`build::${v.slug}`, async () => { h = await VortexRdfStore.fromQuads(data, v.options); }, {
                 afterEach: () => { if (h) freeWasm(h); h = undefined; },
@@ -153,13 +153,13 @@ async function benchBuild(triples: Quad[], realistic: Quad[], literals: Quad[]):
             hs = await VortexRdfStore.fromString(nquads, 'nquads', { layout: 'dictionary' });
         }, { afterEach: () => { if (hs) freeWasm(hs); hs = undefined; } });
         let hl: VortexRdfStore | undefined;
-        b.add('build::sorted_dict_literals', async () => {
+        b.add('build::dict_literals', async () => {
             hl = await VortexRdfStore.fromQuads(literals, { layout: 'dictionary' });
         }, { afterEach: () => { if (hl) freeWasm(hl); hl = undefined; } });
     });
 }
 
-/** Literal-bearing read paths on a Sorted/Dictionary store over
+/** Literal-bearing read paths on a Dictionary store over
  * genLiteralTriples' dataset: toRdf re-escapes every literal on export, and
  * the decoded read parses every literal's serialized form on the JS side. */
 async function benchLiterals(literals: Quad[]): Promise<void> {
@@ -286,7 +286,7 @@ async function main(): Promise<void> {
     const quads = genQuads(DIM_QUADS);
     const literals = genLiteralTriples(DIM);
     // Same row count as the dense cube, realistic term cardinality — for the
-    // term-handling-sensitive tasks (build::sorted_dict, readpath::full_decoded).
+    // term-handling-sensitive tasks (build::dict, readpath::full_decoded).
     const realistic = genDataset(DIM ** 3);
 
     await benchBuild(triples, realistic, literals);

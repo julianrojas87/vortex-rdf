@@ -261,7 +261,7 @@
       <span class="chan-tag mono">WRITE</span>
       <h2>Serialize — ingest &amp; encode</h2>
     </div>
-    <p class="group-desc">Building a Vortex array from 100,000 generated quads and writing it out. Baseline: sorted-stream builder, default layout, no secondary index.</p>
+    <p class="group-desc">Building a Vortex array from 100,000 generated quads and writing it out. Baseline: default layout, no secondary index.</p>
     <div class="panel-grid" id="write-panels"></div>
   </section>
 
@@ -639,27 +639,26 @@ function get(map, id){ const r = map.get(id); if(!r) console.warn("missing bench
 function fmtRatio(a,b){ return (a/b).toFixed(2) + "×"; }
 
 // ---- panel configs (Rust tab) ----
-// Serialize: every measured builder × layout × index configuration in one
-// table, ordered fastest to slowest (sortByColumn) so the cost ranking reads
-// straight down the column. The rows are still declared as axis groups around
-// the sorted-stream / Default / no-index baseline -- that is what makes each
-// row's cost attributable to one axis -- but sorting supersedes the grouping,
-// so the `break` rules those declarations carry are dropped at render time.
-function serRow(builder, layout, index, id, brk){
-  return { labels:[builder, layout, index], ids:[`serialize::${id}`], break:brk };
+// Serialize: every measured layout × index configuration in one table,
+// ordered fastest to slowest (sortByColumn) so the cost ranking reads straight
+// down the column. The rows are still declared as axis groups around the
+// Default / no-index baseline -- that is what makes each row's cost
+// attributable to one axis -- but sorting supersedes the grouping, so the
+// `break` rules those declarations carry are dropped at render time.
+function serRow(layout, index, id, brk){
+  return { labels:[layout, index], ids:[`serialize::${id}`], break:brk };
 }
 const serializePanel = {
-  title:"Serialize: builder × layout × index",
-  note:"Median time to build and write the dataset, fastest first. Each configuration varies one axis around the sorted-stream / Default / no-index baseline, except the last, which combines a layout with an index.",
-  rowHeaders:["Builder","Layout","Index"], columns:["Serialize"], sortByColumn:0,
+  title:"Serialize: layout × index",
+  note:"Median time to build and write the dataset, fastest first. Each configuration varies one axis around the Default / no-index baseline, except the last, which combines a layout with an index.",
+  rowHeaders:["Layout","Index"], columns:["Serialize"], sortByColumn:0,
   rows:[
-    serRow("Sorted stream","Default","none","sorted_stream_default_no_index"),
-    serRow("Sorted in-memory","Default","none","sorted_in_memory_default_no_index"),
-    serRow("Sorted stream","Typed-object","none","sorted_stream_typed_object_no_index", true),
-    serRow("Sorted stream","Dictionary","none","sorted_stream_dictionary_no_index"),
-    serRow("Sorted stream","Default","by-reference","sorted_stream_default_by_reference", true),
-    serRow("Sorted stream","Default","by-copy","sorted_stream_default_by_copy"),
-    serRow("Sorted stream","Dictionary","by-copy","sorted_stream_dictionary_by_copy", true),
+    serRow("Default","none","default_no_index"),
+    serRow("Typed-object","none","typed_object_no_index", true),
+    serRow("Dictionary","none","dictionary_no_index"),
+    serRow("Default","by-reference","default_by_reference", true),
+    serRow("Default","by-copy","default_by_copy"),
+    serRow("Dictionary","by-copy","dictionary_by_copy", true),
   ],
 };
 
@@ -735,16 +734,16 @@ function renderMatrixPanel(container, cfg, map){
 function patternIds(group, patterns){ return patterns.map(p => `${group}::${p}`); }
 
 // The consolidated match matrix: every layout × source × index variant
-// (sorted-stream builder throughout) as rows, grouped by secondary-index
+// as rows, grouped by secondary-index
 // configuration, the six routing patterns as columns.
 const MATCH_INDEXES = [["No index","noindex"],["By reference","byref"],["By copy","bycopy"]];
 const MATCH_LAYOUTS = [
-  {labels:["Default","in-memory"],         group: ix => `match_sorted_default_${ix}_mem`},
-  {labels:["Default","file"],              group: ix => `match_sorted_default_${ix}_file`},
-  {labels:["Typed-object","in-memory"],    group: ix => `match_sorted_typedobj_${ix}_mem`},
-  {labels:["Typed-object","file"],         group: ix => `match_sorted_typedobj_${ix}_file`},
-  {labels:["Dictionary","in-memory"],      group: ix => `match_sorted_dict_${ix}_mem`},
-  {labels:["Dictionary","file"],           group: ix => `match_sorted_dict_${ix}_file`},
+  {labels:["Default","in-memory"],         group: ix => `match_default_${ix}_mem`},
+  {labels:["Default","file"],              group: ix => `match_default_${ix}_file`},
+  {labels:["Typed-object","in-memory"],    group: ix => `match_typedobj_${ix}_mem`},
+  {labels:["Typed-object","file"],         group: ix => `match_typedobj_${ix}_file`},
+  {labels:["Dictionary","in-memory"],      group: ix => `match_dict_${ix}_mem`},
+  {labels:["Dictionary","file"],           group: ix => `match_dict_${ix}_file`},
 ];
 // Row set shared by the materializing and lazy match tables; the lazy bench
 // target names each group `lazy_` + its materializing twin.
@@ -758,7 +757,7 @@ function matchMatrixRows(groupPrefix){
 
 const matchMatrixPanel = {
   title:"Match matrix: index × layout × source, per pattern",
-  note:"Median <code>match_pattern</code> + materialization time; sorted-stream builder throughout. Rows are grouped by secondary-index configuration; within a group only layout and source vary. <b>Green</b> marks the fastest variant in each pattern column across all groups; the grey multiplier is the slowdown vs that column's best.",
+  note:"Median <code>match_pattern</code> + materialization time. Rows are grouped by secondary-index configuration; within a group only layout and source vary. <b>Green</b> marks the fastest variant in each pattern column across all groups; the grey multiplier is the slowdown vs that column's best.",
   wide:true, rowHeaders:["Index","Layout","Source"], columns:RUST_PATTERNS,
   rows: matchMatrixRows(""),
 };
@@ -772,7 +771,7 @@ const lazyMatchMatrixPanel = {
 
 const chainedPanel = {
   title:"Chained refinement (match P, then O)",
-  note:"Two sequential match_pattern calls on the same view — the “views narrow the same coordinate space” feature. Sorted-stream builder, Default layout, by-copy index; only the source varies.",
+  note:"Two sequential match_pattern calls on the same view — the “views narrow the same coordinate space” feature. Default layout, by-copy index; only the source varies.",
   rowHeaders:["Source"], columns:["Time"],
   rows:[
     {labels:["File"], ids:["match_chained::file"]},
@@ -782,7 +781,7 @@ const chainedPanel = {
 
 const decodeLifecyclePanel = {
   title:"Open & full decode, per layout",
-  note:"Sorted-stream builder. Open reads only the file footer (Dictionary additionally lifts its term dictionary), before any decode; decode materializes every quad back out.",
+  note:"Open reads only the file footer (Dictionary additionally lifts its term dictionary), before any decode; decode materializes every quad back out.",
   wide:true, rowHeaders:["Layout"],
   columns:["Open (file)","Decode all (file)","Decode all (in-memory)"],
   rows:[
@@ -909,8 +908,8 @@ function renderRust(){
   panel.className = "panel";
   panel.innerHTML = `<h3>Interaction effects</h3><p class="note">One combination that doesn't reduce to a single axis: a dictionary layout's index holds codes rather than term strings.</p>`;
   const irows = [
-    { name:"Dictionary + by-copy index", id:"serialize::sorted_stream_dictionary_by_copy",
-      refs:[["dictionary alone","serialize::sorted_stream_dictionary_no_index"], ["by-copy alone","serialize::sorted_stream_default_by_copy"]] },
+    { name:"Dictionary + by-copy index", id:"serialize::dictionary_by_copy",
+      refs:[["dictionary alone","serialize::dictionary_no_index"], ["by-copy alone","serialize::default_by_copy"]] },
   ];
   const itable = document.createElement("table");
   itable.className = "interact-table";
@@ -972,22 +971,22 @@ function renderRust(){
 
 // ---- JavaScript tab ----
 const JS_ADAPTERS = [
-  { slug:"vortex_sorted_dict",         label:"Vortex Sorted/Dict" },
-  { slug:"vortex_sorted_dict_byref",   label:"Vortex Sorted/Dict+ByRef" },
-  { slug:"vortex_sorted_dict_bycopy",  label:"Vortex Sorted/Dict+ByCopy" },
-  { slug:"vortex_sorted_default",      label:"Vortex Sorted/Default" },
-  { slug:"vortex_sorted_default_byref",label:"Vortex Sorted/Default+ByRef" },
-  { slug:"vortex_sorted_default_bycopy",label:"Vortex Sorted/Default+ByCopy" },
+  { slug:"vortex_dict",         label:"Vortex Dict" },
+  { slug:"vortex_dict_byref",   label:"Vortex Dict+ByRef" },
+  { slug:"vortex_dict_bycopy",  label:"Vortex Dict+ByCopy" },
+  { slug:"vortex_default",      label:"Vortex Default" },
+  { slug:"vortex_default_byref",label:"Vortex Default+ByRef" },
+  { slug:"vortex_default_bycopy",label:"Vortex Default+ByCopy" },
   { slug:"rdfstores_default",          label:"rdf-stores (default)" },
   { slug:"rdfstores_single",           label:"rdf-stores (1 index)" },
   { slug:"oxigraph",                   label:"oxigraph" },
 ];
 const JS_VORTEX = JS_ADAPTERS.slice(0, 6);
 const CROSS_LIB_SERIES = [
-  { slug:"vortex_sorted_dict_byref",    label:"Vortex Sorted/Dict+ByRef" },
-  { slug:"vortex_sorted_dict_bycopy",   label:"Vortex Sorted/Dict+ByCopy" },
-  { slug:"vortex_sorted_default_byref", label:"Vortex Sorted/Default+ByRef" },
-  { slug:"vortex_sorted_default_bycopy",label:"Vortex Sorted/Default+ByCopy" },
+  { slug:"vortex_dict_byref",    label:"Vortex Dict+ByRef" },
+  { slug:"vortex_dict_bycopy",   label:"Vortex Dict+ByCopy" },
+  { slug:"vortex_default_byref", label:"Vortex Default+ByRef" },
+  { slug:"vortex_default_bycopy",label:"Vortex Default+ByCopy" },
   { slug:"rdfstores_default",           label:"rdf-stores (default)" },
   { slug:"rdfstores_single",            label:"rdf-stores (1 index)" },
   { slug:"oxigraph",                    label:"oxigraph" },
@@ -1081,13 +1080,13 @@ function renderJs(){
 // than buried in a footnote, and they are crossed with the secondary index so
 // that difference can be read both with and without one.
 const PY_VORTEX = [
-  { slug:"vortex_sorted_dict",            label:"vortex-rdf Sorted/Dict (file)" },
-  { slug:"vortex_sorted_dict_mem",        label:"vortex-rdf Sorted/Dict (memory)" },
-  { slug:"vortex_sorted_default",         label:"vortex-rdf Sorted/Default (file)" },
-  { slug:"vortex_sorted_dict_bycopy",     label:"vortex-rdf Sorted/Dict+ByCopy (file)" },
-  { slug:"vortex_sorted_dict_bycopy_mem", label:"vortex-rdf Sorted/Dict+ByCopy (memory)" },
-  { slug:"vortex_sorted_dict_byref",      label:"vortex-rdf Sorted/Dict+ByRef (file)" },
-  { slug:"vortex_sorted_dict_byref_mem",  label:"vortex-rdf Sorted/Dict+ByRef (memory)" },
+  { slug:"vortex_dict",            label:"vortex-rdf Dict (file)" },
+  { slug:"vortex_dict_mem",        label:"vortex-rdf Dict (memory)" },
+  { slug:"vortex_default",         label:"vortex-rdf Default (file)" },
+  { slug:"vortex_dict_bycopy",     label:"vortex-rdf Dict+ByCopy (file)" },
+  { slug:"vortex_dict_bycopy_mem", label:"vortex-rdf Dict+ByCopy (memory)" },
+  { slug:"vortex_dict_byref",      label:"vortex-rdf Dict+ByRef (file)" },
+  { slug:"vortex_dict_byref_mem",  label:"vortex-rdf Dict+ByRef (memory)" },
 ];
 // The four libraries Vortex is measured against.
 const PY_OTHER_LIBS = [

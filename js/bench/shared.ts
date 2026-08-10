@@ -86,12 +86,12 @@ export function reclaim(a: StoreAdapter, h: unknown): void {
 
 // Vortex: one adapter per curated build variant (mirrors the Rust star design axes).
 export const VORTEX_VARIANTS: { slug: string; label: string; options: BuildOptions }[] = [
-    { slug: 'vortex_sorted_dict', label: 'Vortex Sorted/Dict', options: { layout: 'dictionary' } },
-    { slug: 'vortex_sorted_dict_byref', label: 'Vortex Sorted/Dict+ByRef', options: { layout: 'dictionary', indexes: ['secondary-by-reference'] } },
-    { slug: 'vortex_sorted_dict_bycopy', label: 'Vortex Sorted/Dict+ByCopy', options: { layout: 'dictionary', indexes: ['secondary-by-copy'] } },
-    { slug: 'vortex_sorted_default', label: 'Vortex Sorted/Default', options: { layout: 'default' } },
-    { slug: 'vortex_sorted_default_byref', label: 'Vortex Sorted/Default+ByRef', options: { layout: 'default', indexes: ['secondary-by-reference'] } },
-    { slug: 'vortex_sorted_default_bycopy', label: 'Vortex Sorted/Default+ByCopy', options: { layout: 'default', indexes: ['secondary-by-copy'] } },
+    { slug: 'vortex_dict', label: 'Vortex Dict', options: { layout: 'dictionary' } },
+    { slug: 'vortex_dict_byref', label: 'Vortex Dict+ByRef', options: { layout: 'dictionary', indexes: ['secondary-by-reference'] } },
+    { slug: 'vortex_dict_bycopy', label: 'Vortex Dict+ByCopy', options: { layout: 'dictionary', indexes: ['secondary-by-copy'] } },
+    { slug: 'vortex_default', label: 'Vortex Default', options: { layout: 'default' } },
+    { slug: 'vortex_default_byref', label: 'Vortex Default+ByRef', options: { layout: 'default', indexes: ['secondary-by-reference'] } },
+    { slug: 'vortex_default_bycopy', label: 'Vortex Default+ByCopy', options: { layout: 'default', indexes: ['secondary-by-copy'] } },
 ];
 
 export function vortexAdapter(variant: { slug: string; label: string; options: BuildOptions }): StoreAdapter<VortexRdfStore> {

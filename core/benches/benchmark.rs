@@ -87,7 +87,7 @@ fn cached_store_bytes(layout: Layout, index: Index, size: usize) -> Arc<Vec<u8>>
 // Group 1 — SERIALIZE (write path)
 //
 // The write path is the one place all three axes genuinely differ, so we vary
-// them one at a time around a `sorted_stream / default / no_index` baseline and
+// them one at a time around a `default / no_index` baseline and
 // add the one real interaction (Dictionary encodes the index as codes).
 // ══════════════════════════════════════════════════════════════════════════
 
@@ -158,7 +158,7 @@ fn serialize(bencher: divan::Bencher, cfg: &SerCfg) {
 // ══════════════════════════════════════════════════════════════════════════
 // Group 2 — MATCH (query path)
 //
-// Baseline: sorted_stream / default / by_copy / file. Each config sweeps the
+// Baseline: default / by_copy / file. Each config sweeps the
 // six routing patterns. SortedInMemory is omitted because it is
 // query-indistinguishable from SortedStream (identical stamped columns).
 // ══════════════════════════════════════════════════════════════════════════
@@ -200,9 +200,8 @@ macro_rules! match_bench {
     };
 }
 
-/// The full layout × source × index match matrix (sorted-stream builder
-/// throughout). One group per cell, named
-/// `match_sorted_{layout}_{index}_{source}`.
+/// The full layout × source × index match matrix. One group per cell, named
+/// `match_{layout}_{index}_{source}`.
 macro_rules! match_matrix {
     ($(($layout:expr, $index:expr, $source:expr) => $name:ident,)*) => {
         $(match_bench!($name, $layout, $index, $source);)*
@@ -210,26 +209,26 @@ macro_rules! match_matrix {
 }
 match_matrix!(
     // No secondary index.
-    (Layout::Default, Index::None, Source::InMemory) => match_sorted_default_noindex_mem,
-    (Layout::Default, Index::None, Source::File) => match_sorted_default_noindex_file,
-    (Layout::TypedObject, Index::None, Source::InMemory) => match_sorted_typedobj_noindex_mem,
-    (Layout::TypedObject, Index::None, Source::File) => match_sorted_typedobj_noindex_file,
-    (Layout::Dictionary, Index::None, Source::InMemory) => match_sorted_dict_noindex_mem,
-    (Layout::Dictionary, Index::None, Source::File) => match_sorted_dict_noindex_file,
+    (Layout::Default, Index::None, Source::InMemory) => match_default_noindex_mem,
+    (Layout::Default, Index::None, Source::File) => match_default_noindex_file,
+    (Layout::TypedObject, Index::None, Source::InMemory) => match_typedobj_noindex_mem,
+    (Layout::TypedObject, Index::None, Source::File) => match_typedobj_noindex_file,
+    (Layout::Dictionary, Index::None, Source::InMemory) => match_dict_noindex_mem,
+    (Layout::Dictionary, Index::None, Source::File) => match_dict_noindex_file,
     // Secondary by reference.
-    (Layout::Default, Index::ByReference, Source::InMemory) => match_sorted_default_byref_mem,
-    (Layout::Default, Index::ByReference, Source::File) => match_sorted_default_byref_file,
-    (Layout::TypedObject, Index::ByReference, Source::InMemory) => match_sorted_typedobj_byref_mem,
-    (Layout::TypedObject, Index::ByReference, Source::File) => match_sorted_typedobj_byref_file,
-    (Layout::Dictionary, Index::ByReference, Source::InMemory) => match_sorted_dict_byref_mem,
-    (Layout::Dictionary, Index::ByReference, Source::File) => match_sorted_dict_byref_file,
+    (Layout::Default, Index::ByReference, Source::InMemory) => match_default_byref_mem,
+    (Layout::Default, Index::ByReference, Source::File) => match_default_byref_file,
+    (Layout::TypedObject, Index::ByReference, Source::InMemory) => match_typedobj_byref_mem,
+    (Layout::TypedObject, Index::ByReference, Source::File) => match_typedobj_byref_file,
+    (Layout::Dictionary, Index::ByReference, Source::InMemory) => match_dict_byref_mem,
+    (Layout::Dictionary, Index::ByReference, Source::File) => match_dict_byref_file,
     // Secondary by copy.
-    (Layout::Default, Index::ByCopy, Source::InMemory) => match_sorted_default_bycopy_mem,
-    (Layout::Default, Index::ByCopy, Source::File) => match_sorted_default_bycopy_file,
-    (Layout::TypedObject, Index::ByCopy, Source::InMemory) => match_sorted_typedobj_bycopy_mem,
-    (Layout::TypedObject, Index::ByCopy, Source::File) => match_sorted_typedobj_bycopy_file,
-    (Layout::Dictionary, Index::ByCopy, Source::InMemory) => match_sorted_dict_bycopy_mem,
-    (Layout::Dictionary, Index::ByCopy, Source::File) => match_sorted_dict_bycopy_file,
+    (Layout::Default, Index::ByCopy, Source::InMemory) => match_default_bycopy_mem,
+    (Layout::Default, Index::ByCopy, Source::File) => match_default_bycopy_file,
+    (Layout::TypedObject, Index::ByCopy, Source::InMemory) => match_typedobj_bycopy_mem,
+    (Layout::TypedObject, Index::ByCopy, Source::File) => match_typedobj_bycopy_file,
+    (Layout::Dictionary, Index::ByCopy, Source::InMemory) => match_dict_bycopy_mem,
+    (Layout::Dictionary, Index::ByCopy, Source::File) => match_dict_bycopy_file,
 );
 /// Chained refinement: `match_pattern(P)` then `match_pattern(O)` on the
 /// resulting view — the headline "views narrow the same coordinate space"

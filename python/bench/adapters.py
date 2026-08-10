@@ -400,13 +400,13 @@ class RdflibAdapter(Adapter):
 #: an index configuration. The in-memory indexed cells are the ones that match
 #: how pyoxigraph and rdflib are configured.
 VORTEX_VARIANTS = [
-    ("vortex_sorted_dict", "Vortex Sorted/Dict", "dictionary", [], False),
-    ("vortex_sorted_dict_mem", "Vortex Sorted/Dict (in-memory)", "dictionary", [], True),
-    ("vortex_sorted_default", "Vortex Sorted/Default", "default", [], False),
-    ("vortex_sorted_dict_bycopy", "Vortex Sorted/Dict+ByCopy", "dictionary", ["secondary-by-copy"], False),
-    ("vortex_sorted_dict_bycopy_mem", "Vortex Sorted/Dict+ByCopy (in-memory)", "dictionary", ["secondary-by-copy"], True),
-    ("vortex_sorted_dict_byref", "Vortex Sorted/Dict+ByRef", "dictionary", ["secondary-by-reference"], False),
-    ("vortex_sorted_dict_byref_mem", "Vortex Sorted/Dict+ByRef (in-memory)", "dictionary", ["secondary-by-reference"], True),
+    ("vortex_dict", "Vortex Dict", "dictionary", [], False),
+    ("vortex_dict_mem", "Vortex Dict (in-memory)", "dictionary", [], True),
+    ("vortex_default", "Vortex Default", "default", [], False),
+    ("vortex_dict_bycopy", "Vortex Dict+ByCopy", "dictionary", ["secondary-by-copy"], False),
+    ("vortex_dict_bycopy_mem", "Vortex Dict+ByCopy (in-memory)", "dictionary", ["secondary-by-copy"], True),
+    ("vortex_dict_byref", "Vortex Dict+ByRef", "dictionary", ["secondary-by-reference"], False),
+    ("vortex_dict_byref_mem", "Vortex Dict+ByRef (in-memory)", "dictionary", ["secondary-by-reference"], True),
 ]
 
 

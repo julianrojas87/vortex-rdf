@@ -84,20 +84,20 @@ QUAD_PATTERNS = [
 #: Build (write) path, one factor at a time around a Dictionary baseline.
 #: Same set and same slugs as the JS suite's BUILD_VARIANTS.
 BUILD_VARIANTS = {
-    "sorted_dict": dict(builder="sorted-in-memory", layout="dictionary"),
-    "sorted_default": dict(builder="sorted-in-memory", layout="default"),
-    "sorted_typedobject": dict(builder="sorted-in-memory", layout="typed-object"),
-    "sorted_dict_byref": dict(
+    "dict": dict(builder="sorted-in-memory", layout="dictionary"),
+    "default": dict(builder="sorted-in-memory", layout="default"),
+    "typedobject": dict(builder="sorted-in-memory", layout="typed-object"),
+    "dict_byref": dict(
         builder="sorted-in-memory", layout="dictionary", indexes=["secondary-by-reference"]
     ),
-    "sorted_dict_bycopy": dict(
+    "dict_bycopy": dict(
         builder="sorted-in-memory", layout="dictionary", indexes=["secondary-by-copy"]
     ),
 }
 
 #: Query (read) path: the two representative configs the JS suite uses — the
 #: unindexed default and the fully-indexed fast path.
-QUERY_VARIANTS = ("sorted_dict", "sorted_dict_bycopy")
+QUERY_VARIANTS = ("dict", "dict_bycopy")
 
 
 def _build(source: Path, out: Path, variant: str) -> str:
@@ -138,10 +138,10 @@ def stores(tmp_path_factory, data) -> dict[str, VortexRdfStore]:
             _build(data["quads"], root / f"q-{variant}.vortex", variant)
         )
     built["realistic"] = VortexRdfStore(
-        _build(data["realistic"], root / "realistic.vortex", "sorted_dict")
+        _build(data["realistic"], root / "realistic.vortex", "dict")
     )
     built["literals"] = VortexRdfStore(
-        _build(data["literals"], root / "literals.vortex", "sorted_dict")
+        _build(data["literals"], root / "literals.vortex", "dict")
     )
     return built
 
@@ -154,12 +154,12 @@ def stores(tmp_path_factory, data) -> dict[str, VortexRdfStore]:
 def test_build(benchmark, tmp_path_factory, data, variant):
     """Parse an RDF file and write the `.vortex` store, per star variant.
 
-    `sorted_dict` runs over the cardinality-realistic dataset rather than the
+    `dict` runs over the cardinality-realistic dataset rather than the
     cube, as in the JS suite: it is the guard on dictionary construction, and on
     the cube the dictionary is a few dozen terms and its build cost invisible.
     Its number is therefore NOT comparable with the cube variants beside it.
     """
-    source = data["realistic"] if variant == "sorted_dict" else data["cube"]
+    source = data["realistic"] if variant == "dict" else data["cube"]
     out = tmp_path_factory.mktemp("build") / "out.vortex"
     benchmark(lambda: _build(source, out, variant))
 
@@ -168,7 +168,7 @@ def test_build(benchmark, tmp_path_factory, data, variant):
 def test_build_literals(benchmark, tmp_path_factory, data):
     """Build over literal-bearing data — the escaping path on ingest."""
     out = tmp_path_factory.mktemp("build-lit") / "out.vortex"
-    benchmark(lambda: _build(data["literals"], out, "sorted_dict"))
+    benchmark(lambda: _build(data["literals"], out, "dict"))
 
 
 # ─── query_<config>::<pattern> ──────────────────────────────────────────────
@@ -206,7 +206,7 @@ def test_readpath(benchmark, stores, op):
     materialize terms, which in JS is `readpath::getQuads_decoded`; the
     bindings have no lazy quad object, so there is no undecoded `get_quads`.
     """
-    store = stores["triples::sorted_dict"]
+    store = stores["triples::dict"]
     p = TRIPLE_PATTERNS[0]  # S
     call = getattr(store, op)
     benchmark(lambda: call(p.s, p.p, p.o, p.g))
@@ -319,13 +319,13 @@ def test_decode_many_scattered(benchmark, scattered_store):
 
 @pytest.mark.benchmark
 def test_readback_to_bytes(benchmark, stores):
-    store = stores["triples::sorted_dict_bycopy"]
+    store = stores["triples::dict_bycopy"]
     benchmark(store.to_bytes)
 
 
 @pytest.mark.benchmark
 def test_readback_from_bytes(benchmark, stores):
-    data = stores["triples::sorted_dict_bycopy"].to_bytes()
+    data = stores["triples::dict_bycopy"].to_bytes()
     benchmark(lambda: VortexRdfStore.from_bytes(data))
 
 
@@ -333,5 +333,5 @@ def test_readback_from_bytes(benchmark, stores):
 def test_readback_open(benchmark, tmp_path_factory, data):
     """Opening an already-built file — the operation with no JS counterpart,
     since the wasm bindings have no file-backed store."""
-    out = _build(data["cube"], tmp_path_factory.mktemp("open") / "out.vortex", "sorted_dict_bycopy")
+    out = _build(data["cube"], tmp_path_factory.mktemp("open") / "out.vortex", "dict_bycopy")
     benchmark(lambda: VortexRdfStore(out))

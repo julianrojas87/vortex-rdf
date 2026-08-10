@@ -18,7 +18,7 @@
 // ── Attribution sweep (opt-in) ───────────────────────────────────────────────
 //
 //   DICT_MEM_RATIOS=0.001,0.01,0.1,0.5,1.0 \
-//   DICT_MEM_SLUGS=vortex_sorted_dict,vortex_sorted_default \
+//   DICT_MEM_SLUGS=vortex_dict,vortex_default \
 //   npm run bench:dict-memory
 //
 // Fits per-term cost. Needs >= 2 points, and is what produced the bytes/term
@@ -65,9 +65,9 @@ const OUT = resolve(here, process.env.DICT_MEM_OUT ?? 'dict-memory.json');
 const N = Number(process.env.DICT_MEM_N ?? 200_000);
 
 /** Which build variants to run. Dictionary layout is the subject. Add
- *  `vortex_sorted_default` when sweeping: it has no term dictionary, so its
+ *  `vortex_default` when sweeping: it has no term dictionary, so its
  *  slope isolates everything that is *not* the dictionary. */
-const SLUGS = (process.env.DICT_MEM_SLUGS ?? 'vortex_sorted_dict').split(',');
+const SLUGS = (process.env.DICT_MEM_SLUGS ?? 'vortex_dict').split(',');
 
 /** Subject ratio per point; object ratio tracks it at half.
  *
@@ -130,7 +130,7 @@ function atReferenceConfig(points: Point[]): points is [Point] {
     return points.length === 1
         && N === 200_000
         && RATIOS.length === 1 && RATIOS[0] === 1.0
-        && points[0].slug === 'vortex_sorted_dict'
+        && points[0].slug === 'vortex_dict'
         && points[0].stores === REFERENCE.stores;
 }
 

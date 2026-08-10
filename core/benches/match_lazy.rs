@@ -62,74 +62,74 @@ macro_rules! lazy_match_bench {
 // dashboard derives one set of ids from the other.
 // No secondary index.
 lazy_match_bench!(
-    lazy_match_sorted_default_noindex_mem,
+    lazy_match_default_noindex_mem,
     Layout::Default,
     Index::None,
     Source::InMemory
 );
 lazy_match_bench!(
-    lazy_match_sorted_default_noindex_file,
+    lazy_match_default_noindex_file,
     Layout::Default,
     Index::None,
     Source::File
 );
 lazy_match_bench!(
-    lazy_match_sorted_typedobj_noindex_mem,
+    lazy_match_typedobj_noindex_mem,
     Layout::TypedObject,
     Index::None,
     Source::InMemory
 );
 lazy_match_bench!(
-    lazy_match_sorted_typedobj_noindex_file,
+    lazy_match_typedobj_noindex_file,
     Layout::TypedObject,
     Index::None,
     Source::File
 );
 lazy_match_bench!(
-    lazy_match_sorted_dict_noindex_mem,
+    lazy_match_dict_noindex_mem,
     Layout::Dictionary,
     Index::None,
     Source::InMemory
 );
 lazy_match_bench!(
-    lazy_match_sorted_dict_noindex_file,
+    lazy_match_dict_noindex_file,
     Layout::Dictionary,
     Index::None,
     Source::File
 );
 // Secondary by reference.
 lazy_match_bench!(
-    lazy_match_sorted_default_byref_mem,
+    lazy_match_default_byref_mem,
     Layout::Default,
     Index::ByReference,
     Source::InMemory
 );
 lazy_match_bench!(
-    lazy_match_sorted_default_byref_file,
+    lazy_match_default_byref_file,
     Layout::Default,
     Index::ByReference,
     Source::File
 );
 lazy_match_bench!(
-    lazy_match_sorted_typedobj_byref_mem,
+    lazy_match_typedobj_byref_mem,
     Layout::TypedObject,
     Index::ByReference,
     Source::InMemory
 );
 lazy_match_bench!(
-    lazy_match_sorted_typedobj_byref_file,
+    lazy_match_typedobj_byref_file,
     Layout::TypedObject,
     Index::ByReference,
     Source::File
 );
 lazy_match_bench!(
-    lazy_match_sorted_dict_byref_mem,
+    lazy_match_dict_byref_mem,
     Layout::Dictionary,
     Index::ByReference,
     Source::InMemory
 );
 lazy_match_bench!(
-    lazy_match_sorted_dict_byref_file,
+    lazy_match_dict_byref_file,
     Layout::Dictionary,
     Index::ByReference,
     Source::File
@@ -137,56 +137,56 @@ lazy_match_bench!(
 // Lean from_bytes adoption (wire-encoded base, deferred components) on the
 // Dictionary layout: the encoded-probe counterpart of the `_mem` rows.
 lazy_match_bench!(
-    lazy_match_sorted_dict_noindex_bytes,
+    lazy_match_dict_noindex_bytes,
     Layout::Dictionary,
     Index::None,
     Source::Bytes
 );
 lazy_match_bench!(
-    lazy_match_sorted_dict_byref_bytes,
+    lazy_match_dict_byref_bytes,
     Layout::Dictionary,
     Index::ByReference,
     Source::Bytes
 );
 lazy_match_bench!(
-    lazy_match_sorted_dict_bycopy_bytes,
+    lazy_match_dict_bycopy_bytes,
     Layout::Dictionary,
     Index::ByCopy,
     Source::Bytes
 );
 // Secondary by copy.
 lazy_match_bench!(
-    lazy_match_sorted_default_bycopy_mem,
+    lazy_match_default_bycopy_mem,
     Layout::Default,
     Index::ByCopy,
     Source::InMemory
 );
 lazy_match_bench!(
-    lazy_match_sorted_default_bycopy_file,
+    lazy_match_default_bycopy_file,
     Layout::Default,
     Index::ByCopy,
     Source::File
 );
 lazy_match_bench!(
-    lazy_match_sorted_typedobj_bycopy_mem,
+    lazy_match_typedobj_bycopy_mem,
     Layout::TypedObject,
     Index::ByCopy,
     Source::InMemory
 );
 lazy_match_bench!(
-    lazy_match_sorted_typedobj_bycopy_file,
+    lazy_match_typedobj_bycopy_file,
     Layout::TypedObject,
     Index::ByCopy,
     Source::File
 );
 lazy_match_bench!(
-    lazy_match_sorted_dict_bycopy_mem,
+    lazy_match_dict_bycopy_mem,
     Layout::Dictionary,
     Index::ByCopy,
     Source::InMemory
 );
 lazy_match_bench!(
-    lazy_match_sorted_dict_bycopy_file,
+    lazy_match_dict_bycopy_file,
     Layout::Dictionary,
     Index::ByCopy,
     Source::File
