@@ -129,18 +129,38 @@ fn resolved_layout(
     }
 }
 
-/// The compressed-resident form every in-memory construction produces: the
-/// base's u32 code columns and each component's integer children are
-/// re-encoded into probe-supported encodings (see
+/// Row count below which construction keeps the canonical columns its
+/// builders emit.
+///
+/// Compressing is one pass over every code column, paid again on every
+/// compaction; under this many rows the bytes it reclaims are small enough
+/// that a store answering a handful of point queries never repays the pass.
+/// The threshold sits an order of magnitude above the query-routing gates, so
+/// a store below it keeps the canonical slice path at every selection width,
+/// and below the builders' chunk size, so a gated base is always a single
+/// chunk.
+pub(crate) const MIN_COMPRESSED_ROWS: usize = 65_536;
+
+/// The compressed-resident form in-memory construction produces past
+/// [`MIN_COMPRESSED_ROWS`]: the base's u32 code columns and each component's
+/// integer children are re-encoded into probe-supported encodings (see
 /// [`with_compressed_int_children`](array::with_compressed_int_children)),
 /// with the base additionally payload-wrapped so the code-column read path
 /// keeps its zero-copy fast path. Shared by the builder adoption
 /// (`from_row_space`) and compaction's rebuild (`from_raw_quads`) — the two
 /// places canonical built columns become a store.
+///
+/// The size gate is construction's alone: adoption
+/// ([`from_parts`](VortexRdfStore::from_parts), `from_bytes`) keeps whatever
+/// encoding arrived at any size, because its alternative is a decode rather
+/// than a skip.
 fn compress_built_parts(
     base: ArrayRef,
     components: Vec<crate::store::indexes::IndexComponent>,
 ) -> Result<(ArrayRef, Vec<crate::store::indexes::IndexComponent>)> {
+    if base.len() < MIN_COMPRESSED_ROWS {
+        return Ok((base, components));
+    }
     let base = array::with_compressed_int_children(base, true)?;
     let components = components
         .into_iter()

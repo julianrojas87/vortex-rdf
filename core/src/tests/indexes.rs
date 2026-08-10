@@ -871,15 +871,16 @@ async fn test_in_memory_copy_index_serving() {
     assert_eq!(view_strings(&by_p_wiped).await, Vec::<String>::new());
 }
 
-/// A built store's resident form: construction compresses the base's code
-/// columns and every component's integer children into probe-supported
-/// encodings — no canonical primitives are retained — while every sorted
-/// column still binds an encoded search probe, and the payload path still
-/// serves codes (through the base's `vortex.shared` wrappers).
+/// A built store's resident form past the compression size gate:
+/// construction compresses the base's code columns and every component's
+/// integer children into probe-supported encodings — no canonical primitives
+/// are retained — while every sorted column still binds an encoded search
+/// probe, and the payload path still serves codes (through the base's
+/// `vortex.shared` wrappers).
 #[cfg(feature = "file-io")]
 #[tokio::test]
 async fn test_built_store_compresses_resident_form() {
-    let quads = modular_quads(200, 4, 8);
+    let quads = modular_quads(crate::store::MIN_COMPRESSED_ROWS, 4, 8);
     let arr = build_array::<SortedInMemoryBuilder>(
         quad_stream(quads.clone()),
         LayoutStrategy::Dictionary,
@@ -935,6 +936,47 @@ async fn test_built_store_compresses_resident_form() {
         .collect();
     want.sort();
     assert_eq!(got, want);
+}
+
+/// Below the compression size gate a built store keeps the canonical columns
+/// its builder emitted, and every routing path still works over them: the
+/// sorted columns bind encoded search probes, the payload path serves codes,
+/// and matches answer exactly as they do above the gate.
+#[cfg(feature = "file-io")]
+#[tokio::test]
+async fn test_small_built_store_stays_canonical() {
+    let quads = modular_quads(crate::store::MIN_COMPRESSED_ROWS - 1, 4, 8);
+    let arr = build_array::<SortedInMemoryBuilder>(
+        quad_stream(quads.clone()),
+        LayoutStrategy::Dictionary,
+        vec![IndexType::SecondaryByCopy],
+    )
+    .await
+    .unwrap();
+    let store = VortexRdfStore::from_built(arr).unwrap();
+
+    assert!(
+        store.debug_base_int_children_canonical(),
+        "a base under the size gate keeps its canonical code columns"
+    );
+    assert_eq!(
+        store.debug_index_component_int_children_canonical("index:posg"),
+        Some(true),
+        "components follow the base through the same gate"
+    );
+    assert!(store.debug_base_probe_resolvable());
+    assert!(store.debug_base_subject_sorted());
+
+    let p1 = NamedNode::new("http://example.org/p1").unwrap();
+    let matched = store
+        .match_pattern(None, Some(&p1), None, None)
+        .await
+        .unwrap();
+    assert_eq!(matched.size().await.unwrap(), quads.len().div_ceil(4));
+    assert!(
+        matched.code_columns().is_some(),
+        "the canonical base serves codes directly"
+    );
 }
 
 /// The bindings' code-column read on a served in-memory match: `code_columns`
