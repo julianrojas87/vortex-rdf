@@ -101,6 +101,7 @@
     padding: 14px 24px;
   }
   .topbar-row { display:flex; align-items:baseline; justify-content:space-between; gap:16px; flex-wrap:wrap; max-width: 1280px; margin: 0 auto; }
+  .topbar-controls { display:flex; align-items:center; gap:14px; flex-wrap:wrap; }
   .brand { display:flex; align-items:baseline; gap:10px; }
   .brand .mark { font-weight:700; letter-spacing:0.02em; font-size:14px; text-transform:uppercase; }
   .brand .sub { color:var(--ink-2); font-size:13px; }
@@ -120,6 +121,30 @@
   }
   nav.tabs .tab:hover:not(.active) { color:var(--ink); }
   nav.tabs .tab.active { background:var(--accent); color:#fff; border-color:var(--accent); }
+
+  /* ---- theme switch ---- */
+  /* Native radios keep the group's keyboard semantics (arrow keys, single tab
+     stop); the visible control is the label around each one. */
+  .theme-switch {
+    display:inline-flex; gap:2px; padding:2px;
+    border:1px solid var(--border-strong); border-radius:7px;
+  }
+  .theme-switch label {
+    display:inline-flex; align-items:center; justify-content:center;
+    padding:5px 8px; border-radius:5px; color:var(--ink-muted); cursor:pointer;
+  }
+  .theme-switch label:hover { color:var(--ink); }
+  .theme-switch label:has(input:checked) {
+    background:var(--surface-2); color:var(--accent);
+    box-shadow: inset 0 0 0 1px var(--border-strong);
+  }
+  .theme-switch label:has(input:focus-visible) { outline:2px solid var(--focus); outline-offset:2px; }
+  .theme-switch input { position:absolute; width:1px; height:1px; opacity:0; margin:0; }
+  .theme-switch svg { width:15px; height:15px; display:block; }
+  .sr-only {
+    position:absolute; width:1px; height:1px; padding:0; margin:-1px;
+    overflow:hidden; clip-path:inset(50%); white-space:nowrap; border:0;
+  }
   .tabpane { display:none; }
   .tabpane.active { display:block; }
   .tabpane > nav.seclinks { margin-bottom:22px; }
@@ -222,17 +247,56 @@
   }
 </style>
 
+<script>
+  // Runs before the page body is parsed so a stored choice never paints the
+  // system theme first. An unstamped element is the "match system" state, which
+  // is what the prefers-color-scheme rules key on.
+  (function () {
+    try {
+      const stored = localStorage.getItem("vortex-bench-theme");
+      if (stored === "light" || stored === "dark") document.documentElement.dataset.theme = stored;
+    } catch (e) { /* storage blocked; the system theme applies */ }
+  })();
+</script>
+
 <header class="topbar">
   <div class="topbar-row">
     <div class="brand">
       <span class="mark mono">vortex-rdf · bench</span>
       <span class="sub">micro-benchmark results</span>
     </div>
-    <nav class="tabs" role="tablist" aria-label="Benchmark suite">
-      <button class="tab" data-tab="rust" role="tab" type="button">Rust · core</button>
-      <button class="tab" data-tab="js" role="tab" type="button">JavaScript · WASM</button>
-      <button class="tab" data-tab="py" role="tab" type="button">Python · bindings</button>
-    </nav>
+    <div class="topbar-controls">
+      <nav class="tabs" role="tablist" aria-label="Benchmark suite">
+        <button class="tab" data-tab="rust" role="tab" type="button">Rust · core</button>
+        <button class="tab" data-tab="js" role="tab" type="button">JavaScript · WASM</button>
+        <button class="tab" data-tab="py" role="tab" type="button">Python · bindings</button>
+      </nav>
+      <div class="theme-switch" role="radiogroup" aria-label="Color theme">
+        <label title="Light">
+          <input type="radio" name="theme" value="light" />
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
+            <circle cx="12" cy="12" r="4.5" />
+            <path d="M12 1.9v2.5M12 19.6v2.5M4.7 4.7l1.8 1.8M17.5 17.5l1.8 1.8M1.9 12h2.5M19.6 12h2.5M4.7 19.3l1.8-1.8M17.5 6.5l1.8-1.8" />
+          </svg>
+          <span class="sr-only">Light</span>
+        </label>
+        <label title="Match system">
+          <input type="radio" name="theme" value="auto" />
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <rect x="2.5" y="3.5" width="19" height="13" rx="2" />
+            <path d="M8.5 20.5h7M12 16.5v4" />
+          </svg>
+          <span class="sr-only">Match system</span>
+        </label>
+        <label title="Dark">
+          <input type="radio" name="theme" value="dark" />
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M20.5 14.4A8.6 8.6 0 1 1 9.6 3.5a6.8 6.8 0 0 0 10.9 10.9z" />
+          </svg>
+          <span class="sr-only">Dark</span>
+        </label>
+      </div>
+    </div>
   </div>
 </header>
 
@@ -1240,6 +1304,23 @@ window.addEventListener("hashchange", () => {
   const h = location.hash.replace("#", "");
   if (h in panes) showTab(h);
 });
+
+// ---- theme switch ----
+const THEME_KEY = "vortex-bench-theme";
+const themeInputs = document.querySelectorAll(".theme-switch input");
+function applyTheme(choice){
+  if (choice === "light" || choice === "dark") document.documentElement.dataset.theme = choice;
+  else { delete document.documentElement.dataset.theme; choice = "auto"; }
+  themeInputs.forEach(i => { i.checked = i.value === choice; });
+}
+themeInputs.forEach(i => i.addEventListener("change", () => {
+  applyTheme(i.value);
+  try {
+    if (i.value === "auto") localStorage.removeItem(THEME_KEY);
+    else localStorage.setItem(THEME_KEY, i.value);
+  } catch (e) { /* storage blocked; the choice lasts for this page view */ }
+}));
+applyTheme(document.documentElement.dataset.theme || "auto");
 
 // ---- render every tab (hidden panes still populate their DOM) ----
 renderRust();
