@@ -19,8 +19,8 @@
 //! the `_idx_*_rid` columns), so they compose with row selections, tombstones
 //! and chained matches unchanged. What the full copies add over the reference
 //! index is locality: the rows matching a bound predicate/object are a
-//! *contiguous* run of the copy columns, which file-backed stores exploit by
-//! streaming `quads()` straight from the copy family — this index hands back a
+//! *contiguous* run of the copy columns, which both backends exploit by
+//! reading `quads()` straight from the copy family — this index hands back a
 //! serve plan (`InMemoryServePlan` / `FileServePlan`) during resolution to
 //! describe that read — instead of scattering row-id reads across the primary
 //! columns.

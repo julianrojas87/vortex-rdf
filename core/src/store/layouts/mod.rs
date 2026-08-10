@@ -49,9 +49,9 @@ use crate::store::schema::{COL_G, COL_O, COL_P, COL_S};
 pub enum LayoutStrategy {
     /// ### `LayoutStrategy::Default` column schema
     ///
-    /// All quad columns stored as opaque UTF-8 strings in N-Triples form.
-    /// All four quad fields are stored as raw UTF-8 strings in N-Triples serialization form.
-    /// Vortex applies `DictionaryLayout` internally to compress repeated values.
+    /// All four quad fields stored as opaque UTF-8 strings in N-Triples
+    /// serialization form. Vortex applies its own `DictLayout` internally to
+    /// compress repeated values.
     ///
     /// | Column | Type              | Content                                                    |
     /// |--------|-------------------|------------------------------------------------------------|

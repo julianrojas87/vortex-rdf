@@ -71,10 +71,10 @@ for await (const quad of store.match(null, myPredicate, null, null)) {
 }
 ```
 
-When you just want the matches as an array, `getQuads` is the array-returning counterpart (`async`, because resolving the match crosses the WebAssembly boundary):
+When you just want the matches as an array, `getQuads` is the array-returning counterpart (synchronous — no read path performs I/O, so there is nothing to await):
 
 ```javascript
-const quads = await store.getQuads(null, myPredicate, null, null);
+const quads = store.getQuads(null, myPredicate, null, null);
 console.log(`Found ${quads.length} results`);
 ```
 
@@ -169,7 +169,7 @@ if (dict) {
 `matchCodes` is its pattern-matching counterpart: it resolves a pattern to the matched rows' raw term codes — four columnar `Uint32Array`s plus a `length` — without materializing any term strings, and returns `null` under the same conditions `termDict()` returns `undefined`:
 
 ```javascript
-const cols = await store.matchCodes(null, myPredicate, null, null);
+const cols = store.matchCodes(null, myPredicate, null, null);
 if (cols) {
   console.log(cols.length, dict.decode(cols.o[0]));
 }
@@ -207,7 +207,7 @@ const store = await VortexRdfStore.fromString(data, 'nquads', options);
 
 console.log(store.layout()); // 'dictionary'
 
-const quads = await store.getQuads(null, df.namedNode('http://schema.org/name'), null, null);
+const quads = store.getQuads(null, df.namedNode('http://schema.org/name'), null, null);
 for (const quad of quads) {
   console.log(quad.subject.value);
 }

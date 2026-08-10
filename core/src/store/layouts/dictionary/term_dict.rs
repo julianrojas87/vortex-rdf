@@ -4,8 +4,10 @@
 //!
 //! Because IDs are sorted ranks, ID comparisons are order-isomorphic to string
 //! comparisons and term→ID lookup is a binary search — no HashMap is needed on
-//! the query side, and the dictionary is held in its compact columnar form
-//! (`VarBinViewArray`) rather than as owned `String`s.
+//! the query side, and the terms stay in their compact columnar form (see
+//! [`TermStore`]: FSST-compressed windows as built and written, plaintext
+//! `VarBinViewArray` when a producer wrote them that way) rather than as owned
+//! `String`s.
 //!
 //! [`LayoutStrategy::Dictionary`]: crate::store::layouts::LayoutStrategy::Dictionary
 

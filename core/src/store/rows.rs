@@ -171,7 +171,9 @@ impl VortexRdfStore {
     }
 
     /// The rows this view selects, as four `u32` term-code columns (`s`, `p`,
-    /// `o`, `g`) gathered directly from the base's canonical primitive slices.
+    /// `o`, `g`) — read off the answering index's own columns when the view
+    /// carries a serve plan that covers them, else gathered directly from the
+    /// base's canonical primitive slices.
     ///
     /// `None` whenever codes cannot be served both cheaply and correctly:
     /// a non-Dictionary layout, a non-empty append tail (its strings are not

@@ -79,9 +79,10 @@ pub enum IndexType {
     /// Predicate-bound patterns binary-search `_idx_posg_p`; a bound
     /// predicate **and** object prefix-search (p, o) in one probe, resolving
     /// both components; object-bound patterns binary-search `_idx_ospg_o`.
-    /// In file-backed stores the copies additionally let `quads()` stream the
-    /// matching rows from a *contiguous* run of the copy columns instead of
-    /// scattering row-id reads across the primary columns. As with
+    /// The copies additionally let reads take the matching rows from a
+    /// *contiguous* run of the copy columns — sliced or point-read in memory,
+    /// scanned from the index child on a file — instead of scattering row-id
+    /// reads across the primary columns. As with
     /// [`SecondaryByReference`](Self::SecondaryByReference), in-memory routing
     /// engages only when the lead value columns carry the `IsSorted` statistic
     /// (single-chunk builds, or the sorted builders' global emission).

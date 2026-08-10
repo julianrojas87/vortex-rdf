@@ -18,7 +18,8 @@ use crate::terms::js_to_quad;
 extern "C" {
     /// Flatten an RDF/JS quad array into one length-prefixed byte buffer
     /// host-side, so bulk ingestion crosses the wasm boundary once instead of
-    /// ~16–20 Reflect calls per quad. Decoded by [`packed_to_quads`]. Throws
+    /// ~16–20 Reflect calls per quad. Decoded by [`packed_to_quads_into`].
+    /// Throws
     /// on a malformed quad (hence `catch`).
     #[wasm_bindgen(js_name = packQuads, catch)]
     fn pack_quads(

@@ -1,6 +1,15 @@
 //! Low-level helpers over Vortex arrays: string-array construction, canonical
 //! string-column access, sortedness statistics, sorted-column binary search,
-//! and mask conversion.
+//! the encoding of a store's integer children and the canonical accessors
+//! that read them back, and mask conversion.
+//!
+//! The integer-children helpers are the two ends of the compressed-resident
+//! form: [`with_compressed_int_children`] encodes a built store's code
+//! columns into probe-supported encodings, [`with_searchable_int_children`]
+//! keeps an adopted store's encodings wherever a probe binds them, and
+//! [`shared_u32_primitive`] / [`cached_u32_primitive`] hand back the
+//! canonical primitive a slice-bound read path needs — decoding into the
+//! shared wrapper's cache, or only if some earlier read already did.
 
 use crate::error::{Result, VortexRdfError};
 use crate::session::VORTEX_SESSION;

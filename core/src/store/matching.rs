@@ -164,8 +164,11 @@ impl VortexRdfStore {
     }
 
     /// The in-memory backend of [`match_base`](Self::match_base): every
-    /// search below runs against the base array and resolves to exact row
-    /// ids at match time.
+    /// search below runs against the base array and answers in base row ids.
+    /// Those ids are computed here, except for the one case that does not
+    /// need them — a serving index's resolution that is the view's sole
+    /// restriction leaves them pending (`LazyRowIds`), for the first consumer
+    /// that reads through the selection rather than the plan.
     ///
     /// Tombstones are deliberately not consulted here: they are applied by
     /// every read path instead, so matching may name deleted rows without the
