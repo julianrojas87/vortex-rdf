@@ -49,6 +49,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Locate and point-read index-served runs through cached probes (core) ([`ff1c724`](https://github.com/vortex-rdf/vortex-rdf/commit/ff1c7244604b285e6ceefb881fc9dc6c53c793ba) by @julianrojas87)
 - Freeze live objects out of the python timing loop (bench) ([`6307d4e`](https://github.com/vortex-rdf/vortex-rdf/commit/6307d4e6ad3d581e0726d7d422f4800257cd97c5) by julianrojas87)
 - Drop the file-backed dictionary's fence fallback (core) ([`cff8998`](https://github.com/vortex-rdf/vortex-rdf/commit/cff899866b94f6b888d6a929f6e05de4ee18957e) by julianrojas87)
+- Read pattern terms through cached property keys (js) ([`6814a5d`](https://github.com/vortex-rdf/vortex-rdf/commit/6814a5d5bf1997e518691e529623b0e73df48c30) by julianrojas87)
 
 ### Removed
 
