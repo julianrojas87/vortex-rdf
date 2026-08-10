@@ -123,7 +123,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Setup Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v7
         with:
           python-version: "3.14"
       - name: Build wheel
@@ -138,7 +138,7 @@ jobs:
           # need glibc >= 2.28 (RHEL 8+ / Ubuntu 18.10+ / Debian 10+).
           manylinux: "2_28"
           before-script-linux: dnf install -y clang-devel
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: wheel-${{ matrix.platform.name }}
           path: dist
@@ -155,7 +155,7 @@ jobs:
         with:
           command: sdist
           args: --out dist --manifest-path python/Cargo.toml
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: sdist
           path: dist
@@ -169,7 +169,7 @@ jobs:
     permissions:
       id-token: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
