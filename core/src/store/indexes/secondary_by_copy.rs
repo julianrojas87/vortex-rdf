@@ -550,7 +550,7 @@ pub(crate) async fn resolve_file(
             if (range.end - range.start) as usize
                 <= crate::store::selection::POINT_GATHER_MAX_ROWS =>
         {
-            match super::rid_point_reads(file, name, range.clone()).await? {
+            match super::rid_point_reads(file, name, CHILD_RID_COL, range.clone()).await? {
                 Some(ids) => ResolvedRowIds::Eager(ids),
                 None => ResolvedRowIds::Lazy(LazyRowIds::from_index_child_scan(
                     reader.clone(),

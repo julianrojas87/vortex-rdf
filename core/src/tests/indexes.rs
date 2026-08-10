@@ -1212,3 +1212,154 @@ async fn test_copy_index_file_serving_typed() {
 async fn test_copy_index_file_serving_dictionary() {
     run_copy_index_file_serving_test(LayoutStrategy::Dictionary, true).await;
 }
+
+// ─── 4c) SecondaryByReference on a file ─────────────────────────────────
+
+/// The file-backed reference index end to end: on a sorted dictionary-code
+/// child every covered shape locates its matched run through the value
+/// column's chunk probes (small runs read their row ids point by point, wide
+/// ones by a scan restricted to the run); on a string-valued child the same
+/// shapes decline the location and answer through the pushed-down scan. Both
+/// must agree, row for row, with the in-memory store over the same quads.
+#[cfg(feature = "file-io")]
+async fn run_reference_index_file_test(layout: LayoutStrategy, located: bool) {
+    // 900 quads: 300 per predicate (a run wider than the point-read cap) and
+    // ~129 per object (one narrow enough to point-read).
+    let quads: Vec<Quad> = (0..900)
+        .map(|i| {
+            make_quad(
+                &format!("http://example.org/s{i:04}"),
+                &format!("http://example.org/p{}", i % 3),
+                &format!("o{}", i % 7),
+                GraphName::DefaultGraph,
+            )
+        })
+        .collect();
+    let expected = |keep: &dyn Fn(usize) -> bool| -> Vec<String> {
+        let mut strings: Vec<String> = quads
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| keep(*i))
+            .map(|(_, q)| q.to_string())
+            .collect();
+        strings.sort();
+        strings
+    };
+
+    let (_dir, path) =
+        write_store_file(quads.clone(), layout, vec![IndexType::SecondaryByReference]).await;
+    let store = VortexRdfStore::from_file(&path).await.unwrap();
+    assert_eq!(store.indexes(), &[IndexType::SecondaryByReference]);
+
+    let p1 = NamedNode::new("http://example.org/p1").unwrap();
+    let o2 = Term::Literal(Literal::new_simple_literal("o2"));
+
+    // Object-bound: 129 rows — a located run inside the point-read cap.
+    let by_o = store
+        .match_pattern(None, None, Some(&o2), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .debug_reference_index_located_run(None, Some(&o2))
+            .await
+            .unwrap()
+            .map(|r| (r.end - r.start) as usize),
+        located.then_some(129),
+        "object location engages exactly on the code-valued child"
+    );
+    assert_eq!(by_o.size().await.unwrap(), 129);
+    assert_eq!(view_strings(&by_o).await, expected(&|i| i % 7 == 2));
+    // This index serves no quads: the reads gather the primary columns.
+    assert!(!by_o.debug_has_serve_plan());
+
+    // Predicate-bound: 300 rows — a located run past the cap, whose ids come
+    // from the range-restricted rid scan.
+    let by_p = store
+        .match_pattern(None, Some(&p1), None, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .debug_reference_index_located_run(Some(&p1), None)
+            .await
+            .unwrap()
+            .map(|r| (r.end - r.start) as usize),
+        located.then_some(300),
+    );
+    assert_eq!(by_p.size().await.unwrap(), 300);
+    assert_eq!(view_strings(&by_p).await, expected(&|i| i % 3 == 1));
+
+    // Predicate and object bound: this index probes the object column only,
+    // leaving the predicate as a residual filter over the located rows —
+    // i ≡ 2 (mod 7) ∧ i ≡ 1 (mod 3) ⇔ i ≡ 16 (mod 21).
+    let by_po = store
+        .match_pattern(None, Some(&p1), Some(&o2), None)
+        .await
+        .unwrap();
+    assert_eq!(view_strings(&by_po).await, expected(&|i| i % 21 == 16));
+
+    // A term the store has never seen short-circuits before any location.
+    let missing = Term::Literal(Literal::new_simple_literal("nope"));
+    let none = store
+        .match_pattern(None, None, Some(&missing), None)
+        .await
+        .unwrap();
+    assert_eq!(none.size().await.unwrap(), 0);
+
+    // A term the store knows — but never as an object — locates an empty run
+    // (or scans to the same conclusion) and answers empty.
+    let subject_as_o = Term::NamedNode(NamedNode::new("http://example.org/s0000").unwrap());
+    assert_eq!(
+        store
+            .debug_reference_index_located_run(None, Some(&subject_as_o))
+            .await
+            .unwrap()
+            .map(|r| r.is_empty()),
+        located.then_some(true),
+    );
+    let zero = store
+        .match_pattern(None, None, Some(&subject_as_o), None)
+        .await
+        .unwrap();
+    assert_eq!(view_strings(&zero).await, Vec::<String>::new());
+    assert_eq!(zero.size().await.unwrap(), 0);
+
+    // Tombstones ride the resolved ids: a deleted row leaves the run.
+    let deleted = store.delete_quad(&quads[2]).await.unwrap();
+    let after = deleted
+        .match_pattern(None, None, Some(&o2), None)
+        .await
+        .unwrap();
+    assert_eq!(after.size().await.unwrap(), 128);
+    assert_eq!(
+        view_strings(&after).await,
+        expected(&|i| i % 7 == 2 && i != 2)
+    );
+
+    // Chaining composes the resolutions the same way either path resolves
+    // them.
+    let chained = by_p
+        .match_pattern(None, None, Some(&o2), None)
+        .await
+        .unwrap();
+    assert_eq!(view_strings(&chained).await, expected(&|i| i % 21 == 16));
+}
+
+#[cfg(feature = "file-io")]
+#[tokio::test]
+async fn test_reference_index_file_dictionary() {
+    run_reference_index_file_test(LayoutStrategy::Dictionary, true).await;
+}
+
+#[cfg(feature = "file-io")]
+#[tokio::test]
+async fn test_reference_index_file_default() {
+    run_reference_index_file_test(LayoutStrategy::Default, false).await;
+}
+
+#[cfg(feature = "file-io")]
+#[tokio::test]
+async fn test_reference_index_file_typed() {
+    run_reference_index_file_test(LayoutStrategy::TypedObject, false).await;
+}

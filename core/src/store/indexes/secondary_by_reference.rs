@@ -23,11 +23,14 @@
 //!   windows. Every value column is stamped `IsSorted`, and the concatenated
 //!   columns stay globally binary-searchable.
 //!
-//! The two backends read that stamp differently. `resolve_in_memory` needs
-//! it: binary search over a concatenation of per-chunk orders would be wrong,
-//! so an unstamped column makes it decline and `match_pattern` falls back to a
-//! mask scan. `resolve_file` never consults it — the pushed-down equality is
-//! correct whatever the order, and sortedness only decides how much prunes.
+//! Both backends need global sortedness to binary-search, and neither depends
+//! on it to be correct — they differ only in what they do without it.
+//! `resolve_in_memory` declines an unsorted column outright (searching a
+//! concatenation of per-chunk orders would be wrong) and `match_pattern` falls
+//! back to a mask scan; `resolve_file` falls back on its own, to the
+//! pushed-down equality, which answers whatever the order — there, sortedness
+//! decides only whether the matched run can be *located* (and, failing that,
+//! how much of the scan prunes).
 //!
 //! [`IndexType::SecondaryByReference`]: super::IndexType::SecondaryByReference
 // Inspired by https://clickhouse.com/blog/projections-secondary-indices
@@ -275,8 +278,22 @@ pub(crate) fn resolve_in_memory(
 }
 
 /// Resolve a pattern against this index's columns in a file-backed store — the
-/// file counterpart of [`resolve_in_memory`], reaching the columns through a
-/// pushed-down scan instead of an in-memory binary search.
+/// file counterpart of [`resolve_in_memory`], reaching the columns through the
+/// child's cached chunk probes (the file mirror of the in-memory binary
+/// search) or, failing that, a pushed-down scan.
+///
+/// On a globally sorted child the matched rows are one contiguous run of the
+/// value column, so a binary search over the chunk probes bounds it without
+/// reading the column: a small run's row ids then come from rid point reads, a
+/// wide one from a rid scan restricted to the located range — either way
+/// without the filter evaluation (and the pruning it depends on) a scan of the
+/// whole child pays. Anything the probes decline — an unsorted child, a string
+/// value column, an encoding resolving no probe — falls back to the pushed-down
+/// scan, whose filter answers regardless of order.
+///
+/// This index stores no whole quads, so every outcome here is an eager row-id
+/// resolution with no serving plan; the store gathers the matched quads from
+/// the primary columns (point reads of their own, for a small id set).
 #[cfg(feature = "file-io")]
 pub(crate) async fn resolve_file(
     file: &crate::store::native_file::NativeStoreFile,
@@ -288,7 +305,7 @@ pub(crate) async fn resolve_file(
     };
     // Map the probed role onto its persisted child; be graceful when the
     // child is absent (a foreign writer could omit one role).
-    let Some((_, reader)) = file
+    let Some((descriptor, reader)) = file
         .component_reader(probe.role.component_name())
         .map_err(VortexRdfError::Vortex)?
     else {
@@ -298,8 +315,34 @@ pub(crate) async fn resolve_file(
     let Some(native) = codes.probe_scalar(probe.probe_term)? else {
         return Ok(IndexResolution::Empty);
     };
-    // A back-reference index stores no whole quads to serve from, so its file
-    // resolution is always the eager rid scan.
+
+    let name = probe.role.component_name();
+    if let Some(range) = locate_run(file, probe.role, &native, descriptor.sorted).await? {
+        // A located empty run proves the term absent from the data — the
+        // short-circuit an empty scan reaches only after reading it.
+        if range.is_empty() {
+            return Ok(IndexResolution::Empty);
+        }
+        // The located range is exactly this index's matched rows: the value
+        // column is the one and only constraint.
+        let row_ids = if (range.end - range.start) as usize
+            <= crate::store::selection::POINT_GATHER_MAX_ROWS
+        {
+            super::rid_point_reads(file, name, CHILD_RID_COL, range.clone()).await?
+        } else {
+            Some(super::scan_located_row_ids(reader.clone(), CHILD_RID_COL, range).await?)
+        };
+        // `None` is a mid-read decline (an unprobeable rid chunk); the scan
+        // below reads the same rows the long way.
+        if let Some(row_ids) = row_ids {
+            return Ok(IndexResolution::Resolved {
+                row_ids: ResolvedRowIds::Eager(row_ids),
+                resolves: probe.resolves,
+                // A back-reference index stores no whole quads to serve from.
+                serve: None,
+            });
+        }
+    }
     super::resolve_eager_from_scan(
         reader,
         &[(CHILD_VAL_COL, native)],
@@ -307,6 +350,62 @@ pub(crate) async fn resolve_file(
         probe.resolves,
     )
     .await
+}
+
+/// The child rows whose indexed value equals `native`, bounded by binary-
+/// searching the value column's cached chunk probes — the file mirror of
+/// [`resolve_in_memory`]'s search, reading only the chunks the bisection
+/// touches.
+///
+/// `None` declines the location (the caller falls back to its pushed-down
+/// scan): a child that is not globally sorted, a probe value that is not an
+/// integer (the string value columns), or a chunk whose encoding resolves no
+/// probe.
+#[cfg(feature = "file-io")]
+async fn locate_run(
+    file: &crate::store::native_file::NativeStoreFile,
+    role: RefRole,
+    native: &vortex_array::scalar::Scalar,
+    sorted: bool,
+) -> Result<Option<Range<u64>>> {
+    if !sorted {
+        return Ok(None);
+    }
+    let Ok(needle) = u64::try_from(native) else {
+        return Ok(None);
+    };
+    let Some(chunks) = file.component_column_chunks(role.component_name(), CHILD_VAL_COL) else {
+        return Ok(None);
+    };
+    chunks
+        .bounds(needle, &file.segment_source(), file.session())
+        .await
+        .map_err(VortexRdfError::Vortex)
+}
+
+/// Test-only hook exposing the run [`resolve_file`] locates for a pattern —
+/// `None` when the location declines and the resolution falls back to its
+/// pushed-down scan — so tests can assert engagement instead of inferring it
+/// from results.
+#[cfg(all(test, feature = "file-io"))]
+pub(crate) async fn debug_located_run(
+    file: &crate::store::native_file::NativeStoreFile,
+    pattern: QuadPattern<'_>,
+    codes: &mut PatternCodes,
+) -> Result<Option<Range<u64>>> {
+    let Some(probe) = choose(pattern) else {
+        return Ok(None);
+    };
+    let Some((descriptor, _)) = file
+        .component_reader(probe.role.component_name())
+        .map_err(VortexRdfError::Vortex)?
+    else {
+        return Ok(None);
+    };
+    let Some(native) = codes.probe_scalar(probe.probe_term)? else {
+        return Ok(None);
+    };
+    locate_run(file, probe.role, &native, descriptor.sorted).await
 }
 
 /// Append the four reference secondary-index columns for one chunk, sorting

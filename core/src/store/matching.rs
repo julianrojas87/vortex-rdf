@@ -777,6 +777,26 @@ impl VortexRdfStore {
             .map_err(VortexRdfError::Vortex)
     }
 
+    /// Test-only hook exposing the index-child run the reference index's file
+    /// resolution locates for a predicate/object pattern — `None` when the
+    /// location declines and the resolution falls back to its pushed-down
+    /// scan — so tests can assert engagement instead of inferring it from
+    /// results.
+    #[cfg(all(test, feature = "file-io"))]
+    pub(crate) async fn debug_reference_index_located_run(
+        &self,
+        predicate: Option<&NamedNode>,
+        object: Option<&Term>,
+    ) -> Result<Option<Range<u64>>> {
+        let QuadsSource::File { file, .. } = &self.quads else {
+            return Ok(None);
+        };
+        let pattern = QuadPattern::new(None, predicate, object, None);
+        let mut codes = self.layout.prepare_pattern(pattern).await?;
+        crate::store::indexes::secondary_by_reference::debug_located_run(file, pattern, &mut codes)
+            .await
+    }
+
     /// Whether the store holds a quad equal to `quad` (tombstoned rows count
     /// as absent). One fully-bound `match_pattern`, so it rides whatever fast
     /// path the store has — subject binary search, secondary indexes, or file

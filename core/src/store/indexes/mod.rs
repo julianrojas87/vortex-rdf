@@ -565,14 +565,17 @@ pub(crate) fn sorted_probe_run(
 /// base row order — the file counterpart of slicing an in-memory rid run.
 /// `Ok(None)` when the rid column's chunks decline (the caller keeps its
 /// scan); rids are unique by construction, so sorting alone suffices.
+///
+/// `rid_column` comes from the calling index — the hub names no index's
+/// columns.
 #[cfg(feature = "file-io")]
 pub(crate) async fn rid_point_reads(
     file: &crate::store::native_file::NativeStoreFile,
     component: &str,
+    rid_column: &str,
     range: Range<u64>,
 ) -> Result<Option<Buffer<u64>>> {
-    let Some(chunks) = file.component_column_chunks(component, secondary_by_copy::CHILD_RID_COL)
-    else {
+    let Some(chunks) = file.component_column_chunks(component, rid_column) else {
         return Ok(None);
     };
     let source = file.segment_source();
@@ -691,10 +694,56 @@ pub(crate) async fn scan_index_row_ids(
         return Ok(Buffer::empty());
     };
 
-    let arr = vortex_layout::scan::scan_builder::ScanBuilder::new(VORTEX_SESSION.clone(), reader)
+    read_scanned_row_ids(
+        rid_scan(reader, row_id_column).with_filter(filter),
+        row_id_column,
+    )
+    .await
+}
+
+/// The row ids of a *located* index-child run — the rows a resolver bounded
+/// by binary-searching the child's cached chunk probes — read by a rid-only
+/// scan restricted to that range. The wide-run counterpart of
+/// [`rid_point_reads`], for runs too large to read point by point.
+///
+/// The scan carries no filter: the location bounded exactly the rows the
+/// constraints select, so re-testing the value columns would only re-read and
+/// re-compare them. A resolver whose location covers only *some* of its
+/// constraints must keep [`scan_index_row_ids`], whose filter tests them all.
+#[cfg(feature = "file-io")]
+pub(crate) async fn scan_located_row_ids(
+    reader: vortex_layout::LayoutReaderRef,
+    row_id_column: &'static str,
+    range: Range<u64>,
+) -> Result<Buffer<u64>> {
+    read_scanned_row_ids(
+        rid_scan(reader, row_id_column).with_row_range(range),
+        row_id_column,
+    )
+    .await
+}
+
+/// A rid-only scan of an index child: just the row-id column, unordered
+/// (callers sort the ids anyway). Restrictions — a filter, a row range — are
+/// the caller's to add.
+#[cfg(feature = "file-io")]
+fn rid_scan(
+    reader: vortex_layout::LayoutReaderRef,
+    row_id_column: &'static str,
+) -> vortex_layout::scan::scan_builder::ScanBuilder<ArrayRef> {
+    vortex_layout::scan::scan_builder::ScanBuilder::new(VORTEX_SESSION.clone(), reader)
         .with_projection(select([row_id_column], root()))
-        .with_filter(filter)
         .with_ordered(false)
+}
+
+/// Run a rid-only scan and decode its row-id column into the ascending,
+/// unique buffer every index resolution answers in.
+#[cfg(feature = "file-io")]
+async fn read_scanned_row_ids(
+    scan: vortex_layout::scan::scan_builder::ScanBuilder<ArrayRef>,
+    row_id_column: &'static str,
+) -> Result<Buffer<u64>> {
+    let arr = scan
         .into_array_stream()
         .map_err(VortexRdfError::Vortex)?
         .read_all()
