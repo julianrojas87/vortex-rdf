@@ -179,10 +179,13 @@ function depVersion(pkg: string): string {
 }
 
 function provenance(): string {
-    const date = new Date().toISOString().slice(0, 10);
+    // UTC, to the minute — the format every dashboard tab dates itself in
+    // (`scripts/render_bench_dashboard.py`, `python/bench/run.py`), so one page
+    // never shows three formats or three timezones for one run.
+    const measured = `${new Date().toISOString().slice(0, 16).replace('T', ' ')} UTC`;
     const cpu = cpus()[0]?.model ?? 'unknown CPU';
     return (
-        `Measured ${date} · node ${process.version} · ${cpu}, ${cpus().length} threads · ` +
+        `Measured ${measured} · node ${process.version} · ${cpu}, ${cpus().length} threads · ` +
         `triples D=${D} (${N_TRIPLES.toLocaleString()} quads, ${moduli(N_TRIPLES).terms.toLocaleString()} terms), ` +
         `quads Dq=${DQ} (${N_QUADS.toLocaleString()} quads, ${moduli(N_QUADS, { graphs: 8 }).terms.toLocaleString()} terms), ` +
         `MUT_BATCH=${MUT_BATCH.toLocaleString()} · tinybench ${depVersion('tinybench')}, wall-clock · ` +

@@ -27,7 +27,7 @@ import shutil
 import subprocess
 import sys
 import time
-from datetime import date
+from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -248,8 +248,12 @@ def main() -> int:
     lib_str = ", ".join(
         [f"vortex-rdf {vortex_version}"] + [f"{k} {v}" for k, v in sorted(versions.items())]
     )
+    # UTC, to the minute — the format every dashboard tab dates itself in (see
+    # `scripts/render_bench_dashboard.py`, `js/bench/compare.bench.ts`), so one
+    # page never shows three formats or three timezones for one run.
+    measured = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     provenance = (
-        f"Measured {date.today().isoformat()} · Python {py_ver} · {cpu_model()}, {os.cpu_count()} threads · "
+        f"Measured {measured} · Python {py_ver} · {cpu_model()}, {os.cpu_count()} threads · "
         f"triples D={D} ({N_TRIPLES:,} quads, {tm.terms:,} terms), "
         f"quads Dq={DQ} ({N_QUADS:,} quads, {qm.terms:,} terms), MUT_BATCH={MUT_BATCH:,} · "
         f"wall-clock (perf_counter_ns) · {lib_str} · one adapter per process and per virtualenv, isolated"

@@ -131,17 +131,37 @@ def default_bench_size():
     return int(m.group(1).replace("_", "")) if m else None
 
 
-def build_provenance(results, timer_precision, bench_size=None):
+def measured_at(source=None):
+    """The dashboard's shared "Measured …" stamp: UTC, to the minute.
+
+    All three tabs date themselves this way — `js/bench/compare.bench.ts` and
+    `python/bench/run.py` build the same string for the lines they emit — so one
+    page never shows three formats (or three timezones) for one run.
+
+    `source` is the file whose measurement is being stamped; its mtime is when
+    that suite finished writing, which is what the other two tabs report. Only
+    when it is missing does this fall back to now, which for a render long after
+    the bench would overstate how fresh the numbers are.
+    """
+    when = datetime.now(timezone.utc)
+    if source is not None:
+        try:
+            when = datetime.fromtimestamp(source.stat().st_mtime, timezone.utc)
+        except OSError:
+            pass
+    return when.strftime("%Y-%m-%d %H:%M UTC")
+
+
+def build_provenance(results, timer_precision, bench_size=None, source=None):
     commit = os.environ.get("GITHUB_SHA", git("rev-parse", "HEAD"))[:7]
     branch = os.environ.get("GITHUB_REF_NAME", git("rev-parse", "--abbrev-ref", "HEAD", default="unknown"))
-    date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     samples = results[0]["samples"] if results else "?"
     size = bench_size if bench_size is not None else default_bench_size()
     size_str = f"{size:,}" if size else "unknown"
     precision = f", {timer_precision} precision" if timer_precision else ""
 
     return (
-        f"Measured {date} · commit {commit} ({branch}) · {cpu_model()}, {os.cpu_count()} threads · "
+        f"Measured {measured_at(source)} · commit {commit} ({branch}) · {cpu_model()}, {os.cpu_count()} threads · "
         f"BENCH_SIZE = {size_str} quads · {samples} samples/benchmark · "
         f"codspeed-divan-compat, wall-clock (os) timer{precision}"
     )
@@ -228,7 +248,7 @@ def main():
     if py_path:
         py_results, py_provenance, py_memory, py_sizes, py_config = load_python_results(py_path)
 
-    provenance = build_provenance(results, timer_precision, bench_size_override)
+    provenance = build_provenance(results, timer_precision, bench_size_override, in_path)
     template = template_path.read_text(encoding="utf-8")
     out = (
         template
