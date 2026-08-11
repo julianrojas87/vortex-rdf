@@ -37,7 +37,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Compress built stores into probe-supported resident form (core) ([`c3eb922`](https://github.com/vortex-rdf/vortex-rdf/commit/c3eb92200e89f8be6be3d2b48c4af1c1f95b877e) by @julianrojas87)
 - Measure the dictionary regimes the residency axis now turns on (bench) ([`876b4d5`](https://github.com/vortex-rdf/vortex-rdf/commit/876b4d5f878e5ff6ab97ca70c71c1664f285a164) by @julianrojas87)
 - Build every store sorted, chosen by the target (core) ([`1573187`](https://github.com/vortex-rdf/vortex-rdf/commit/1573187e65fde559f1468bc9badc76cb642329cd) by @julianrojas87)
-- Add a light/dark theme switch to the dashboard (bench) ([`9628229`](https://github.com/vortex-rdf/vortex-rdf/commit/96282293e211f63835db6ed4a15e3d356e1132b3) by julianrojas87)
+- Add a light/dark theme switch to the dashboard (bench) ([`9628229`](https://github.com/vortex-rdf/vortex-rdf/commit/96282293e211f63835db6ed4a15e3d356e1132b3) by @julianrojas87)
+- Measure both cache regimes, on one dataset and one repetition count (bench) ([`d82a635`](https://github.com/vortex-rdf/vortex-rdf/commit/d82a635b3bbcfd2d0fc22a302abb470a10e6cb43) by julianrojas87)
 
 ### Changed
 
@@ -58,7 +59,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Size-gate the resident compression pass (core) ([`500ce7b`](https://github.com/vortex-rdf/vortex-rdf/commit/500ce7b8d72b549e5b1e94000bc0cfa51acac96e) by @julianrojas87)
 - Drop the resident compression size gate (core) ([`34fcd71`](https://github.com/vortex-rdf/vortex-rdf/commit/34fcd718aa6ae1f1fa9389abe8c7f0924713e803) by @julianrojas87)
 - Drop "sorted" from every benchmark name and label (bench) ([`dd2564b`](https://github.com/vortex-rdf/vortex-rdf/commit/dd2564b88072bef20767989394b387e408d274b5) by @julianrojas87)
-- Locate reference-index runs through cached chunk probes (core) ([`b4a1e4f`](https://github.com/vortex-rdf/vortex-rdf/commit/b4a1e4f9d96f2f5399265c52f78cbd0e97bd16b0) by julianrojas87)
+- Locate reference-index runs through cached chunk probes (core) ([`b4a1e4f`](https://github.com/vortex-rdf/vortex-rdf/commit/b4a1e4f9d96f2f5399265c52f78cbd0e97bd16b0) by @julianrojas87)
 
 ### Removed
 
@@ -75,6 +76,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Drop the dead call that discarded a completed run (bench) ([`205df5e`](https://github.com/vortex-rdf/vortex-rdf/commit/205df5ede2750138e50d5c1537f3a0a15e248375) by @julianrojas87)
 - Search only the asserted window in sliced probes (encoded-search) ([`fca93f1`](https://github.com/vortex-rdf/vortex-rdf/commit/fca93f1504c431556b68f55c9b272972fd017ec5) by @julianrojas87)
 - Drop the removed builder argument from the Python adapters (bench) ([`db92557`](https://github.com/vortex-rdf/vortex-rdf/commit/db925576fc93c9221ffcf40fe0bbd23d099c770b) by @julianrojas87)
+- Drop the removed builder option from the bench suites (bench) ([`d3a0560`](https://github.com/vortex-rdf/vortex-rdf/commit/d3a0560bf290d88e975bfc959392a54514191a6d) by @julianrojas87)
+- Stamp every dashboard tab in UTC, to the minute (bench) ([`68df60d`](https://github.com/vortex-rdf/vortex-rdf/commit/68df60dc79f6c2ee588a9cf7e8f0d2b72f944ec8) by julianrojas87)
 
 ## [0.5.0](https://github.com/vortex-rdf/vortex-rdf/compare/v0.4.0...v0.5.0) - 2026-07-29
 
