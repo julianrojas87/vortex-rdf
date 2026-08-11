@@ -60,6 +60,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Drop the resident compression size gate (core) ([`34fcd71`](https://github.com/vortex-rdf/vortex-rdf/commit/34fcd718aa6ae1f1fa9389abe8c7f0924713e803) by @julianrojas87)
 - Drop "sorted" from every benchmark name and label (bench) ([`dd2564b`](https://github.com/vortex-rdf/vortex-rdf/commit/dd2564b88072bef20767989394b387e408d274b5) by @julianrojas87)
 - Locate reference-index runs through cached chunk probes (core) ([`b4a1e4f`](https://github.com/vortex-rdf/vortex-rdf/commit/b4a1e4f9d96f2f5399265c52f78cbd0e97bd16b0) by @julianrojas87)
+- Cold measures the first query, not the open before it (bench) ([`397f92c`](https://github.com/vortex-rdf/vortex-rdf/commit/397f92c3b70b0d8f274c0cee1186b958b2f97a69) by julianrojas87)
 
 ### Removed
 
@@ -78,6 +79,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Drop the removed builder argument from the Python adapters (bench) ([`db92557`](https://github.com/vortex-rdf/vortex-rdf/commit/db925576fc93c9221ffcf40fe0bbd23d099c770b) by @julianrojas87)
 - Drop the removed builder option from the bench suites (bench) ([`d3a0560`](https://github.com/vortex-rdf/vortex-rdf/commit/d3a0560bf290d88e975bfc959392a54514191a6d) by @julianrojas87)
 - Stamp every dashboard tab in UTC, to the minute (bench) ([`68df60d`](https://github.com/vortex-rdf/vortex-rdf/commit/68df60dc79f6c2ee588a9cf7e8f0d2b72f944ec8) by julianrojas87)
+- Give the JS cold regime its own process (bench) ([`20590cd`](https://github.com/vortex-rdf/vortex-rdf/commit/20590cd8c52556333e7684c1e53729954ed5e99c) by julianrojas87)
 
 ## [0.5.0](https://github.com/vortex-rdf/vortex-rdf/compare/v0.4.0...v0.5.0) - 2026-07-29
 
