@@ -6,8 +6,9 @@ name: Release
 # partial failure (registries reject re-publishing an existing version).
 #
 # Registries:
-#   crates.io  vortex-rdf-core + vortex-rdf-cli  (cargo publish --workspace
-#              skips the publish = false js/python members and orders deps)
+#   crates.io  vortex-rdf-encoded-search + vortex-rdf-core + vortex-rdf-cli
+#              (cargo publish --workspace skips the publish = false js/python
+#              members and orders deps)
 #   npm        @vortex-rdf/vortex-rdf-store      (js/, wasm-pack build)
 #   PyPI       vortex-rdf                        (python/, maturin abi3 wheels)
 #
@@ -17,6 +18,13 @@ name: Release
 #   crates.io: crate Settings -> Trusted Publishing
 #   npm:       package Settings -> Trusted publisher
 #   PyPI:      project publishing settings (pending publisher for vortex-rdf)
+#
+# A crate's FIRST version cannot go out this way: crates.io configures a
+# trusted publisher on an existing crate, so the OIDC token this workflow
+# mints is not valid for a name that has never been published. Publish a new
+# member's first version by hand with an API token, add its trusted publisher,
+# and only then let a tag drive it — otherwise `cargo publish --workspace`
+# fails on that member and takes the whole crates.io job with it.
 #
 # dry_run builds everything and runs the registries' dry-run modes without
 # publishing (PyPI has no dry run: its publish job is skipped instead).

@@ -276,6 +276,26 @@ impl ColumnChunks {
     }
 }
 
+/// Reports the column's shape and how much of it has been fetched: chunks
+/// whose probe is resolved and cached have already cost a segment read.
+impl std::fmt::Debug for ColumnChunks {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ColumnChunks")
+            .field("row_count", &self.row_count)
+            .field("dtype", &self.dtype)
+            .field("chunks", &self.chunks.len())
+            .field(
+                "fetched",
+                &self
+                    .chunks
+                    .iter()
+                    .filter(|c| c.cell.get().is_some())
+                    .count(),
+            )
+            .finish()
+    }
+}
+
 /// Descend through zoned wrappers to their data child (child 0).
 fn unwrap_zoned(mut node: LayoutRef) -> Option<LayoutRef> {
     while node.is::<Zoned>() {

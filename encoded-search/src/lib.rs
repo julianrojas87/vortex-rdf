@@ -13,6 +13,8 @@
 //! else — including nullable or non-unsigned-integer dtypes and non-host
 //! buffers — declines, and the caller falls back to its generic search path.
 
+#![deny(missing_docs)]
+
 mod node;
 mod owned;
 mod patches;
@@ -111,6 +113,17 @@ impl<'a> SortedProbe<'a> {
     }
 }
 
+/// Reports what the probe resolved to, not the data it reads: the row count
+/// and the pre-order encoding kinds of the tree.
+impl std::fmt::Debug for SortedProbe<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SortedProbe")
+            .field("len", &self.len())
+            .field("nodes", &self.node_kinds())
+            .finish()
+    }
+}
+
 /// The set of probe-node shapes a [`SortedProbe`] resolves.
 ///
 /// This is deliberately not a vortex type: vortex identifies encodings by an
@@ -121,14 +134,26 @@ impl<'a> SortedProbe<'a> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum NodeKind {
+    /// A decoded buffer of unsigned integers, read directly.
     Primitive,
+    /// One value repeated for the whole array.
     Constant,
+    /// An arithmetic sequence, evaluated from its start and step.
     Sequence,
+    /// Run-end encoding: a search over run ends, then the run's value.
     RunEnd,
+    /// Frame of reference: a reference value added to an encoded child.
     FoR,
+    /// Bit-packed words, unpacked one value at a time.
     BitPacked,
+    /// The exception values riding beside a [`NodeKind::BitPacked`] node.
     Patches,
+    /// A window over a child, offsetting every index into it.
     Slice,
+    /// Chunks concatenated end to end, addressed by chunk extremes.
     Chunked,
+    /// Dictionary encoding: codes indexing a values child. Dictionary values
+    /// are not order-preserving, so bounds search probes the composed
+    /// logical values rather than the values child.
     Dict,
 }

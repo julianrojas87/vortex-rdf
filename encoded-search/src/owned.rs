@@ -87,6 +87,15 @@ impl OwnedSortedProbe {
     }
 }
 
+/// Forwards to the borrowed [`SortedProbe`]'s own [`std::fmt::Debug`].
+impl std::fmt::Debug for OwnedSortedProbe {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("OwnedSortedProbe")
+            .field(self.probe())
+            .finish()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use vortex_array::IntoArray;

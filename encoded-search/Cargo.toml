@@ -11,6 +11,11 @@ readme = "README.md"
 keywords = ["vortex", "columnar", "binary-search", "compression"]
 categories = ["encoding", "data-structures"]
 
+# `layout` is off by default, so docs.rs would otherwise document the crate
+# without `ColumnChunks` — half of what it offers.
+[package.metadata.docs.rs]
+all-features = true
+
 [dependencies]
 self_cell = { workspace = true }
 vortex-array = { workspace = true }
