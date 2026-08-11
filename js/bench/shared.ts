@@ -224,6 +224,15 @@ export function collect(bench: Bench, results: Row[], regime?: 'cold' | 'warm'):
 // they were the same experiment.
 export const QUERY_OPTS: BenchOptions = { time: 0, iterations: 10, warmup: true, warmupIterations: 5, throws: true };
 export const HEAVY_OPTS: BenchOptions = { time: 0, iterations: 3, warmup: false, warmupIterations: 0, throws: true };
+// The cold arm keeps the query repetition count but drops warmup, for two
+// reasons. Warming up a cold measurement is self-contradictory — every
+// iteration adopts a fresh store by construction, so there is nothing for a
+// preceding run to warm. And each adoption is expensive in a way that does not
+// come back: the first query on a `fromBytes` store retains its whole buffer
+// past `free()` (measured: +32 MB per iteration at D=128, flat without the
+// query), and wasm linear memory never shrinks, so warmup runs would spend a
+// third of the budget for nothing and trip the wasm allocator.
+export const COLD_QUERY_OPTS: BenchOptions = { time: 0, iterations: 10, warmup: false, warmupIterations: 0, throws: true };
 // See the comment on FULL_SCAN_PATTERN (datasets.ts): far fewer repetitions of a
 // full-table dump.
 export const FULL_SCAN_OPTS: BenchOptions = { time: 0, iterations: 3, warmup: false, warmupIterations: 0, throws: true };

@@ -68,7 +68,7 @@ interface WorkerOutput {
 
 /** One adapter, one role, one process. A worker that cannot finish is skipped:
  *  the remaining adapters still run and still produce their rows. */
-function runWorker(slug: string, role: 'query' | 'fullscan' | 'mutate'): WorkerOutput | null {
+function runWorker(slug: string, role: 'query' | 'querycold' | 'fullscan' | 'mutate'): WorkerOutput | null {
     return runWorkerProcess<WorkerOutput>(workerPath, [slug, role], `${slug}/${role}`);
 }
 
@@ -120,6 +120,21 @@ async function main(): Promise<void> {
             `, store: ${out.storeFootprint?.rssMb ?? '?'} MB RSS` +
             ` / ${out.storeFootprint?.wasmHeapMb ?? '-'} MB wasm`,
         );
+    }
+
+    // The cold regime gets its own process per adapter: every iteration adopts a
+    // fresh store, and the first query on one retains its whole buffer past
+    // free() in wasm memory that never shrinks. Sharing the query process piled
+    // those adoptions on top of a live store until the wasm allocator trapped.
+    // Adapters with no persistent form return no rows here (see runQueryCold).
+    for (const a of ADAPTERS) {
+        const out = runWorker(a.slug, 'querycold');
+        if (!out) continue;
+        results.push(...out.rows);
+        for (const f of out.failures ?? []) {
+            failures.push({ slug: a.slug, label: a.label, role: 'querycold', ...f });
+            console.error(`  !! ${a.label} could not complete '${f.phase}': ${f.error}`);
+        }
     }
 
     // The full scan gets its own process per adapter, for the same reason each

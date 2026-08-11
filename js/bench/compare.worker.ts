@@ -10,14 +10,14 @@ import { writeFileSync } from 'node:fs';
 import {
     ADAPTERS, MUT_ADAPTERS, N_TRIPLES, N_QUADS, MUT_BATCH,
     genDataset, genFresh, genDatasetPrefix, datasetProbes, moduli,
-    FULL_SCAN_PATTERN, QUERY_OPTS, HEAVY_OPTS, FULL_SCAN_OPTS,
+    FULL_SCAN_PATTERN, QUERY_OPTS, COLD_QUERY_OPTS, HEAVY_OPTS, FULL_SCAN_OPTS,
     reclaim, collect, peakRssMb, rssMb, jsHeapMb, wasmHeapMb,
     type Row, type Pat, type StoreAdapter,
 } from './shared.js';
 
 const [, , slug, role, outFile] = process.argv;
 if (!slug || !role || !outFile) {
-    console.error('usage: compare.worker.ts <slug> <query|fullscan|mutate> <out-file>');
+    console.error('usage: compare.worker.ts <slug> <query|querycold|fullscan|mutate> <out-file>');
     process.exit(1);
 }
 
@@ -105,19 +105,6 @@ async function runQuery(a: StoreAdapter): Promise<Row[]> {
     await bench('query_triples', rows, QUERY_OPTS, (b) => {
         for (const p of tProbes.triples) b.add(`${a.slug}::${p.name}`, async () => { await a.countMatch(th, p); });
     }, 'warm');
-    // Cold: a store opened per iteration answering its first query. Only the
-    // adapters with a persistent form take part (see `snapshot`/`open` in
-    // shared.ts); the snapshot itself is taken once, outside the measurement.
-    if (a.snapshot && a.open) {
-        const snap = await a.snapshot(th);
-        await bench('query_triples_cold', rows, QUERY_OPTS, (b) => {
-            for (const p of tProbes.triples) b.add(`${a.slug}::${p.name}`, async () => {
-                const h = await a.open!(snap);
-                await a.countMatch(h, p);
-                a.dispose?.(h);
-            });
-        }, 'cold');
-    }
     reclaim(a, th);
     th = null;
 
@@ -128,16 +115,6 @@ async function runQuery(a: StoreAdapter): Promise<Row[]> {
     await bench('query_quads', rows, QUERY_OPTS, (b) => {
         for (const p of qProbes.quads) b.add(`${a.slug}::${p.name}`, async () => { await a.countMatch(qh, p); });
     }, 'warm');
-    if (a.snapshot && a.open) {
-        const snap = await a.snapshot(qh);
-        await bench('query_quads_cold', rows, QUERY_OPTS, (b) => {
-            for (const p of qProbes.quads) b.add(`${a.slug}::${p.name}`, async () => {
-                const h = await a.open!(snap);
-                await a.countMatch(h, p);
-                a.dispose?.(h);
-            });
-        }, 'cold');
-    }
     reclaim(a, qh);
     qh = null;
 
@@ -169,6 +146,57 @@ async function runQuery(a: StoreAdapter): Promise<Row[]> {
  * ~5.9 GB). Measuring it here instead reports the scan rather than the residue
  * of everything that ran before it.
  */
+/**
+ * The cold query regime, in a process of its own.
+ *
+ * Every iteration adopts the snapshot into a fresh store and answers one query
+ * on it. That is unavoidably expensive in a way that does not come back: the
+ * first query on an adopted store retains its whole buffer past `free()`
+ * (measured at D=128: +32 MB per iteration, and flat when the query is
+ * skipped), and wasm linear memory never returns to the OS. Sharing a process
+ * with the warm phase therefore piled a live store plus every adoption into one
+ * address space, and the wasm allocator eventually trapped ("unreachable").
+ *
+ * Here the built store is freed the moment its snapshot exists, so the whole
+ * budget belongs to the measurements.
+ */
+async function runQueryCold(a: StoreAdapter): Promise<Row[]> {
+    const rows: Row[] = [];
+    if (!a.snapshot || !a.open) return rows; // no persistent form, no cold rows
+
+    console.log(`[${a.label}] query cold (triples)…`);
+    const triples = genDataset(N_TRIPLES);
+    const tProbes = datasetProbes(N_TRIPLES);
+    let th: unknown = await a.build(triples);
+    const tSnap = await a.snapshot(th);
+    reclaim(a, th);
+    th = null;
+    await bench('query_triples_cold', rows, COLD_QUERY_OPTS, (b) => {
+        for (const p of tProbes.triples) b.add(`${a.slug}::${p.name}`, async () => {
+            const h = await a.open!(tSnap);
+            await a.countMatch(h, p);
+            a.dispose?.(h);
+        });
+    }, 'cold');
+
+    console.log(`[${a.label}] query cold (quads)…`);
+    const quads = genDataset(N_QUADS, { graphs: 8 });
+    const qProbes = datasetProbes(N_QUADS, { graphs: 8 });
+    let qh: unknown = await a.build(quads);
+    const qSnap = await a.snapshot(qh);
+    reclaim(a, qh);
+    qh = null;
+    await bench('query_quads_cold', rows, COLD_QUERY_OPTS, (b) => {
+        for (const p of qProbes.quads) b.add(`${a.slug}::${p.name}`, async () => {
+            const h = await a.open!(qSnap);
+            await a.countMatch(h, p);
+            a.dispose?.(h);
+        });
+    }, 'cold');
+
+    return rows;
+}
+
 async function runFullScan(a: StoreAdapter): Promise<Row[]> {
     const rows: Row[] = [];
     console.log(`[${a.label}] full scan…`);
@@ -234,8 +262,9 @@ async function main(): Promise<void> {
     }
 
     const rows = role === 'query' ? await runQuery(a)
-        : role === 'fullscan' ? await runFullScan(a)
-            : await runMutate(a);
+        : role === 'querycold' ? await runQueryCold(a)
+            : role === 'fullscan' ? await runFullScan(a)
+                : await runMutate(a);
     writeFileSync(outFile, JSON.stringify({
         rows,
         peakRssMb: peakRssMb(),
