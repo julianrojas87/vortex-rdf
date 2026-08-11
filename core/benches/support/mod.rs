@@ -22,19 +22,44 @@ use vortex_rdf_core::{
 /// Single dataset size for the whole suite. In simulation mode CodSpeed counts
 /// instructions deterministically, so one representative size catches
 /// regressions in every path; larger sizes only multiply valgrind cost without
-/// adding signal (CodSpeed does not analyse scaling curves). Default matches
-/// CodSpeed CI; override locally (e.g. `BENCH_SIZE=2097152 cargo bench`, to
-/// match the JS comparative benchmark's default D=128 scale) to see how
-/// results shift at a larger size.
+/// adding signal (CodSpeed does not analyse scaling curves).
+///
+/// The default is the size all three CodSpeed suites share — `CODSPEED_BENCH_DIM`
+/// is 32 in `js/bench/codspeed.bench.ts` and `python/bench/test_codspeed.py`,
+/// and 32³ is this number — so one shared-core regression lands in all three
+/// tabs at comparable magnitude instead of showing up in one and hiding in
+/// another. It is also 4 zones of 8,192 rows, the smallest round size at which
+/// zone pruning has anything to prune.
+///
+/// Override for a different scale: `BENCH_SIZE=2097152 cargo bench` matches the
+/// comparative suites' D=128, which is what the dashboard workflow runs.
 pub fn bench_size() -> usize {
     static SIZE: OnceLock<usize> = OnceLock::new();
     *SIZE.get_or_init(|| {
         std::env::var("BENCH_SIZE")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(100_000)
+            .unwrap_or(32_768)
     })
 }
+
+/// Samples per query benchmark — the repetition count every comparative suite
+/// uses for a query (`QUERY_OPTS.iterations` in `js/bench/shared.ts`,
+/// `QUERY_ITERS` in `python/bench/worker.py`), so one number describes a
+/// repetition across all three environments.
+///
+/// Set per bench rather than through `DIVAN_SAMPLE_COUNT` so a plain
+/// `cargo bench` reproduces the dashboard's regime without remembering an env
+/// var. CodSpeed ignores it entirely: its simulation mode measures one
+/// invocation per case, deterministically.
+pub const QUERY_SAMPLES: u32 = 10;
+
+/// Samples per heavy benchmark — ingest, full decode, open, serialize. These
+/// run for seconds per iteration at the dashboard's 2M scale, where ten
+/// samples would add tens of minutes to a refresh for a number that barely
+/// moves; the comparative suites make the same trade (`HEAVY_OPTS`,
+/// `HEAVY_ITERS`).
+pub const HEAVY_SAMPLES: u32 = 3;
 
 // ── shared tokio runtime ────────────────────────────────────────────────────
 

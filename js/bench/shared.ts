@@ -54,6 +54,15 @@ export interface StoreAdapter<H = unknown> {
     addBatch?(h: H, quads: Quad[]): Promise<void> | void; // optional batch add (Vortex)
     deleteAll(h: H, quads: Quad[]): Promise<void> | void; // per-quad delete loop
     countMatch(h: H, p: Pat): Promise<number> | number; // consume + count
+    // Cold-regime pair, optional: `snapshot` serializes a built store once
+    // (untimed) and `open` adopts that snapshot into a fresh handle, which the
+    // cold query phase does per iteration. Only the stores with a persistent
+    // form implement them — an in-memory library has no artifact to reopen, so
+    // its "cold" would be a full re-parse of the source and would compare
+    // seconds against microseconds. Adapters without the pair are simply
+    // absent from the cold rows.
+    snapshot?(h: H): Promise<unknown>;
+    open?(snapshot: unknown): Promise<H>;
     // Both Vortex and oxigraph are wasm-bindgen: `.free()` deterministically drops
     // the WASM-side allocation. The generated FinalizationRegistry is a fallback
     // only — V8 has no visibility into WASM linear-memory pressure, so it can defer
@@ -104,6 +113,8 @@ export function vortexAdapter(variant: { slug: string; label: string; options: B
         addBatch: (h, quads) => h.addQuads(quads),
         deleteAll: async (h, quads) => { for (const q of quads) await h.deleteQuad(q); },
         countMatch: async (h, p) => (await h.getQuads(p.s, p.p, p.o, p.g)).length,
+        snapshot: (h) => h.toBytes(),
+        open: (bytes) => VortexRdfStore.fromBytes(bytes as Uint8Array),
         dispose: freeWasm,
     };
 }
@@ -171,9 +182,13 @@ export interface Row {
     fastest: string; slowest: string; median: string; mean: string;
     fastest_ns: number; slowest_ns: number; median_ns: number; mean_ns: number;
     samples: string;
+    /** Cache regime this row was measured in — 'warm' is a repeat query on an
+     *  open store, 'cold' opens one per iteration and answers its first. Absent
+     *  on rows where the distinction does not apply (ingest, mutation). */
+    regime?: 'cold' | 'warm';
 }
 
-export function collect(bench: Bench, results: Row[]): void {
+export function collect(bench: Bench, results: Row[], regime?: 'cold' | 'warm'): void {
     for (const task of bench.tasks) {
         const r = task.result;
         if (!r || !('latency' in r) || !r.latency) continue;
@@ -191,13 +206,23 @@ export function collect(bench: Bench, results: Row[]): void {
             median: fmtNs(median_ns), mean: fmtNs(mean_ns),
             fastest_ns, slowest_ns, median_ns, mean_ns,
             samples: String(lat.samplesCount),
+            ...(regime ? { regime } : {}),
         });
     }
 }
 
-// tinybench options per phase. Query gets a time budget; the expensive build/mutation
-// phases get a low fixed iteration count (each build is costly at D=128).
-export const QUERY_OPTS: BenchOptions = { time: 500, iterations: 10, warmup: true, warmupIterations: 5, throws: true };
+// tinybench options per phase, in the repetition counts every comparative suite
+// shares: 10 measured runs for a query (`QUERY_ITERS` in
+// `python/bench/worker.py`, `QUERY_SAMPLES` in `core/benches/support/mod.rs`),
+// 3 for the phases that cost seconds each.
+//
+// `time: 0` is what makes the query count mean 10. tinybench treats `time` as a
+// minimum duration and keeps iterating until BOTH budgets are satisfied, so the
+// previous 500 ms floor ran a microsecond-scale query tens of thousands of
+// times — the JS tab reported a mean over ~80,000 runs while the Python tab
+// reported a median of 10, and the dashboard presented them side by side as if
+// they were the same experiment.
+export const QUERY_OPTS: BenchOptions = { time: 0, iterations: 10, warmup: true, warmupIterations: 5, throws: true };
 export const HEAVY_OPTS: BenchOptions = { time: 0, iterations: 3, warmup: false, warmupIterations: 0, throws: true };
 // See the comment on FULL_SCAN_PATTERN (datasets.ts): far fewer repetitions of a
 // full-table dump.

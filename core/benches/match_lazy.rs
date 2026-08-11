@@ -25,6 +25,11 @@ fn main() {
 /// Time `match_pattern` only: the returned view (a store sharing Arc'd
 /// internals with the base) is black-boxed and dropped per iteration, never
 /// executed.
+///
+/// COLD by construction — `with_inputs` hands each sample a store built
+/// fresh, so no probe or segment cache survives between them. The dashboard
+/// labels this table accordingly; `benchmark.rs` is the target that carries
+/// both regimes.
 fn run_lazy_match(
     bencher: divan::Bencher,
     layout: Layout,
@@ -51,7 +56,7 @@ fn run_lazy_match(
 
 macro_rules! lazy_match_bench {
     ($name:ident, $layout:expr, $index:expr, $source:expr) => {
-        #[divan::bench(args = PATTERNS)]
+        #[divan::bench(args = PATTERNS, sample_count = QUERY_SAMPLES)]
         fn $name(bencher: divan::Bencher, pattern: &Pattern) {
             run_lazy_match(bencher, $layout, $index, $source, *pattern);
         }
@@ -59,77 +64,80 @@ macro_rules! lazy_match_bench {
 }
 
 // The full matrix, named `lazy_` + the materializing twin's group name so the
-// dashboard derives one set of ids from the other.
+// dashboard derives one set of ids from the other. The twin carries a cache
+// regime in its name and this target has only one — every sample gets a store
+// built fresh — so the names say `cold` too rather than leaving the reader to
+// infer which of the two a lazy row corresponds to.
 // No secondary index.
 lazy_match_bench!(
-    lazy_match_default_noindex_mem,
+    lazy_match_cold_default_noindex_mem,
     Layout::Default,
     Index::None,
     Source::InMemory
 );
 lazy_match_bench!(
-    lazy_match_default_noindex_file,
+    lazy_match_cold_default_noindex_file,
     Layout::Default,
     Index::None,
     Source::File
 );
 lazy_match_bench!(
-    lazy_match_typedobj_noindex_mem,
+    lazy_match_cold_typedobj_noindex_mem,
     Layout::TypedObject,
     Index::None,
     Source::InMemory
 );
 lazy_match_bench!(
-    lazy_match_typedobj_noindex_file,
+    lazy_match_cold_typedobj_noindex_file,
     Layout::TypedObject,
     Index::None,
     Source::File
 );
 lazy_match_bench!(
-    lazy_match_dict_noindex_mem,
+    lazy_match_cold_dict_noindex_mem,
     Layout::Dictionary,
     Index::None,
     Source::InMemory
 );
 lazy_match_bench!(
-    lazy_match_dict_noindex_file,
+    lazy_match_cold_dict_noindex_file,
     Layout::Dictionary,
     Index::None,
     Source::File
 );
 // Secondary by reference.
 lazy_match_bench!(
-    lazy_match_default_byref_mem,
+    lazy_match_cold_default_byref_mem,
     Layout::Default,
     Index::ByReference,
     Source::InMemory
 );
 lazy_match_bench!(
-    lazy_match_default_byref_file,
+    lazy_match_cold_default_byref_file,
     Layout::Default,
     Index::ByReference,
     Source::File
 );
 lazy_match_bench!(
-    lazy_match_typedobj_byref_mem,
+    lazy_match_cold_typedobj_byref_mem,
     Layout::TypedObject,
     Index::ByReference,
     Source::InMemory
 );
 lazy_match_bench!(
-    lazy_match_typedobj_byref_file,
+    lazy_match_cold_typedobj_byref_file,
     Layout::TypedObject,
     Index::ByReference,
     Source::File
 );
 lazy_match_bench!(
-    lazy_match_dict_byref_mem,
+    lazy_match_cold_dict_byref_mem,
     Layout::Dictionary,
     Index::ByReference,
     Source::InMemory
 );
 lazy_match_bench!(
-    lazy_match_dict_byref_file,
+    lazy_match_cold_dict_byref_file,
     Layout::Dictionary,
     Index::ByReference,
     Source::File
@@ -137,56 +145,56 @@ lazy_match_bench!(
 // Lean from_bytes adoption (wire-encoded base, deferred components) on the
 // Dictionary layout: the encoded-probe counterpart of the `_mem` rows.
 lazy_match_bench!(
-    lazy_match_dict_noindex_bytes,
+    lazy_match_cold_dict_noindex_bytes,
     Layout::Dictionary,
     Index::None,
     Source::Bytes
 );
 lazy_match_bench!(
-    lazy_match_dict_byref_bytes,
+    lazy_match_cold_dict_byref_bytes,
     Layout::Dictionary,
     Index::ByReference,
     Source::Bytes
 );
 lazy_match_bench!(
-    lazy_match_dict_bycopy_bytes,
+    lazy_match_cold_dict_bycopy_bytes,
     Layout::Dictionary,
     Index::ByCopy,
     Source::Bytes
 );
 // Secondary by copy.
 lazy_match_bench!(
-    lazy_match_default_bycopy_mem,
+    lazy_match_cold_default_bycopy_mem,
     Layout::Default,
     Index::ByCopy,
     Source::InMemory
 );
 lazy_match_bench!(
-    lazy_match_default_bycopy_file,
+    lazy_match_cold_default_bycopy_file,
     Layout::Default,
     Index::ByCopy,
     Source::File
 );
 lazy_match_bench!(
-    lazy_match_typedobj_bycopy_mem,
+    lazy_match_cold_typedobj_bycopy_mem,
     Layout::TypedObject,
     Index::ByCopy,
     Source::InMemory
 );
 lazy_match_bench!(
-    lazy_match_typedobj_bycopy_file,
+    lazy_match_cold_typedobj_bycopy_file,
     Layout::TypedObject,
     Index::ByCopy,
     Source::File
 );
 lazy_match_bench!(
-    lazy_match_dict_bycopy_mem,
+    lazy_match_cold_dict_bycopy_mem,
     Layout::Dictionary,
     Index::ByCopy,
     Source::InMemory
 );
 lazy_match_bench!(
-    lazy_match_dict_bycopy_file,
+    lazy_match_cold_dict_bycopy_file,
     Layout::Dictionary,
     Index::ByCopy,
     Source::File

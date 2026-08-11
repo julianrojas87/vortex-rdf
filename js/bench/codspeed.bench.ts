@@ -22,7 +22,7 @@
 //
 // Run locally (after `npm run build`):
 //   npm run bench:codspeed
-//   CODSPEED_BENCH_DIM=24 npm run bench:codspeed   # bigger dataset
+//   CODSPEED_BENCH_DIM=48 npm run bench:codspeed   # bigger dataset
 
 import { Bench, type BenchOptions } from 'tinybench';
 import { withCodSpeed } from '@codspeed/tinybench-plugin';
@@ -50,8 +50,14 @@ import {
 // scaling with rows; see datasets.ts) for the term-handling-sensitive tasks,
 // where the cube's ~48 distinct terms would make dictionary build and
 // per-distinct-term decode invisible.
-const DIM = Number(process.env.CODSPEED_BENCH_DIM ?? 16); // triples: DIM³ rows
-const DIM_QUADS = Number(process.env.CODSPEED_BENCH_DIM_QUADS ?? 8); // quads: DIM_QUADS⁴ rows
+// The defaults are the size all three CodSpeed suites share — 32³ = 32,768,
+// which `core/benches/support/mod.rs` takes as its BENCH_SIZE default — so one
+// shared-core regression lands in all three tabs at comparable magnitude
+// instead of showing up in one and hiding in another. It is also 4 zones of
+// 8,192 rows, the smallest round size at which zone pruning has anything to
+// prune; the previous 16³ = 4,096 was half a zone.
+const DIM = Number(process.env.CODSPEED_BENCH_DIM ?? 32); // triples: DIM³ rows
+const DIM_QUADS = Number(process.env.CODSPEED_BENCH_DIM_QUADS ?? 13); // quads: DIM_QUADS⁴ rows
 const MUT_N = Number(process.env.CODSPEED_MUT_N ?? 500); // add/delete batch size
 
 // ─── Query patterns (probe terms fixed at index 0, so they always hit rows) ──
@@ -180,17 +186,41 @@ async function benchQuery(triples: Quad[], quads: Quad[]): Promise<void> {
         const th = await VortexRdfStore.fromQuads(triples, v.options);
         await runGroup(READ_OPTS, (b) => {
             for (const p of TRIPLE_PATTERNS)
-                b.add(`query_${v.slug}::${p.name}`, async () => { await th.getQuads(p.s, p.p, p.o, p.g); });
-            b.add(`query_${v.slug}::full`, async () => {
+                b.add(`query_warm_${v.slug}::${p.name}`, async () => { await th.getQuads(p.s, p.p, p.o, p.g); });
+            b.add(`query_warm_${v.slug}::full`, async () => {
                 await th.getQuads(FULL_SCAN_PATTERN.s, FULL_SCAN_PATTERN.p, FULL_SCAN_PATTERN.o, FULL_SCAN_PATTERN.g);
             });
+        });
+        // Cold: adopt the serialized store and answer one query on it, the way
+        // a freshly loaded page does — nothing decoded, no probe resolved, no
+        // dictionary memo. Same regime the Rust suite's `match_cold_*` groups
+        // measure. The handle is freed inside the timed region because leaving
+        // it to the GC would grow wasm linear memory across iterations, and
+        // wasm never returns it.
+        const tbytes = await th.toBytes();
+        await runGroup(READ_OPTS, (b) => {
+            for (const p of TRIPLE_PATTERNS)
+                b.add(`query_cold_${v.slug}::${p.name}`, async () => {
+                    const h = await VortexRdfStore.fromBytes(tbytes);
+                    await h.getQuads(p.s, p.p, p.o, p.g);
+                    freeWasm(h);
+                });
         });
         freeWasm(th);
 
         const qh = await VortexRdfStore.fromQuads(quads, v.options);
         await runGroup(READ_OPTS, (b) => {
             for (const p of QUAD_PATTERNS)
-                b.add(`query_${v.slug}::${p.name}`, async () => { await qh.getQuads(p.s, p.p, p.o, p.g); });
+                b.add(`query_warm_${v.slug}::${p.name}`, async () => { await qh.getQuads(p.s, p.p, p.o, p.g); });
+        });
+        const qbytes = await qh.toBytes();
+        await runGroup(READ_OPTS, (b) => {
+            for (const p of QUAD_PATTERNS)
+                b.add(`query_cold_${v.slug}::${p.name}`, async () => {
+                    const h = await VortexRdfStore.fromBytes(qbytes);
+                    await h.getQuads(p.s, p.p, p.o, p.g);
+                    freeWasm(h);
+                });
         });
         freeWasm(qh);
     }

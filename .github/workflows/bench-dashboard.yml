@@ -37,6 +37,16 @@ jobs:
         # Both targets feed one log: the render script keeps parsing across
         # concatenated divan outputs. match_lazy is the local/dashboard-only
         # lazy match matrix (never uploaded to CodSpeed).
+        #
+        # BENCH_SIZE puts the Rust tab on the same 2,097,152 quads the JS and
+        # Python comparative suites use (D=128), so a row means the same thing
+        # on all three tabs. The suites' own default is the much smaller
+        # CodSpeed size, which stays that way — instrumented runs there measure
+        # instructions, where a bigger dataset only multiplies valgrind cost.
+        # Repetition counts need no env: they are per-bench in the source
+        # (QUERY_SAMPLES / HEAVY_SAMPLES), matching the other two suites.
+        env:
+          BENCH_SIZE: 2097152
         run: |
           cargo bench --bench benchmark | tee bench_output.txt
           cargo bench --bench match_lazy | tee -a bench_output.txt
@@ -88,10 +98,14 @@ jobs:
           python3 bench/run.py
 
       - name: Render dashboard
+        # --bench-size must repeat the BENCH_SIZE above: the script otherwise
+        # reads the suite's compiled-in default for the provenance line, which
+        # is the CodSpeed size, not what this run measured.
         run: |
           python3 scripts/render_bench_dashboard.py bench_output.txt public/index.html \
             --js js/bench/results.json \
-            --python python/bench/results.json
+            --python python/bench/results.json \
+            --bench-size 2097152
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v5

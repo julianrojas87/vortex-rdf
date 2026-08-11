@@ -26,7 +26,7 @@ Where the two suites cannot correspond:
 
 Run locally (after `maturin develop`):
     uv run pytest bench/test_codspeed.py --codspeed
-    CODSPEED_BENCH_DIM=24 uv run pytest bench/test_codspeed.py --codspeed
+    CODSPEED_BENCH_DIM=48 uv run pytest bench/test_codspeed.py --codspeed
 """
 
 from __future__ import annotations
@@ -62,8 +62,15 @@ from vortex_rdf import VortexRdfStore, serialize_rdf  # noqa: E402
 # and boundary cost, and the cardinality-realistic generator for the
 # term-handling-sensitive tasks, where the cube's few distinct terms would make
 # dictionary build and per-distinct-term decode invisible.
-DIM = int(os.environ.get("CODSPEED_BENCH_DIM", 16))  # triples: DIM**3 rows
-DIM_QUADS = int(os.environ.get("CODSPEED_BENCH_DIM_QUADS", 8))  # quads: DIM_QUADS**4 rows
+#
+# The defaults are the size all three CodSpeed suites share -- 32**3 = 32,768,
+# which core/benches/support/mod.rs takes as its BENCH_SIZE default -- so one
+# shared-core regression lands in all three tabs at comparable magnitude
+# instead of showing up in one and hiding in another. It is also 4 zones of
+# 8,192 rows, the smallest round size at which zone pruning has anything to
+# prune; the previous 16**3 = 4,096 was half a zone.
+DIM = int(os.environ.get("CODSPEED_BENCH_DIM", 32))  # triples: DIM**3 rows
+DIM_QUADS = int(os.environ.get("CODSPEED_BENCH_DIM_QUADS", 13))  # quads: DIM_QUADS**4 rows
 
 # ─── Query patterns (probe terms fixed at index 0, so they always hit rows) ──
 T0 = nn(0)
@@ -121,25 +128,29 @@ def data(tmp_path_factory) -> dict[str, Path]:
 
 
 @pytest.fixture(scope="session")
-def stores(tmp_path_factory, data) -> dict[str, VortexRdfStore]:
-    """Stores built once per session for the read-path tasks (build is timed
-    separately, so it must not be paid inside a read measurement)."""
+def store_paths(tmp_path_factory, data) -> dict[str, str]:
+    """The `.vortex` artifacts, written once per session. Separate from
+    `stores` because the cold query tasks need the path to reopen, not an
+    already-opened handle."""
     root = tmp_path_factory.mktemp("codspeed-stores")
-    built: dict[str, VortexRdfStore] = {}
+    paths: dict[str, str] = {}
     for variant in QUERY_VARIANTS:
-        built[f"triples::{variant}"] = VortexRdfStore(
-            _build(data["cube"], root / f"t-{variant}.vortex", variant)
+        paths[f"triples::{variant}"] = _build(
+            data["cube"], root / f"t-{variant}.vortex", variant
         )
-        built[f"quads::{variant}"] = VortexRdfStore(
-            _build(data["quads"], root / f"q-{variant}.vortex", variant)
+        paths[f"quads::{variant}"] = _build(
+            data["quads"], root / f"q-{variant}.vortex", variant
         )
-    built["realistic"] = VortexRdfStore(
-        _build(data["realistic"], root / "realistic.vortex", "dict")
-    )
-    built["literals"] = VortexRdfStore(
-        _build(data["literals"], root / "literals.vortex", "dict")
-    )
-    return built
+    paths["realistic"] = _build(data["realistic"], root / "realistic.vortex", "dict")
+    paths["literals"] = _build(data["literals"], root / "literals.vortex", "dict")
+    return paths
+
+
+@pytest.fixture(scope="session")
+def stores(store_paths) -> dict[str, VortexRdfStore]:
+    """Stores opened once per session for the warm read-path tasks (build is
+    timed separately, so it must not be paid inside a read measurement)."""
+    return {key: VortexRdfStore(path) for key, path in store_paths.items()}
 
 
 # ─── build::<config> ────────────────────────────────────────────────────────
@@ -175,7 +186,9 @@ def test_build_literals(benchmark, tmp_path_factory, data):
 @pytest.mark.parametrize(
     "pattern", TRIPLE_PATTERNS + [FULL_SCAN_PATTERN], ids=lambda p: p.name
 )
-def test_query_triples(benchmark, stores, variant, pattern):
+def test_query_warm_triples(benchmark, stores, variant, pattern):
+    """A repeat query on an open store — the steady state of a long-lived
+    process, with probes resolved and chunk/dictionary caches populated."""
     store = stores[f"triples::{variant}"]
     benchmark(lambda: store.get_quads(pattern.s, pattern.p, pattern.o, pattern.g))
 
@@ -183,9 +196,35 @@ def test_query_triples(benchmark, stores, variant, pattern):
 @pytest.mark.benchmark
 @pytest.mark.parametrize("variant", QUERY_VARIANTS)
 @pytest.mark.parametrize("pattern", QUAD_PATTERNS, ids=lambda p: p.name)
-def test_query_quads(benchmark, stores, variant, pattern):
+def test_query_warm_quads(benchmark, stores, variant, pattern):
     store = stores[f"quads::{variant}"]
     benchmark(lambda: store.get_quads(pattern.s, pattern.p, pattern.o, pattern.g))
+
+
+def _cold_query(path: str, pattern: Pat) -> int:
+    """Open the artifact and answer one query on it — the cold regime, with the
+    open inside the measured region. The counterpart of the Rust suite's
+    `match_cold_*` groups and the JS suite's `query_cold_*` tasks."""
+    store = VortexRdfStore(path)
+    return len(store.get_quads(pattern.s, pattern.p, pattern.o, pattern.g))
+
+
+@pytest.mark.benchmark
+@pytest.mark.parametrize("variant", QUERY_VARIANTS)
+@pytest.mark.parametrize(
+    "pattern", TRIPLE_PATTERNS + [FULL_SCAN_PATTERN], ids=lambda p: p.name
+)
+def test_query_cold_triples(benchmark, store_paths, variant, pattern):
+    path = store_paths[f"triples::{variant}"]
+    benchmark(lambda: _cold_query(path, pattern))
+
+
+@pytest.mark.benchmark
+@pytest.mark.parametrize("variant", QUERY_VARIANTS)
+@pytest.mark.parametrize("pattern", QUAD_PATTERNS, ids=lambda p: p.name)
+def test_query_cold_quads(benchmark, store_paths, variant, pattern):
+    path = store_paths[f"quads::{variant}"]
+    benchmark(lambda: _cold_query(path, pattern))
 
 
 # ─── readpath::<variant> ────────────────────────────────────────────────────

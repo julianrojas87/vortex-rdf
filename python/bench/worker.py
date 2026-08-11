@@ -56,6 +56,7 @@ def measure(
     warmup: int = 0,
     setup: Optional[Callable[[], None]] = None,
     teardown: Optional[Callable[[object], None]] = None,
+    regime: Optional[str] = None,
 ) -> None:
     """Time `fn` and append one dashboard-shaped row.
 
@@ -115,6 +116,7 @@ def measure(
             "median_ns": median,
             "mean_ns": mean,
             "samples": str(len(samples)),
+            **({"regime": regime} if regime else {}),
         }
     )
 
@@ -211,12 +213,64 @@ def run_query(a, args) -> dict:
     for pat in probes["triples"]:
         log(f"match {pat.name}…")
         counts[pat.name] = a.count(handle, pat)
-        measure(f"{a.slug}::{pat.name}", lambda p=pat: a.count(handle, p), rows, QUERY_ITERS, QUERY_WARMUP)
+        measure(
+            f"{a.slug}::{pat.name}",
+            lambda p=pat: a.count(handle, p),
+            rows,
+            QUERY_ITERS,
+            QUERY_WARMUP,
+            regime="warm",
+        )
+
+    # --- match: the same patterns, COLD ---
+    # A handle opened per iteration answering its first query, with the open
+    # inside the timed region -- what a short-lived process pays, and the arm
+    # that makes cache work visible (a warm-only tab reports a probe-cache
+    # improvement as noise).
+    #
+    # Gated on `has_distinct_open`: for a store that lives only in memory,
+    # opening IS re-parsing the source, so its cold cell would be tens of
+    # seconds of ingest sitting in a microsecond column. Those adapters simply
+    # have no cold rows, and the dashboard leaves the cells blank.
+    if a.has_distinct_open:
+        def cold(p):
+            h = a.open(artifact, args.triples)
+            a.count(h, p)
+            return h
+
+        for pat in probes["triples"]:
+            log(f"match {pat.name} (cold)…")
+            measure(
+                f"{a.slug}::{pat.name}",
+                lambda p=pat: cold(p),
+                rows,
+                QUERY_ITERS,
+                QUERY_WARMUP,
+                teardown=lambda h: a.dispose(h),
+                regime="cold",
+            )
 
     log("match full…")
     full = probes["full"][0]
     counts["full"] = a.count(handle, full)
-    measure(f"{a.slug}::full", lambda: a.count(handle, full), rows, FULL_SCAN_ITERS)
+    measure(f"{a.slug}::full", lambda: a.count(handle, full), rows, FULL_SCAN_ITERS, regime="warm")
+
+    if a.has_distinct_open:
+        log("match full (cold)…")
+
+        def cold_full():
+            h = a.open(artifact, args.triples)
+            a.count(h, full)
+            return h
+
+        measure(
+            f"{a.slug}::full",
+            cold_full,
+            rows,
+            FULL_SCAN_ITERS,
+            teardown=lambda h: a.dispose(h),
+            regime="cold",
+        )
     a.dispose(handle)
     del handle
     gc.collect()
@@ -230,11 +284,36 @@ def run_query(a, args) -> dict:
             )
     else:
         log("build (quads)…")
-        qh = a.build(args.quads, a.artifact_path(workdir, args.quads))
+        quads_artifact = a.artifact_path(workdir, args.quads)
+        qh = a.build(args.quads, quads_artifact)
         for pat in quad_probes:
             log(f"match {pat.name}…")
             counts[pat.name] = a.count(qh, pat)
-            measure(f"{a.slug}::{pat.name}", lambda p=pat: a.count(qh, p), rows, QUERY_ITERS, QUERY_WARMUP)
+            measure(
+                f"{a.slug}::{pat.name}",
+                lambda p=pat: a.count(qh, p),
+                rows,
+                QUERY_ITERS,
+                QUERY_WARMUP,
+                regime="warm",
+            )
+        if a.has_distinct_open:
+            def cold_quad(p):
+                h = a.open(quads_artifact, args.quads)
+                a.count(h, p)
+                return h
+
+            for pat in quad_probes:
+                log(f"match {pat.name} (cold)…")
+                measure(
+                    f"{a.slug}::{pat.name}",
+                    lambda p=pat: cold_quad(p),
+                    rows,
+                    QUERY_ITERS,
+                    QUERY_WARMUP,
+                    teardown=lambda h: a.dispose(h),
+                    regime="cold",
+                )
         a.dispose(qh)
         del qh
         gc.collect()

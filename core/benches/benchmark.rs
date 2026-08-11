@@ -13,13 +13,17 @@
 //!   change behaviour (e.g. Dictionary × index, where the index columns hold
 //!   u32 codes rather than term strings).
 //! * **Match (Group 2)** is a full 18-cell layout × index × source factorial
-//!   (× 6 routing patterns), plus a chained-view pair. Some cells are
-//!   redundant on paper — a bound subject
+//!   (× 6 routing patterns × 2 cache regimes), plus a chained-view pair. Some
+//!   cells are redundant on paper — a bound subject
 //!   declines every secondary index in favour of the primary sorted `s`
 //!   column, and a bound graph never routes through an index at all — but
-//!   index-decline routing is exactly where regressions have hidden, and the
-//!   cell names are long-lived CodSpeed baselines, so the matrix is kept
-//!   whole.
+//!   index-decline routing is exactly where regressions have hidden, so the
+//!   matrix is kept whole.
+//!
+//!   The regime axis is `match_cold_*` (a store opened per iteration, the open
+//!   inside the timed region) against `match_warm_*` (one store, reused). Both
+//!   are needed: a cold-only suite cannot see caching work at all, and reports
+//!   an improvement that only a resolved probe cache delivers as noise.
 //! * **Decode/load (Group 3) and dictionary residency (Group 4)** sweep only
 //!   the axis each path actually branches on.
 //!
@@ -37,9 +41,9 @@
 //!
 //! Subjects are unique; predicates repeat every 100 rows; objects every 50;
 //! graphs every 10. Probe terms are chosen to hit rows that actually exist, so
-//! at `BENCH_SIZE = 100_000` the matched-row counts are: `S`→1, `P`→1,000,
-//! `O`→2,000, `PO`→1,000, `G`→10,000, `SPOG`→1. (The previous suite probed a
-//! graph term — `.../graph` — that the generator never emits, so every
+//! at the default `BENCH_SIZE = 32_768` the matched-row counts are: `S`→1,
+//! `P`→328, `O`→656, `PO`→328, `G`→3,277, `SPOG`→1. (The previous suite probed
+//! a graph term — `.../graph` — that the generator never emits, so every
 //! graph-bound benchmark silently matched zero rows.)
 
 use std::collections::HashMap;
@@ -131,7 +135,7 @@ const SERIALIZE_CONFIGS: &[SerCfg] = &[
     },
 ];
 
-#[divan::bench(args = SERIALIZE_CONFIGS)]
+#[divan::bench(args = SERIALIZE_CONFIGS, sample_count = HEAVY_SAMPLES)]
 fn serialize(bencher: divan::Bencher, cfg: &SerCfg) {
     let cfg = *cfg;
     bencher
@@ -161,10 +165,17 @@ fn serialize(bencher: divan::Bencher, cfg: &SerCfg) {
 // query-indistinguishable from SortedStream (identical stamped columns).
 // ══════════════════════════════════════════════════════════════════════════
 
-/// Run one match config across a pattern: build the store once (untimed), then
-/// time `match_pattern` plus materialization of the matched quads (so the lazy
-/// derived view is actually executed).
-fn run_match(
+/// Run one match config across a pattern, COLD: a store opened per iteration
+/// answering its first query, with the open inside the timed region. This is
+/// what a short-lived process pays — no chunk probes resolved, no segment
+/// cache, no dictionary memos, and (for `Source::InMemory`) component adoption
+/// not yet run.
+///
+/// The artifact itself is *not* built here: `make_store` reads a cached
+/// `BuiltArray` or an already-written file, and the caches are primed below
+/// before the first sample so no ingest lands inside a measurement. The OS
+/// page cache stays warm too — this is process-level cold, not storage-level.
+fn run_match_cold(
     bencher: divan::Bencher,
     layout: Layout,
     index: Index,
@@ -175,63 +186,113 @@ fn run_match(
     // does): its ~4 String allocations per iteration are fixed setup, and at
     // the lazy suite's ~31 µs match floor they are visible noise.
     let (s, p, o, g) = terms_for(pattern);
-    bencher
-        .with_inputs(|| make_store(source, layout, index, bench_size()))
-        .bench_refs(|store| {
-            rt().block_on(async {
-                let matched = store
-                    .match_pattern(s.as_ref(), p.as_ref(), o.as_ref(), g.as_ref())
-                    .await
-                    .expect("match_pattern failed");
-                let quads = matched.quads_vec().await.expect("execute match");
-                black_box(quads)
-            })
-        });
+    // Prime the ingest/file caches so the first sample times an open, not a
+    // build.
+    drop(make_store(source, layout, index, bench_size()));
+    bencher.bench(|| {
+        let store = make_store(source, layout, index, bench_size());
+        rt().block_on(async {
+            let matched = store
+                .match_pattern(s.as_ref(), p.as_ref(), o.as_ref(), g.as_ref())
+                .await
+                .expect("match_pattern failed");
+            let quads = matched.quads_vec().await.expect("execute match");
+            black_box(quads)
+        })
+    });
 }
 
+/// Run one match config across a pattern, WARM: one store, reused across every
+/// iteration, so each measurement is a repeat query against caches the earlier
+/// iterations populated — the steady state a long-lived process reaches.
+///
+/// This arm is what makes caching work visible at all. A cold-only suite
+/// measures the same store construction over and over and reports a
+/// cache-resolution improvement as noise: the by-reference index's chunk-probe
+/// location moved this suite's cold object lookup 1.15x and the warm
+/// comparative tab 188x.
+fn run_match_warm(
+    bencher: divan::Bencher,
+    layout: Layout,
+    index: Index,
+    source: Source,
+    pattern: Pattern,
+) {
+    let (s, p, o, g) = terms_for(pattern);
+    let store = make_store(source, layout, index, bench_size());
+    // One untimed query resolves the probes and fills the caches, so even the
+    // first measured iteration is genuinely warm.
+    rt().block_on(async {
+        let matched = store
+            .match_pattern(s.as_ref(), p.as_ref(), o.as_ref(), g.as_ref())
+            .await
+            .expect("match_pattern failed");
+        black_box(matched.quads_vec().await.expect("execute match"));
+    });
+    bencher.bench(|| {
+        rt().block_on(async {
+            let matched = store
+                .match_pattern(s.as_ref(), p.as_ref(), o.as_ref(), g.as_ref())
+                .await
+                .expect("match_pattern failed");
+            let quads = matched.quads_vec().await.expect("execute match");
+            black_box(quads)
+        })
+    });
+}
+
+/// Both cache regimes for one matrix cell: `match_cold_*` opens a store per
+/// iteration and answers its first query, `match_warm_*` reuses one store. The
+/// pair is the point — see [`run_match_warm`] on why a cold-only suite cannot
+/// see caching work.
 macro_rules! match_bench {
-    ($name:ident, $layout:expr, $index:expr, $source:expr) => {
-        #[divan::bench(args = PATTERNS)]
-        fn $name(bencher: divan::Bencher, pattern: &Pattern) {
-            run_match(bencher, $layout, $index, $source, *pattern);
+    ($cold:ident, $warm:ident, $layout:expr, $index:expr, $source:expr) => {
+        #[divan::bench(args = PATTERNS, sample_count = QUERY_SAMPLES)]
+        fn $cold(bencher: divan::Bencher, pattern: &Pattern) {
+            run_match_cold(bencher, $layout, $index, $source, *pattern);
+        }
+
+        #[divan::bench(args = PATTERNS, sample_count = QUERY_SAMPLES)]
+        fn $warm(bencher: divan::Bencher, pattern: &Pattern) {
+            run_match_warm(bencher, $layout, $index, $source, *pattern);
         }
     };
 }
 
-/// The full layout × source × index match matrix. One group per cell, named
-/// `match_{layout}_{index}_{source}`.
+/// The full layout × source × index match matrix, in both cache regimes. Two
+/// groups per cell, named `match_{cold,warm}_{layout}_{index}_{source}`.
 macro_rules! match_matrix {
-    ($(($layout:expr, $index:expr, $source:expr) => $name:ident,)*) => {
-        $(match_bench!($name, $layout, $index, $source);)*
+    ($(($layout:expr, $index:expr, $source:expr) => $cold:ident / $warm:ident,)*) => {
+        $(match_bench!($cold, $warm, $layout, $index, $source);)*
     };
 }
 match_matrix!(
     // No secondary index.
-    (Layout::Default, Index::None, Source::InMemory) => match_default_noindex_mem,
-    (Layout::Default, Index::None, Source::File) => match_default_noindex_file,
-    (Layout::TypedObject, Index::None, Source::InMemory) => match_typedobj_noindex_mem,
-    (Layout::TypedObject, Index::None, Source::File) => match_typedobj_noindex_file,
-    (Layout::Dictionary, Index::None, Source::InMemory) => match_dict_noindex_mem,
-    (Layout::Dictionary, Index::None, Source::File) => match_dict_noindex_file,
+    (Layout::Default, Index::None, Source::InMemory) => match_cold_default_noindex_mem / match_warm_default_noindex_mem,
+    (Layout::Default, Index::None, Source::File) => match_cold_default_noindex_file / match_warm_default_noindex_file,
+    (Layout::TypedObject, Index::None, Source::InMemory) => match_cold_typedobj_noindex_mem / match_warm_typedobj_noindex_mem,
+    (Layout::TypedObject, Index::None, Source::File) => match_cold_typedobj_noindex_file / match_warm_typedobj_noindex_file,
+    (Layout::Dictionary, Index::None, Source::InMemory) => match_cold_dict_noindex_mem / match_warm_dict_noindex_mem,
+    (Layout::Dictionary, Index::None, Source::File) => match_cold_dict_noindex_file / match_warm_dict_noindex_file,
     // Secondary by reference.
-    (Layout::Default, Index::ByReference, Source::InMemory) => match_default_byref_mem,
-    (Layout::Default, Index::ByReference, Source::File) => match_default_byref_file,
-    (Layout::TypedObject, Index::ByReference, Source::InMemory) => match_typedobj_byref_mem,
-    (Layout::TypedObject, Index::ByReference, Source::File) => match_typedobj_byref_file,
-    (Layout::Dictionary, Index::ByReference, Source::InMemory) => match_dict_byref_mem,
-    (Layout::Dictionary, Index::ByReference, Source::File) => match_dict_byref_file,
+    (Layout::Default, Index::ByReference, Source::InMemory) => match_cold_default_byref_mem / match_warm_default_byref_mem,
+    (Layout::Default, Index::ByReference, Source::File) => match_cold_default_byref_file / match_warm_default_byref_file,
+    (Layout::TypedObject, Index::ByReference, Source::InMemory) => match_cold_typedobj_byref_mem / match_warm_typedobj_byref_mem,
+    (Layout::TypedObject, Index::ByReference, Source::File) => match_cold_typedobj_byref_file / match_warm_typedobj_byref_file,
+    (Layout::Dictionary, Index::ByReference, Source::InMemory) => match_cold_dict_byref_mem / match_warm_dict_byref_mem,
+    (Layout::Dictionary, Index::ByReference, Source::File) => match_cold_dict_byref_file / match_warm_dict_byref_file,
     // Secondary by copy.
-    (Layout::Default, Index::ByCopy, Source::InMemory) => match_default_bycopy_mem,
-    (Layout::Default, Index::ByCopy, Source::File) => match_default_bycopy_file,
-    (Layout::TypedObject, Index::ByCopy, Source::InMemory) => match_typedobj_bycopy_mem,
-    (Layout::TypedObject, Index::ByCopy, Source::File) => match_typedobj_bycopy_file,
-    (Layout::Dictionary, Index::ByCopy, Source::InMemory) => match_dict_bycopy_mem,
-    (Layout::Dictionary, Index::ByCopy, Source::File) => match_dict_bycopy_file,
+    (Layout::Default, Index::ByCopy, Source::InMemory) => match_cold_default_bycopy_mem / match_warm_default_bycopy_mem,
+    (Layout::Default, Index::ByCopy, Source::File) => match_cold_default_bycopy_file / match_warm_default_bycopy_file,
+    (Layout::TypedObject, Index::ByCopy, Source::InMemory) => match_cold_typedobj_bycopy_mem / match_warm_typedobj_bycopy_mem,
+    (Layout::TypedObject, Index::ByCopy, Source::File) => match_cold_typedobj_bycopy_file / match_warm_typedobj_bycopy_file,
+    (Layout::Dictionary, Index::ByCopy, Source::InMemory) => match_cold_dict_bycopy_mem / match_warm_dict_bycopy_mem,
+    (Layout::Dictionary, Index::ByCopy, Source::File) => match_cold_dict_bycopy_file / match_warm_dict_bycopy_file,
 );
 /// Chained refinement: `match_pattern(P)` then `match_pattern(O)` on the
 /// resulting view — the headline "views narrow the same coordinate space"
 /// feature, which no single-pattern benchmark exercises.
-#[divan::bench(args = [Source::File, Source::InMemory])]
+#[divan::bench(args = [Source::File, Source::InMemory], sample_count = QUERY_SAMPLES)]
 fn match_chained(bencher: divan::Bencher, source: &Source) {
     let source = *source;
     let p = NamedNode::new_unchecked("http://example.org/predicate/0");
@@ -304,7 +365,7 @@ const DECODE_CONFIGS: &[DecodeCfg] = &[
 
 /// Decode every quad in the store (`quads()` → `Vec`). Index is irrelevant to a
 /// full scan, so it is fixed to `None`.
-#[divan::bench(args = DECODE_CONFIGS)]
+#[divan::bench(args = DECODE_CONFIGS, sample_count = HEAVY_SAMPLES)]
 fn decode_all(bencher: divan::Bencher, cfg: &DecodeCfg) {
     let cfg = *cfg;
     bencher
@@ -321,7 +382,7 @@ fn decode_all(bencher: divan::Bencher, cfg: &DecodeCfg) {
 /// typed, and escape-carrying values — see the generator's doc): the star
 /// dataset is named-node-only, so this is the one benchmark whose decode
 /// reaches the literal unescape path.
-#[divan::bench]
+#[divan::bench(sample_count = HEAVY_SAMPLES)]
 fn decode_all_literals(bencher: divan::Bencher) {
     bencher
         .with_inputs(|| cached_literal_store(bench_size()))
@@ -336,7 +397,7 @@ fn decode_all_literals(bencher: divan::Bencher) {
 /// Open a file-backed store. Default and TypedObject read the footer only;
 /// Dictionary also reads its term dictionary up front (an extra single-column
 /// scan), so the layouts are worth distinguishing.
-#[divan::bench(args = [Layout::Default, Layout::TypedObject, Layout::Dictionary])]
+#[divan::bench(args = [Layout::Default, Layout::TypedObject, Layout::Dictionary], sample_count = HEAVY_SAMPLES)]
 fn open_file(bencher: divan::Bencher, layout: &Layout) {
     let layout = *layout;
     bencher
@@ -351,7 +412,7 @@ fn open_file(bencher: divan::Bencher, layout: &Layout) {
 
 /// Load a store from file bytes (`from_bytes`): root-layout validation plus a
 /// full in-memory materialization off the buffer-backed file.
-#[divan::bench]
+#[divan::bench(sample_count = HEAVY_SAMPLES)]
 fn from_bytes(bencher: divan::Bencher) {
     bencher
         .with_inputs(|| cached_store_bytes(Layout::Default, Index::None, bench_size()))
@@ -442,7 +503,7 @@ fn open_dict_store(residency: DictResidency, size: usize) -> VortexRdfStore {
 
 /// Open cost across the residency axis: resident pays the child read and
 /// dictionary lift, file-backed only the footer reads.
-#[divan::bench(args = DICT_CONFIGS)]
+#[divan::bench(args = DICT_CONFIGS, sample_count = HEAVY_SAMPLES)]
 fn dict_open(bencher: divan::Bencher, residency: &DictResidency) {
     let residency = *residency;
     bencher
@@ -463,7 +524,7 @@ fn dict_open(bencher: divan::Bencher, residency: &DictResidency) {
 /// probes are in-memory binary searches; file-backed ones binary-search the
 /// term column through chunk leaves fetched on demand, so this cell prices
 /// those first fetches rather than the search over them.
-#[divan::bench(args = DICT_CONFIGS)]
+#[divan::bench(args = DICT_CONFIGS, sample_count = QUERY_SAMPLES)]
 fn dict_probe_cold(bencher: divan::Bencher, residency: &DictResidency) {
     let residency = *residency;
     let s = NamedOrBlankNode::NamedNode(NamedNode::new_unchecked("http://example.org/subject/0"));
@@ -489,7 +550,7 @@ fn dict_probe_cold(bencher: divan::Bencher, residency: &DictResidency) {
 /// machinery around the dictionary rather than the dictionary itself. The
 /// residency axis shows in [`dict_probe_cold`], which pays the chunk fetches,
 /// and to a much smaller degree in [`dict_probe_distinct`] — not here.
-#[divan::bench(args = DICT_CONFIGS)]
+#[divan::bench(args = DICT_CONFIGS, sample_count = QUERY_SAMPLES)]
 fn dict_probe_warm(bencher: divan::Bencher, residency: &DictResidency) {
     let store = open_dict_store(*residency, bench_size());
     let s = NamedOrBlankNode::NamedNode(NamedNode::new_unchecked("http://example.org/subject/0"));
@@ -515,7 +576,7 @@ fn dict_probe_warm(bencher: divan::Bencher, residency: &DictResidency) {
 /// are already paid, so what is left is what residency costs a warm binary
 /// search. The term is built outside the timed closure, as the other probe
 /// cells do.
-#[divan::bench(args = DICT_CONFIGS)]
+#[divan::bench(args = DICT_CONFIGS, sample_count = QUERY_SAMPLES)]
 fn dict_probe_distinct(bencher: divan::Bencher, residency: &DictResidency) {
     let store = open_dict_store(*residency, bench_size());
     let subjects = bench_size();
@@ -545,7 +606,7 @@ fn dict_probe_distinct(bencher: divan::Bencher, residency: &DictResidency) {
 /// dictionary resolves them by reading exactly those rows out of its cached
 /// wire chunks instead of scanning. The bound term is memoized after the
 /// first iteration, so this cell prices the decode, not the probe.
-#[divan::bench(args = DICT_CONFIGS)]
+#[divan::bench(args = DICT_CONFIGS, sample_count = QUERY_SAMPLES)]
 fn dict_decode_point(bencher: divan::Bencher, residency: &DictResidency) {
     let store = open_dict_store(*residency, bench_size());
     let s = NamedOrBlankNode::NamedNode(NamedNode::new_unchecked("http://example.org/subject/0"));
@@ -567,7 +628,7 @@ fn dict_decode_point(bencher: divan::Bencher, residency: &DictResidency) {
 /// point-read cap admits, so a file-backed dictionary resolves them with one
 /// row-index scan — the bulk path, whose whole-leaf decode is what wins at
 /// this width. [`dict_decode_point`] covers the other side of the cap.
-#[divan::bench(args = DICT_CONFIGS)]
+#[divan::bench(args = DICT_CONFIGS, sample_count = QUERY_SAMPLES)]
 fn dict_decode_matched(bencher: divan::Bencher, residency: &DictResidency) {
     let store = open_dict_store(*residency, bench_size());
     let p = NamedNode::new_unchecked("http://example.org/predicate/0");

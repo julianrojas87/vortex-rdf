@@ -21,11 +21,14 @@ if (!slug || !role || !outFile) {
     process.exit(1);
 }
 
-async function runBench(rows: Row[], opts: typeof QUERY_OPTS, add: (b: Bench) => void): Promise<void> {
+async function runBench(
+    rows: Row[], opts: typeof QUERY_OPTS, add: (b: Bench) => void,
+    regime?: 'cold' | 'warm',
+): Promise<void> {
     const bench = withCodSpeed(new Bench(opts));
     add(bench);
     await bench.run();
-    collect(bench, rows);
+    collect(bench, rows, regime);
 }
 
 /** Phases that could not be measured, and why. */
@@ -41,9 +44,12 @@ const failures: { phase: string; error: string }[] = [];
  * than swallowed, so a missing row is visibly attributed instead of looking like
  * a benchmark that was never run.
  */
-async function bench(phase: string, rows: Row[], opts: typeof QUERY_OPTS, add: (b: Bench) => void): Promise<void> {
+async function bench(
+    phase: string, rows: Row[], opts: typeof QUERY_OPTS, add: (b: Bench) => void,
+    regime?: 'cold' | 'warm',
+): Promise<void> {
     try {
-        await runBench(rows, opts, add);
+        await runBench(rows, opts, add, regime);
     } catch (e) {
         const error = e instanceof Error ? e.message : String(e);
         console.error(`  !! phase '${phase}' failed: ${error}`);
@@ -98,7 +104,20 @@ async function runQuery(a: StoreAdapter): Promise<Row[]> {
     await countAll(a, th, tProbes.triples);
     await bench('query_triples', rows, QUERY_OPTS, (b) => {
         for (const p of tProbes.triples) b.add(`${a.slug}::${p.name}`, async () => { await a.countMatch(th, p); });
-    });
+    }, 'warm');
+    // Cold: a store opened per iteration answering its first query. Only the
+    // adapters with a persistent form take part (see `snapshot`/`open` in
+    // shared.ts); the snapshot itself is taken once, outside the measurement.
+    if (a.snapshot && a.open) {
+        const snap = await a.snapshot(th);
+        await bench('query_triples_cold', rows, QUERY_OPTS, (b) => {
+            for (const p of tProbes.triples) b.add(`${a.slug}::${p.name}`, async () => {
+                const h = await a.open!(snap);
+                await a.countMatch(h, p);
+                a.dispose?.(h);
+            });
+        }, 'cold');
+    }
     reclaim(a, th);
     th = null;
 
@@ -108,7 +127,17 @@ async function runQuery(a: StoreAdapter): Promise<Row[]> {
     await countAll(a, qh, qProbes.quads);
     await bench('query_quads', rows, QUERY_OPTS, (b) => {
         for (const p of qProbes.quads) b.add(`${a.slug}::${p.name}`, async () => { await a.countMatch(qh, p); });
-    });
+    }, 'warm');
+    if (a.snapshot && a.open) {
+        const snap = await a.snapshot(qh);
+        await bench('query_quads_cold', rows, QUERY_OPTS, (b) => {
+            for (const p of qProbes.quads) b.add(`${a.slug}::${p.name}`, async () => {
+                const h = await a.open!(snap);
+                await a.countMatch(h, p);
+                a.dispose?.(h);
+            });
+        }, 'cold');
+    }
     reclaim(a, qh);
     qh = null;
 
@@ -147,7 +176,17 @@ async function runFullScan(a: StoreAdapter): Promise<Row[]> {
     let h: unknown = await a.build(triples);
     await bench('full', rows, FULL_SCAN_OPTS, (b) => {
         b.add(`${a.slug}::full`, async () => { await a.countMatch(h, FULL_SCAN_PATTERN); });
-    });
+    }, 'warm');
+    if (a.snapshot && a.open) {
+        const snap = await a.snapshot(h);
+        await bench('full_cold', rows, FULL_SCAN_OPTS, (b) => {
+            b.add(`${a.slug}::full`, async () => {
+                const fresh = await a.open!(snap);
+                await a.countMatch(fresh, FULL_SCAN_PATTERN);
+                a.dispose?.(fresh);
+            });
+        }, 'cold');
+    }
     reclaim(a, h);
     h = null;
     return rows;

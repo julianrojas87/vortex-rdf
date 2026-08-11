@@ -209,6 +209,9 @@
     font-family:inherit; font-variant-numeric:normal;
   }
   .matrix-table tbody tr.group-break td { border-top:1px solid var(--border-strong); }
+  /* Two-level header (pattern spanning its cold/warm leaves) */
+  .matrix-table th.colgroup { border-bottom:1px solid var(--border-strong); }
+  .matrix-table th.subcol { font-size:11px; font-weight:500; color:var(--ink-2); text-transform:lowercase; letter-spacing:.02em; }
 
   /* ---- data table ---- */
   .table-toolbar { display:flex; align-items:center; gap:10px; margin-bottom:10px; flex-wrap:wrap; }
@@ -666,8 +669,12 @@ const PY_MEMORY = __PY_MEMORY_DATA__;
 const PY_SIZES = __PY_SIZE_DATA__;
 const PY_CONFIG = __PY_CONFIG_DATA__;
 const PY_PROVENANCE = __PY_PROVENANCE__;
+// Cold and warm measurements of one pattern share an id and differ only by
+// `regime`, so the key carries it. The Rust tab needs no suffix: its regimes are
+// separate bench groups (match_cold_* / match_warm_*), so its ids already differ.
+const byKey = d => d.regime === "cold" ? `${d.id}#cold` : d.id;
 const rustById = new Map(RUST_DATA.map(d => [d.id, d]));
-const jsById = new Map(JS_DATA.map(d => [d.id, d]));
+const jsById = new Map(JS_DATA.map(d => [byKey(d), d]));
 // Reshaped to the same {median, median_ns} shape renderMatrixPanel already
 // reads, so the memory panels reuse the same renderer instead of a parallel
 // one just for a different unit (MB peak RSS in place of a time duration).
@@ -675,7 +682,7 @@ const jsMemById = new Map(JS_MEMORY.map(m => [`${m.slug}::${m.role}`, {
   median: (m.peakRssMb ?? "?") + " MB", median_ns: m.peakRssMb ?? 0,
 }]));
 
-const pyById = new Map(PY_DATA.map(d => [d.id, d]));
+const pyById = new Map(PY_DATA.map(d => [byKey(d), d]));
 const pyMemById = new Map(PY_MEMORY.map(m => [`${m.slug}::${m.role}`, {
   median: (m.peakRssMb ?? "?") + " MB", median_ns: m.peakRssMb ?? 0,
 }]));
@@ -699,7 +706,15 @@ function fmtBytes(n){
 const RUST_PATTERNS = ["S","P","O","PO","G","SPOG"];
 const JS_PATTERNS = ["S","P","O","PO","SPO","full","G","SPOG"];
 
-function get(map, id){ const r = map.get(id); if(!r) console.warn("missing bench id", id); return r; }
+function get(map, id){
+  const r = map.get(id);
+  // A missing `#cold` id is usually intentional, not a data problem: a store
+  // with no persistent form has nothing to reopen, so it has no cold row and
+  // the cell prints "—". Warn only for the ids a run is actually expected to
+  // produce.
+  if(!r && !String(id).endsWith("#cold")) console.warn("missing bench id", id);
+  return r;
+}
 function fmtRatio(a,b){ return (a/b).toFixed(2) + "×"; }
 
 // ---- panel configs (Rust tab) ----
@@ -731,7 +746,9 @@ const serializePanel = {
  * measurement columns. Cells print the median; the column-fastest cell is
  * green and every other cell carries its slowdown multiplier vs that best.
  * cfg: { title, note, wide, rowHeaders:[...], columns:[...],
- *        rows:[{ labels:[...], ids:[... parallel to columns, null → "—"],
+ *        subColumns:[...] (optional — each column spans these, and every row's
+ *                    ids run columns × subColumns in that order),
+ *        rows:[{ labels:[...], ids:[... parallel to the leaf columns, null → "—"],
  *                break: true rules off a row group }] } */
 function renderMatrixPanel(container, cfg, map){
   const rows = cfg.rows
@@ -747,8 +764,13 @@ function renderMatrixPanel(container, cfg, map){
     rows.forEach(r => delete r.break);
   }
 
-  // Column-wise best, so each column reads as its own ranking.
-  const best = cfg.columns.map((_, i) => Math.min(
+  // Leaf columns: with subColumns, every (column, subColumn) pair is its own
+  // leaf — a cold cell must never be ranked against a warm one.
+  const subs = cfg.subColumns ?? null;
+  const leafCount = cfg.columns.length * (subs ? subs.length : 1);
+
+  // Column-wise best, so each leaf column reads as its own ranking.
+  const best = Array.from({length: leafCount}, (_, i) => Math.min(
     ...rows.map(r => r.recs[i]?.median_ns ?? Infinity)));
 
   const panel = document.createElement("div");
@@ -759,9 +781,16 @@ function renderMatrixPanel(container, cfg, map){
   wrap.className = "table-wrap";
   const table = document.createElement("table");
   table.className = "matrix-table";
-  table.innerHTML = "<thead><tr>" +
-    cfg.rowHeaders.map(h => `<th class="rowh">${h}</th>`).join("") +
-    cfg.columns.map(c => `<th>${c}</th>`).join("") + "</tr></thead>";
+  table.innerHTML = subs
+    ? "<thead><tr>" +
+        cfg.rowHeaders.map(h => `<th class="rowh" rowspan="2">${h}</th>`).join("") +
+        cfg.columns.map(c => `<th colspan="${subs.length}" class="colgroup">${c}</th>`).join("") +
+      "</tr><tr>" +
+        cfg.columns.map(() => subs.map(sc => `<th class="subcol">${sc}</th>`).join("")).join("") +
+      "</tr></thead>"
+    : "<thead><tr>" +
+        cfg.rowHeaders.map(h => `<th class="rowh">${h}</th>`).join("") +
+        cfg.columns.map(c => `<th>${c}</th>`).join("") + "</tr></thead>";
   const tbody = document.createElement("tbody");
 
   for (const r of rows){
@@ -795,34 +824,58 @@ function renderMatrixPanel(container, cfg, map){
   container.appendChild(panel);
 }
 
-function patternIds(group, patterns){ return patterns.map(p => `${group}::${p}`); }
+function patternIds(group, patterns, regime){
+  const suffix = regime === "cold" ? "#cold" : "";
+  return patterns.map(p => `${group}::${p}${suffix}`);
+}
+
+/** Interleave one row's ids across a cold/warm sub-column pair, in the order
+ *  `subColumns` declares. */
+function coldWarmIds(group, patterns){
+  return patterns.flatMap(p => [`${group}::${p}#cold`, `${group}::${p}`]);
+}
 
 // The consolidated match matrix: every layout × source × index variant
 // as rows, grouped by secondary-index
 // configuration, the six routing patterns as columns.
 const MATCH_INDEXES = [["No index","noindex"],["By reference","byref"],["By copy","bycopy"]];
 const MATCH_LAYOUTS = [
-  {labels:["Default","in-memory"],         group: ix => `match_default_${ix}_mem`},
-  {labels:["Default","file"],              group: ix => `match_default_${ix}_file`},
-  {labels:["Typed-object","in-memory"],    group: ix => `match_typedobj_${ix}_mem`},
-  {labels:["Typed-object","file"],         group: ix => `match_typedobj_${ix}_file`},
-  {labels:["Dictionary","in-memory"],      group: ix => `match_dict_${ix}_mem`},
-  {labels:["Dictionary","file"],           group: ix => `match_dict_${ix}_file`},
+  {labels:["Default","in-memory"],         group: (ix, re) => `match_${re}_default_${ix}_mem`},
+  {labels:["Default","file"],              group: (ix, re) => `match_${re}_default_${ix}_file`},
+  {labels:["Typed-object","in-memory"],    group: (ix, re) => `match_${re}_typedobj_${ix}_mem`},
+  {labels:["Typed-object","file"],         group: (ix, re) => `match_${re}_typedobj_${ix}_file`},
+  {labels:["Dictionary","in-memory"],      group: (ix, re) => `match_${re}_dict_${ix}_mem`},
+  {labels:["Dictionary","file"],           group: (ix, re) => `match_${re}_dict_${ix}_file`},
 ];
 // Row set shared by the materializing and lazy match tables; the lazy bench
 // target names each group `lazy_` + its materializing twin.
 function matchMatrixRows(groupPrefix){
   return MATCH_INDEXES.flatMap(([ixLabel, ix]) => MATCH_LAYOUTS.map((v, vi) => ({
     labels:[vi === 0 ? ixLabel : "", ...v.labels],
-    ids: patternIds(groupPrefix + v.group(ix), RUST_PATTERNS),
+    // Cold then warm per pattern, matching the subColumns order below.
+    ids: RUST_PATTERNS.flatMap(pat => [
+      `${groupPrefix}${v.group(ix, "cold")}::${pat}`,
+      `${groupPrefix}${v.group(ix, "warm")}::${pat}`,
+    ]),
+    break: vi === 0,
+  })));
+}
+
+/** The lazy target has one regime only (a fresh store per sample), so its rows
+ *  stay single-columned. */
+function lazyMatchMatrixRows(){
+  return MATCH_INDEXES.flatMap(([ixLabel, ix]) => MATCH_LAYOUTS.map((v, vi) => ({
+    labels:[vi === 0 ? ixLabel : "", ...v.labels],
+    ids: patternIds(`lazy_${v.group(ix, "cold")}`, RUST_PATTERNS),
     break: vi === 0,
   })));
 }
 
 const matchMatrixPanel = {
-  title:"Match matrix: index × layout × source, per pattern",
-  note:"Median <code>match_pattern</code> + materialization time. Rows are grouped by secondary-index configuration; within a group only layout and source vary. <b>Green</b> marks the fastest variant in each pattern column across all groups; the grey multiplier is the slowdown vs that column's best.",
-  wide:true, rowHeaders:["Index","Layout","Source"], columns:RUST_PATTERNS,
+  title:"Match matrix: index × layout × source, per pattern and cache regime",
+  note:"Median <code>match_pattern</code> + materialization time, in both cache regimes. <b>Cold</b> opens a store per iteration and answers its first query, with the open inside the measurement — what a short-lived process pays. <b>Warm</b> reuses one store, so probes are resolved and caches populated. Rows are grouped by secondary-index configuration; within a group only layout and source vary. <b>Green</b> marks the fastest variant in each leaf column; the grey multiplier is the slowdown vs that column's best.",
+  wide:true, rowHeaders:["Index","Layout","Source"],
+  columns:RUST_PATTERNS, subColumns:["cold","warm"],
   rows: matchMatrixRows(""),
 };
 
@@ -830,7 +883,7 @@ const lazyMatchMatrixPanel = {
   title:"Match matrix without materialization, per pattern",
   note:"The same variants and probes, timing <code>match_pattern</code> alone — index resolution and row-selection composition into the narrowed view, before any quad is decoded. The difference against the table above is materialization's share of a match: it is what an iterative query plan defers by refining views and decoding only the final result. Local-only benchmarks (<code>match_lazy</code> target), not uploaded to CodSpeed.",
   wide:true, rowHeaders:["Index","Layout","Source"], columns:RUST_PATTERNS,
-  rows: matchMatrixRows("lazy_"),
+  rows: lazyMatchMatrixRows(),
 };
 
 const chainedPanel = {
@@ -1073,10 +1126,10 @@ function renderJs(){
 
   // Query — cross-library, per routing shape
   renderMatrixPanel(document.getElementById("js-query-panels"), {
-    title:"Cross-library match, by routing shape",
-    note:"Four Vortex build variants vs rdf-stores (both index configs) vs oxigraph. Green = fastest store in each pattern column; the grey multiplier is the slowdown vs that column's best.",
-    wide:true, rowHeaders:["Store"], columns:JS_PATTERNS,
-    rows: CROSS_LIB_SERIES.map(a => ({ labels:[a.label], ids: patternIds(a.slug, JS_PATTERNS),
+    title:"Cross-library match, by routing shape and cache regime",
+    note:"Four Vortex build variants vs rdf-stores (both index configs) vs oxigraph. <b>Warm</b> is a repeat query on an open store; <b>cold</b> opens one per iteration and answers its first query. Only stores with a persistent form have a cold cell — for an in-memory library, opening IS re-parsing the source, which would put tens of seconds in a microsecond column. Green = fastest store in each leaf column.",
+    wide:true, rowHeaders:["Store"], columns:JS_PATTERNS, subColumns:["cold","warm"],
+    rows: CROSS_LIB_SERIES.map(a => ({ labels:[a.label], ids: coldWarmIds(a.slug, JS_PATTERNS),
       break: a.slug === "rdfstores_default" })),
   }, jsById);
 
@@ -1186,10 +1239,10 @@ function renderPy(){
 
   // Query — every configuration against every routing shape.
   renderMatrixPanel(document.getElementById("py-query-panels"), {
-    title:"Match by pattern",
-    wide:true, rowHeaders:["Configuration"], columns:PY_PATTERNS,
-    note:"Median time to resolve each pattern and count the results. lightrdf re-parses the whole file per call, so its row is flat across selectivity — that flatness is what having no index costs.",
-    rows: PY_ADAPTERS.map(a => ({ labels:[a.label], ids:patternIds(a.slug, PY_PATTERNS) })),
+    title:"Match by pattern and cache regime",
+    wide:true, rowHeaders:["Configuration"], columns:PY_PATTERNS, subColumns:["cold","warm"],
+    note:"Median time to resolve each pattern and count the results. <b>Warm</b> is a repeat query on an open store; <b>cold</b> reopens the artifact per iteration and answers its first query, the open included in the measurement. Only the configurations with a real artifact to reopen have a cold cell — for an in-memory library, opening IS re-parsing the source. lightrdf re-parses the whole file per call, so its row is flat across selectivity — that flatness is what having no index costs.",
+    rows: PY_ADAPTERS.map(a => ({ labels:[a.label], ids:coldWarmIds(a.slug, PY_PATTERNS) })),
   }, pyById);
 
   // Mutations — two of the five libraries can do this at all. One row per
