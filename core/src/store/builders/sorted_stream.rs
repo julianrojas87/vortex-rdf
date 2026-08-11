@@ -3,12 +3,12 @@
 //!
 //! It offers the same sortedness guarantee as
 //! [`sorted_in_memory`](super::sorted_in_memory) — globally sorted `s` and
-//! index value columns, both binary-searchable — without holding the dataset,
+//! index children, both binary-searchable — without holding the dataset,
 //! paying for it in temp-file I/O. Requested indexes are merged from their
-//! own spilled `(value, row id)` runs and handed over as native components
-//! rather than riding along as `_idx_*` row-space columns. The run file
-//! format itself belongs to [`spill`](super::spill), the emission machinery
-//! to [`builders`](super); what lives here is the merge.
+//! own spilled `(value, row id)` runs and stream straight out as components,
+//! never materialized whole. The run file format itself belongs to
+//! [`spill`](super::spill), the emission machinery to [`builders`](super);
+//! what lives here is the merge.
 
 use super::spill::{
     PairMerger, PairRunSpiller, Run, RunWriter, TempRunsGuard, make_temp_dir, write_run,
@@ -22,10 +22,7 @@ use crate::io::container::NativeComponentWrite;
 use crate::store::RawQuad;
 use crate::store::array::stamp_is_sorted;
 use crate::store::indexes::secondary_by_copy::{self, CopyKey};
-use crate::store::indexes::{
-    IndexComponent, IndexType, Indexes, indexes_need_global_sorted_emission, known_component,
-    unique_indexes,
-};
+use crate::store::indexes::{IndexComponent, IndexType, Indexes, known_component, unique_indexes};
 use crate::store::layouts::dictionary::{TermDictionary, TermDictionaryBuilder};
 use crate::store::layouts::{LayoutStrategy, dictionary};
 
@@ -107,8 +104,8 @@ impl VortexArrayBuilder for SortedStreamBuilder {
 /// The quad result is canonicalized and its `s` sortedness stat re-stamped
 /// (assembling chunks loses the per-chunk stats that `match_pattern` gates
 /// its binary searches on). The streamed index children are materialized
-/// directly as the store's in-memory components — never re-welded into
-/// row-space columns; `from_built` adopts them as they are.
+/// directly as the store's in-memory components, which `from_built` adopts
+/// as they are.
 pub(crate) async fn build_sorted_stream_array(
     quad_stream: Box<dyn Stream<Item = Result<RawQuad>> + Unpin + Send + 'static>,
     layout: LayoutStrategy,
@@ -163,7 +160,7 @@ pub(crate) async fn build_sorted_stream_array(
             component.descriptor.sorted,
         ));
     }
-    let assembled = assemble_chunks(chunks, layout, &indexes)?;
+    let assembled = assemble_chunks(chunks, layout)?;
     // Correct by construction for this builder: every emission is a window
     // of the global merge, so the s column is globally sorted — the stamp
     // the store's adoption reads back.
@@ -289,12 +286,11 @@ pub(crate) async fn build_sorted_stream_chunk_stream(
     }
 
     // ── Phase 3: chunk emission ──
-    let want_global_idx = indexes_need_global_sorted_emission(&indexes);
-
-    if want_global_idx {
-        // Two-pass pipeline for globally sorted index columns; spill only the
-        // families the requested index types actually need.
-        let unique = unique_indexes(&indexes);
+    // Any requested index means the two-pass pipeline: the index children are
+    // globally sorted, which needs the quad merge's row ids before the pairs
+    // can be sorted. Spill only the families the requested types need.
+    let unique = unique_indexes(&indexes);
+    if !unique.is_empty() {
         let want_ref = unique.contains(&IndexType::SecondaryByReference);
         let want_copy = unique.contains(&IndexType::SecondaryByCopy);
         if let Some(b) = dict_builder {
@@ -341,9 +337,6 @@ pub(crate) async fn build_sorted_stream_chunk_stream(
             dtype,
             chunks,
             components,
-            // Index children stream from the global merge; the row-space
-            // chunks are primary-only, so the serializer's tee is a no-op.
-            components_sorted: true,
             quads_sorted: true,
             dict: None,
         });
@@ -360,39 +353,33 @@ pub(crate) async fn build_sorted_stream_chunk_stream(
             dict_start.elapsed(),
             build_start.elapsed()
         );
-        return emit_dict_chunks(runs, heap, dict, id_map, indexes, chunk_size, guard);
+        return emit_dict_chunks(runs, heap, dict, id_map, chunk_size, guard);
     }
 
     // The first chunk is built eagerly so the schema dtype is known up front.
     let first_buf = next_sorted_chunk(&mut runs, &mut heap, chunk_size)?;
     let first = if first_buf.is_empty() {
-        make_empty_struct(layout, &indexes)?
+        make_empty_struct(layout)?
     } else {
-        build_struct_array(&first_buf, layout, &indexes, 0, true, false)?
+        build_struct_array(&first_buf, layout, true)?
     };
     let dtype = first.dtype().clone();
-    let next_row = first_buf.len() as u32;
     drop(first_buf);
 
     let rest = stream::unfold(
-        (runs, heap, layout, indexes, next_row, guard),
-        move |(mut runs, mut heap, layout, indexes, row, guard)| async move {
+        (runs, heap, layout, guard),
+        move |(mut runs, mut heap, layout, guard)| async move {
             let buf = match next_sorted_chunk(&mut runs, &mut heap, chunk_size) {
                 Ok(b) => b,
                 Err(e) => {
-                    return Some((
-                        Err(into_vortex_error(e)),
-                        (runs, heap, layout, indexes, row, guard),
-                    ));
+                    return Some((Err(into_vortex_error(e)), (runs, heap, layout, guard)));
                 }
             };
             if buf.is_empty() {
                 return None;
             }
-            let n = buf.len();
-            let chunk = build_struct_array(&buf, layout, &indexes, row, true, false)
-                .map_err(into_vortex_error);
-            Some((chunk, (runs, heap, layout, indexes, row + n as u32, guard)))
+            let chunk = build_struct_array(&buf, layout, true).map_err(into_vortex_error);
+            Some((chunk, (runs, heap, layout, guard)))
         },
     );
 
@@ -401,8 +388,6 @@ pub(crate) async fn build_sorted_stream_chunk_stream(
         dtype,
         chunks,
         components: Vec::new(),
-        // Any welded index columns are per-chunk local sorts.
-        components_sorted: false,
         quads_sorted: true,
         dict: None,
     })
@@ -740,7 +725,7 @@ fn emit_presorted_chunks(
     )?;
     let buf = read_merged_batch(&mut merged, chunk_size)?;
     let first = if buf.is_empty() {
-        make_empty_struct(layout, &Vec::new())?
+        make_empty_struct(layout)?
     } else {
         build_presorted_chunk(&buf, layout)?
     };
@@ -789,9 +774,9 @@ fn emit_presorted_dict_chunks(
     )?;
     let buf = read_merged_batch(&mut merged, chunk_size)?;
     let first = if buf.is_empty() {
-        dictionary::empty_struct(&Vec::new())?
+        dictionary::empty_struct()?
     } else {
-        build_presorted_dict_chunk(&buf, &dict, &id_map)?
+        dictionary::build_chunk(&buf, &dict, &id_map, true)?
     };
     let dtype = first.dtype().clone();
 
@@ -804,7 +789,7 @@ fn emit_presorted_dict_chunks(
                 if buf.is_empty() {
                     return Ok(None);
                 }
-                build_presorted_dict_chunk(&buf, &dict, &id_map).map(Some)
+                dictionary::build_chunk(&buf, &dict, &id_map, true).map(Some)
             })();
             match chunk {
                 Ok(None) => None,
@@ -819,19 +804,9 @@ fn emit_presorted_dict_chunks(
         dtype,
         chunks,
         components,
-        components_sorted: true,
         quads_sorted: true,
         dict: Some(dict),
     })
-}
-
-/// Build one primary-code-columns chunk against the completed dictionary.
-fn build_presorted_dict_chunk(
-    quads: &[RawQuad],
-    dict: &TermDictionary,
-    id_map: &crate::store::layouts::dictionary::TermIdMap,
-) -> Result<ArrayRef> {
-    dictionary::build_chunk_presorted_indexes(quads, dict, id_map, None, None, true)
 }
 
 /// Dictionary-layout emission over the K-way merge (no secondary indexes):
@@ -842,40 +817,34 @@ fn emit_dict_chunks(
     mut heap: BinaryHeap<HeapItem>,
     dict: Arc<TermDictionary>,
     id_map: Arc<crate::store::layouts::dictionary::TermIdMap>,
-    indexes: Indexes,
     chunk_size: usize,
     guard: Arc<TempRunsGuard>,
 ) -> Result<BuiltStream> {
     let first_buf = next_sorted_chunk(&mut runs, &mut heap, chunk_size)?;
     let first = if first_buf.is_empty() {
-        dictionary::empty_struct(&indexes)?
+        dictionary::empty_struct()?
     } else {
-        dictionary::build_chunk(&first_buf, &dict, &id_map, &indexes, 0, true, false)?
+        dictionary::build_chunk(&first_buf, &dict, &id_map, true)?
     };
     let dtype = first.dtype().clone();
-    let next_row = first_buf.len() as u32;
     drop(first_buf);
 
     let stream_dict = Arc::clone(&dict);
     let rest = stream::unfold(
-        (runs, heap, stream_dict, id_map, indexes, next_row, guard),
-        move |(mut runs, mut heap, dict, id_map, indexes, row, guard)| async move {
+        (runs, heap, stream_dict, id_map, guard),
+        move |(mut runs, mut heap, dict, id_map, guard)| async move {
             let buf = match next_sorted_chunk(&mut runs, &mut heap, chunk_size) {
                 Ok(b) => b,
                 Err(e) => {
-                    return Some((
-                        Err(into_vortex_error(e)),
-                        (runs, heap, dict, id_map, indexes, row, guard),
-                    ));
+                    return Some((Err(into_vortex_error(e)), (runs, heap, dict, id_map, guard)));
                 }
             };
             if buf.is_empty() {
                 return None;
             }
-            let n = buf.len() as u32;
-            let chunk = dictionary::build_chunk(&buf, &dict, &id_map, &indexes, row, true, false)
-                .map_err(into_vortex_error);
-            Some((chunk, (runs, heap, dict, id_map, indexes, row + n, guard)))
+            let chunk =
+                dictionary::build_chunk(&buf, &dict, &id_map, true).map_err(into_vortex_error);
+            Some((chunk, (runs, heap, dict, id_map, guard)))
         },
     );
 
@@ -884,7 +853,6 @@ fn emit_dict_chunks(
         dtype,
         chunks,
         components: Vec::new(),
-        components_sorted: false,
         quads_sorted: true,
         dict: Some(dict),
     })

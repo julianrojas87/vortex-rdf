@@ -12,22 +12,16 @@ use vortex_error::{VortexResult, vortex_bail, vortex_ensure_eq};
 
 use super::wire::StoreComponentDescriptor;
 
-/// Replayable producer for one independently typed component. Sources may be
-/// buffered arrays ([`ReplayableArraySource`]), spill-run mergers, or
-/// channels tee-fed by the quad stream — see [`NativeComponentSource::
-/// channel_backed`] for the concurrency contract of the last kind.
+/// Replayable producer for one independently typed component. Sources are
+/// buffered arrays ([`ReplayableArraySource`]) or spill-run mergers pulled
+/// chunk by chunk ([`PullComponentSource`]); both are lazy — nothing is
+/// produced until the write strategy polls, which is what lets it bound how
+/// many components compress concurrently.
 pub(crate) trait NativeComponentSource: Send + Sync + 'static {
     fn dtype(&self) -> &DType;
     fn open(&self) -> VortexResult<vortex_array::stream::SendableArrayStream>;
     fn buffered_bytes(&self) -> u64 {
         0
-    }
-    /// True when this source is fed by the quad stream's own poll loop (a
-    /// tee channel): the write strategy must then poll every component job
-    /// concurrently, or a full channel blocks the quad stream and the write
-    /// deadlocks.
-    fn channel_backed(&self) -> bool {
-        false
     }
 }
 

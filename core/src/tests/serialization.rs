@@ -228,34 +228,65 @@ async fn test_locally_sorted_children_from_bytes_match_correctly() {
         .collect();
     let raws: Vec<crate::store::RawQuad> =
         quads.iter().map(crate::store::RawQuad::from_quad).collect();
-    // Cut the rows into three chunks, each with its own locally-sorted index
-    // columns and no global emission behind them — the shape a chunked write
-    // must not claim sortedness for.
-    let dtype;
-    let mut chunk_arrays = Vec::new();
+    // Cut the rows into three chunks and sort each family's child WITHIN a
+    // chunk only: the concatenated child is not globally sorted, so its
+    // descriptor must say so — the shape a chunked foreign writer could
+    // produce and a reader must not binary-search.
+    use crate::store::indexes::secondary_by_copy::{CopyKey, Family, copy_child_chunk_strings};
+    let mut quad_chunks = Vec::new();
+    let mut child_chunks: Vec<Vec<vortex_array::ArrayRef>> = vec![Vec::new(), Vec::new()];
     for (n, rows) in raws.chunks(4).enumerate() {
-        chunk_arrays.push(
-            crate::store::builders::build_struct_array(
-                rows,
-                LayoutStrategy::Default,
-                &[IndexType::SecondaryByCopy],
-                (n * 4) as u32,
-                false,
-                false,
-            )
-            .unwrap(),
+        quad_chunks.push(
+            crate::store::builders::build_struct_array(rows, LayoutStrategy::Default, false)
+                .unwrap(),
         );
+        for (family_ix, family) in [Family::Posg, Family::Ospg].into_iter().enumerate() {
+            let mut keys: Vec<(CopyKey<String>, u32)> = rows
+                .iter()
+                .enumerate()
+                .map(|(i, q)| {
+                    let spog = [q.s.clone(), q.p.clone(), q.o.clone(), q.g.clone()];
+                    let key = match family {
+                        Family::Posg => CopyKey::posg(&spog),
+                        Family::Ospg => CopyKey::ospg(spog),
+                    };
+                    (key, (n * 4 + i) as u32)
+                })
+                .collect();
+            keys.sort_unstable();
+            child_chunks[family_ix].push(copy_child_chunk_strings(family, &keys).unwrap());
+        }
     }
-    dtype = chunk_arrays[0].dtype().clone();
-    let chunks: crate::store::builders::ChunkStream =
-        Box::pin(futures::stream::iter(chunk_arrays.into_iter().map(Ok)));
-    let split = crate::store::indexes::tee::split_row_space(dtype, chunks, false).unwrap();
-    let components = split.components;
+    let dtype = quad_chunks[0].dtype().clone();
+    let components: Vec<container::NativeComponentWrite> = [Family::Posg, Family::Ospg]
+        .into_iter()
+        .zip(child_chunks)
+        .map(|(family, chunks)| {
+            container::NativeComponentWrite::new(
+                container::StoreComponentDescriptor {
+                    name: family.component_name().into(),
+                    role: container::StoreComponentRole::Index,
+                    implementation: family.component_slug().into(),
+                    version: 1,
+                    required: false,
+                    // Per-chunk sorts only: the writer may not claim global order.
+                    sorted: false,
+                    dtype: crate::store::indexes::secondary_by_copy::copy_child_dtype(false),
+                },
+                std::sync::Arc::new(container::ReplayableArraySource::try_new(chunks).unwrap()),
+                container::default_child_strategy(),
+            )
+            .unwrap()
+        })
+        .collect();
     let mut bytes: Vec<u8> = Vec::new();
     container::write_store(
         &crate::session::VORTEX_SESSION,
         &mut bytes,
-        vortex_array::stream::ArrayStreamAdapter::new(split.quad_dtype, split.quad_chunks),
+        vortex_array::stream::ArrayStreamAdapter::new(
+            dtype,
+            Box::pin(futures::stream::iter(quad_chunks.into_iter().map(Ok))),
+        ),
         container::default_child_strategy(),
         false,
         components,

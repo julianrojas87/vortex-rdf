@@ -65,9 +65,10 @@ pub struct VortexRdfStore {
     /// once at construction and propagated to derived stores, which may have
     /// lost the payload row through slicing/filtering).
     layout: ResolvedLayout,
-    /// The secondary indexes whose columns this store's base schema carries,
-    /// detected at construction (`detect_indexes`). Pattern matching plans
-    /// index lookups against this set.
+    /// The secondary indexes this store can route through, read at
+    /// construction off the roster of components it holds (or, file-backed,
+    /// its index children) — see `indexes_from_components`. Pattern matching
+    /// plans index lookups against this set.
     ///
     /// Views derived through `match_pattern` keep their indexes: a view narrows
     /// a [`RowSelection`] over the base rather than rewriting rows, so the
@@ -132,7 +133,7 @@ fn resolved_layout(
 /// [`with_compressed_int_children`](array::with_compressed_int_children)),
 /// with the base additionally payload-wrapped so the code-column read path
 /// keeps its zero-copy fast path. Shared by the builder adoption
-/// (`from_row_space`) and compaction's rebuild (`from_raw_quads`) — the two
+/// (`from_built`) and compaction's rebuild (`from_raw_quads`) — the two
 /// places canonical built columns become a store.
 fn compress_built_parts(
     base: ArrayRef,
@@ -265,33 +266,14 @@ impl VortexRdfStore {
         )
     }
 
-    /// Build from a builder's output: the quad array plus whatever the
-    /// builder carries beside it — the Dictionary layout's term dictionary,
-    /// and any index components emitted natively rather than as welded
-    /// `_idx_*` columns (the out-of-core sorted strategy's), which are
-    /// adopted directly. The direct construction path — no padding
-    /// round-trip, no re-derivation, no re-split of pre-split components.
+    /// Build from a builder's output: the primary quad array plus whatever the
+    /// builder carries beside it — the Dictionary layout's term dictionary and
+    /// the requested indexes' components, both adopted as they are. The direct
+    /// construction path — no padding round-trip, no re-derivation, and
+    /// nothing to split out of the rows.
     pub fn from_built(built: BuiltArray) -> Result<Self> {
-        Self::from_row_space(built.array, built.components, built.dict)
-    }
-
-    /// Adopt a (possibly welded) row-space array: split any `_idx_*` columns
-    /// into in-memory [`IndexComponent`]s beside a pure primary base, append
-    /// the components the caller already holds pre-split (a builder's native
-    /// emission carries them beside a primary-only array), and derive the
-    /// queryable index set from the resulting roster. The one place a
-    /// builder's row space becomes the store's component model.
-    ///
-    /// [`IndexComponent`]: crate::store::indexes::IndexComponent
-    fn from_row_space(
-        array: ArrayRef,
-        pre_split: Vec<crate::store::indexes::IndexComponent>,
-        dict: Option<Arc<TermDictionary>>,
-    ) -> Result<Self> {
-        let (base, mut components) = crate::store::indexes::split_built_row_space(array)?;
-        components.extend(pre_split);
-        let layout = resolved_layout(dict, base.dtype())?;
-        let (base, components) = compress_built_parts(base, components)?;
+        let layout = resolved_layout(built.dict, built.array.dtype())?;
+        let (base, components) = compress_built_parts(built.array, built.components)?;
         Self::from_parts_internal(base, components, layout)
     }
 

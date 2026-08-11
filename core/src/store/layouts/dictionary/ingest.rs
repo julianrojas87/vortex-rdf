@@ -16,7 +16,7 @@ use vortex_array::arrays::VarBinViewArray;
 
 use crate::error::Result;
 use crate::store::RawQuad;
-use crate::store::builders::BuiltArray;
+use crate::store::builders::{BuiltArray, build_components_from_codes};
 use crate::store::indexes::Indexes;
 
 use super::term_dict::TermDictionary;
@@ -150,10 +150,11 @@ impl DictionaryQuadSink {
     /// array, exactly as the corresponding stream builder would.
     pub fn finish(self) -> Result<BuiltArray> {
         let (dict, codes) = self.interner.finish()?;
-        let array = build_array(&codes, &self.indexes)?;
+        let array = build_array(&codes)?;
+        let components = build_components_from_codes(&self.indexes, &codes)?;
         Ok(BuiltArray {
             array,
-            components: Vec::new(),
+            components,
             dict: Some(Arc::new(dict)),
         })
     }

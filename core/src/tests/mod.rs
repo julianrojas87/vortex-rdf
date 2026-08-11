@@ -115,6 +115,12 @@ async fn build_array<B: VortexArrayBuilder>(
     B::build_vortex_array(Box::new(quads), layout, indexes).await
 }
 
+/// The names of a build's index children, in emission order — what a schema
+/// assertion checks now that index data never rides in the quad rows.
+fn component_names(built: &BuiltArray) -> Vec<&'static str> {
+    built.components.iter().map(|c| c.name).collect()
+}
+
 /// A quad stream serialized to native store bytes with the suite's default
 /// configuration (Default layout, no indexes).
 #[cfg(feature = "file-io")]

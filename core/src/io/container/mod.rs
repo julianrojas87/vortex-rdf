@@ -4,11 +4,11 @@
 //! A store file's root layout is `vortex-rdf.store.v1`: child 0 is the
 //! *transparent* `quad-source` — the quad table itself, to which the root
 //! delegates its dtype, row count, and scan — and every further child is an
-//! *auxiliary* component (the term dictionary, index copies, and future
-//! additions such as change sets) with its own row space, written through
-//! the same segment sink and addressable by name. A session that has this
-//! layout registered scans the file exactly like a plain quad table; the
-//! components never appear in the row space.
+//! *auxiliary* component (the term dictionary, the secondary indexes' own
+//! sorted tables, and future additions such as change sets) with its own
+//! rows and schema, written through the same segment sink and addressable by
+//! name. A session that has this layout registered scans the file exactly
+//! like a plain quad table; the components never appear in its columns.
 //!
 //! One concern per module: [`wire`] is the persisted metadata codec
 //! (component descriptors and their JSON stamp), [`layout`] the root layout
@@ -20,9 +20,9 @@
 
 pub(crate) mod layout;
 // The write strategy is the sole consumer of the sources' write hooks
-// (`buffered_bytes`, `channel_backed`, the per-child strategy), so native
-// no-file-io builds — which compile the sources but no serializer — see
-// those as dead. One allowance here at the boundary, not per item.
+// (`buffered_bytes`, the per-child strategy), so native no-file-io builds —
+// which compile the sources but no serializer — see those as dead. One
+// allowance here at the boundary, not per item.
 #[cfg_attr(
     not(any(feature = "file-io", target_arch = "wasm32")),
     allow(dead_code)
@@ -55,7 +55,8 @@ pub(crate) use layout::{
     RdfStoreLayoutVTable, is_native_file, quads_sorted, register, store_component, store_components,
 };
 pub(crate) use sources::{NativeComponentWrite, default_child_strategy};
-// Consumed only by `ser`, which is gated the same way.
+// Consumed only by the write side (`ser` and `IndexComponent::to_write`),
+// gated the same way.
 #[cfg(any(feature = "file-io", target_arch = "wasm32"))]
 pub(crate) use sources::ReplayableArraySource;
 pub(crate) use wire::{StoreComponentDescriptor, StoreComponentRole};

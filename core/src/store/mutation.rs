@@ -77,8 +77,7 @@ impl VortexRdfStore {
             return Ok(self.clone());
         }
 
-        let fresh_rows =
-            build_struct_array(&fresh, self.tail_layout().strategy(), &[], 0, false, false)?;
+        let fresh_rows = build_struct_array(&fresh, self.tail_layout().strategy(), false)?;
         let rows = match &self.tail {
             None => fresh_rows,
             // Append = accrete: the fresh rows join the tail as one more chunk

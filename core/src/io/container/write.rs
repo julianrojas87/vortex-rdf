@@ -155,15 +155,10 @@ impl vortex_layout::LayoutStrategy for RdfStoreWriteStrategy {
             quad_eof,
             session,
         );
-        // Channel-backed components are fed by the quad stream's poll loop:
-        // every job must then be in flight or the tee blocks the quad write.
-        // Lazy (replayable / merger-backed) sources cost nothing until
-        // polled, so a small window only bounds concurrent compression.
-        let concurrency = if self.components.iter().any(|c| c.source.channel_backed()) {
-            jobs.len().max(1)
-        } else {
-            jobs.len().clamp(1, 2)
-        };
+        // Every component source is lazy (replayable or merger-backed) and
+        // costs nothing until polled, so a small window is enough: it bounds
+        // how many children compress at once without starving any of them.
+        let concurrency = jobs.len().clamp(1, 2);
         let components_future = futures::stream::iter(jobs)
             .buffered(concurrency)
             .try_collect::<Vec<_>>();

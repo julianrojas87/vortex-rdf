@@ -150,7 +150,7 @@ async fn test_dictionary_streaming_chunk_boundaries() {
         // codes, and the dictionary the stream carried beside them is
         // handed back with the reassembled array — all chunks' codes must
         // reference that same global dictionary.
-        let arr = assemble_chunks(chunks, LayoutStrategy::Dictionary, &vec![]).unwrap();
+        let arr = assemble_chunks(chunks, LayoutStrategy::Dictionary).unwrap();
         let store = VortexRdfStore::from_built(crate::store::builders::BuiltArray {
             array: arr,
             components: Vec::new(),
@@ -212,7 +212,7 @@ async fn test_sorted_streaming_spilled_indexes_match_in_memory() {
     );
 
     // The materializing path re-glues the streamed components into the
-    // in-memory row space, index routing included.
+    // in-memory build, index routing included.
     let built = crate::store::builders::sorted_stream::build_sorted_stream_array(
         Box::new(quad_stream(quads.clone())),
         LayoutStrategy::Default,

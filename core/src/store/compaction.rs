@@ -6,10 +6,12 @@ use crate::error::Result;
 use crate::error::VortexRdfError;
 use crate::store::QuadsSource;
 use crate::store::RawQuad;
-use crate::store::builders::{DEFAULT_CHUNK_SIZE, build_struct_array};
+use crate::store::builders::{
+    DEFAULT_CHUNK_SIZE, build_components, build_components_from_codes, build_struct_array,
+};
 use crate::store::indexes::{Indexes, unique_indexes};
 use crate::store::layouts::DictAccess;
-use crate::store::layouts::dictionary::TermDictionary;
+use crate::store::layouts::dictionary::{QuadCodes, TermDictionary};
 use crate::store::layouts::{LayoutStrategy, ResolvedLayout, dictionary};
 
 use std::sync::Arc;
@@ -151,43 +153,46 @@ impl VortexRdfStore {
     /// The Dictionary layout re-derives its term dictionary from the quads
     /// (they may hold appended terms the old dictionary has no code for); the
     /// other layouts rebuild their columns directly. `sorted` must be `true`
-    /// only when `raws` is SPOG-sorted: it stamps the `s` column (and, with
-    /// indexes, is what makes the single-chunk index emission globally
-    /// binary-searchable).
+    /// only when `raws` is SPOG-sorted: it stamps the `s` column. The index
+    /// children are rebuilt over the whole quad set either way, so they are
+    /// globally sorted whatever the row order.
     fn from_raw_quads(
         raws: &[RawQuad],
         strategy: LayoutStrategy,
         indexes: Indexes,
         sorted: bool,
     ) -> Result<Self> {
-        let (layout, base) = match strategy {
+        let (layout, base, components) = match strategy {
+            // An empty result still carries its indexes: the children are
+            // built over the (empty) codes rather than skipped, so the
+            // compacted store keeps the roster — and its code dtypes — that
+            // a non-empty one would have.
             LayoutStrategy::Dictionary if raws.is_empty() => (
                 ResolvedLayout::Dictionary(DictAccess::Resident(Arc::new(TermDictionary::empty()))),
-                dictionary::empty_struct(&indexes)?,
+                dictionary::empty_struct()?,
+                build_components_from_codes(&indexes, &QuadCodes::empty())?,
             ),
             LayoutStrategy::Dictionary => {
                 let (dict, id_map) = TermDictionary::from_quads_with_map(raws)?;
-                let base =
-                    dictionary::build_chunk(raws, &dict, &id_map, &indexes, 0, sorted, true)?;
+                let codes = dictionary::encode_quads(raws, &dict, &id_map)?;
+                let base = dictionary::build_code_chunk(&codes, 0..raws.len(), sorted)?;
                 (
                     ResolvedLayout::Dictionary(DictAccess::Resident(Arc::new(dict))),
                     base,
+                    build_components_from_codes(&indexes, &codes)?,
                 )
             }
             strategy => {
-                let base = build_struct_array(raws, strategy, &indexes, 0, sorted, true)?;
+                let base = build_struct_array(raws, strategy, sorted)?;
                 let layout = match strategy {
                     LayoutStrategy::TypedObject => ResolvedLayout::TypedObject,
                     _ => ResolvedLayout::Default,
                 };
-                (layout, base)
+                (layout, base, build_components(&indexes, raws)?)
             }
         };
-        // The rebuild welds `_idx_*` columns (single-chunk, stamped when
-        // sorted); split them into components and compress like every other
-        // construction — a compacted store carries the same resident form a
-        // freshly built one does.
-        let (base, components) = crate::store::indexes::split_built_row_space(base)?;
+        // Compress like every other construction — a compacted store carries
+        // the same resident form a freshly built one does.
         let (base, components) = super::compress_built_parts(base, components)?;
         Self::from_parts_internal(base, components, layout)
     }

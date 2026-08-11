@@ -1,22 +1,22 @@
-//! The persistence model of a secondary index: how its `_idx_*` row-space
-//! columns become standalone *components* and back again.
+//! The persistence model of a secondary index: the *component*, which is the
+//! one form index data ever takes.
 //!
 //! One [`IndexComponent`] is one child of a native store file (or its
 //! in-memory twin): a set of rows under the child's own plain column names,
-//! carrying the writer's sortedness provenance. This module owns both
-//! directions of that mapping — splitting a builder's welded row space into
-//! components ([`split_built_row_space`]), describing the children a
-//! serializer should write ([`index_component_specs`]), and reading a
-//! persisted child's implementation slug back onto a component identity.
+//! carrying the writer's sortedness provenance. Builders emit components
+//! directly, beside primary-only quad rows; this module owns what happens to
+//! them afterwards — assembling a child's rows ([`child_struct`]), adopting a
+//! persisted one back into memory, and reading a persisted child's
+//! implementation slug onto a component identity.
 //!
-//! The column *names* on either side belong to the index modules, not here:
-//! each leaf declares them once in its const [`ComponentRole`] table
-//! (reached through [`IndexType::component_roles`]), and every loop below is
-//! parameterized by those rows.
+//! The column *names* belong to the index modules, not here: each leaf
+//! declares them once in its const [`ComponentRole`] table (reached through
+//! [`IndexType::component_roles`]), and the loops below are parameterized by
+//! those rows.
 
 use std::sync::{Arc, OnceLock};
 
-use vortex_array::arrays::struct_::{StructArray, StructArrayExt};
+use vortex_array::arrays::StructArray;
 use vortex_array::dtype::{DType, FieldName};
 use vortex_array::validity::Validity;
 use vortex_array::{ArrayRef, IntoArray, VortexSessionExecute};
@@ -24,29 +24,20 @@ use vortex_array::{ArrayRef, IntoArray, VortexSessionExecute};
 use crate::error::{Result, VortexRdfError};
 use crate::session::VORTEX_SESSION;
 
-use super::{ALL_INDEX_TYPES, IndexType, Indexes, detect_indexes, strip_index_columns};
+use super::{ALL_INDEX_TYPES, IndexType, Indexes};
 
-/// One persisted-child role of an index: the component's identity plus the
-/// row-space columns it is assembled from. Each leaf module declares its
-/// roles as a const table ([`IndexType::component_roles`]); the generic
-/// loops here — spec push, row-space split, presence detection, the slug
-/// registry — are parameterized by these rows instead of re-spelling the
-/// scheme per leaf.
+/// One persisted-child role of an index: the identity a component carries on
+/// the wire. Each leaf module declares its roles as a const table
+/// ([`IndexType::component_roles`]); the generic loops here — the slug
+/// registry and the roster it builds — are parameterized by these rows
+/// instead of re-spelling the scheme per leaf. The columns behind a role are
+/// the leaf's business ([`child_struct`] assembles them).
 pub(crate) struct ComponentRole {
     /// The component name (`index:posg`, `index:ref-o`, …) — the same
     /// identity the persisted child carries.
     pub(crate) name: &'static str,
     /// The implementation slug (`secondary-by-copy/posg`, …).
     pub(crate) slug: &'static str,
-    /// The row-space `_idx_*` columns, in child-column order:
-    /// `source_columns[i]` becomes the child's `child_columns[i]`.
-    pub(crate) source_columns: &'static [&'static str],
-    /// The child's own plain column names.
-    pub(crate) child_columns: &'static [&'static str],
-    /// The row-space column holding this role's leading sort key: the one
-    /// the globally sorted emission stamps `IsSorted` and the split reads
-    /// back as sortedness provenance.
-    pub(crate) lead_source: &'static str,
 }
 
 /// Everything the read side knows about a persisted component slug: the role
@@ -182,8 +173,8 @@ pub(crate) struct IndexComponent {
 /// How an [`IndexComponent`] holds its rows.
 #[derive(Clone)]
 enum ComponentRows {
-    /// Canonical from construction — a builder's emission or a row-space
-    /// split, already one struct in child schema.
+    /// Canonical from construction — a builder's emission, already one
+    /// struct in child schema.
     Built(StructArray),
     /// Adopted from a serialized container without executing: the deferral
     /// state is `Arc`-shared so every clone of the component — and of the
@@ -214,7 +205,7 @@ enum DeferredSource {
 
 impl IndexComponent {
     /// A component whose rows are already canonical in memory — the
-    /// construction the builders and the row-space split use.
+    /// construction every builder's emission uses.
     pub(crate) fn built(
         name: &'static str,
         implementation: &'static str,
@@ -278,6 +269,37 @@ impl IndexComponent {
     #[cfg(any(feature = "file-io", target_arch = "wasm32"))]
     pub(crate) fn as_array(&self) -> Result<ArrayRef> {
         Ok(self.rows()?.clone().into_array())
+    }
+
+    /// This component as a replayable native child write, its descriptor
+    /// carrying the component's own sortedness provenance — the one way a
+    /// component reaches the container writer, from a store's serialization
+    /// and from a builder's chunk stream alike. Compiled only where a store
+    /// can be written, the gate [`as_array`](Self::as_array) carries.
+    ///
+    /// Writing is a genuine use: a deferred adoption materializes here, so
+    /// the written child is byte-identical to an eagerly-adopted one's.
+    #[cfg(any(feature = "file-io", target_arch = "wasm32"))]
+    pub(crate) fn to_write(&self) -> Result<crate::io::container::NativeComponentWrite> {
+        use crate::io::container::{
+            NativeComponentWrite, ReplayableArraySource, StoreComponentDescriptor,
+            StoreComponentRole, default_child_strategy,
+        };
+        let array = self.as_array()?;
+        NativeComponentWrite::new(
+            StoreComponentDescriptor {
+                name: self.name.into(),
+                role: StoreComponentRole::Index,
+                implementation: self.implementation.into(),
+                version: 1,
+                required: false,
+                sorted: self.sorted,
+                dtype: array.dtype().clone(),
+            },
+            Arc::new(ReplayableArraySource::try_new(vec![array]).map_err(VortexRdfError::Vortex)?),
+            default_child_strategy(),
+        )
+        .map_err(VortexRdfError::Vortex)
     }
 
     /// Whether the rows have been canonicalized yet — the laziness probe the
@@ -399,69 +421,10 @@ pub(crate) fn indexes_from_components(components: &[IndexComponent]) -> Indexes 
     indexes
 }
 
-/// Split a builder's welded row space into the store's model: the primary
-/// quad array (index columns projected away) plus one [`IndexComponent`] per
-/// persisted-child role the `_idx_*` columns assemble.
-///
-/// The builders keep emitting the welded form — it is also the streaming
-/// write path's wire shape — and the store splits once at construction.
-/// Sortedness is read off the welded columns' own `IsSorted` stamps, which
-/// only the globally-sorted emission paths set (multi-chunk arrays lose
-/// per-chunk stamps in canonicalization, correctly landing on `false`: a
-/// concatenation of per-chunk sorts is not binary-searchable).
-pub(crate) fn split_built_row_space(array: ArrayRef) -> Result<(ArrayRef, Vec<IndexComponent>)> {
-    let detected = detect_indexes(array.dtype());
-    if detected.is_empty() {
-        return Ok((array, Vec::new()));
-    }
-    let mut ctx = VORTEX_SESSION.create_execution_ctx();
-    let struct_arr = array
-        .execute::<StructArray>(&mut ctx)
-        .map_err(VortexRdfError::Vortex)?;
-    let mut components = Vec::new();
-    for index in &detected {
-        for role in index.component_roles() {
-            if let Some(component) = component_from_columns(&struct_arr, role)? {
-                components.push(component);
-            }
-        }
-    }
-    let primary = strip_index_columns(struct_arr.into_array())?;
-    Ok((primary, components))
-}
-
-/// Rebuild a role's component from row-space column arrays: relabel
-/// `source_columns[i]` (shared, stats and all) to the child's
-/// `child_columns[i]` names. `sorted` provenance comes from the lead
-/// column's own stamp — set only by globally-sorted emission.
-fn component_from_columns(
-    struct_arr: &StructArray,
-    role: &ComponentRole,
-) -> Result<Option<IndexComponent>> {
-    let mut arrays = Vec::with_capacity(role.source_columns.len());
-    for column in role.source_columns {
-        match struct_arr.unmasked_field_by_name(column) {
-            Ok(a) => arrays.push(a.clone()),
-            // A partial column set means this component was never built.
-            Err(_) => return Ok(None),
-        }
-    }
-    let sorted = role
-        .source_columns
-        .iter()
-        .position(|c| *c == role.lead_source)
-        .map(|i| crate::store::array::column_is_sorted(&arrays[i]))
-        .unwrap_or(false);
-    let array = child_struct(role.child_columns, arrays, struct_arr.len())?;
-    Ok(Some(IndexComponent::built(
-        role.name, role.slug, array, sorted,
-    )))
-}
-
 /// Assemble a child's rows from its column arrays: `columns[i]` under the
 /// `child_columns[i]` name, non-nullable throughout — the one construction
-/// shared by the row-space split, the tee's chunk projection, and the
-/// builders' direct child-chunk emissions.
+/// every builder's component emission goes through, in-memory and
+/// out-of-core alike.
 pub(crate) fn child_struct(
     child_columns: &[&'static str],
     columns: Vec<ArrayRef>,
@@ -480,71 +443,10 @@ pub(crate) fn child_struct(
     .map_err(VortexRdfError::Vortex)
 }
 
-/// One persisted child component of an index type: the descriptor written
-/// into the native store root plus the role naming the row-space columns the
-/// component is assembled from.
-#[cfg(feature = "file-io")]
-pub(crate) struct IndexComponentSpec {
-    pub(crate) descriptor: crate::io::container::StoreComponentDescriptor,
-    pub(crate) role: &'static ComponentRole,
-}
-
-/// The index components a row-space dtype implies, over every detected index
-/// type — what the serializer turns into auxiliary children. `sorted` is the
-/// writer's promise that the emitted columns are globally (not per-chunk)
-/// sorted; it travels to the descriptors so a reader lifting the components
-/// back into memory knows whether they are binary-searchable.
-#[cfg(feature = "file-io")]
-pub(crate) fn index_component_specs(
-    dtype: &DType,
-    sorted: bool,
-) -> Result<Vec<IndexComponentSpec>> {
-    use crate::io::container::{StoreComponentDescriptor, StoreComponentRole};
-    let mut specs = Vec::new();
-    for index in detect_indexes(dtype) {
-        for role in index.component_roles() {
-            specs.push(IndexComponentSpec {
-                descriptor: StoreComponentDescriptor {
-                    name: role.name.into(),
-                    role: StoreComponentRole::Index,
-                    implementation: role.slug.into(),
-                    version: 1,
-                    required: false,
-                    sorted,
-                    dtype: component_child_dtype(dtype, role)?,
-                },
-                role,
-            });
-        }
-    }
-    Ok(specs)
-}
-
-/// The child struct dtype a role's component assembles: the row-space
-/// columns' dtypes under the child's own names.
-#[cfg(feature = "file-io")]
-fn component_child_dtype(dtype: &DType, role: &ComponentRole) -> Result<DType> {
-    let DType::Struct(fields, _) = dtype else {
-        return Err(VortexRdfError::Serialization(format!(
-            "index components need a struct row space, got {dtype}"
-        )));
-    };
-    let field_dtypes = role
-        .source_columns
-        .iter()
-        .map(|n| {
-            fields.field(n).ok_or_else(|| {
-                VortexRdfError::Serialization(format!("row space misses index column {n}"))
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
-    Ok(child_struct_dtype(role.child_columns, field_dtypes))
-}
-
 /// The child struct dtype under `child_columns` names — the dtype counterpart
 /// of [`child_struct`], shared with the builders' direct child dtypes
-/// (`copy_child_dtype`/`ref_child_dtype`) so the derived-from-row-space and
-/// hand-built constructions cannot drift in shape.
+/// (`copy_child_dtype`/`ref_child_dtype`) so a component's declared and built
+/// shapes cannot drift.
 pub(crate) fn child_struct_dtype(
     child_columns: &[&'static str],
     field_dtypes: Vec<DType>,

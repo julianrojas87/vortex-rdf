@@ -6,7 +6,7 @@ use crate::error::{Result, VortexRdfError};
 #[cfg(feature = "file-io")]
 use crate::io::native_file;
 use crate::store::QuadsSource;
-use crate::store::builders::build_struct_array;
+use crate::store::builders::{build_components, build_components_from_codes, build_struct_array};
 use crate::store::layouts::dictionary::TermDictionary;
 use crate::store::layouts::{ResolvedLayout, dictionary};
 use crate::store::selection::gather_live;
@@ -102,17 +102,17 @@ impl VortexRdfStore {
                     raws.extend(ResolvedLayout::Default.raw_quads(tail_rows)?);
                 }
                 if raws.is_empty() {
-                    let empty = dictionary::empty_struct(&[])?;
+                    let empty = dictionary::empty_struct()?;
                     return Ok((empty, Vec::new(), Some(Arc::new(TermDictionary::empty()))));
                 }
                 let (dict, id_map) = TermDictionary::from_quads_with_map(&raws)?;
-                // Rebuild the index components over the surviving rows
-                // (welded then split — the same adoption path as a fresh
-                // build), so a mutated store's serialization keeps its
-                // indexes instead of silently dropping them.
-                let chunk =
-                    dictionary::build_chunk(&raws, &dict, &id_map, &self.indexes, 0, sorted, true)?;
-                let (primary, components) = crate::store::indexes::split_built_row_space(chunk)?;
+                // Rebuild the index children over the surviving rows — the
+                // same emission a fresh build runs — so a mutated store's
+                // serialization keeps its indexes instead of silently
+                // dropping them.
+                let codes = dictionary::encode_quads(&raws, &dict, &id_map)?;
+                let primary = dictionary::build_code_chunk(&codes, 0..raws.len(), sorted)?;
+                let components = build_components_from_codes(&self.indexes, &codes)?;
                 Ok((primary, components, Some(Arc::new(dict))))
             }
             _ if !self.indexes.is_empty() => {
@@ -122,15 +122,8 @@ impl VortexRdfStore {
                 if let Some(tail_rows) = &tail_rows {
                     raws.extend(self.tail_layout().raw_quads(tail_rows)?);
                 }
-                let welded = build_struct_array(
-                    &raws,
-                    self.layout.strategy(),
-                    &self.indexes,
-                    0,
-                    sorted,
-                    true,
-                )?;
-                let (primary, components) = crate::store::indexes::split_built_row_space(welded)?;
+                let primary = build_struct_array(&raws, self.layout.strategy(), sorted)?;
+                let components = build_components(&self.indexes, &raws)?;
                 Ok((primary, components, None))
             }
             _ => {

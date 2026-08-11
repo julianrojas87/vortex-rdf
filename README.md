@@ -39,7 +39,7 @@ Every file is **self-describing**: its root is a native Vortex layout (`vortex-r
 RDF quads are stored as a Vortex [`StructArray`](https://docs.rs/vortex/latest/vortex/array/arrays/struct_/type.StructArray.html) (or a [`ChunkedArray`](https://docs.rs/vortex/latest/vortex/array/arrays/chunked/type.ChunkedArray.html) of StructArrays for chunked/streamed builds). How that array is shaped is controlled by two **orthogonal, build-time choices**:
 
 1. A **column layout** (`LayoutStrategy`) — the columnar schema used for the quad terms.
-2. An optional set of **secondary indexes** (`IndexType`) — persisted as their own layout children beside the quads (extra columns of the in-memory array) to accelerate pattern matching.
+2. An optional set of **secondary indexes** (`IndexType`) — their own sorted tables beside the quads, held as components in memory and persisted as layout children in a file, to accelerate pattern matching.
 
 How the incoming quad stream is turned into that array is not a choice: rows are always sorted globally by `(s, p, o, g)`, through the out-of-core pipeline where a filesystem exists and the in-memory one where none does (see [Ingestion](#3-ingestion)).
 
@@ -81,34 +81,35 @@ Because term IDs are **lexicographic ranks**:
 
 ### 2. Secondary Indexes
 
-Indexes are opt-in, embedded as extra columns at build time. Indexes are static and can only incorporate mutations by full reconstruction of the dataset (a.k.a. [compaction](core/src/store/compaction.rs)). Two types are supported:
+Indexes are opt-in, built at build time as their **own sorted tables beside the quad rows** — never as extra columns of those rows. In memory each is an `IndexComponent`; in a file each is one named auxiliary child of the store root. Indexes are static and can only incorporate mutations by full reconstruction of the dataset (a.k.a. [compaction](core/src/store/compaction.rs)). Two types are supported:
 
 #### `SecondaryByReference`
 Sorted permutation indexes for the predicate and object columns, enabling binary-search routing for predicate-only and object-only patterns without re-sorting the whole dataset:
 
+Two children, `index:ref-o` and `index:ref-p`, each a two-column table:
+
 | Column | Content |
 |---|---|
-| `_idx_o_val` | All object values in sorted order (`VarBin<Utf8>`; `u32` codes under the Dictionary layout) |
-| `_idx_o_rid` | Row ID (`u32`) of the quad each sorted object value came from |
-| `_idx_p_val` | All predicate values in sorted order (same dtype rules as above) |
-| `_idx_p_rid` | Row ID (`u32`) of the quad each sorted predicate value came from |
+| `val` | All object (resp. predicate) values in sorted order (`VarBin<Utf8>`; `u32` codes under the Dictionary layout) |
+| `rid` | Row ID (`u32`) of the quad each sorted value came from |
 
 The two backends engage this index differently:
-- **In-memory**: binary-search routing only engages when the value columns carry the `IsSorted` statistic, which builders stamp when the columns hold a *globally* sorted order (single-chunk builds, or the sorted builders' global index emission) — an unstamped column (e.g. the concatenation of several per-chunk sorts) makes the store decline and fall back to a [mask scan](https://docs.rs/vortex/latest/vortex/scan/selection/enum.Selection.html).
-- **File-backed**: the probe is always pushed down as a range-predicate scan over the index columns, regardless of the `IsSorted` stamp — sortedness only decides how tightly the scan's zone pruning shrinks the read, not whether the index is used. The index columns live in the file itself, so they're never re-derived or stripped; they stay valid however the store's view has been narrowed, and are simply never projected into the quads a caller sees.
+- **In-memory**: binary-search routing engages only on a component whose writer recorded it *globally* sorted — which every build in this crate does, since both pipelines sort the whole dataset. A component that declines (a file written elsewhere may declare one unsorted) makes the store fall back to a [mask scan](https://docs.rs/vortex/latest/vortex/scan/selection/enum.Selection.html).
+- **File-backed**: the probe is always pushed down as a range-predicate scan over the child, regardless of the recorded sortedness — which only decides how tightly the scan's zone pruning shrinks the read, not whether the index is used. The children live in the file itself, so they're never re-derived or stripped; they stay valid however the store's view has been narrowed.
 
 #### `SecondaryByCopy`
 Two complete extra copies of the quad columns — the classic triple-store permutation indexes (POS/OSP), adapted to quads — each paired with the primary row IDs it permutes. This gives predicate- and object-bound patterns the same sorted-column access path the primary `(s, p, o, g)` order gives subjects:
 
-| Columns | Content |
-|---|---|
-| `_idx_posg_{s,p,o,g}` | The quads re-sorted by `(p, o, s, g)` (term strings, or `u32` codes under the Dictionary layout) |
-| `_idx_posg_rid` | Row ID (`u32`) of the primary quad each copy row mirrors |
-| `_idx_ospg_{s,p,o,g}` | The quads re-sorted by `(o, s, p, g)` |
-| `_idx_ospg_rid` | Row ID (`u32`) of the primary quad each copy row mirrors |
+Two children, `index:posg` and `index:ospg`, each a five-column table under the same names:
 
-Predicate-bound patterns binary-search `_idx_posg_p`; a bound predicate **and** object resolve in one `(p, o)` *prefix* search; object-bound patterns binary-search `_idx_ospg_o`. The two backends engage this index the same way `SecondaryByReference` does:
-- **In-memory**: routing requires the lead value column's `IsSorted` stamp; an unstamped copy (a per-chunk sort that doesn't span the whole array) makes the store decline to a mask scan.
+| Child | Columns | Content |
+|---|---|---|
+| `index:posg` | `s`,`p`,`o`,`g` | The quads re-sorted by `(p, o, s, g)` (term strings, or `u32` codes under the Dictionary layout) |
+| `index:ospg` | `s`,`p`,`o`,`g` | The quads re-sorted by `(o, s, p, g)` |
+| both | `rid` | Row ID (`u32`) of the primary quad each copy row mirrors |
+
+Predicate-bound patterns binary-search `index:posg`'s `p` column; a bound predicate **and** object resolve in one `(p, o)` *prefix* search; object-bound patterns binary-search `index:ospg`'s `o` column. The two backends engage this index the same way `SecondaryByReference` does:
+- **In-memory**: routing requires the child's recorded global sortedness; a component that declines falls back to a mask scan.
 - **File-backed**: the probe is always pushed down as a range predicate, `IsSorted` or not — sortedness only sharpens zone pruning. File-backed stores additionally let `quads()` stream matched rows straight from the copy family — where they sit in a contiguous, zone-prunable run — instead of scattering row-ID reads across the primary columns, mirroring the subject fast path's locality.
 
 Compared to `SecondaryByReference`, this costs roughly 2× the primary columns in extra storage (before compression; the sorted copies compress well) in exchange for contiguous reads on predicate/object patterns.
@@ -124,8 +125,8 @@ Which pipeline runs is a property of the target, not a caller's choice:
 | Anywhere a filesystem exists (native: Rust, CLI, Python) | **`SortedStreamBuilder`** | Out-of-core, bounded by chunk size | Yes |
 | `wasm32-unknown-unknown` (the JS bindings) | **`SortedInMemoryBuilder`** | Full dataset in memory | No — there is nothing to spill to |
 
-- **`SortedInMemoryBuilder`**: Loads all quads in memory and performs a global sort by `(s, p, o, g)`. Requested secondary index columns are built once over the whole dataset and emitted in global order (stamped `IsSorted`), so `match_pattern` can binary-search subjects, predicates, and objects. This is the wasm pipeline, and the only one compiled into that target.
-- **`SortedStreamBuilder`**: External [merge-sort](https://en.wikipedia.org/wiki/Merge_sort) for datasets larger than memory. Quads are ingested in bounded batches, sorted locally, and spilled to disk as sorted runs; a K-way heap merge then emits globally sorted, fixed-size chunks. When secondary indexes are requested, a second external sort over `(value, row ID)` pairs produces globally sorted index columns as well. Spill files are internal, length-prefixed [`rkyv` records](https://github.com/rkyv/rkyv) in a per-build temp directory — under the OS temp dir by default, overridable via the `VORTEX_RDF_SPILL_DIR` environment variable (compaction instead spills beside the store file, so the runs share the output's volume) — and are cleaned up automatically.
+- **`SortedInMemoryBuilder`**: Loads all quads in memory and performs a global sort by `(s, p, o, g)`. Each requested index's children are built once over the whole sorted dataset, so `match_pattern` can binary-search subjects, predicates, and objects. This is the wasm pipeline, and the only one compiled into that target.
+- **`SortedStreamBuilder`**: External [merge-sort](https://en.wikipedia.org/wiki/Merge_sort) for datasets larger than memory. Quads are ingested in bounded batches, sorted locally, and spilled to disk as sorted runs; a K-way heap merge then emits globally sorted, fixed-size chunks. When secondary indexes are requested, a second external sort over `(value, row ID)` pairs streams each index child straight off its own merger, so no index is ever materialized whole. Spill files are internal, length-prefixed [`rkyv` records](https://github.com/rkyv/rkyv) in a per-build temp directory — under the OS temp dir by default, overridable via the `VORTEX_RDF_SPILL_DIR` environment variable (compaction instead spills beside the store file, so the runs share the output's volume) — and are cleaned up automatically.
 
 The Dictionary layout always needs two passes (the global dictionary is only complete after ingesting the whole stream). The in-memory build (`build_vortex_array`, the JS/WASM path) interns terms as the stream drains, so the sort runs over 16-byte coded rows and nothing spills.
 
@@ -135,14 +136,14 @@ The Dictionary layout always needs two passes (the global dictionary is only com
 
 **In-memory** resolves patterns with a routing cascade, each step clearing whichever components it answers:
 1. **Subject binary search**: if a subject is bound and the base's `s` column is stamped `IsSorted`, the matching row range is found via a fast binary search and sliced — no scan at all.
-2. **Index routing**: if `SecondaryByCopy` columns are present and stamped `IsSorted`, predicate-bound patterns binary-search `_idx_posg_p`, object-bound patterns `_idx_ospg_o`, and predicate+object patterns resolve both components in one `(p, o)` prefix search. Otherwise, if `SecondaryByReference` columns are present and stamped `IsSorted`, object-only and predicate-only patterns binary-search `_idx_*_val` and `take` the referenced rows from the quads columns.
+2. **Index routing**: if the `SecondaryByCopy` children are present and globally sorted, predicate-bound patterns binary-search `index:posg`'s `p` column, object-bound patterns `index:ospg`'s `o` column, and predicate+object patterns resolve both components in one `(p, o)` prefix search. Otherwise, if the `SecondaryByReference` children are, object-only and predicate-only patterns binary-search their `val` column and `take` the referenced rows from the quads columns.
 3. **Vectorized mask scan**: remaining constraints are resolved with columnar equality masks (SIMD-friendly, no string materialization).
 
-**File-backed** stores skip host-side binary search entirely: every bound component — subject included — compiles to a Vortex equality filter [expression](https://docs.vortex.dev/concepts/expressions) pushed down into the lazy scan, and the filter's zone-map envelope [narrows the read](https://docs.vortex.dev/developer-guide/internals/execution) to a contiguous row range before any data is fetched. Index columns (`SecondaryByCopy`/`SecondaryByReference`) are read the same way, as a range-predicate scan rather than a binary search, with `SecondaryByCopy` additionally streaming matched rows straight from the copy family (a contiguous, zone-prunable run) instead of gathering by row ID. `IsSorted` never gates whether a file-backed pattern uses its filter or index — sortedness only sharpens how tightly zone pruning shrinks the scanned range. Under the Dictionary layout, bound terms are first translated to their `u32` codes through the cached dictionary; a term absent from the dictionary short-circuits to an empty result on either backend.
+**File-backed** stores skip host-side binary search entirely: every bound component — subject included — compiles to a Vortex equality filter [expression](https://docs.vortex.dev/concepts/expressions) pushed down into the lazy scan, and the filter's zone-map envelope [narrows the read](https://docs.vortex.dev/developer-guide/internals/execution) to a contiguous row range before any data is fetched. Index children (`SecondaryByCopy`/`SecondaryByReference`) are read the same way, as a range-predicate scan rather than a binary search, with `SecondaryByCopy` additionally streaming matched rows straight from the copy family (a contiguous, zone-prunable run) instead of gathering by row ID. Sortedness never gates whether a file-backed pattern uses its filter or index — it only sharpens how tightly zone pruning shrinks the scanned range. Under the Dictionary layout, bound terms are first translated to their `u32` codes through the cached dictionary; a term absent from the dictionary short-circuits to an empty result on either backend.
 
 ## Mutations
 
-`VortexRdfStore` never rewrites its data in place to answer a mutation. Instead it follows a [**merge-on-read** pattern](https://iceberglakehouse.com/iceberg/iceberg-merge-on-read/): the store you built or opened (the "base") stays exactly as it was written — sorted order, secondary indexes, file bytes and all — and mutations are layered on top of it as two lightweight side-structures, (i) an append-only [**Tail**](core/src/store/source.rs) for additions and; (ii)  **Tombstone masks** (for [in-memory](core/src/store/source.rs#L54) and [file-backed](core/src/store/source.rs#L101) stores) for deletions. Reads transparently merge base + tail, minus tombstones, so the store still behaves as one dataset; nothing is actually rewritten, and none of the base's row ids ever move, which is what lets secondary indexes (whose `_idx_*_rid` columns address base row ids) and any in-flight views survive a mutation. 
+`VortexRdfStore` never rewrites its data in place to answer a mutation. Instead it follows a [**merge-on-read** pattern](https://iceberglakehouse.com/iceberg/iceberg-merge-on-read/): the store you built or opened (the "base") stays exactly as it was written — sorted order, secondary indexes, file bytes and all — and mutations are layered on top of it as two lightweight side-structures, (i) an append-only [**Tail**](core/src/store/source.rs) for additions and; (ii)  **Tombstone masks** (for [in-memory](core/src/store/source.rs#L54) and [file-backed](core/src/store/source.rs#L101) stores) for deletions. Reads transparently merge base + tail, minus tombstones, so the store still behaves as one dataset; nothing is actually rewritten, and none of the base's row ids ever move, which is what lets secondary indexes (whose `rid` columns address base row ids) and any in-flight views survive a mutation. 
 
 All of this is virtual: nothing is written back to the original Vortex file unless a compaction takes place.
 
@@ -235,19 +236,19 @@ Vortex compresses the repeated strings internally (FSST, dictionary encodings), 
 
 ### Adding `SecondaryByReference` indexes
 
-Four extra columns hold the objects and predicates in sorted order, each paired with the row ID it came from (shown here with Dictionary-layout codes; under the other layouts the `_val` columns hold the term strings instead):
+The quad columns above are untouched. Two children are built beside them, holding the objects and predicates in sorted order, each value paired with the row ID it came from (shown here with Dictionary-layout codes; under the other layouts the `val` columns hold the term strings instead):
 
-| s | p | o | g | _idx_o_val | _idx_o_rid | _idx_p_val | _idx_p_rid |
-|---|---|---|---|---|---|---|---|
-| 2 | 4 | 5 | 0 | 1 | 1 | 4 | 0 |
-| 2 | 7 | 1 | 0 | 2 | 3 | 4 | 2 |
-| 3 | 4 | 5 | 0 | 5 | 0 | 6 | 3 |
-| 3 | 6 | 2 | 0 | 5 | 2 | 7 | 1 |
+| `index:ref-o` → | val | rid | | `index:ref-p` → | val | rid |
+|---|---|---|---|---|---|---|
+| | 1 | 1 | | | 4 | 0 |
+| | 2 | 3 | | | 4 | 2 |
+| | 5 | 0 | | | 6 | 3 |
+| | 5 | 2 | | | 7 | 1 |
 
 Example object-only query `(?, ?, ex:alice, ?)`:
 1. Translate `<http://example.org/alice>` to its code: `2`.
-2. Binary-search `_idx_o_val` for `2` → position 1.
-3. `_idx_o_rid[1] = 3` → row 3: *(bob, knows, alice)*.
+2. Binary-search `index:ref-o`'s `val` column for `2` → position 1.
+3. Its `rid[1] = 3` → row 3: *(bob, knows, alice)*.
 
 ---
 

@@ -7,16 +7,17 @@
 //!
 //! The two families are:
 //!
-//! - **`_idx_posg_*`** — quads sorted by (p, o, s, g). Serves predicate-bound
-//!   patterns by binary search on `_idx_posg_p`, and predicate+object patterns
-//!   by a two-key *prefix* search: within a predicate's run the object column
-//!   is itself sorted, so a second binary search inside the run resolves both
-//!   components at once (`IndexedComponent::PredicateObject`).
-//! - **`_idx_ospg_*`** — quads sorted by (o, s, p, g). Serves object-bound
-//!   patterns by binary search on `_idx_ospg_o`.
+//! - **`index:posg`** — quads sorted by (p, o, s, g). Serves predicate-bound
+//!   patterns by binary search on the child's `p` column, and
+//!   predicate+object patterns by a two-key *prefix* search: within a
+//!   predicate's run the object column is itself sorted, so a second binary
+//!   search inside the run resolves both components at once
+//!   (`IndexedComponent::PredicateObject`).
+//! - **`index:ospg`** — quads sorted by (o, s, p, g). Serves object-bound
+//!   patterns by binary search on the child's `o` column.
 //!
 //! Like [`secondary_by_reference`], resolutions answer in *base row ids* (via
-//! the `_idx_*_rid` columns), so they compose with row selections, tombstones
+//! each child's `rid` column), so they compose with row selections, tombstones
 //! and chained matches unchanged. What the full copies add over the reference
 //! index is locality: the rows matching a bound predicate/object are a
 //! *contiguous* run of the copy columns, which both backends exploit by
@@ -27,20 +28,17 @@
 //!
 //! The copies come in two encodings — term strings (Default and TypedObject
 //! layouts, the object as its full N-Triples term string), or u32 dictionary
-//! codes under the Dictionary layout — and in the same two scopes as the
-//! reference index: per-chunk (chunk-local sort, `IsSorted` stamped only when
-//! the chunk spans the dataset) and global (`GlobalCopyArrays` and the
-//! `append_sorted_*_keys` helpers, always stamped). The in-memory resolver
-//! requires the lead value column's `IsSorted` stamp; the file resolver pushes
-//! equality predicates down and only prunes better when the columns are
-//! sorted.
+//! codes under the Dictionary layout — and, like the reference index, are
+//! always sorted over the complete dataset: [`GlobalCopyArrays`] for the
+//! in-memory builders, merged `(sort key, row id)` spill runs for the
+//! out-of-core one, lead column stamped either way. The in-memory resolver
+//! requires that global provenance; the file resolver pushes equality
+//! predicates down and only prunes better when the columns are sorted.
 //!
 //! [`IndexType::SecondaryByCopy`]: super::IndexType::SecondaryByCopy
 //! [`secondary_by_reference`]: super::secondary_by_reference
 
 use std::cmp::Ordering;
-use std::ops::Range;
-use std::sync::Arc;
 
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::struct_::StructArrayExt;
@@ -73,35 +71,26 @@ pub(crate) enum Family {
 }
 
 /// Column names inside a copy family's persisted child: the plain primaries
-/// plus the primary row id — no `_idx_*` prefixes; the child's identity
-/// carries the family.
+/// plus the primary row id. Both families use the same names — the child's
+/// identity is what says which sort order the rows are in.
 pub(crate) const CHILD_COLUMNS: [&str; 5] = ["s", "p", "o", "g", "rid"];
 pub(crate) const CHILD_RID_COL: &str = "rid";
 pub(crate) const POSG_IMPLEMENTATION: &str = "secondary-by-copy/posg";
 pub(crate) const OSPG_IMPLEMENTATION: &str = "secondary-by-copy/ospg";
 
-const POSG_SOURCE_COLUMNS: [&str; 5] = Family::Posg.column_names();
-const OSPG_SOURCE_COLUMNS: [&str; 5] = Family::Ospg.column_names();
-
 /// This index's persisted-child role table — one differently-sorted quad
-/// table per family — feeding every generic loop in the hub (spec push,
-/// row-space split, schema detection, the slug registry); see
+/// table per family — feeding every generic loop in the hub (the slug
+/// registry and the roster it builds); see
 /// [`IndexType::component_roles`](super::IndexType::component_roles). Built
 /// from the [`Family`] accessors so each name keeps exactly one spelling.
 pub(crate) const ROLES: [super::ComponentRole; 2] = [
     super::ComponentRole {
         name: Family::Posg.component_name(),
         slug: Family::Posg.component_slug(),
-        source_columns: &POSG_SOURCE_COLUMNS,
-        child_columns: &CHILD_COLUMNS,
-        lead_source: Family::Posg.lead_col(),
     },
     super::ComponentRole {
         name: Family::Ospg.component_name(),
         slug: Family::Ospg.component_slug(),
-        source_columns: &OSPG_SOURCE_COLUMNS,
-        child_columns: &CHILD_COLUMNS,
-        lead_source: Family::Ospg.lead_col(),
     },
 ];
 
@@ -172,8 +161,6 @@ pub(crate) fn copy_child_chunk_codes(
 }
 
 impl Family {
-    pub(crate) const ALL: [Family; 2] = [Family::Posg, Family::Ospg];
-
     /// The persisted child's component name.
     pub(crate) const fn component_name(self) -> &'static str {
         match self {
@@ -206,65 +193,7 @@ impl Family {
         }
     }
 
-    pub(crate) const fn s_col(self) -> &'static str {
-        match self {
-            Family::Posg => "_idx_posg_s",
-            Family::Ospg => "_idx_ospg_s",
-        }
-    }
-
-    pub(crate) const fn p_col(self) -> &'static str {
-        match self {
-            Family::Posg => "_idx_posg_p",
-            Family::Ospg => "_idx_ospg_p",
-        }
-    }
-
-    pub(crate) const fn o_col(self) -> &'static str {
-        match self {
-            Family::Posg => "_idx_posg_o",
-            Family::Ospg => "_idx_ospg_o",
-        }
-    }
-
-    pub(crate) const fn g_col(self) -> &'static str {
-        match self {
-            Family::Posg => "_idx_posg_g",
-            Family::Ospg => "_idx_ospg_g",
-        }
-    }
-
-    pub(crate) const fn rid_col(self) -> &'static str {
-        match self {
-            Family::Posg => "_idx_posg_rid",
-            Family::Ospg => "_idx_ospg_rid",
-        }
-    }
-
-    /// The five column names in the order the builders emit them (s, p, o, g,
-    /// rid).
-    // `const` (with the accessors above) so [`ROLES`] can assemble its
-    // `&'static` rosters from these instead of re-spelling the names.
-    pub(crate) const fn column_names(self) -> [&'static str; 5] {
-        [
-            self.s_col(),
-            self.p_col(),
-            self.o_col(),
-            self.g_col(),
-            self.rid_col(),
-        ]
-    }
-
-    /// The column holding this family's leading sort key — the one binary
-    /// searches probe and builders stamp `IsSorted`.
-    pub(crate) const fn lead_col(self) -> &'static str {
-        match self {
-            Family::Posg => self.p_col(),
-            Family::Ospg => self.o_col(),
-        }
-    }
-
-    /// Index of the lead value column within [`Self::column_names`] order.
+    /// Index of the lead value column within [`CHILD_COLUMNS`] order.
     fn lead_ix(self) -> usize {
         match self {
             Family::Posg => 1,
@@ -653,9 +582,9 @@ fn code_perm(codes: &QuadCodes, family: Family) -> Vec<u32> {
 }
 
 /// One family's five columns (s, p, o, g, rid) over `perm` order, term-string
-/// encoding. `start_row` offsets the row ids so they address the assembled
-/// array.
-fn family_string_columns(quads: &[RawQuad], perm: &[u32], start_row: u32) -> [ArrayRef; 5] {
+/// encoding. The row ids are the quads' own positions: the emission covers
+/// the whole dataset, so `perm` already addresses the assembled array.
+fn family_string_columns(quads: &[RawQuad], perm: &[u32]) -> [ArrayRef; 5] {
     let col = |term_of: fn(&RawQuad) -> &str| -> ArrayRef {
         make_string_array(perm.iter().map(|&i| term_of(&quads[i as usize])))
     };
@@ -664,12 +593,12 @@ fn family_string_columns(quads: &[RawQuad], perm: &[u32], start_row: u32) -> [Ar
         col(|q| &q.p),
         col(|q| &q.o),
         col(|q| &q.g),
-        PrimitiveArray::from_iter(perm.iter().map(|&i| start_row + i)).into_array(),
+        PrimitiveArray::from_iter(perm.iter().copied()).into_array(),
     ]
 }
 
 /// Code-column variant of [`family_string_columns`].
-fn family_code_columns(codes: &QuadCodes, perm: &[u32], start_row: u32) -> [ArrayRef; 5] {
+fn family_code_columns(codes: &QuadCodes, perm: &[u32]) -> [ArrayRef; 5] {
     let col = |column: &[u32]| -> ArrayRef {
         PrimitiveArray::from_iter(perm.iter().map(|&i| column[i as usize])).into_array()
     };
@@ -678,71 +607,8 @@ fn family_code_columns(codes: &QuadCodes, perm: &[u32], start_row: u32) -> [Arra
         col(&codes.p),
         col(&codes.o),
         col(&codes.g),
-        PrimitiveArray::from_iter(perm.iter().map(|&i| start_row + i)).into_array(),
+        PrimitiveArray::from_iter(perm.iter().copied()).into_array(),
     ]
-}
-
-fn push_family(
-    field_names: &mut Vec<Arc<str>>,
-    field_arrays: &mut Vec<ArrayRef>,
-    family: Family,
-    columns: [ArrayRef; 5],
-) {
-    field_names.extend(
-        family
-            .column_names()
-            .iter()
-            .map(|name| Arc::<str>::from(*name)),
-    );
-    field_arrays.extend(columns);
-}
-
-/// Append the ten copy columns for one chunk, sorting the chunk's own quads
-/// into each family's order.
-///
-/// `start_row` is the global row ID of the first quad in `quads`, so per-chunk
-/// builders emit row IDs that address the fully assembled array. An empty
-/// `quads` slice yields empty columns with the correct dtypes.
-///
-/// `whole_dataset` must be `true` only when `quads` is the entire dataset
-/// (single-chunk builds): the chunk-local sort is then the global order and
-/// the lead value columns are stamped `IsSorted` for binary-search routing.
-pub(crate) fn append_columns(
-    field_names: &mut Vec<Arc<str>>,
-    field_arrays: &mut Vec<ArrayRef>,
-    quads: &[RawQuad],
-    start_row: u32,
-    whole_dataset: bool,
-) {
-    for family in Family::ALL {
-        let perm = string_perm(quads, family);
-        let columns = family_string_columns(quads, &perm, start_row);
-        if whole_dataset {
-            stamp_is_sorted(&columns[family.lead_ix()]);
-        }
-        push_family(field_names, field_arrays, family, columns);
-    }
-}
-
-/// Dictionary-layout variant of [`append_columns`]: the copy columns hold u32
-/// dictionary codes instead of strings. Sorting codes is order-equivalent to
-/// sorting the term strings, so the families stay binary-searchable — queries
-/// translate the pattern terms to codes first.
-pub(crate) fn append_encoded_columns(
-    field_names: &mut Vec<Arc<str>>,
-    field_arrays: &mut Vec<ArrayRef>,
-    codes: &QuadCodes,
-    start_row: u32,
-    whole_dataset: bool,
-) {
-    for family in Family::ALL {
-        let perm = code_perm(codes, family);
-        let columns = family_code_columns(codes, &perm, start_row);
-        if whole_dataset {
-            stamp_is_sorted(&columns[family.lead_ix()]);
-        }
-        push_family(field_names, field_arrays, family, columns);
-    }
 }
 
 /// A quad's terms rearranged into one family's sort-key order, so deriving
@@ -780,49 +646,9 @@ impl<V: Clone> CopyKey<V> {
     }
 }
 
-/// Append both families' globally sorted code-key windows as row-space
-/// `_idx_*` columns (the in-memory builders' emission path).
-#[cfg_attr(all(target_arch = "wasm32", target_os = "unknown"), allow(dead_code))]
-pub(crate) fn append_sorted_code_keys(
-    field_names: &mut Vec<Arc<str>>,
-    field_arrays: &mut Vec<ArrayRef>,
-    posg: &[(CopyKey<u32>, u32)],
-    ospg: &[(CopyKey<u32>, u32)],
-    stamp_sorted: bool,
-) {
-    append_family_code_keys(field_names, field_arrays, Family::Posg, posg, stamp_sorted);
-    append_family_code_keys(field_names, field_arrays, Family::Ospg, ospg, stamp_sorted);
-}
-
-#[cfg_attr(all(target_arch = "wasm32", target_os = "unknown"), allow(dead_code))]
-fn append_family_code_keys(
-    field_names: &mut Vec<Arc<str>>,
-    field_arrays: &mut Vec<ArrayRef>,
-    family: Family,
-    keys: &[(CopyKey<u32>, u32)],
-    stamp_sorted: bool,
-) {
-    let [s_ix, p_ix, o_ix, g_ix] = family.key_positions();
-    let col = |ix: usize| -> ArrayRef {
-        PrimitiveArray::from_iter(keys.iter().map(|(key, _)| key.0[ix])).into_array()
-    };
-    let columns = [
-        col(s_ix),
-        col(p_ix),
-        col(o_ix),
-        col(g_ix),
-        PrimitiveArray::from_iter(keys.iter().map(|(_, rid)| *rid)).into_array(),
-    ];
-    if stamp_sorted {
-        stamp_is_sorted(&columns[family.lead_ix()]);
-    }
-    push_family(field_names, field_arrays, family, columns);
-}
-
-/// The complete dataset's copy columns in global family order, built once by
-/// in-memory builders and sliced per chunk: chunk `i` carries window
-/// `[i·C, (i+1)·C)` of the same order, so the concatenation across chunks is
-/// itself the globally sorted copy.
+/// The complete dataset's copy columns in global family order — the
+/// in-memory builders' emission, handed on as this index's two persisted
+/// children by [`into_components`](Self::into_components).
 pub(crate) struct GlobalCopyArrays {
     posg: [ArrayRef; 5],
     ospg: [ArrayRef; 5],
@@ -835,7 +661,7 @@ impl GlobalCopyArrays {
     pub(crate) fn from_quads(quads: &[RawQuad]) -> Self {
         let build = |family: Family| {
             let perm = string_perm(quads, family);
-            let columns = family_string_columns(quads, &perm, 0);
+            let columns = family_string_columns(quads, &perm);
             stamp_is_sorted(&columns[family.lead_ix()]);
             columns
         };
@@ -849,7 +675,7 @@ impl GlobalCopyArrays {
     pub(crate) fn from_codes(codes: &QuadCodes) -> Self {
         let build = |family: Family| {
             let perm = code_perm(codes, family);
-            let columns = family_code_columns(codes, &perm, 0);
+            let columns = family_code_columns(codes, &perm);
             stamp_is_sorted(&columns[family.lead_ix()]);
             columns
         };
@@ -859,26 +685,24 @@ impl GlobalCopyArrays {
         }
     }
 
-    /// Append window `range` of the global order as one chunk's copy columns.
-    /// Lead value slices are re-stamped `IsSorted` (a slice of a sorted array
-    /// is sorted, but slicing does not propagate the stat).
-    pub(crate) fn append_slice(
-        &self,
-        field_names: &mut Vec<Arc<str>>,
-        field_arrays: &mut Vec<ArrayRef>,
-        range: Range<usize>,
-    ) -> Result<()> {
-        for (family, columns) in [(Family::Posg, &self.posg), (Family::Ospg, &self.ospg)] {
-            for (ix, (name, arr)) in family.column_names().iter().zip(columns).enumerate() {
-                let sliced = arr.slice(range.clone()).map_err(VortexRdfError::Vortex)?;
-                if ix == family.lead_ix() {
-                    stamp_is_sorted(&sliced);
-                }
-                field_names.push((*name).into());
-                field_arrays.push(sliced);
-            }
-        }
-        Ok(())
+    /// This index's two persisted children, one sorted quad copy per family.
+    /// Globally sorted by construction, so both are handed over with that
+    /// provenance.
+    pub(crate) fn into_components(self) -> Result<Vec<super::IndexComponent>> {
+        let Self { posg, ospg } = self;
+        [(Family::Posg, posg), (Family::Ospg, ospg)]
+            .into_iter()
+            .map(|(family, columns)| {
+                let len = columns[0].len();
+                let rows = child_struct(&CHILD_COLUMNS, columns.to_vec(), len)?;
+                Ok(super::IndexComponent::built(
+                    family.component_name(),
+                    family.component_slug(),
+                    rows,
+                    true,
+                ))
+            })
+            .collect()
     }
 }
 

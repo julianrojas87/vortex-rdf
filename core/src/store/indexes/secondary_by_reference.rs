@@ -6,37 +6,26 @@
 //! directly for each backend).
 //!
 //! The value columns come in two encodings — term strings, or u32 dictionary
-//! codes under the Dictionary layout — and in two scopes:
-//!
-//! - **Per-chunk** (`append_columns` / `append_encoded_columns`): each
-//!   chunk sorts its own quads. Cheap and single-pass, but the concatenation
-//!   of several chunks is *not* globally sorted, so the `IsSorted` stat is
-//!   stamped only when the chunk spans the whole dataset. The chunk-local sort
-//!   still pays off in a file-backed store: `resolve_file` pushes the probe
-//!   down as an equality predicate (falsified against each zone's min/max),
-//!   and clustering the values shrinks each zone's min/max so the scan prunes
-//!   to the few zones that can hold the probe. Zones are smaller than a chunk
-//!   (8192 rows), so this holds within a chunk even though the whole column is
-//!   unsorted.
-//! - **Global** (`GlobalIndexArrays` and the `append_sorted_*` helpers):
-//!   the complete dataset's sorted order, emitted per chunk as consecutive
-//!   windows. Every value column is stamped `IsSorted`, and the concatenated
-//!   columns stay globally binary-searchable.
+//! codes under the Dictionary layout — and are always built over the complete
+//! dataset in one global sort: [`GlobalIndexArrays`] for the in-memory
+//! builders, merged `(value, row id)` spill runs for the out-of-core one.
+//! Both hand the columns over as this index's two persisted children
+//! (`{val, rid}` per covered role), value column stamped `IsSorted`.
 //!
 //! Both backends need global sortedness to binary-search, and neither depends
-//! on it to be correct — they differ only in what they do without it.
-//! `resolve_in_memory` declines an unsorted column outright (searching a
-//! concatenation of per-chunk orders would be wrong) and `match_pattern` falls
-//! back to a mask scan; `resolve_file` falls back on its own, to the
-//! pushed-down equality, which answers whatever the order — there, sortedness
-//! decides only whether the matched run can be *located* (and, failing that,
-//! how much of the scan prunes).
+//! on it to be correct — they differ only in what they do without it, which
+//! is what a child declaring itself unsorted (this crate never writes one,
+//! but the wire format can carry one) falls back to. `resolve_in_memory`
+//! declines outright and `match_pattern` mask-scans; `resolve_file` falls
+//! back to the pushed-down equality, which answers whatever the order —
+//! there, sortedness decides only whether the matched run can be *located*
+//! (and, failing that, how much of the scan prunes).
 //!
 //! [`IndexType::SecondaryByReference`]: super::IndexType::SecondaryByReference
 // Inspired by https://clickhouse.com/blog/projections-secondary-indices
 
+#[cfg(feature = "file-io")]
 use std::ops::Range;
-use std::sync::Arc;
 
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::struct_::StructArrayExt;
@@ -101,43 +90,26 @@ pub(crate) const CHILD_RID_COL: &str = "rid";
 pub(crate) const O_IMPLEMENTATION: &str = "secondary-by-reference/o";
 pub(crate) const P_IMPLEMENTATION: &str = "secondary-by-reference/p";
 
-const O_SOURCE_COLUMNS: [&str; 2] = [RefRole::O.val_col(), RefRole::O.rid_col()];
-const P_SOURCE_COLUMNS: [&str; 2] = [RefRole::P.val_col(), RefRole::P.rid_col()];
-
 /// This index's persisted-child role table — one `{val, rid}` table per
-/// covered role — feeding every generic loop in the hub (spec push,
-/// row-space split, schema detection, the slug registry); see
+/// covered role — feeding every generic loop in the hub (the slug registry
+/// and the roster it builds); see
 /// [`IndexType::component_roles`](super::IndexType::component_roles). Built
 /// from the [`RefRole`] accessors so each name keeps exactly one spelling.
 pub(crate) const ROLES: [super::ComponentRole; 2] = [
     super::ComponentRole {
         name: RefRole::O.component_name(),
         slug: RefRole::O.component_slug(),
-        source_columns: &O_SOURCE_COLUMNS,
-        child_columns: &CHILD_COLUMNS,
-        lead_source: RefRole::O.val_col(),
     },
     super::ComponentRole {
         name: RefRole::P.component_name(),
         slug: RefRole::P.component_slug(),
-        source_columns: &P_SOURCE_COLUMNS,
-        child_columns: &CHILD_COLUMNS,
-        lead_source: RefRole::P.val_col(),
     },
 ];
 
-/// This index's four columns: a sorted copy of a component's values paired
-/// with the primary row id each value came from.
-pub(crate) const O_VAL_COL: &str = "_idx_o_val";
-pub(crate) const O_RID_COL: &str = "_idx_o_rid";
-pub(crate) const P_VAL_COL: &str = "_idx_p_val";
-pub(crate) const P_RID_COL: &str = "_idx_p_rid";
-
 /// One of the two quad components this index covers, named after it. Each
-/// role owns one `{val, rid}` component — its name, implementation slug, and
-/// the row-space column pair it is assembled from — so the association is
-/// stated once here (and in the [`ROLES`] rows built from these accessors)
-/// instead of at every roster site.
+/// role owns one `{val, rid}` component — its name and implementation slug —
+/// so the association is stated once here (and in the [`ROLES`] rows built
+/// from these accessors) instead of at every roster site.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) enum RefRole {
     /// Object values.
@@ -160,22 +132,6 @@ impl RefRole {
         match self {
             RefRole::O => O_IMPLEMENTATION,
             RefRole::P => P_IMPLEMENTATION,
-        }
-    }
-
-    /// The row-space column holding this role's sorted values.
-    pub(crate) const fn val_col(self) -> &'static str {
-        match self {
-            RefRole::O => O_VAL_COL,
-            RefRole::P => P_VAL_COL,
-        }
-    }
-
-    /// The row-space column holding the primary row id paired with each value.
-    pub(crate) const fn rid_col(self) -> &'static str {
-        match self {
-            RefRole::O => O_RID_COL,
-            RefRole::P => P_RID_COL,
         }
     }
 }
@@ -408,134 +364,9 @@ pub(crate) async fn debug_located_run(
     locate_run(file, probe.role, &native, descriptor.sorted).await
 }
 
-/// Append the four reference secondary-index columns for one chunk, sorting
-/// the chunk's own quads: `_idx_o_val`/`_idx_o_rid` (sorted objects) and
-/// `_idx_p_val`/`_idx_p_rid` (sorted predicates).
-///
-/// `start_row` is the global row ID of the first quad in `quads`, so per-chunk
-/// index builders can emit row IDs that address the fully assembled array.
-/// An empty `quads` slice yields empty columns with the correct dtypes.
-///
-/// `whole_dataset` must be `true` only when `quads` is the entire dataset
-/// (single-chunk builds): the chunk-local sort is then the global order and
-/// the value columns are stamped `IsSorted` for binary-search routing.
-pub(crate) fn append_columns(
-    field_names: &mut Vec<Arc<str>>,
-    field_arrays: &mut Vec<ArrayRef>,
-    quads: &[RawQuad],
-    start_row: u32,
-    whole_dataset: bool,
-) {
-    let sorted_pairs = |term_of: fn(&RawQuad) -> &str| -> Vec<(&str, u32)> {
-        let mut pairs: Vec<(&str, u32)> = quads
-            .iter()
-            .enumerate()
-            .map(|(i, q)| (term_of(q), start_row + i as u32))
-            .collect();
-        pairs.sort_unstable();
-        pairs
-    };
-    append_sorted_string_pairs(
-        field_names,
-        field_arrays,
-        &sorted_pairs(|q| &q.o),
-        &sorted_pairs(|q| &q.p),
-        whole_dataset,
-    );
-}
-
-/// Dictionary-layout variant of [`append_columns`]: `_idx_o_val`/`_idx_p_val`
-/// hold the terms' u32 dictionary codes instead of strings. Sorting codes is
-/// order-equivalent to sorting the term strings (sorted-dictionary codes are
-/// lexicographic ranks), so the index stays binary-searchable — queries
-/// translate the pattern term to its code first.
-pub(crate) fn append_encoded_columns(
-    field_names: &mut Vec<Arc<str>>,
-    field_arrays: &mut Vec<ArrayRef>,
-    codes: &QuadCodes,
-    start_row: u32,
-    whole_dataset: bool,
-) {
-    let sorted_pairs = |column: &[u32]| -> Vec<(u32, u32)> {
-        let mut pairs: Vec<(u32, u32)> = column
-            .iter()
-            .enumerate()
-            .map(|(i, &code)| (code, start_row + i as u32))
-            .collect();
-        pairs.sort_unstable();
-        pairs
-    };
-    append_sorted_code_pairs(
-        field_names,
-        field_arrays,
-        &sorted_pairs(&codes.o),
-        &sorted_pairs(&codes.p),
-        whole_dataset,
-    );
-}
-
-/// Append the four index columns from already-sorted (term, row ID) pairs.
-/// Out-of-core builders call this directly with pairs merged from disk runs
-/// in global order (`stamp_sorted = true`).
-pub(crate) fn append_sorted_string_pairs(
-    field_names: &mut Vec<Arc<str>>,
-    field_arrays: &mut Vec<ArrayRef>,
-    o_pairs: &[(impl AsRef<str>, u32)],
-    p_pairs: &[(impl AsRef<str>, u32)],
-    stamp_sorted: bool,
-) {
-    let o_val = make_string_array(o_pairs.iter().map(|(s, _)| s.as_ref()));
-    let p_val = make_string_array(p_pairs.iter().map(|(s, _)| s.as_ref()));
-    if stamp_sorted {
-        stamp_is_sorted(&o_val);
-        stamp_is_sorted(&p_val);
-    }
-    field_names.extend_from_slice(&[
-        O_VAL_COL.into(),
-        O_RID_COL.into(),
-        P_VAL_COL.into(),
-        P_RID_COL.into(),
-    ]);
-    field_arrays.extend([
-        o_val,
-        PrimitiveArray::from_iter(o_pairs.iter().map(|(_, rid)| *rid)).into_array(),
-        p_val,
-        PrimitiveArray::from_iter(p_pairs.iter().map(|(_, rid)| *rid)).into_array(),
-    ]);
-}
-
-/// Code-column variant of [`append_sorted_string_pairs`].
-pub(crate) fn append_sorted_code_pairs(
-    field_names: &mut Vec<Arc<str>>,
-    field_arrays: &mut Vec<ArrayRef>,
-    o_pairs: &[(u32, u32)],
-    p_pairs: &[(u32, u32)],
-    stamp_sorted: bool,
-) {
-    let o_val = PrimitiveArray::from_iter(o_pairs.iter().map(|(code, _)| *code)).into_array();
-    let p_val = PrimitiveArray::from_iter(p_pairs.iter().map(|(code, _)| *code)).into_array();
-    if stamp_sorted {
-        stamp_is_sorted(&o_val);
-        stamp_is_sorted(&p_val);
-    }
-    field_names.extend_from_slice(&[
-        O_VAL_COL.into(),
-        O_RID_COL.into(),
-        P_VAL_COL.into(),
-        P_RID_COL.into(),
-    ]);
-    field_arrays.extend([
-        o_val,
-        PrimitiveArray::from_iter(o_pairs.iter().map(|(_, rid)| *rid)).into_array(),
-        p_val,
-        PrimitiveArray::from_iter(p_pairs.iter().map(|(_, rid)| *rid)).into_array(),
-    ]);
-}
-
-/// The complete dataset's secondary-index columns in global sorted order,
-/// built once by in-memory builders and sliced per chunk: chunk `i` carries
-/// window `[i·C, (i+1)·C)` of the same order, so the concatenation across
-/// chunks is itself the globally sorted index.
+/// The complete dataset's secondary-index columns in global sorted order —
+/// the in-memory builders' emission, handed on as this index's two persisted
+/// children by [`into_components`](Self::into_components).
 pub(crate) struct GlobalIndexArrays {
     o_val: ArrayRef,
     o_rid: ArrayRef,
@@ -595,29 +426,29 @@ impl GlobalIndexArrays {
         }
     }
 
-    /// Append window `range` of the global order as one chunk's index columns.
-    /// Value slices are re-stamped `IsSorted` (a slice of a sorted array is
-    /// sorted, but slicing does not propagate the stat).
-    pub(crate) fn append_slice(
-        &self,
-        field_names: &mut Vec<Arc<str>>,
-        field_arrays: &mut Vec<ArrayRef>,
-        range: Range<usize>,
-    ) -> Result<()> {
-        for (name, arr, is_val) in [
-            (O_VAL_COL, &self.o_val, true),
-            (O_RID_COL, &self.o_rid, false),
-            (P_VAL_COL, &self.p_val, true),
-            (P_RID_COL, &self.p_rid, false),
-        ] {
-            let sliced = arr.slice(range.clone()).map_err(VortexRdfError::Vortex)?;
-            if is_val {
-                stamp_is_sorted(&sliced);
-            }
-            field_names.push(name.into());
-            field_arrays.push(sliced);
-        }
-        Ok(())
+    /// This index's two persisted children, each a `{val, rid}` table over the
+    /// whole dataset. Globally sorted by construction, so both are handed over
+    /// with that provenance.
+    pub(crate) fn into_components(self) -> Result<Vec<super::IndexComponent>> {
+        let Self {
+            o_val,
+            o_rid,
+            p_val,
+            p_rid,
+        } = self;
+        [(RefRole::O, o_val, o_rid), (RefRole::P, p_val, p_rid)]
+            .into_iter()
+            .map(|(role, val, rid)| {
+                let len = val.len();
+                let rows = child_struct(&CHILD_COLUMNS, vec![val, rid], len)?;
+                Ok(super::IndexComponent::built(
+                    role.component_name(),
+                    role.component_slug(),
+                    rows,
+                    true,
+                ))
+            })
+            .collect()
     }
 }
 
@@ -639,13 +470,13 @@ mod tests {
         // Object preferred over predicate when both are bound.
         let probe = choose(QuadPattern::new(None, Some(&p), Some(&o), None)).unwrap();
         assert_eq!(probe.resolves, IndexedComponent::Object);
-        assert_eq!(probe.role.val_col(), "_idx_o_val");
+        assert_eq!(probe.role.component_name(), REF_O_COMPONENT);
         assert_eq!(probe.probe_term.to_string(), o.to_string());
 
         // Predicate-only patterns use the predicate side.
         let probe = choose(QuadPattern::new(None, Some(&p), None, None)).unwrap();
         assert_eq!(probe.resolves, IndexedComponent::Predicate);
-        assert_eq!(probe.role.val_col(), "_idx_p_val");
+        assert_eq!(probe.role.component_name(), REF_P_COMPONENT);
         assert_eq!(probe.probe_term.to_string(), p.to_string());
 
         // Nothing this index covers is bound: declines.

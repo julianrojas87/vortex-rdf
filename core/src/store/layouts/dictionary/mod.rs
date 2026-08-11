@@ -14,8 +14,9 @@
 //! `build_struct_array` path: encoding requires the global `TermDictionary`
 //! (complete only after the whole dataset has been ingested), so the builders
 //! run a dedicated two-pass pipeline that calls `build_chunk` directly.
-//! Secondary indexes compose normally: they are appended per chunk via
-//! `IndexType::append_dictionary_columns`, working on the encoded codes.
+//! Secondary indexes compose normally: like every layout's, their children
+//! are built beside the chunks — over the encoded codes rather than the term
+//! strings, which sort identically.
 //!
 //! [`LayoutStrategy::Dictionary`]: super::LayoutStrategy::Dictionary
 
@@ -37,9 +38,6 @@ use crate::error::{Result, VortexRdfError};
 use crate::session::VORTEX_SESSION;
 use crate::store::RawQuad;
 use crate::store::array::stamp_is_sorted;
-use crate::store::builders::GlobalIndexes;
-use crate::store::indexes::secondary_by_copy::CopyKey;
-use crate::store::indexes::{IndexType, unique_indexes};
 use crate::store::schema::{COL_G, COL_O, COL_P, COL_S, PRIMARY_COLUMNS};
 
 pub(crate) mod access;
@@ -78,6 +76,19 @@ pub(crate) struct QuadCodes {
     pub g: Vec<u32>,
 }
 
+impl QuadCodes {
+    /// The encoding of no quads — what an empty build's index children are
+    /// built over, so they carry the code dtypes a non-empty build's would.
+    pub(crate) fn empty() -> Self {
+        Self {
+            s: Vec::new(),
+            p: Vec::new(),
+            o: Vec::new(),
+            g: Vec::new(),
+        }
+    }
+}
+
 /// Encode every term of every quad to its dictionary code.
 ///
 /// Generic over the map's key so both the owned [`TermIdMap`] (streaming
@@ -86,7 +97,7 @@ pub(crate) struct QuadCodes {
 /// `get(term)` lookup identical for either.
 ///
 /// [`BorrowedTermIdMap`]: self::ingest::BorrowedTermIdMap
-fn encode_quads<K>(
+pub(crate) fn encode_quads<K>(
     quads: &[RawQuad],
     dict: &TermDictionary,
     id_map: &HashMap<K, u32>,
@@ -124,9 +135,7 @@ where
     Ok(codes)
 }
 
-/// Build the primary part of a Dictionary-layout chunk — the four u32 code
-/// columns — returning the open field vectors so the caller can append index
-/// columns before finalizing.
+/// Build a Dictionary-layout chunk's four u32 code columns.
 ///
 /// The term dictionary is *not* a column of the chunk: in memory it lives in
 /// the layout ([`DictAccess`]), and serialized files carry it as the native
@@ -161,23 +170,16 @@ fn finish_chunk(names: Vec<Arc<str>>, arrays: Vec<ArrayRef>, n: usize) -> Result
         .map(|a| a.into_array())
 }
 
-/// Build a complete Dictionary-layout StructArray chunk: four u32 code columns
-/// encoded against the global dictionary, plus the columns of every requested
-/// secondary index (deduplicated, built over the same codes by sorting this
-/// chunk's quads).
-///
-/// `start_row` has the same global-row-ID semantics as `build_struct_array`,
-/// and `whole_dataset` the same index-stamping semantics: pass `true` only
-/// when `quads` is the entire dataset, so the per-chunk index sort is the
-/// global order.
+/// Build a Dictionary-layout StructArray chunk from raw quads: four u32 code
+/// columns encoded against the global dictionary. Secondary indexes are built
+/// separately as components (see
+/// [`build_components_from_codes`](crate::store::builders::build_components_from_codes)),
+/// so nothing else rides here.
 pub(crate) fn build_chunk<K>(
     quads: &[RawQuad],
     dict: &TermDictionary,
     id_map: &HashMap<K, u32>,
-    indexes: &[IndexType],
-    start_row: u32,
     s_sorted: bool,
-    whole_dataset: bool,
 ) -> Result<ArrayRef>
 where
     K: Borrow<str> + Eq + Hash,
@@ -188,24 +190,16 @@ where
     let codes = encode_quads(quads, dict, id_map)?;
     let encode_elapsed = encode_start.elapsed();
     let primary_start = Instant::now();
-    let (mut names, mut arrays) = chunk_parts(&codes, 0..n, s_sorted);
+    let (names, arrays) = chunk_parts(&codes, 0..n, s_sorted);
     let primary_elapsed = primary_start.elapsed();
-
-    let indexes_start = Instant::now();
-    for idx in unique_indexes(indexes) {
-        idx.append_dictionary_columns(&mut names, &mut arrays, &codes, start_row, whole_dataset);
-    }
-    let indexes_elapsed = indexes_start.elapsed();
 
     let finish_start = Instant::now();
     let chunk = finish_chunk(names, arrays, n)?;
     log::debug!(
-        "[Dictionary] Built chunk of {} rows at row {}: encode {:?}, primary columns {:?}, indexes {:?}, struct {:?}, total {:?}",
+        "[Dictionary] Built chunk of {} rows: encode {:?}, code columns {:?}, struct {:?}, total {:?}",
         n,
-        start_row,
         encode_elapsed,
         primary_elapsed,
-        indexes_elapsed,
         finish_start.elapsed(),
         total_start.elapsed()
     );
@@ -217,103 +211,39 @@ where
 /// ingest ([`InterningQuadBuilder`]) so no owned quad strings are involved.
 ///
 /// The codes arrive in global (s, p, o, g) order, so the `s` column is
-/// stamped sorted; index columns are globally sorted too
-/// (`GlobalIndexes::from_codes` sorts pairs).
+/// stamped sorted.
 ///
 /// [`InterningQuadBuilder`]: self::ingest::InterningQuadBuilder
-pub(crate) fn build_array(codes: &QuadCodes, indexes: &[IndexType]) -> Result<ArrayRef> {
+pub(crate) fn build_array(codes: &QuadCodes) -> Result<ArrayRef> {
     if codes.s.is_empty() {
-        return empty_struct(indexes);
+        return empty_struct();
     }
     let n = codes.s.len();
-    let global_idx = GlobalIndexes::from_codes(indexes, codes);
-    build_chunk_global(codes, 0..n, &global_idx, true)
+    build_code_chunk(codes, 0..n, true)
 }
 
-/// Build a Dictionary-layout chunk for rows `range` of a fully encoded
-/// dataset, with index columns sliced from the precomputed global order —
-/// the sorted in-memory builders' chunked emission path.
-pub(crate) fn build_chunk_global(
+/// Build a Dictionary-layout chunk for rows `range` of an already encoded
+/// dataset — the sorted in-memory builders' chunked emission path.
+pub(crate) fn build_code_chunk(
     codes: &QuadCodes,
     range: Range<usize>,
-    global_indexes: &GlobalIndexes,
     s_sorted: bool,
 ) -> Result<ArrayRef> {
     let start = Instant::now();
     let n = range.len();
-    let (mut names, mut arrays) = chunk_parts(codes, range.clone(), s_sorted);
-    global_indexes.append_slice(&mut names, &mut arrays, range)?;
+    let (names, arrays) = chunk_parts(codes, range, s_sorted);
     let chunk = finish_chunk(names, arrays, n)?;
     log::debug!(
-        "[Dictionary] Built globally encoded chunk of {} rows in {:?}",
+        "[Dictionary] Built encoded chunk of {} rows in {:?}",
         n,
         start.elapsed()
     );
     Ok(chunk)
 }
 
-/// The two `SecondaryByReference` code columns of a presorted chunk, as
-/// borrowed globally sorted (code, row ID) slices: (objects, predicates).
-// This vocabulary serves only the external-sort builder, compiled out on
-// wasm (see the module gate in `store::builders`).
-#[cfg_attr(all(target_arch = "wasm32", target_os = "unknown"), allow(dead_code))]
-type RefPairSlices<'a> = (&'a [(u32, u32)], &'a [(u32, u32)]);
-/// The two `SecondaryByCopy` code columns of a presorted chunk, as borrowed
-/// globally sorted (sort key, row ID) slices: (POSG, OSPG).
-#[cfg_attr(all(target_arch = "wasm32", target_os = "unknown"), allow(dead_code))]
-type CopyKeySlices<'a> = (&'a [(CopyKey<u32>, u32)], &'a [(CopyKey<u32>, u32)]);
-
-/// Build a Dictionary-layout chunk with index columns taken from
-/// already-globally-sorted (code, row ID) entries — the out-of-core sorted
-/// builder's emission path, where the entries are merged from disk runs.
-/// Each index family is appended only when its entries are supplied.
-#[cfg_attr(all(target_arch = "wasm32", target_os = "unknown"), allow(dead_code))]
-pub(crate) fn build_chunk_presorted_indexes(
-    quads: &[RawQuad],
-    dict: &TermDictionary,
-    id_map: &TermIdMap,
-    ref_pairs: Option<RefPairSlices<'_>>,
-    copy_keys: Option<CopyKeySlices<'_>>,
-    s_sorted: bool,
-) -> Result<ArrayRef> {
-    use crate::store::indexes::secondary_by_copy::append_sorted_code_keys;
-    use crate::store::indexes::secondary_by_reference::append_sorted_code_pairs;
-
-    let total_start = Instant::now();
-    let n = quads.len();
-    let encode_start = Instant::now();
-    let codes = encode_quads(quads, dict, id_map)?;
-    let encode_elapsed = encode_start.elapsed();
-    let (mut names, mut arrays) = chunk_parts(&codes, 0..n, s_sorted);
-    if let Some((posg, ospg)) = copy_keys {
-        append_sorted_code_keys(&mut names, &mut arrays, posg, ospg, true);
-    }
-    if let Some((o_pairs, p_pairs)) = ref_pairs {
-        append_sorted_code_pairs(&mut names, &mut arrays, o_pairs, p_pairs, true);
-    }
-    let chunk = finish_chunk(names, arrays, n)?;
-    log::debug!(
-        "[Dictionary] Built presorted-index chunk of {} rows: encode {:?}, remaining build {:?}, total {:?}",
-        n,
-        encode_elapsed,
-        total_start.elapsed().saturating_sub(encode_elapsed),
-        total_start.elapsed()
-    );
-    Ok(chunk)
-}
-
-/// An empty StructArray with the Dictionary-layout schema (including the
-/// columns of any requested secondary indexes).
-pub(crate) fn empty_struct(indexes: &[IndexType]) -> Result<ArrayRef> {
-    build_chunk(
-        &[],
-        &TermDictionary::empty(),
-        &TermIdMap::new(),
-        indexes,
-        0,
-        false,
-        false,
-    )
+/// An empty StructArray with the Dictionary-layout code schema.
+pub(crate) fn empty_struct() -> Result<ArrayRef> {
+    build_chunk(&[], &TermDictionary::empty(), &TermIdMap::new(), false)
 }
 
 /// The four primary code columns of a chunk, as arrays whose `u32` slices the

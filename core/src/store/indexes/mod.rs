@@ -1,20 +1,19 @@
 //! Secondary-index vocabulary and the store's dispatch into it.
 //!
 //! This hub owns what is common to every index: the [`IndexType`] enum and
-//! its exhaustive dispatch into the per-index modules (column emission,
-//! schema detection, resolution), the resolution currency
-//! (`IndexResolution`, `IndexedComponent`, the eager/lazy `ResolvedRowIds`
-//! split and its `LazyRowIds` recipe) both backends answer in, the planners
-//! that try a store's whole index set in preference order, and the row-space
-//! helpers shared across index families.
+//! its exhaustive dispatch into the per-index modules (persisted-child roles,
+//! resolution), the resolution currency (`IndexResolution`,
+//! `IndexedComponent`, the eager/lazy `ResolvedRowIds` split and its
+//! `LazyRowIds` recipe) both backends answer in, and the planners that try a
+//! store's whole index set in preference order.
 //!
 //! What belongs in a leaf instead: an index's column-name scheme, its sort
-//! orders, and how it probes them (`secondary_by_copy`,
-//! `secondary_by_reference`) — the hub never hardcodes a column name.
-//! Three further clusters live beside it: `serve` (reading matched quads out
-//! of an index's own columns), `components` (the persisted-child model and
-//! the slug registry), and `row_space` (the `_idx_` column-name convention),
-//! all re-exported here so callers see one `indexes::` surface.
+//! orders, how it builds its children, and how it probes them
+//! (`secondary_by_copy`, `secondary_by_reference`) — the hub never hardcodes
+//! a column name. Two further clusters live beside it: `serve` (reading
+//! matched quads out of an index's own columns) and `components` (the
+//! persisted-child model and the slug registry), both re-exported here so
+//! callers see one `indexes::` surface.
 
 use std::ops::Range;
 use std::sync::{Arc, OnceLock};
@@ -32,60 +31,55 @@ use vortex_buffer::Buffer;
 
 use crate::error::{Result, VortexRdfError};
 use crate::session::VORTEX_SESSION;
-use crate::store::RawQuad;
-use crate::store::layouts::dictionary::QuadCodes;
 use crate::store::layouts::{PatternCodes, QuadPattern, ResolvedLayout};
 
 pub(crate) mod components;
-pub(crate) mod row_space;
 pub(crate) mod secondary_by_copy;
 pub(crate) mod secondary_by_reference;
 pub(crate) mod serve;
-#[cfg(feature = "file-io")]
-pub(crate) mod tee;
 
+#[cfg(feature = "file-io")]
+pub(crate) use components::adopt_scanned_component;
 pub(crate) use components::{
     ComponentRole, IndexComponent, KnownComponent, adopt_component_reader, indexes_from_components,
-    known_component, split_built_row_space,
+    known_component,
 };
-#[cfg(feature = "file-io")]
-pub(crate) use components::{IndexComponentSpec, adopt_scanned_component, index_component_specs};
-#[cfg(feature = "file-io")]
-pub(crate) use row_space::primary_dtype;
-pub(crate) use row_space::strip_index_columns;
 #[cfg(feature = "file-io")]
 pub(crate) use serve::FileServePlan;
 pub(crate) use serve::InMemoryServePlan;
 
-/// A secondary index that can be embedded alongside the primary quad columns.
+/// A secondary index, built as its own sorted children beside the primary
+/// quad rows.
 ///
 /// Variant declaration order is the resolution preference order: pattern
-/// matching tries each detected index in this order and takes the first that
-/// doesn't decline (see `resolve_indexes_in_memory`).
+/// matching tries each index the store's component roster carries, in this
+/// order, and takes the first that doesn't decline (see
+/// `resolve_indexes_in_memory`).
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
 pub enum IndexType {
-    /// Appends two complete extra copies of the quad columns, each in its own
-    /// sort order and each paired with the primary row IDs it permutes — the
+    /// Two complete extra copies of the quad columns, each in its own sort
+    /// order and each paired with the primary row IDs it permutes — the
     /// classic triple-store permutation indexes, giving predicate- and
     /// object-bound patterns the same sorted-column access path the primary
     /// (s, p, o, g) order gives subjects.
     ///
-    /// Adds ten extra columns to the StructArray (`VarBin<Utf8>` term strings,
-    /// or u32 codes under the Dictionary layout; `_idx_*_rid` always `u32`):
-    /// - `_idx_posg_{s,p,o,g,rid}`: the quads sorted by (p, o, s, g)
-    /// - `_idx_ospg_{s,p,o,g,rid}`: the quads sorted by (o, s, p, g)
+    /// Adds two children beside the quad rows, each a `{s, p, o, g, rid}`
+    /// table (`VarBin<Utf8>` term strings, or u32 codes under the Dictionary
+    /// layout; `rid` always `u32`):
+    /// - `index:posg`: the quads sorted by (p, o, s, g)
+    /// - `index:ospg`: the quads sorted by (o, s, p, g)
     ///
-    /// Predicate-bound patterns binary-search `_idx_posg_p`; a bound
-    /// predicate **and** object prefix-search (p, o) in one probe, resolving
-    /// both components; object-bound patterns binary-search `_idx_ospg_o`.
-    /// The copies additionally let reads take the matching rows from a
-    /// *contiguous* run of the copy columns — sliced or point-read in memory,
-    /// scanned from the index child on a file — instead of scattering row-id
-    /// reads across the primary columns. As with
-    /// [`SecondaryByReference`](Self::SecondaryByReference), in-memory routing
-    /// engages only when the lead value columns carry the `IsSorted` statistic
-    /// (single-chunk builds, or the sorted builders' global emission).
+    /// Predicate-bound patterns binary-search `index:posg`'s `p` column; a
+    /// bound predicate **and** object prefix-search (p, o) in one probe,
+    /// resolving both components; object-bound patterns binary-search
+    /// `index:ospg`'s `o` column. The copies additionally let reads take the
+    /// matching rows from a *contiguous* run of the copy columns — sliced or
+    /// point-read in memory, scanned from the index child on a file — instead
+    /// of scattering row-id reads across the primary columns. As with
+    /// [`SecondaryByReference`](Self::SecondaryByReference), routing engages
+    /// only on children whose writer recorded them globally sorted, which
+    /// every build here does.
     ///
     /// Costs roughly 2× the primary columns in extra storage — choose it over
     /// `SecondaryByReference` when predicate/object reads dominate.
@@ -93,19 +87,16 @@ pub enum IndexType {
 
     /// Builds sorted secondary indexes for both predicates **and** objects.
     ///
-    /// Adds four extra columns to the StructArray:
-    /// - `_idx_o_val`: object values sorted (`VarBin<Utf8>`; u32 codes under
-    ///   the Dictionary layout)
-    /// - `_idx_o_rid`: primary row IDs corresponding to each sorted object (`u32`)
-    /// - `_idx_p_val`: predicate values sorted (`VarBin<Utf8>`; u32 codes under
-    ///   the Dictionary layout)
-    /// - `_idx_p_rid`: primary row IDs corresponding to each sorted predicate (`u32`)
+    /// Adds two children beside the quad rows, each a `{val, rid}` table:
+    /// - `index:ref-o`: object values sorted (`VarBin<Utf8>`; u32 codes under
+    ///   the Dictionary layout), paired with the primary row id (`u32`) each
+    ///   came from
+    /// - `index:ref-p`: the same for predicate values
     ///
     /// Enables binary-search routing in `match_pattern` for predicate-only and
-    /// object-only patterns, avoiding full scans. Routing engages only when
-    /// the value columns carry the `IsSorted` statistic, which builders stamp
-    /// when the columns hold a globally sorted order (single-chunk builds, or
-    /// the sorted builders' global emission).
+    /// object-only patterns, avoiding full scans. Routing engages only on
+    /// children whose writer recorded them globally sorted, which every build
+    /// here does.
     SecondaryByReference,
 }
 
@@ -140,9 +131,9 @@ impl std::str::FromStr for IndexType {
     }
 }
 
-/// Every [`IndexType`], in declaration = preference order — what
-/// [`detect_indexes`] scans and what [`IndexType::preference_rank`] indexes
-/// into. Adding a variant fails to compile at that exhaustive match until the
+/// Every [`IndexType`], in declaration = preference order — what the slug
+/// registry scans and what [`IndexType::preference_rank`] indexes into.
+/// Adding a variant fails to compile at that exhaustive match until the
 /// variant is listed here too.
 pub(crate) const ALL_INDEX_TYPES: [IndexType; 2] =
     [IndexType::SecondaryByCopy, IndexType::SecondaryByReference];
@@ -158,120 +149,14 @@ impl IndexType {
     }
 
     /// This index's persisted-child roles — the const table every generic
-    /// loop is parameterized by: the spec push and row-space split
-    /// (`components`), schema detection ([`Self::is_present`]), the slug
-    /// registry ([`known_component`]), and the sorted-column roster
-    /// ([`globally_sorted_columns`]). The exhaustive match is the
-    /// compile-fail anchor for those loops: a new variant answers here once
-    /// and flows into all of them.
+    /// loop is parameterized by: the slug registry ([`known_component`]) and
+    /// the roster-to-index-set fold ([`indexes_from_components`]). The
+    /// exhaustive match is the compile-fail anchor for those loops: a new
+    /// variant answers here once and flows into all of them.
     pub(crate) const fn component_roles(self) -> &'static [ComponentRole] {
         match self {
             IndexType::SecondaryByCopy => &secondary_by_copy::ROLES,
             IndexType::SecondaryByReference => &secondary_by_reference::ROLES,
-        }
-    }
-
-    /// Whether this index needs the sorted builders' global two-pass
-    /// emission path so its value columns are globally sorted.
-    // Asked only by the external-sort builder, compiled out on wasm (see the
-    // module gate in `store::builders`).
-    #[cfg_attr(all(target_arch = "wasm32", target_os = "unknown"), allow(dead_code))]
-    pub(crate) fn needs_global_sorted_emission(self) -> bool {
-        match self {
-            IndexType::SecondaryByCopy => true,
-            IndexType::SecondaryByReference => true,
-        }
-    }
-
-    /// Append the columns contributed by this index type to the given field
-    /// name/array vectors, sorting the chunk's own quads.
-    ///
-    /// This is the single dispatch point for per-chunk index-column
-    /// generation: adding a new `IndexType` variant only requires a new arm
-    /// here delegating to its dedicated module.
-    ///
-    /// `start_row` is the global row ID of the first quad in `quads`, so
-    /// per-chunk builders can emit row IDs that address the fully assembled
-    /// array. An empty `quads` slice yields empty columns with the correct
-    /// dtypes (used for empty-store schemas).
-    ///
-    /// `whole_dataset` marks the chunk as spanning the entire dataset, making
-    /// the chunk-local sort a global order (stamped `IsSorted` for routing).
-    pub(crate) fn append_columns(
-        self,
-        field_names: &mut Vec<Arc<str>>,
-        field_arrays: &mut Vec<ArrayRef>,
-        quads: &[RawQuad],
-        start_row: u32,
-        whole_dataset: bool,
-    ) {
-        match self {
-            IndexType::SecondaryByCopy => secondary_by_copy::append_columns(
-                field_names,
-                field_arrays,
-                quads,
-                start_row,
-                whole_dataset,
-            ),
-            IndexType::SecondaryByReference => secondary_by_reference::append_columns(
-                field_names,
-                field_arrays,
-                quads,
-                start_row,
-                whole_dataset,
-            ),
-        }
-    }
-
-    /// Append this index's columns for a Dictionary-layout chunk, where terms
-    /// are already encoded as u32 codes. Sorted-dictionary codes preserve
-    /// lexicographic order, so a code-based index is order-equivalent to its
-    /// string-based counterpart while sorting integers instead of strings and
-    /// storing 4 bytes per entry.
-    ///
-    /// `start_row` and `whole_dataset` have the same semantics as
-    /// [`Self::append_columns`].
-    pub(crate) fn append_dictionary_columns(
-        self,
-        field_names: &mut Vec<Arc<str>>,
-        field_arrays: &mut Vec<ArrayRef>,
-        codes: &QuadCodes,
-        start_row: u32,
-        whole_dataset: bool,
-    ) {
-        match self {
-            IndexType::SecondaryByCopy => secondary_by_copy::append_encoded_columns(
-                field_names,
-                field_arrays,
-                codes,
-                start_row,
-                whole_dataset,
-            ),
-            IndexType::SecondaryByReference => secondary_by_reference::append_encoded_columns(
-                field_names,
-                field_arrays,
-                codes,
-                start_row,
-                whole_dataset,
-            ),
-        }
-    }
-
-    /// Whether this index's columns are present in an array/file of `dtype`:
-    /// every role's source columns, all of them — a partial set (e.g. after
-    /// a lossy projection) must not count as a usable index.
-    ///
-    /// The query-side counterpart of `append_columns`: each index module
-    /// still owns its column-name scheme — this just reads the names off its
-    /// role table rather than the store probing hardcoded ones.
-    pub(crate) fn is_present(self, dtype: &DType) -> bool {
-        match dtype {
-            DType::Struct(fields, _) => self.component_roles().iter().all(|role| {
-                role.source_columns
-                    .iter()
-                    .all(|name| fields.names().iter().any(|n| n.as_ref() == *name))
-            }),
-            _ => false,
         }
     }
 
@@ -282,8 +167,8 @@ impl IndexType {
     /// accelerates (e.g. `SecondaryByReference` declines when a subject is
     /// bound), chooses and probes its columns, and hands back the row ids to
     /// select — or declines, leaving the store to fall back to a scan. Like
-    /// `append_columns`, the exhaustive match makes the compiler demand a
-    /// query-side answer from every new index variant.
+    /// [`component_roles`](Self::component_roles), the exhaustive match makes
+    /// the compiler demand a query-side answer from every new index variant.
     pub(crate) fn resolve_in_memory(
         self,
         components: &[IndexComponent],
@@ -788,20 +673,6 @@ pub(crate) async fn resolve_eager_from_scan(
     })
 }
 
-/// Index types whose columns are present in `dtype` — how a store discovers
-/// its queryable indexes from an array or file schema at construction.
-///
-/// Iterates [`ALL_INDEX_TYPES`], so a new variant flows in here (and into the
-/// resolvers) with no store changes once it is listed there and its
-/// `component_roles`/`resolve_*` arms exist.
-pub(crate) fn detect_indexes(dtype: &DType) -> Indexes {
-    ALL_INDEX_TYPES
-        .iter()
-        .copied()
-        .filter(|index| index.is_present(dtype))
-        .collect()
-}
-
 /// Resolve the pattern against the configured indexes over an in-memory array,
 /// returning the first index whose outcome isn't `Declined` (indexes are tried
 /// in declaration = preference order). `Declined` when none apply, so the store
@@ -850,17 +721,6 @@ pub(crate) async fn resolve_indexes_file(
     Ok(IndexResolution::Declined)
 }
 
-/// True when any requested index type requires the sorted builders' global
-/// two-pass emission pipeline. The plural name marks the planner over the whole
-/// index set; the singular [`IndexType::needs_global_sorted_emission`] it folds
-/// over answers for one index.
-#[cfg_attr(all(target_arch = "wasm32", target_os = "unknown"), allow(dead_code))]
-pub(crate) fn indexes_need_global_sorted_emission(indexes: &[IndexType]) -> bool {
-    unique_indexes(indexes)
-        .into_iter()
-        .any(IndexType::needs_global_sorted_emission)
-}
-
 /// The set of optional secondary indexes to embed in a store.
 ///
 /// An empty `Indexes` means no secondary index columns are written (fastest
@@ -869,23 +729,9 @@ pub(crate) fn indexes_need_global_sorted_emission(indexes: &[IndexType]) -> bool
 /// `vec![IndexType::SecondaryByCopy]` for the full sorted quad copies.
 pub type Indexes = Vec<IndexType>;
 
-/// The index value columns a globally sorted emission guarantees sorted,
-/// across every index type — what the sorted builders (re-)stamp `IsSorted`
-/// after canonicalization, which drops per-chunk stats. Each role's lead
-/// sort-key column, read off the same tables the row-space split reads its
-/// sortedness provenance from, so the re-stamp and the resolution gate can
-/// never disagree about which columns matter; the fold over
-/// [`ALL_INDEX_TYPES`] × [`IndexType::component_roles`] flows a new variant
-/// in the moment it declares its roles.
-pub(crate) fn globally_sorted_columns() -> impl Iterator<Item = &'static str> {
-    ALL_INDEX_TYPES
-        .into_iter()
-        .flat_map(|index| index.component_roles().iter().map(|role| role.lead_source))
-}
-
 /// Deduplicate the requested indexes, preserving first-seen order, so a
 /// repeated index (e.g. the same `--indexes` flag passed twice) cannot
-/// produce duplicate columns in the schema.
+/// produce duplicate components.
 pub(crate) fn unique_indexes(indexes: &[IndexType]) -> Vec<IndexType> {
     let mut seen: Vec<IndexType> = Vec::with_capacity(indexes.len());
     for &idx in indexes {
@@ -900,105 +746,22 @@ pub(crate) fn unique_indexes(indexes: &[IndexType]) -> Vec<IndexType> {
 mod tests {
     use super::*;
     use oxrdf::{GraphName, Literal, NamedNode, NamedOrBlankNode, Term};
-    use vortex_array::dtype::{Nullability, StructFields};
-
-    fn struct_dtype(names: &[&str]) -> DType {
-        DType::Struct(
-            StructFields::from_iter(
-                names
-                    .iter()
-                    .map(|n| (*n, DType::Utf8(Nullability::NonNullable))),
-            ),
-            Nullability::NonNullable,
-        )
-    }
 
     #[test]
-    fn detect_indexes_by_schema() {
-        // All four columns present: the index is detected.
-        let with_idx = struct_dtype(&[
-            "s",
-            "p",
-            "o",
-            "g",
-            "_idx_o_val",
-            "_idx_o_rid",
-            "_idx_p_val",
-            "_idx_p_rid",
-        ]);
-        assert_eq!(
-            detect_indexes(&with_idx),
-            vec![IndexType::SecondaryByReference]
-        );
+    fn slug_registry_covers_every_role() {
+        // Every declared role's slug resolves back to its own index and
+        // component name — the mapping a persisted child is read through.
+        for index in ALL_INDEX_TYPES {
+            for role in index.component_roles() {
+                let known = known_component(role.slug).expect("declared slug is known");
+                assert_eq!(known.index, index);
+                assert_eq!(known.role.name, role.name);
+            }
+        }
 
-        // The ten copy-family columns mark the SecondaryByCopy index.
-        let with_copy = struct_dtype(&[
-            "s",
-            "p",
-            "o",
-            "g",
-            "_idx_posg_s",
-            "_idx_posg_p",
-            "_idx_posg_o",
-            "_idx_posg_g",
-            "_idx_posg_rid",
-            "_idx_ospg_s",
-            "_idx_ospg_p",
-            "_idx_ospg_o",
-            "_idx_ospg_g",
-            "_idx_ospg_rid",
-        ]);
-        assert_eq!(detect_indexes(&with_copy), vec![IndexType::SecondaryByCopy]);
-
-        // Both index families in one schema: copy first (preference order).
-        let with_both = struct_dtype(&[
-            "s",
-            "p",
-            "o",
-            "g",
-            "_idx_o_val",
-            "_idx_o_rid",
-            "_idx_p_val",
-            "_idx_p_rid",
-            "_idx_posg_s",
-            "_idx_posg_p",
-            "_idx_posg_o",
-            "_idx_posg_g",
-            "_idx_posg_rid",
-            "_idx_ospg_s",
-            "_idx_ospg_p",
-            "_idx_ospg_o",
-            "_idx_ospg_g",
-            "_idx_ospg_rid",
-        ]);
-        assert_eq!(
-            detect_indexes(&with_both),
-            vec![IndexType::SecondaryByCopy, IndexType::SecondaryByReference]
-        );
-
-        // No index columns: nothing detected.
-        let without_idx = struct_dtype(&["s", "p", "o", "g"]);
-        assert!(detect_indexes(&without_idx).is_empty());
-
-        // A partial column set (e.g. after a lossy projection) must not
-        // count as a usable index.
-        let partial = struct_dtype(&["s", "p", "o", "g", "_idx_o_val", "_idx_o_rid"]);
-        assert!(detect_indexes(&partial).is_empty());
-        let partial_copy = struct_dtype(&[
-            "s",
-            "p",
-            "o",
-            "g",
-            "_idx_posg_s",
-            "_idx_posg_p",
-            "_idx_posg_o",
-            "_idx_posg_g",
-            "_idx_posg_rid",
-        ]);
-        assert!(detect_indexes(&partial_copy).is_empty());
-
-        // Non-struct dtypes carry no indexes.
-        assert!(detect_indexes(&DType::Utf8(Nullability::NonNullable)).is_empty());
+        // A slug this version does not implement is skippable, not fatal.
+        assert!(known_component("secondary-by-copy/spog").is_none());
+        assert!(known_component("").is_none());
     }
 
     #[test]

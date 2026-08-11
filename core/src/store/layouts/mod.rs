@@ -13,10 +13,11 @@
 //! term-dictionary subsystem (storage, ingest, residency) beside its
 //! encode/decode paths.
 //!
-//! Secondary-index columns are *not* part of a layout. Every layout carries
-//! whichever `_idx_*` columns the requested
-//! [`IndexType`](crate::store::indexes::IndexType)s append, in that index's
-//! own encoding for the layout; the index modules own those names.
+//! Secondary indexes are *not* part of a layout. They are built as their own
+//! children beside a layout's quad rows, in that index's own encoding for the
+//! layout (term strings, or the Dictionary layout's u32 codes); the index
+//! modules own those columns and their names — see
+//! [`IndexType`](crate::store::indexes::IndexType).
 
 use std::sync::Arc;
 
@@ -105,10 +106,9 @@ pub enum LayoutStrategy {
     /// order-isomorphic to string comparisons (sorted builders keep the
     /// subject binary-search fast path on the u32 column).
     ///
-    /// Every requested [`IndexType`] appends its usual columns, except that
-    /// the term-valued ones hold u32 codes instead of strings (see
-    /// `IndexType::append_dictionary_columns`); the `_idx_*_rid` row-id
-    /// columns are `u32` under every layout.
+    /// Every requested [`IndexType`] builds its usual children, except that
+    /// their term-valued columns hold u32 codes instead of strings; the
+    /// row-id columns are `u32` under every layout.
     ///
     /// [`IndexType`]: crate::store::indexes::IndexType
     Dictionary,

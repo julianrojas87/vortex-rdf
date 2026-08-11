@@ -187,29 +187,25 @@ async fn test_dictionary_layout_secondary_index_compatibility() {
     .await
     .unwrap();
 
-    // Deduped index columns appear exactly once, and under the Dictionary
-    // layout the index value columns hold u32 codes — same dtype as the
-    // primary code columns — instead of strings.
+    // The quad rows stay primary-only, and the deduped index contributes its
+    // two children exactly once. Under the Dictionary layout each child's
+    // value column holds u32 codes — same dtype as the primary code columns —
+    // instead of strings.
     if let vortex_array::dtype::DType::Struct(fields, _) = arr.array.dtype() {
         let names: Vec<&str> = fields.names().iter().map(|n| n.as_ref()).collect();
-        assert_eq!(
-            names,
-            [
-                "s",
-                "p",
-                "o",
-                "g",
-                "_idx_o_val",
-                "_idx_o_rid",
-                "_idx_p_val",
-                "_idx_p_rid"
-            ],
-        );
-        assert_eq!(fields.field("_idx_o_val"), fields.field("o"));
-        assert_eq!(fields.field("_idx_p_val"), fields.field("p"));
+        assert_eq!(names, ["s", "p", "o", "g"]);
+        for component in &arr.components {
+            let rows = component.rows().unwrap();
+            let vortex_array::dtype::DType::Struct(child_fields, _) = rows.dtype() else {
+                panic!("expected a struct child");
+            };
+            assert_eq!(child_fields.field("val"), fields.field("o"));
+        }
     } else {
         panic!("expected StructArray dtype");
     }
+    let component_names: Vec<&str> = arr.components.iter().map(|c| c.name).collect();
+    assert_eq!(component_names, ["index:ref-o", "index:ref-p"]);
 
     let store = VortexRdfStore::from_built(arr).unwrap();
 
@@ -217,7 +213,7 @@ async fn test_dictionary_layout_secondary_index_compatibility() {
     let decoded: Vec<Quad> = store.quads().unwrap().try_collect().await.unwrap();
     assert_eq!(quad_strings(&decoded), quad_strings(&quads));
 
-    // Predicate-only match: routes through the code-based `_idx_p_*` index
+    // Predicate-only match: routes through the code-based `index:ref-p` child
     // (p0 occurs for i = 0,3,6,9).
     let p0 = NamedNode::new("http://example.org/p0").unwrap();
     let by_pred = store
@@ -232,7 +228,7 @@ async fn test_dictionary_layout_secondary_index_compatibility() {
             .all(|q| q.predicate == "http://example.org/p0")
     );
 
-    // Object-only match: routes through the code-based `_idx_o_*` index and
+    // Object-only match: routes through the code-based `index:ref-o` child and
     // decodes through the store-cached dictionary ("object 1" for i = 1,5,9).
     let o1 = Term::Literal(Literal::new_simple_literal("object 1"));
     let by_obj = store

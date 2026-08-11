@@ -29,25 +29,15 @@ async fn test_multiple_indexes_deduplicated() {
     .await
     .expect("build failed");
 
-    // Schema: 4 primary columns + 4 reference index columns, exactly once.
+    // The quad rows carry the four primary columns and nothing else; the
+    // index contributes its two children, each exactly once.
     if let vortex_array::dtype::DType::Struct(fields, _) = arr.array.dtype() {
         let names: Vec<&str> = fields.names().iter().map(|n| n.as_ref()).collect();
-        assert_eq!(
-            names,
-            [
-                "s",
-                "p",
-                "o",
-                "g",
-                "_idx_o_val",
-                "_idx_o_rid",
-                "_idx_p_val",
-                "_idx_p_rid"
-            ]
-        );
+        assert_eq!(names, ["s", "p", "o", "g"]);
     } else {
         panic!("expected StructArray dtype");
     }
+    assert_eq!(component_names(&arr), ["index:ref-o", "index:ref-p"]);
 
     // Index-routed matching still works.
     let store = VortexRdfStore::from_built(arr).unwrap();
@@ -60,8 +50,8 @@ async fn test_multiple_indexes_deduplicated() {
 }
 
 /// A store derived by matching keeps its indexes, because a view narrows a
-/// selection over the base rather than rewriting rows — so the `_idx_*_rid`
-/// ids still address the data. This is what lets a chained match keep
+/// selection over the base rather than rewriting rows — so the components'
+/// `rid` values still address the data. This is what lets a chained match keep
 /// routing through the index instead of degrading to a scan.
 #[tokio::test]
 async fn test_in_memory_derived_view_keeps_indexes() {
@@ -272,6 +262,59 @@ async fn run_compact_with_indexes_layout(layout: LayoutStrategy) {
             .unwrap(),
         6,
     );
+}
+
+/// Compacting down to nothing still builds the requested indexes: a store
+/// whose rows all went away keeps the roster (and, under the Dictionary
+/// layout, its children's code dtypes) a non-empty compaction would have
+/// given it, so the result is a usable indexed store rather than one that
+/// silently lost its indexes.
+async fn run_compact_to_empty_keeps_indexes(layout: LayoutStrategy) {
+    let quads = modular_quads(8, 3, 4);
+    let arr = build_array::<SortedInMemoryBuilder>(
+        quad_stream(quads.clone()),
+        layout,
+        vec![IndexType::SecondaryByReference],
+    )
+    .await
+    .unwrap();
+    let store = VortexRdfStore::from_built(arr).unwrap();
+
+    // A pattern nothing matches: the view is empty, and so is its compaction.
+    let absent = Term::Literal(Literal::new_simple_literal("no such object"));
+    let empty = store
+        .match_pattern(None, None, Some(&absent), None)
+        .await
+        .unwrap()
+        .compact_with_indexes(vec![IndexType::SecondaryByReference])
+        .await
+        .unwrap();
+    assert_eq!(empty.size().await.unwrap(), 0);
+    assert_eq!(empty.indexes(), &[IndexType::SecondaryByReference]);
+
+    // The empty children are still routable — a probe answers empty rather
+    // than erroring or falling back.
+    let object = Term::Literal(Literal::new_simple_literal("object 1"));
+    assert_eq!(
+        empty
+            .match_pattern(None, None, Some(&object), None)
+            .await
+            .unwrap()
+            .size()
+            .await
+            .unwrap(),
+        0,
+    );
+}
+
+#[tokio::test]
+async fn test_compact_to_empty_keeps_indexes_default() {
+    run_compact_to_empty_keeps_indexes(LayoutStrategy::Default).await;
+}
+
+#[tokio::test]
+async fn test_compact_to_empty_keeps_indexes_dictionary() {
+    run_compact_to_empty_keeps_indexes(LayoutStrategy::Dictionary).await;
 }
 
 #[tokio::test]
@@ -514,42 +557,31 @@ async fn run_index_matrix_cell<B: VortexArrayBuilder>(
 
     if let vortex_array::dtype::DType::Struct(fields, _) = arr.array.dtype() {
         let names: Vec<&str> = fields.names().iter().map(|n| n.as_ref()).collect();
-        let ref_cols = ["_idx_o_val", "_idx_o_rid", "_idx_p_val", "_idx_p_rid"];
-        let copy_cols = [
-            "_idx_posg_s",
-            "_idx_posg_p",
-            "_idx_posg_o",
-            "_idx_posg_g",
-            "_idx_posg_rid",
-            "_idx_ospg_s",
-            "_idx_ospg_p",
-            "_idx_ospg_o",
-            "_idx_ospg_g",
-            "_idx_ospg_rid",
-        ];
+        // Whatever the builder or layout, index data never rides in the quad
+        // rows: those carry the layout's primary columns and nothing else.
+        assert!(
+            names.iter().all(|n| !n.starts_with("_idx")),
+            "index columns leaked into the quad rows for builder={builder_name} layout={layout_name} indexes={index_name}",
+        );
         let expect_ref = indexes.contains(&IndexType::SecondaryByReference);
         let expect_copy = indexes.contains(&IndexType::SecondaryByCopy);
-        // A requested family rides in exactly one carrier: welded
-        // `_idx_*` row-space columns, or pre-split components beside
-        // a primary-only array (the out-of-core builder's native
-        // emission). Within the welded form, all-or-nothing.
-        let welded_ref = ref_cols.iter().all(|c| names.contains(c));
-        let welded_copy = copy_cols.iter().all(|c| names.contains(c));
+        // Each requested family contributes its children, all or nothing.
         let component_names: Vec<&str> = arr.components.iter().map(|c| c.name).collect();
-        let comp_ref = ["index:ref-o", "index:ref-p"]
-            .iter()
-            .all(|c| component_names.contains(c));
-        let comp_copy = ["index:posg", "index:ospg"]
-            .iter()
-            .all(|c| component_names.contains(c));
+        let has = |roster: [&str; 2]| {
+            let present = roster
+                .iter()
+                .filter(|c| component_names.contains(c))
+                .count();
+            assert!(
+                present == 0 || present == roster.len(),
+                "partial component roster {component_names:?} for builder={builder_name} layout={layout_name} indexes={index_name}",
+            );
+            present == roster.len()
+        };
         assert!(
-            (welded_ref || comp_ref) == expect_ref
-                && !(welded_ref && comp_ref)
-                && (welded_copy || comp_copy) == expect_copy
-                && !(welded_copy && comp_copy)
-                && ref_cols.iter().all(|c| names.contains(c) == welded_ref)
-                && copy_cols.iter().all(|c| names.contains(c) == welded_copy),
-            "index column mismatch for builder={builder_name} layout={layout_name} indexes={index_name}",
+            has(["index:ref-o", "index:ref-p"]) == expect_ref
+                && has(["index:posg", "index:ospg"]) == expect_copy,
+            "index component mismatch for builder={builder_name} layout={layout_name} indexes={index_name}",
         );
     } else {
         panic!(
