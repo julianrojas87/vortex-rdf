@@ -39,6 +39,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Build every store sorted, chosen by the target (core) ([`1573187`](https://github.com/vortex-rdf/vortex-rdf/commit/1573187e65fde559f1468bc9badc76cb642329cd) by @julianrojas87)
 - Add a light/dark theme switch to the dashboard (bench) ([`9628229`](https://github.com/vortex-rdf/vortex-rdf/commit/96282293e211f63835db6ed4a15e3d356e1132b3) by @julianrojas87)
 - Measure both cache regimes, on one dataset and one repetition count (bench) ([`d82a635`](https://github.com/vortex-rdf/vortex-rdf/commit/d82a635b3bbcfd2d0fc22a302abb470a10e6cb43) by julianrojas87)
+- Debug for the probe types, and docs for publication (encoded-search) ([`ca5e4c4`](https://github.com/vortex-rdf/vortex-rdf/commit/ca5e4c4954f8e23d4e71732565221fa636c34217) by julianrojas87)
 
 ### Changed
 
@@ -61,6 +62,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Drop "sorted" from every benchmark name and label (bench) ([`dd2564b`](https://github.com/vortex-rdf/vortex-rdf/commit/dd2564b88072bef20767989394b387e408d274b5) by @julianrojas87)
 - Locate reference-index runs through cached chunk probes (core) ([`b4a1e4f`](https://github.com/vortex-rdf/vortex-rdf/commit/b4a1e4f9d96f2f5399265c52f78cbd0e97bd16b0) by @julianrojas87)
 - Cold measures the first query, not the open before it (bench) ([`397f92c`](https://github.com/vortex-rdf/vortex-rdf/commit/397f92c3b70b0d8f274c0cee1186b958b2f97a69) by julianrojas87)
+- Make components the one form index data takes (core) ([`fb8a354`](https://github.com/vortex-rdf/vortex-rdf/commit/fb8a35487c004ea87e0dcbb068d17a57b59a57c5) by julianrojas87)
+- Rename the crate to vortex-rdf-encoded-search (encoded-search) ([`a3479cf`](https://github.com/vortex-rdf/vortex-rdf/commit/a3479cf86b1d6a4a6048bf4402273fee3d7ec806) by julianrojas87)
 
 ### Removed
 
