@@ -223,30 +223,36 @@ def run_query(a, args) -> dict:
         )
 
     # --- match: the same patterns, COLD ---
-    # A handle opened per iteration answering its first query, with the open
-    # inside the timed region -- what a short-lived process pays, and the arm
-    # that makes cache work visible (a warm-only tab reports a probe-cache
-    # improvement as noise).
+    # Each iteration answers the FIRST query on a freshly opened handle. The
+    # open runs in `setup`, which is outside the timed region, so this isolates
+    # what a query costs against empty caches rather than reporting that plus
+    # the open -- which is measured on its own as `open::<slug>` above.
     #
     # Gated on `has_distinct_open`: for a store that lives only in memory,
     # opening IS re-parsing the source, so its cold cell would be tens of
     # seconds of ingest sitting in a microsecond column. Those adapters simply
     # have no cold rows, and the dashboard leaves the cells blank.
     if a.has_distinct_open:
-        def cold(p):
-            h = a.open(artifact, args.triples)
-            a.count(h, p)
-            return h
+        # `setup` takes no arguments and `teardown` sees the timed call's
+        # return value, so the handle travels between them in a one-slot box.
+        box: list = []
+
+        def open_cold():
+            box.append(a.open(artifact, args.triples))
+
+        def drop_cold(_result):
+            a.dispose(box.pop())
 
         for pat in probes["triples"]:
             log(f"match {pat.name} (cold)…")
             measure(
                 f"{a.slug}::{pat.name}",
-                lambda p=pat: cold(p),
+                lambda p=pat: a.count(box[-1], p),
                 rows,
                 QUERY_ITERS,
                 QUERY_WARMUP,
-                teardown=lambda h: a.dispose(h),
+                setup=open_cold,
+                teardown=drop_cold,
                 regime="cold",
             )
 
@@ -257,18 +263,13 @@ def run_query(a, args) -> dict:
 
     if a.has_distinct_open:
         log("match full (cold)…")
-
-        def cold_full():
-            h = a.open(artifact, args.triples)
-            a.count(h, full)
-            return h
-
         measure(
             f"{a.slug}::full",
-            cold_full,
+            lambda: a.count(box[-1], full),
             rows,
             FULL_SCAN_ITERS,
-            teardown=lambda h: a.dispose(h),
+            setup=open_cold,
+            teardown=drop_cold,
             regime="cold",
         )
     a.dispose(handle)
@@ -298,20 +299,24 @@ def run_query(a, args) -> dict:
                 regime="warm",
             )
         if a.has_distinct_open:
-            def cold_quad(p):
-                h = a.open(quads_artifact, args.quads)
-                a.count(h, p)
-                return h
+            qbox: list = []
+
+            def open_cold_quad():
+                qbox.append(a.open(quads_artifact, args.quads))
+
+            def drop_cold_quad(_result):
+                a.dispose(qbox.pop())
 
             for pat in quad_probes:
                 log(f"match {pat.name} (cold)…")
                 measure(
                     f"{a.slug}::{pat.name}",
-                    lambda p=pat: cold_quad(p),
+                    lambda p=pat: a.count(qbox[-1], p),
                     rows,
                     QUERY_ITERS,
                     QUERY_WARMUP,
-                    teardown=lambda h: a.dispose(h),
+                    setup=open_cold_quad,
+                    teardown=drop_cold_quad,
                     regime="cold",
                 )
         a.dispose(qh)

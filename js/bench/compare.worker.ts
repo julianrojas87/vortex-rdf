@@ -147,22 +147,41 @@ async function runQuery(a: StoreAdapter): Promise<Row[]> {
  * of everything that ran before it.
  */
 /**
- * The cold query regime, in a process of its own.
+ * The cold query regime, plus the open it deliberately excludes — in a process
+ * of its own.
  *
- * Every iteration adopts the snapshot into a fresh store and answers one query
- * on it. That is unavoidably expensive in a way that does not come back: the
- * first query on an adopted store retains its whole buffer past `free()`
- * (measured at D=128: +32 MB per iteration, and flat when the query is
- * skipped), and wasm linear memory never returns to the OS. Sharing a process
- * with the warm phase therefore piled a live store plus every adoption into one
- * address space, and the wasm allocator eventually trapped ("unreachable").
+ * Each iteration answers the FIRST query on a freshly adopted store. The adopt
+ * happens in tinybench's `beforeEach`, which is untimed, so the column isolates
+ * what a query costs against empty caches rather than reporting that plus the
+ * cost of building a store. Opening is measured separately as `open::<slug>`,
+ * mirroring the Python tab, so the two are attributable on their own.
  *
- * Here the built store is freed the moment its snapshot exists, so the whole
- * budget belongs to the measurements.
+ * The process isolation is not stylistic. The first query on an adopted store
+ * retains its whole buffer past `free()` (measured at D=128: +32 MB per
+ * iteration, and exactly flat when the query is skipped), and wasm linear
+ * memory never returns to the OS. Sharing a process with the warm phase piled a
+ * live 2M-quad store plus every adoption into one address space until the wasm
+ * allocator trapped ("unreachable"). Here the built store is freed the moment
+ * its snapshot exists, so the whole budget belongs to the measurements.
  */
 async function runQueryCold(a: StoreAdapter): Promise<Row[]> {
     const rows: Row[] = [];
     if (!a.snapshot || !a.open) return rows; // no persistent form, no cold rows
+
+    // One dataset's cold pass: adopt per iteration (untimed), query (timed).
+    const coldPass = async (
+        phase: string, snap: unknown, probes: Pat[],
+    ): Promise<void> => {
+        await bench(phase, rows, COLD_QUERY_OPTS, (b) => {
+            for (const p of probes) {
+                let h: unknown;
+                b.add(`${a.slug}::${p.name}`, async () => { await a.countMatch(h, p); }, {
+                    beforeEach: async () => { h = await a.open!(snap); },
+                    afterEach: () => { a.dispose?.(h); h = undefined; },
+                });
+            }
+        }, 'cold');
+    };
 
     console.log(`[${a.label}] query cold (triples)…`);
     const triples = genDataset(N_TRIPLES);
@@ -171,13 +190,19 @@ async function runQueryCold(a: StoreAdapter): Promise<Row[]> {
     const tSnap = await a.snapshot(th);
     reclaim(a, th);
     th = null;
-    await bench('query_triples_cold', rows, COLD_QUERY_OPTS, (b) => {
-        for (const p of tProbes.triples) b.add(`${a.slug}::${p.name}`, async () => {
-            const h = await a.open!(tSnap);
-            await a.countMatch(h, p);
-            a.dispose?.(h);
+
+    // Open, on its own: adopting the snapshot into a queryable store, with no
+    // query behind it. The Python tab has measured this as `open::<slug>` all
+    // along; without it the cold column's context — how much of a cold start is
+    // the open — is not on the page.
+    await bench('open', rows, HEAVY_OPTS, (b) => {
+        let h: unknown;
+        b.add(`open::${a.slug}`, async () => { h = await a.open!(tSnap); }, {
+            afterEach: () => { a.dispose?.(h); h = undefined; },
         });
-    }, 'cold');
+    });
+
+    await coldPass('query_triples_cold', tSnap, tProbes.triples);
 
     console.log(`[${a.label}] query cold (quads)…`);
     const quads = genDataset(N_QUADS, { graphs: 8 });
@@ -186,13 +211,7 @@ async function runQueryCold(a: StoreAdapter): Promise<Row[]> {
     const qSnap = await a.snapshot(qh);
     reclaim(a, qh);
     qh = null;
-    await bench('query_quads_cold', rows, COLD_QUERY_OPTS, (b) => {
-        for (const p of qProbes.quads) b.add(`${a.slug}::${p.name}`, async () => {
-            const h = await a.open!(qSnap);
-            await a.countMatch(h, p);
-            a.dispose?.(h);
-        });
-    }, 'cold');
+    await coldPass('query_quads_cold', qSnap, qProbes.quads);
 
     return rows;
 }
@@ -208,10 +227,10 @@ async function runFullScan(a: StoreAdapter): Promise<Row[]> {
     if (a.snapshot && a.open) {
         const snap = await a.snapshot(h);
         await bench('full_cold', rows, FULL_SCAN_OPTS, (b) => {
-            b.add(`${a.slug}::full`, async () => {
-                const fresh = await a.open!(snap);
-                await a.countMatch(fresh, FULL_SCAN_PATTERN);
-                a.dispose?.(fresh);
+            let fresh: unknown;
+            b.add(`${a.slug}::full`, async () => { await a.countMatch(fresh, FULL_SCAN_PATTERN); }, {
+                beforeEach: async () => { fresh = await a.open!(snap); },
+                afterEach: () => { a.dispose?.(fresh); fresh = undefined; },
             });
         }, 'cold');
     }

@@ -708,11 +708,12 @@ const JS_PATTERNS = ["S","P","O","PO","SPO","full","G","SPOG"];
 
 function get(map, id){
   const r = map.get(id);
-  // A missing `#cold` id is usually intentional, not a data problem: a store
-  // with no persistent form has nothing to reopen, so it has no cold row and
-  // the cell prints "—". Warn only for the ids a run is actually expected to
-  // produce.
-  if(!r && !String(id).endsWith("#cold")) console.warn("missing bench id", id);
+  // Two id shapes are legitimately absent rather than missing data, both for
+  // the same reason — a store with no persistent form has nothing to reopen,
+  // so it has neither a cold row (`…#cold`) nor an open row (`open::…`), and
+  // the cell prints "—". Warn only for the ids a run is expected to produce.
+  const optional = String(id).endsWith("#cold") || String(id).startsWith("open::");
+  if(!r && !optional) console.warn("missing bench id", id);
   return r;
 }
 function fmtRatio(a,b){ return (a/b).toFixed(2) + "×"; }
@@ -873,7 +874,7 @@ function lazyMatchMatrixRows(){
 
 const matchMatrixPanel = {
   title:"Match matrix: index × layout × source, per pattern and cache regime",
-  note:"Median <code>match_pattern</code> + materialization time, in both cache regimes. <b>Cold</b> opens a store per iteration and answers its first query, with the open inside the measurement — what a short-lived process pays. <b>Warm</b> reuses one store, so probes are resolved and caches populated. Rows are grouped by secondary-index configuration; within a group only layout and source vary. <b>Green</b> marks the fastest variant in each leaf column; the grey multiplier is the slowdown vs that column's best.",
+  note:"Median <code>match_pattern</code> + materialization time, in both cache regimes. <b>Cold</b> answers the first query on a freshly opened store — empty probe, segment and dictionary caches. <b>Warm</b> reuses one store, so those caches are populated. Opening is <i>not</i> inside either measurement: it is its own row (<code>open_file</code>), so a cold number is the query's cost against cold caches rather than that plus a store construction. Rows are grouped by secondary-index configuration; within a group only layout and source vary. <b>Green</b> marks the fastest variant in each leaf column; the grey multiplier is the slowdown vs that column's best.",
   wide:true, rowHeaders:["Index","Layout","Source"],
   columns:RUST_PATTERNS, subColumns:["cold","warm"],
   rows: matchMatrixRows(""),
@@ -1118,16 +1119,16 @@ function renderJs(){
 
   // Ingest — every adapter, fastest first
   renderMatrixPanel(document.getElementById("js-ingest-panels"), {
-    title:"Ingest (bulk build)",
-    note:"Time to build a queryable store from the generated triples, fastest first. Green = fastest store; the multiplier is the slowdown vs it.",
-    rowHeaders:["Store"], columns:["Ingest"], sortByColumn:0,
-    rows: JS_ADAPTERS.map(a => ({ labels:[a.label], ids:[`ingest::${a.slug}`] })),
+    title:"Ingest and open",
+    note:"<b>Ingest</b>: time to build a queryable store from the generated triples, fastest first. <b>Open</b>: adopting an already-built store's bytes, with no query behind it — the other half of a cold start, and the cost the cold query columns deliberately exclude. Only the stores with a persistent form have one; the others must rebuild from quads, which is the Ingest column. Green = fastest per column.",
+    rowHeaders:["Store"], columns:["Ingest","Open"], sortByColumn:0,
+    rows: JS_ADAPTERS.map(a => ({ labels:[a.label], ids:[`ingest::${a.slug}`, `open::${a.slug}`] })),
   }, jsById);
 
   // Query — cross-library, per routing shape
   renderMatrixPanel(document.getElementById("js-query-panels"), {
     title:"Cross-library match, by routing shape and cache regime",
-    note:"Four Vortex build variants vs rdf-stores (both index configs) vs oxigraph. <b>Warm</b> is a repeat query on an open store; <b>cold</b> opens one per iteration and answers its first query. Only stores with a persistent form have a cold cell — for an in-memory library, opening IS re-parsing the source, which would put tens of seconds in a microsecond column. Green = fastest store in each leaf column.",
+    note:"Four Vortex build variants vs rdf-stores (both index configs) vs oxigraph. <b>Warm</b> is a repeat query on an open store; <b>cold</b> is the first query on a freshly opened one, against empty caches. The open itself is excluded from both and measured separately (<code>open::&lt;store&gt;</code>). Only stores with a persistent form have a cold cell — for an in-memory library, opening IS re-parsing the source, which would put tens of seconds in a microsecond column. Green = fastest store in each leaf column.",
     wide:true, rowHeaders:["Store"], columns:JS_PATTERNS, subColumns:["cold","warm"],
     rows: CROSS_LIB_SERIES.map(a => ({ labels:[a.label], ids: coldWarmIds(a.slug, JS_PATTERNS),
       break: a.slug === "rdfstores_default" })),
@@ -1241,7 +1242,7 @@ function renderPy(){
   renderMatrixPanel(document.getElementById("py-query-panels"), {
     title:"Match by pattern and cache regime",
     wide:true, rowHeaders:["Configuration"], columns:PY_PATTERNS, subColumns:["cold","warm"],
-    note:"Median time to resolve each pattern and count the results. <b>Warm</b> is a repeat query on an open store; <b>cold</b> reopens the artifact per iteration and answers its first query, the open included in the measurement. Only the configurations with a real artifact to reopen have a cold cell — for an in-memory library, opening IS re-parsing the source. lightrdf re-parses the whole file per call, so its row is flat across selectivity — that flatness is what having no index costs.",
+    note:"Median time to resolve each pattern and count the results. <b>Warm</b> is a repeat query on an open store; <b>cold</b> is the first query on a freshly reopened artifact, against empty caches. The reopen is excluded from the measurement and reported separately (<code>open::&lt;store&gt;</code>). Only the configurations with a real artifact to reopen have a cold cell — for an in-memory library, opening IS re-parsing the source. lightrdf re-parses the whole file per call, so its row is flat across selectivity — that flatness is what having no index costs.",
     rows: PY_ADAPTERS.map(a => ({ labels:[a.label], ids:coldWarmIds(a.slug, PY_PATTERNS) })),
   }, pyById);
 

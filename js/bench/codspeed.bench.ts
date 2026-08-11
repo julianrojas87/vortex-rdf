@@ -191,20 +191,27 @@ async function benchQuery(triples: Quad[], quads: Quad[]): Promise<void> {
                 await th.getQuads(FULL_SCAN_PATTERN.s, FULL_SCAN_PATTERN.p, FULL_SCAN_PATTERN.o, FULL_SCAN_PATTERN.g);
             });
         });
-        // Cold: adopt the serialized store and answer one query on it, the way
-        // a freshly loaded page does — nothing decoded, no probe resolved, no
-        // dictionary memo. Same regime the Rust suite's `match_cold_*` groups
-        // measure. The handle is freed inside the timed region because leaving
-        // it to the GC would grow wasm linear memory across iterations, and
-        // wasm never returns it.
+        // Cold: the FIRST query on a freshly adopted store — nothing decoded, no
+        // probe resolved, no dictionary memo — the regime the Rust suite's
+        // `match_cold_*` groups measure. The adopt runs in `beforeEach`, which
+        // tinybench does not time (and which CodSpeed likewise excludes from
+        // the measured invocation), so this isolates the query against empty
+        // caches; adopting is measured on its own as `open::<config>` below.
+        // The handle is freed in `afterEach` rather than left to the GC: wasm
+        // linear memory never comes back.
         const tbytes = await th.toBytes();
         await runGroup(READ_OPTS, (b) => {
-            for (const p of TRIPLE_PATTERNS)
-                b.add(`query_cold_${v.slug}::${p.name}`, async () => {
-                    const h = await VortexRdfStore.fromBytes(tbytes);
-                    await h.getQuads(p.s, p.p, p.o, p.g);
-                    freeWasm(h);
+            let h: VortexRdfStore | undefined;
+            b.add(`open::${v.slug}`, async () => { h = await VortexRdfStore.fromBytes(tbytes); }, {
+                afterEach: () => { if (h) freeWasm(h); h = undefined; },
+            });
+            for (const p of TRIPLE_PATTERNS) {
+                let q: VortexRdfStore | undefined;
+                b.add(`query_cold_${v.slug}::${p.name}`, async () => { await q!.getQuads(p.s, p.p, p.o, p.g); }, {
+                    beforeEach: async () => { q = await VortexRdfStore.fromBytes(tbytes); },
+                    afterEach: () => { if (q) freeWasm(q); q = undefined; },
                 });
+            }
         });
         freeWasm(th);
 
@@ -215,12 +222,13 @@ async function benchQuery(triples: Quad[], quads: Quad[]): Promise<void> {
         });
         const qbytes = await qh.toBytes();
         await runGroup(READ_OPTS, (b) => {
-            for (const p of QUAD_PATTERNS)
-                b.add(`query_cold_${v.slug}::${p.name}`, async () => {
-                    const h = await VortexRdfStore.fromBytes(qbytes);
-                    await h.getQuads(p.s, p.p, p.o, p.g);
-                    freeWasm(h);
+            for (const p of QUAD_PATTERNS) {
+                let q: VortexRdfStore | undefined;
+                b.add(`query_cold_${v.slug}::${p.name}`, async () => { await q!.getQuads(p.s, p.p, p.o, p.g); }, {
+                    beforeEach: async () => { q = await VortexRdfStore.fromBytes(qbytes); },
+                    afterEach: () => { if (q) freeWasm(q); q = undefined; },
                 });
+            }
         });
         freeWasm(qh);
     }

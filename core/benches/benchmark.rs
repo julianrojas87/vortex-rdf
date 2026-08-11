@@ -20,10 +20,11 @@
 //!   index-decline routing is exactly where regressions have hidden, so the
 //!   matrix is kept whole.
 //!
-//!   The regime axis is `match_cold_*` (a store opened per iteration, the open
-//!   inside the timed region) against `match_warm_*` (one store, reused). Both
-//!   are needed: a cold-only suite cannot see caching work at all, and reports
-//!   an improvement that only a resolved probe cache delivers as noise.
+//!   The regime axis is `match_cold_*` (each sample answers the first query on a
+//!   freshly opened store) against `match_warm_*` (one store, reused). Both are
+//!   needed: a cold-only suite cannot see caching work at all, and reports an
+//!   improvement that only a resolved probe cache delivers as noise. Opening is
+//!   never inside either measurement — it is its own benchmark (`open_file`).
 //! * **Decode/load (Group 3) and dictionary residency (Group 4)** sweep only
 //!   the axis each path actually branches on.
 //!
@@ -165,16 +166,19 @@ fn serialize(bencher: divan::Bencher, cfg: &SerCfg) {
 // query-indistinguishable from SortedStream (identical stamped columns).
 // ══════════════════════════════════════════════════════════════════════════
 
-/// Run one match config across a pattern, COLD: a store opened per iteration
-/// answering its first query, with the open inside the timed region. This is
-/// what a short-lived process pays — no chunk probes resolved, no segment
-/// cache, no dictionary memos, and (for `Source::InMemory`) component adoption
-/// not yet run.
+/// Run one match config across a pattern, COLD: each sample gets a store
+/// opened fresh and answers its FIRST query on it — no chunk probes resolved,
+/// no segment cache, no dictionary memos, and (for `Source::InMemory`) no
+/// component adoption yet run.
 ///
-/// The artifact itself is *not* built here: `make_store` reads a cached
-/// `BuiltArray` or an already-written file, and the caches are primed below
-/// before the first sample so no ingest lands inside a measurement. The OS
-/// page cache stays warm too — this is process-level cold, not storage-level.
+/// The open is deliberately outside the measurement (`with_inputs` is untimed):
+/// what this arm isolates is the cost of a query against empty caches, not the
+/// cost of constructing a store. Opening is its own benchmark — `open_file`
+/// here, `open::<slug>` on the comparative tabs — so the two costs stay
+/// separately attributable instead of one column reporting their sum.
+///
+/// This is process-level cold, not storage-level: the OS page cache stays warm,
+/// and dropping it would need root.
 fn run_match_cold(
     bencher: divan::Bencher,
     layout: Layout,
@@ -186,20 +190,18 @@ fn run_match_cold(
     // does): its ~4 String allocations per iteration are fixed setup, and at
     // the lazy suite's ~31 µs match floor they are visible noise.
     let (s, p, o, g) = terms_for(pattern);
-    // Prime the ingest/file caches so the first sample times an open, not a
-    // build.
-    drop(make_store(source, layout, index, bench_size()));
-    bencher.bench(|| {
-        let store = make_store(source, layout, index, bench_size());
-        rt().block_on(async {
-            let matched = store
-                .match_pattern(s.as_ref(), p.as_ref(), o.as_ref(), g.as_ref())
-                .await
-                .expect("match_pattern failed");
-            let quads = matched.quads_vec().await.expect("execute match");
-            black_box(quads)
-        })
-    });
+    bencher
+        .with_inputs(|| make_store(source, layout, index, bench_size()))
+        .bench_refs(|store| {
+            rt().block_on(async {
+                let matched = store
+                    .match_pattern(s.as_ref(), p.as_ref(), o.as_ref(), g.as_ref())
+                    .await
+                    .expect("match_pattern failed");
+                let quads = matched.quads_vec().await.expect("execute match");
+                black_box(quads)
+            })
+        });
 }
 
 /// Run one match config across a pattern, WARM: one store, reused across every

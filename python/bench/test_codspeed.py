@@ -201,12 +201,20 @@ def test_query_warm_quads(benchmark, stores, variant, pattern):
     benchmark(lambda: store.get_quads(pattern.s, pattern.p, pattern.o, pattern.g))
 
 
-def _cold_query(path: str, pattern: Pat) -> int:
-    """Open the artifact and answer one query on it — the cold regime, with the
-    open inside the measured region. The counterpart of the Rust suite's
-    `match_cold_*` groups and the JS suite's `query_cold_*` tasks."""
+def _cold_query(benchmark, path: str, pattern: Pat) -> None:
+    """The FIRST query on a freshly opened store — nothing decoded, no probe
+    resolved, no dictionary memo. The counterpart of the Rust suite's
+    `match_cold_*` groups and the JS suite's `query_cold_*` tasks.
+
+    The open is outside the measured callable, so this isolates the query
+    against empty caches rather than reporting that plus the open; opening is
+    its own task (`test_open`). That works because instrumentation measures a
+    single invocation — which is genuinely the store's first query. Under a
+    harness that called the function repeatedly the later calls would be warm,
+    so read this task only from an instrumented run.
+    """
     store = VortexRdfStore(path)
-    return len(store.get_quads(pattern.s, pattern.p, pattern.o, pattern.g))
+    benchmark(lambda: store.get_quads(pattern.s, pattern.p, pattern.o, pattern.g))
 
 
 @pytest.mark.benchmark
@@ -215,16 +223,24 @@ def _cold_query(path: str, pattern: Pat) -> int:
     "pattern", TRIPLE_PATTERNS + [FULL_SCAN_PATTERN], ids=lambda p: p.name
 )
 def test_query_cold_triples(benchmark, store_paths, variant, pattern):
-    path = store_paths[f"triples::{variant}"]
-    benchmark(lambda: _cold_query(path, pattern))
+    _cold_query(benchmark, store_paths[f"triples::{variant}"], pattern)
 
 
 @pytest.mark.benchmark
 @pytest.mark.parametrize("variant", QUERY_VARIANTS)
 @pytest.mark.parametrize("pattern", QUAD_PATTERNS, ids=lambda p: p.name)
 def test_query_cold_quads(benchmark, store_paths, variant, pattern):
-    path = store_paths[f"quads::{variant}"]
-    benchmark(lambda: _cold_query(path, pattern))
+    _cold_query(benchmark, store_paths[f"quads::{variant}"], pattern)
+
+
+@pytest.mark.benchmark
+@pytest.mark.parametrize("variant", QUERY_VARIANTS)
+def test_open(benchmark, store_paths, variant):
+    """Opening the artifact into a queryable store, with no query behind it —
+    the other half of a cold start, so the cold query tasks above can be read
+    without their number silently containing this one."""
+    path = store_paths[f"triples::{variant}"]
+    benchmark(lambda: VortexRdfStore(path))
 
 
 # ─── readpath::<variant> ────────────────────────────────────────────────────
