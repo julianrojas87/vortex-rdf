@@ -15,9 +15,9 @@ use vortex_array::session::ArraySession;
 use vortex_array::{ArrayRef, ExecutionCtx, IntoArray, VortexSessionExecute};
 use vortex_btrblocks::schemes::integer;
 use vortex_btrblocks::{BtrBlocksCompressorBuilder, Scheme};
-use vortex_encoded_search::{NodeKind, SortedProbe};
 use vortex_io::session::RuntimeSession;
 use vortex_layout::session::LayoutSession;
+use vortex_rdf_encoded_search::{NodeKind, SortedProbe};
 use vortex_sequence::Sequence;
 use vortex_session::VortexSession;
 

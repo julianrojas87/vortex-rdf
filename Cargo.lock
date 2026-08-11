@@ -3197,27 +3197,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "vortex-encoded-search"
-version = "0.5.0"
-dependencies = [
- "codspeed-divan-compat",
- "futures",
- "self_cell",
- "tokio",
- "vortex-array",
- "vortex-btrblocks",
- "vortex-buffer",
- "vortex-error",
- "vortex-fastlanes",
- "vortex-file",
- "vortex-io",
- "vortex-layout",
- "vortex-runend",
- "vortex-sequence",
- "vortex-session",
-]
-
-[[package]]
 name = "vortex-error"
 version = "0.83.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3525,16 +3504,37 @@ dependencies = [
  "vortex",
  "vortex-array",
  "vortex-buffer",
- "vortex-encoded-search",
  "vortex-error",
  "vortex-file",
  "vortex-fsst",
  "vortex-io",
  "vortex-layout",
  "vortex-mask",
+ "vortex-rdf-encoded-search",
  "vortex-scan",
  "vortex-session",
  "web-time",
+]
+
+[[package]]
+name = "vortex-rdf-encoded-search"
+version = "0.5.0"
+dependencies = [
+ "codspeed-divan-compat",
+ "futures",
+ "self_cell",
+ "tokio",
+ "vortex-array",
+ "vortex-btrblocks",
+ "vortex-buffer",
+ "vortex-error",
+ "vortex-fastlanes",
+ "vortex-file",
+ "vortex-io",
+ "vortex-layout",
+ "vortex-runend",
+ "vortex-sequence",
+ "vortex-session",
 ]
 
 [[package]]

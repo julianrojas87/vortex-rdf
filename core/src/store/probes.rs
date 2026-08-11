@@ -11,7 +11,7 @@ use std::sync::{Arc, OnceLock};
 
 use vortex_array::ArrayRef;
 use vortex_array::dtype::FieldName;
-use vortex_encoded_search::OwnedSortedProbe;
+use vortex_rdf_encoded_search::OwnedSortedProbe;
 
 /// Lazily-resolved probes for one base array's struct children, shared
 /// across the views over that base (`Arc` in `QuadsSource::InMemory`).

@@ -383,7 +383,7 @@ impl IndexComponent {
     pub(crate) fn probe(
         &self,
         column: &str,
-    ) -> Option<Arc<vortex_encoded_search::OwnedSortedProbe>> {
+    ) -> Option<Arc<vortex_rdf_encoded_search::OwnedSortedProbe>> {
         let rows = self.rows().ok()?.clone().into_array();
         self.probes.by_name(&rows, column).cloned()
     }

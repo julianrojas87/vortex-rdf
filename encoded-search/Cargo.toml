@@ -1,5 +1,5 @@
 [package]
-name = "vortex-encoded-search"
+name = "vortex-rdf-encoded-search"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -7,6 +7,7 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Bounds search and point access over compressed Vortex arrays without decoding"
+readme = "README.md"
 keywords = ["vortex", "columnar", "binary-search", "compression"]
 categories = ["encoding", "data-structures"]
 

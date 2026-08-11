@@ -127,7 +127,7 @@ pub(crate) fn search_sorted_bounds(
     if arr.dtype().is_unsigned_int()
         && !arr.dtype().is_nullable()
         && let Ok(needle) = u64::try_from(probe)
-        && let Some(encoded) = vortex_encoded_search::SortedProbe::resolve(arr)
+        && let Some(encoded) = vortex_rdf_encoded_search::SortedProbe::resolve(arr)
     {
         return Ok(encoded.bounds(needle));
     }
@@ -185,7 +185,7 @@ pub(crate) fn with_searchable_int_children(rows: ArrayRef) -> Result<ArrayRef> {
             .map_err(VortexRdfError::Vortex)?;
         let decode = child.dtype().is_int()
             && !child.dtype().is_nullable()
-            && vortex_encoded_search::SortedProbe::resolve(child).is_none();
+            && vortex_rdf_encoded_search::SortedProbe::resolve(child).is_none();
         if !decode {
             children.push(child.clone());
             continue;

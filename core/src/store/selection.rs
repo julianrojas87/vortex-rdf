@@ -360,7 +360,7 @@ pub(crate) fn gather_by_point_reads(
     use vortex_array::arrays::struct_::StructArrayExt;
     use vortex_array::arrays::{Struct, StructArray};
     use vortex_array::dtype::PType;
-    use vortex_encoded_search::SortedProbe;
+    use vortex_rdf_encoded_search::SortedProbe;
 
     let live: Vec<usize> = match selection {
         RowSelection::All => return Ok(None),

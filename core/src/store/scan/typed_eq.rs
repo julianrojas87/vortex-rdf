@@ -52,7 +52,7 @@ impl Needle {
 /// and the caller falls back to the general mask-scan pipeline.
 enum TypedEq<'a> {
     Code(PrimitiveArray, u32),
-    CodeProbe(vortex_encoded_search::SortedProbe<'a>, u32),
+    CodeProbe(vortex_rdf_encoded_search::SortedProbe<'a>, u32),
     Str(StrEq<'a>),
 }
 
@@ -109,7 +109,7 @@ impl<'a> TypedEq<'a> {
                 if let Some(prim) = canonical {
                     return Some(TypedEq::Code(prim, *code));
                 }
-                let probe = vortex_encoded_search::SortedProbe::resolve(col)?;
+                let probe = vortex_rdf_encoded_search::SortedProbe::resolve(col)?;
                 Some(TypedEq::CodeProbe(probe, *code))
             }
             Needle::Str(s) => {

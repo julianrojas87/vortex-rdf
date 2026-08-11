@@ -8,10 +8,10 @@ use vortex_array::session::ArraySession;
 use vortex_array::stream::ArrayStreamAdapter;
 use vortex_array::validity::Validity;
 use vortex_array::{ArrayRef, IntoArray};
-use vortex_encoded_search::ColumnChunks;
 use vortex_file::{OpenOptionsSessionExt as _, WriteOptionsSessionExt as _};
 use vortex_io::session::RuntimeSession;
 use vortex_layout::session::LayoutSession;
+use vortex_rdf_encoded_search::ColumnChunks;
 use vortex_session::VortexSession;
 
 fn session() -> VortexSession {

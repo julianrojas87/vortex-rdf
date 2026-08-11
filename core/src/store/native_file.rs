@@ -52,8 +52,10 @@ pub(crate) struct NativeStoreFile {
 
 /// Memoized per-column chunk-probe handles; see
 /// [`NativeStoreFile::column_chunks`].
-type ColumnChunksMemo =
-    std::collections::HashMap<String, Option<std::sync::Arc<vortex_encoded_search::ColumnChunks>>>;
+type ColumnChunksMemo = std::collections::HashMap<
+    String,
+    Option<std::sync::Arc<vortex_rdf_encoded_search::ColumnChunks>>,
+>;
 
 /// Entry cap on [`NativeStoreFile::pruning_envelopes`] — sized for a query
 /// workload's distinct filter shapes, not for arbitrary term churn.
@@ -99,7 +101,7 @@ impl NativeStoreFile {
     /// child's layout shape declines — callers then keep the scan path.
     pub(crate) fn sorted_subject_chunks(
         &self,
-    ) -> Option<std::sync::Arc<vortex_encoded_search::ColumnChunks>> {
+    ) -> Option<std::sync::Arc<vortex_rdf_encoded_search::ColumnChunks>> {
         self.column_chunks(crate::store::schema::COL_S)
     }
 
@@ -109,13 +111,13 @@ impl NativeStoreFile {
     pub(crate) fn column_chunks(
         &self,
         column: &str,
-    ) -> Option<std::sync::Arc<vortex_encoded_search::ColumnChunks>> {
+    ) -> Option<std::sync::Arc<vortex_rdf_encoded_search::ColumnChunks>> {
         let mut memo = self.column_chunks.lock().expect("column chunks lock");
         memo.entry(column.to_owned())
             .or_insert_with(|| {
                 let typed = self.file.footer().layout().as_::<RdfStoreLayoutVTable>();
                 let quads = typed.child(0).ok()?;
-                vortex_encoded_search::ColumnChunks::from_struct_layout(&quads, column)
+                vortex_rdf_encoded_search::ColumnChunks::from_struct_layout(&quads, column)
                     .map(std::sync::Arc::new)
             })
             .clone()
@@ -129,7 +131,7 @@ impl NativeStoreFile {
         &self,
         component: &str,
         column: &str,
-    ) -> Option<std::sync::Arc<vortex_encoded_search::ColumnChunks>> {
+    ) -> Option<std::sync::Arc<vortex_rdf_encoded_search::ColumnChunks>> {
         // The `/` separator cannot appear in a bare quad column name, so the
         // composite keys share the quad columns' memo without collisions.
         let key = format!("{component}/{column}");
@@ -139,7 +141,7 @@ impl NativeStoreFile {
                 let index = self.components.iter().position(|c| c.name == component)?;
                 let typed = self.file.footer().layout().as_::<RdfStoreLayoutVTable>();
                 let child = typed.child(index + 1).ok()?;
-                vortex_encoded_search::ColumnChunks::from_struct_layout(&child, column)
+                vortex_rdf_encoded_search::ColumnChunks::from_struct_layout(&child, column)
                     .map(std::sync::Arc::new)
             })
             .clone()

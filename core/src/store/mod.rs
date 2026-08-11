@@ -605,7 +605,7 @@ fn debug_sorted_children_probe_resolvable(struct_arr: &StructArray) -> bool {
             return false;
         };
         !array::column_is_sorted(child)
-            || vortex_encoded_search::SortedProbe::resolve(child).is_some()
+            || vortex_rdf_encoded_search::SortedProbe::resolve(child).is_some()
     })
 }
 

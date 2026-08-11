@@ -25,7 +25,7 @@ vortex-file.workspace = true
 vortex-scan.workspace = true
 vortex-buffer.workspace = true
 # Encoding-aware bounds search over compressed columns (sibling workspace crate).
-vortex-encoded-search.workspace = true
+vortex-rdf-encoded-search.workspace = true
 
 tokio.workspace = true
 
@@ -61,7 +61,7 @@ file-io = [
     "vortex/files",
     "vortex-file/tokio",
     "tokio/fs",
-    "vortex-encoded-search/layout",
+    "vortex-rdf-encoded-search/layout",
 ]
 # Opt-in: let a binary that depends on this crate have it install mimalloc as
 # the process's global allocator, instead of picking one itself.

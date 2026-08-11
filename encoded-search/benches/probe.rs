@@ -16,9 +16,9 @@ use vortex_array::search_sorted::{SearchSorted, SearchSortedSide};
 use vortex_array::session::ArraySession;
 use vortex_array::{ArrayRef, IntoArray, VortexSessionExecute};
 use vortex_btrblocks::BtrBlocksCompressorBuilder;
-use vortex_encoded_search::SortedProbe;
 use vortex_io::session::RuntimeSession;
 use vortex_layout::session::LayoutSession;
+use vortex_rdf_encoded_search::SortedProbe;
 use vortex_session::VortexSession;
 
 const N: usize = 2_097_152;
