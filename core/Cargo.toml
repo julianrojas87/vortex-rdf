@@ -74,6 +74,14 @@ clap = ["dep:clap"]
 
 [dev-dependencies]
 divan = { version = "5.0.1", package = "codspeed-divan-compat" }
+# `rocksdb` adds the file-backed `Store::open*` constructors the comparative
+# bench's oxigraph (rocksdb) adapter uses; `Store::new` stays purely in-memory.
+oxigraph = { version = "0.5.9", default-features = false, features = ["rocksdb"] }
+sophia = "0.10"
+# `nt` is what makes hdt buildable from N-Triples rather than read-only.
+hdt = { version = "0.7", features = ["nt"] }
+serde_json = "1.0"
+futures = { workspace = true }
 # RAII temp dirs for the file-io tests: cleanup must survive a panicking
 # assertion, which hand-rolled `remove_file` tails never did.
 tempfile = "3"
@@ -84,10 +92,12 @@ name = "benchmark"
 harness = false
 required-features = ["file-io"]
 
-# Local-only lazy-match matrix (match_pattern without materialization).
-# CodSpeed CI runs `cargo codspeed run --bench benchmark`, so this target is
-# never uploaded; it feeds the dashboard's lazy-match table.
 [[bench]]
 name = "match_lazy"
+harness = false
+required-features = ["file-io"]
+
+[[bench]]
+name = "compare"
 harness = false
 required-features = ["file-io"]
