@@ -50,6 +50,9 @@ jobs:
         run: |
           cargo bench --bench benchmark | tee bench_output.txt
           cargo bench --bench match_lazy | tee -a bench_output.txt
+          # Cross-library comparison (oxigraph, sophia, hdt). Writes its own
+          # JSON rather than divan text, so it is not appended above.
+          cargo bench --bench compare
 
       - name: Setup Node
         uses: actions/setup-node@v7
@@ -59,9 +62,13 @@ jobs:
           cache-dependency-path: js/package-lock.json
 
       # Build the wasm bindings and run the JavaScript comparative benchmark
-      # (VortexRdfStore variants vs rdf-stores.js vs oxigraph). Wall-clock via
-      # tinybench; deliberately NOT uploaded to CodSpeed. Same full scale as a
-      # local run (rdf-stores' own default: BENCH_DIM=128, 2,097,152 triples).
+      # (VortexRdfStore variants vs rdf-stores.js, oxigraph and hdt). Wall-clock
+      # via tinybench; deliberately NOT uploaded to CodSpeed. Same full scale as
+      # a local run (rdf-stores' own default: BENCH_DIM=128, 2,097,152 triples).
+      # The hdt adapter opens the .hdt artifact the Rust comparative bench above
+      # already built from the same dataset (target/bench_compare/hdt/data.hdt);
+      # its wasm bindings are read-only, so BENCH_DIM here must keep matching
+      # the Rust step's BENCH_SIZE (128³) or the hdt rows report a mismatch.
       - name: Build wasm + run JS comparative benchmark
         working-directory: js
         env:
@@ -71,6 +78,7 @@ jobs:
         run: |
           npm ci
           npm run build
+          npm run build:hdt-wasm
           npm run bench
 
       # The Python comparative benchmark (vortex_rdf vs pyoxigraph, pycottas,
@@ -98,13 +106,16 @@ jobs:
           python3 bench/run.py
 
       - name: Render dashboard
-        # --bench-size must repeat the BENCH_SIZE above: the script otherwise
-        # reads the suite's compiled-in default for the provenance line, which
-        # is the CodSpeed size, not what this run measured.
+        # --bench-size is now a fallback: each bench target stamps a `#dataset`
+        # line into the log with the row count and moduli it actually generated,
+        # and the renderer prefers that (and warns if the two disagree). Kept so
+        # a log from before the stamp still renders with the right size rather
+        # than the suite's compiled-in CodSpeed default.
         run: |
           python3 scripts/render_bench_dashboard.py bench_output.txt public/index.html \
             --js js/bench/results.json \
             --python python/bench/results.json \
+            --rust-compare core/bench/results.json \
             --bench-size 2097152
 
       - name: Upload Pages artifact
