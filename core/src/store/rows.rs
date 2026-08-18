@@ -415,15 +415,20 @@ impl VortexRdfStore {
         let proj = self.layout.primary_column_names();
         let mut scan = file.scan().map_err(VortexRdfError::Vortex)?;
         // The scan's scope (the quad-source root dtype) is what filters and
-        // projections bind against — read it before the projection replaces it.
+        // projections bind against — read it before the projection replaces
+        // it. Binding goes through the handle's memo so a repeated shape
+        // keeps one identity (see `BoundExprMemo`).
         let scope = scan.dtype().map_err(VortexRdfError::Vortex)?;
+        let memo = file.bound_exprs();
         scan = scan.with_projection(
-            select(proj, root())
-                .bind(&scope)
+            memo.bind(file_scan::QUAD_SCOPE, &select(proj, root()), &scope)
                 .map_err(VortexRdfError::Vortex)?,
         );
         if let Some(f) = filter {
-            scan = scan.with_filter(f.bind(&scope).map_err(VortexRdfError::Vortex)?);
+            scan = scan.with_filter(
+                memo.bind(file_scan::QUAD_SCOPE, f, &scope)
+                    .map_err(VortexRdfError::Vortex)?,
+            );
         }
         Ok(selection.restrict_scan(scan, deleted))
     }

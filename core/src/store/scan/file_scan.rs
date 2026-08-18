@@ -25,6 +25,10 @@ use crate::store::layouts::{Constraints, PatternCodes};
 use crate::store::native_file::NativeStoreFile;
 use crate::store::selection::RowSelection;
 
+/// The bind-memo scope tag for expressions over the quad table's schema
+/// (the transparent root the file scan reads).
+pub(crate) const QUAD_SCOPE: &str = "quads";
+
 impl RowSelection {
     /// Apply this selection — and any tombstones — to a file scan.
     ///
@@ -137,22 +141,16 @@ static AVAILABLE_PARALLELISM: std::sync::LazyLock<usize> = std::sync::LazyLock::
 /// to absolute row ids. Mirrors the filter phase of vortex's own `split_exec`.
 pub(crate) async fn evaluate_filter_split(
     reader: Arc<dyn LayoutReader>,
-    filter_conjuncts: &[Expression],
+    filter_conjuncts: &[BoundExpression],
     range: &Range<u64>,
     start_mask: Mask,
 ) -> Result<Mask> {
-    // The readers evaluate type-checked expressions; bind every conjunct
-    // against the reader's scope once, ahead of both phases.
-    let bound: Vec<BoundExpression> = filter_conjuncts
-        .iter()
-        .map(|conjunct| conjunct.bind(reader.dtype()))
-        .collect::<vortex_error::VortexResult<_>>()
-        .map_err(VortexRdfError::Vortex)?;
+    let bound = filter_conjuncts;
     let mut mask = start_mask;
     // Phase 1: prune using zone-map/footer stats only — no I/O beyond the
     // cached stats tables. Each conjunct narrows the mask; stop once nothing
     // survives.
-    for conjunct in &bound {
+    for conjunct in bound {
         if mask.all_false() {
             return Ok(mask);
         }
@@ -166,7 +164,7 @@ pub(crate) async fn evaluate_filter_split(
     // Phase 2: for whatever the stats couldn't rule out, read and evaluate each
     // conjunct for real, threading the narrowing mask so later conjuncts see
     // fewer rows.
-    for conjunct in &bound {
+    for conjunct in bound {
         if mask.all_false() {
             return Ok(mask);
         }
@@ -203,9 +201,19 @@ where
     // The cached layout reader tree — reused across every split task below,
     // so zone-map stats are looked up once, not once per split.
     let reader = file.layout_reader().map_err(VortexRdfError::Vortex)?;
-    // Split the filter into its top-level AND-ed conditions: the struct
-    // layout can only prune a single-field expression at a time.
-    let filter_conjuncts = conjuncts(filter);
+    // Split the filter into its top-level AND-ed conditions (the struct
+    // layout can only prune a single-field expression at a time) and bind
+    // them through the handle's memo: one bound identity per shape, shared
+    // by every split task and every later call, is what keeps vortex's
+    // identity-keyed reader caches hitting (see `BoundExprMemo`).
+    let filter_conjuncts: Vec<BoundExpression> = conjuncts(filter)
+        .iter()
+        .map(|conjunct| {
+            file.bound_exprs()
+                .bind(QUAD_SCOPE, conjunct, reader.dtype())
+        })
+        .collect::<vortex_error::VortexResult<_>>()
+        .map_err(VortexRdfError::Vortex)?;
     // Translate the view's selection into the two knobs the split loop
     // understands: the bounds it iterates and the per-split starting mask
     // (see `split_start_mask`).
@@ -573,8 +581,9 @@ pub(crate) async fn row_range_from_pruning(
         if mask.all_false() {
             break;
         }
-        let conjunct = conjunct
-            .bind(reader.dtype())
+        let conjunct = file
+            .bound_exprs()
+            .bind(QUAD_SCOPE, &conjunct, reader.dtype())
             .map_err(VortexRdfError::Vortex)?;
         // Evaluate this conjunct's prunability over the *entire* file in one
         // call: the zoned reader vectorizes this over all its zones and the

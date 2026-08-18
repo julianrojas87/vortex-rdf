@@ -5,7 +5,7 @@
 //! component readers. The pure open/materialize primitives are in
 //! [`io::native_file`](crate::io::native_file).
 
-use vortex_array::expr::Expression;
+use vortex_array::expr::{BoundExpression, Expression};
 use vortex_error::{VortexResult, vortex_bail};
 use vortex_layout::LayoutReaderRef;
 
@@ -48,6 +48,57 @@ pub(crate) struct NativeStoreFile {
     /// file. Each handle caches fetched chunk probes internally, so repeated
     /// bound-subject queries and point reads touch segments once.
     column_chunks: std::sync::Mutex<ColumnChunksMemo>,
+    /// One bound tree per (scope, filter shape), held for the handle's
+    /// lifetime — see [`BoundExprMemo`].
+    bound_exprs: std::sync::Arc<BoundExprMemo>,
+}
+
+/// Structural (scope, expression) → the one [`BoundExpression`] this file
+/// hands out for that shape.
+///
+/// Vortex keys its reader-side pruning and evaluation caches by bound-tree
+/// *identity* (`ExactBoundExpr` compares the children `Arc` pointer), not
+/// structure, and those caches live as long as the cached reader tree — the
+/// handle's lifetime. A fresh `bind` per call would never hit them and grow
+/// them per call; this memo pins one identity per shape so repeats, across
+/// splits and across calls, land on the entries the first use created. A
+/// clone of a memoized tree shares its `Arc`s and therefore its identity.
+/// The scope tag separates trees bound against different schemas (the quad
+/// root vs. an index child). Bounded like [`NativeStoreFile::pruning_envelopes`]:
+/// cleared wholesale past [`BIND_MEMO_MAX`].
+pub(crate) struct BoundExprMemo(
+    std::sync::Mutex<std::collections::HashMap<(&'static str, Expression), BoundExpression>>,
+);
+
+/// Entry cap on [`BoundExprMemo`] — sized for a query workload's distinct
+/// filter shapes, not for arbitrary term churn.
+const BIND_MEMO_MAX: usize = 4096;
+
+impl BoundExprMemo {
+    fn new() -> Self {
+        Self(std::sync::Mutex::new(std::collections::HashMap::new()))
+    }
+
+    /// The memoized bound form of `expr` against `dtype`, binding on first
+    /// use. `scope` names the schema the dtype belongs to; the same shape
+    /// bound against two scopes is two entries.
+    pub(crate) fn bind(
+        &self,
+        scope: &'static str,
+        expr: &Expression,
+        dtype: &vortex_array::dtype::DType,
+    ) -> VortexResult<BoundExpression> {
+        let mut memo = self.0.lock().expect("bound-expression memo lock");
+        if let Some(bound) = memo.get(&(scope, expr.clone())) {
+            return Ok(bound.clone());
+        }
+        let bound = expr.bind(dtype)?;
+        if memo.len() >= BIND_MEMO_MAX {
+            memo.clear();
+        }
+        memo.insert((scope, expr.clone()), bound.clone());
+        Ok(bound)
+    }
 }
 
 /// Memoized per-column chunk-probe handles; see
@@ -93,7 +144,15 @@ impl NativeStoreFile {
             splits: std::sync::OnceLock::new(),
             pruning_envelopes: std::sync::Mutex::new(std::collections::HashMap::new()),
             column_chunks: std::sync::Mutex::new(std::collections::HashMap::new()),
+            bound_exprs: std::sync::Arc::new(BoundExprMemo::new()),
         })
+    }
+
+    /// The handle's bound-expression memo — shared (`Arc`) so serve plans
+    /// and deferred row-id sources outliving a borrow can keep binding
+    /// through it.
+    pub(crate) fn bound_exprs(&self) -> &std::sync::Arc<BoundExprMemo> {
+        &self.bound_exprs
     }
 
     /// The subject column's chunk-probe handle, for exact bound-subject row

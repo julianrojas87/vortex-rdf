@@ -485,6 +485,8 @@ pub(crate) async fn resolve_file(
                     reader.clone(),
                     constraints.clone(),
                     CHILD_RID_COL,
+                    file.bound_exprs().clone(),
+                    name,
                 )),
             }
         }
@@ -492,9 +494,19 @@ pub(crate) async fn resolve_file(
             reader.clone(),
             constraints.clone(),
             CHILD_RID_COL,
+            file.bound_exprs().clone(),
+            name,
         )),
     };
-    match build_serve_plan(reader.clone(), layout, pattern, codes, name, located)? {
+    match build_serve_plan(
+        reader.clone(),
+        layout,
+        pattern,
+        codes,
+        name,
+        located,
+        file.bound_exprs(),
+    )? {
         // A serving resolution reads the matched quads straight from the
         // copy columns — point reads over a located run, or the pushed-down
         // filter scan.
@@ -507,8 +519,15 @@ pub(crate) async fn resolve_file(
         // `build_serve_plan`): fall back to the eager scan, whose ids the
         // store will actually need.
         None => {
-            super::resolve_eager_from_scan(reader, &constraints, CHILD_RID_COL, probe.resolves)
-                .await
+            super::resolve_eager_from_scan(
+                reader,
+                &constraints,
+                CHILD_RID_COL,
+                probe.resolves,
+                file.bound_exprs(),
+                name,
+            )
+            .await
         }
     }
 }
@@ -532,6 +551,7 @@ fn build_serve_plan(
     codes: &mut PatternCodes,
     component: &'static str,
     row_range: Option<std::ops::Range<u64>>,
+    memo: &std::sync::Arc<crate::store::native_file::BoundExprMemo>,
 ) -> Result<Option<FileServePlan>> {
     let mut constraints: Vec<(&'static str, Scalar)> = Vec::new();
     for (column, term) in [
@@ -562,6 +582,7 @@ fn build_serve_plan(
         constraints,
         component,
         row_range,
+        memo.clone(),
     )))
 }
 

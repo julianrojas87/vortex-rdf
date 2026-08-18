@@ -336,6 +336,11 @@ enum LazyRowIdSource {
         reader: vortex_layout::LayoutReaderRef,
         constraints: Vec<(&'static str, Scalar)>,
         rid_column: &'static str,
+        /// The owning file handle's bind memo and this child's scope tag —
+        /// so the deferred scan binds with the same identity every plan and
+        /// eager scan of this component uses (see `BoundExprMemo`).
+        memo: Arc<crate::store::native_file::BoundExprMemo>,
+        scope: &'static str,
     },
 }
 
@@ -361,6 +366,8 @@ impl LazyRowIds {
         reader: vortex_layout::LayoutReaderRef,
         constraints: Vec<(&'static str, Scalar)>,
         rid_column: &'static str,
+        memo: Arc<crate::store::native_file::BoundExprMemo>,
+        scope: &'static str,
     ) -> Self {
         Self {
             cell: Arc::new(OnceLock::new()),
@@ -368,6 +375,8 @@ impl LazyRowIds {
                 reader,
                 constraints,
                 rid_column,
+                memo,
+                scope,
             },
         }
     }
@@ -395,7 +404,9 @@ impl LazyRowIds {
                 reader,
                 constraints,
                 rid_column,
-            } => scan_index_row_ids(reader.clone(), constraints, rid_column).await?,
+                memo,
+                scope,
+            } => scan_index_row_ids(reader.clone(), constraints, rid_column, memo, scope).await?,
         };
         Ok(self.cell.get_or_init(|| ids).clone())
     }
@@ -556,14 +567,15 @@ pub(crate) fn sorted_row_ids(row_id_column: ArrayRef) -> Result<Buffer<u64>> {
 /// min/max envelope as a `>= probe AND <= probe` range pair (see vortex's
 /// `stats/rewrite/builtins.rs`), while the pair evaluates two conjuncts to
 /// compute the same mask — measured, `eq` was never slower on this rid-scan
-/// path. One shared shape also keeps both paths hitting the same per-conjunct
-/// pruning caches. Output order is irrelevant (the ids are sorted
-/// afterwards), so the scan may run unordered.
+/// path. Output order is irrelevant (the ids are sorted afterwards), so the
+/// scan may run unordered.
 #[cfg(feature = "file-io")]
 pub(crate) async fn scan_index_row_ids(
     reader: vortex_layout::LayoutReaderRef,
     value_constraints: &[(&'static str, Scalar)],
     row_id_column: &'static str,
+    memo: &crate::store::native_file::BoundExprMemo,
+    scope: &'static str,
 ) -> Result<Buffer<u64>> {
     let mut filter: Option<Expression> = None;
     for (column, probe) in value_constraints {
@@ -578,12 +590,12 @@ pub(crate) async fn scan_index_row_ids(
     let Some(filter) = filter else {
         return Ok(Buffer::empty());
     };
-    let filter = filter
-        .bind(reader.dtype())
+    let filter = memo
+        .bind(scope, &filter, reader.dtype())
         .map_err(VortexRdfError::Vortex)?;
 
     read_scanned_row_ids(
-        rid_scan(reader, row_id_column)?.with_filter(filter),
+        rid_scan(reader, row_id_column, memo, scope)?.with_filter(filter),
         row_id_column,
     )
     .await
@@ -603,9 +615,11 @@ pub(crate) async fn scan_located_row_ids(
     reader: vortex_layout::LayoutReaderRef,
     row_id_column: &'static str,
     range: Range<u64>,
+    memo: &crate::store::native_file::BoundExprMemo,
+    scope: &'static str,
 ) -> Result<Buffer<u64>> {
     read_scanned_row_ids(
-        rid_scan(reader, row_id_column)?.with_row_range(range),
+        rid_scan(reader, row_id_column, memo, scope)?.with_row_range(range),
         row_id_column,
     )
     .await
@@ -618,9 +632,11 @@ pub(crate) async fn scan_located_row_ids(
 fn rid_scan(
     reader: vortex_layout::LayoutReaderRef,
     row_id_column: &'static str,
+    memo: &crate::store::native_file::BoundExprMemo,
+    scope: &'static str,
 ) -> Result<vortex_layout::scan::scan_builder::ScanBuilder<ArrayRef>> {
-    let projection = select([row_id_column], root())
-        .bind(reader.dtype())
+    let projection = memo
+        .bind(scope, &select([row_id_column], root()), reader.dtype())
         .map_err(VortexRdfError::Vortex)?;
     Ok(
         vortex_layout::scan::scan_builder::ScanBuilder::new(VORTEX_SESSION.clone(), reader)
@@ -669,8 +685,10 @@ pub(crate) async fn resolve_eager_from_scan(
     constraints: &[(&'static str, Scalar)],
     rid_column: &'static str,
     resolves: IndexedComponent,
+    memo: &crate::store::native_file::BoundExprMemo,
+    scope: &'static str,
 ) -> Result<IndexResolution<FileServePlan>> {
-    let row_ids = scan_index_row_ids(reader, constraints, rid_column).await?;
+    let row_ids = scan_index_row_ids(reader, constraints, rid_column, memo, scope).await?;
     if row_ids.is_empty() {
         return Ok(IndexResolution::Empty);
     }

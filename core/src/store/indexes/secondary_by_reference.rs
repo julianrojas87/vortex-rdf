@@ -286,7 +286,16 @@ pub(crate) async fn resolve_file(
         {
             super::rid_point_reads(file, name, CHILD_RID_COL, range.clone()).await?
         } else {
-            Some(super::scan_located_row_ids(reader.clone(), CHILD_RID_COL, range).await?)
+            Some(
+                super::scan_located_row_ids(
+                    reader.clone(),
+                    CHILD_RID_COL,
+                    range,
+                    file.bound_exprs(),
+                    name,
+                )
+                .await?,
+            )
         };
         // `None` is a mid-read decline (an unprobeable rid chunk); the scan
         // below reads the same rows the long way.
@@ -304,6 +313,8 @@ pub(crate) async fn resolve_file(
         &[(CHILD_VAL_COL, native)],
         CHILD_RID_COL,
         probe.resolves,
+        file.bound_exprs(),
+        name,
     )
     .await
 }

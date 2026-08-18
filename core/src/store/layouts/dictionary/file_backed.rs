@@ -236,6 +236,11 @@ pub(crate) struct FileBackedDict {
     /// Wire-chunk point-read handle, shared across clones — the dictionary
     /// analogue of the quad columns' cached chunk probes.
     chunks: Arc<TermChunks>,
+    /// The wide-batch scan's term projection, bound once per handle — a
+    /// fresh bind per call would miss the reader's identity-keyed caches
+    /// (see `BoundExprMemo` on the store file handle) and grow them per
+    /// call. Shared across clones like the reader whose caches it keys.
+    projection: Arc<OnceLock<vortex_array::expr::BoundExpression>>,
 }
 
 impl FileBackedDict {
@@ -249,6 +254,7 @@ impl FileBackedDict {
             len,
             probes: Arc::new(ProbeCache::new()),
             chunks: Arc::new(chunks),
+            projection: Arc::new(OnceLock::new()),
         }
     }
 
@@ -295,9 +301,15 @@ impl FileBackedDict {
         let rows: vortex_buffer::Buffer<u64> = codes.iter().map(|&code| code as u64).collect();
         let rows = vortex_scan::strict_sorted_buffer::StrictSortedBuffer::try_new(rows)
             .map_err(VortexRdfError::Vortex)?;
-        let projection = select([TERM_FIELD], root())
-            .bind(self.reader.dtype())
-            .map_err(VortexRdfError::Vortex)?;
+        let projection = match self.projection.get() {
+            Some(bound) => bound.clone(),
+            None => {
+                let bound = select([TERM_FIELD], root())
+                    .bind(self.reader.dtype())
+                    .map_err(VortexRdfError::Vortex)?;
+                self.projection.get_or_init(|| bound).clone()
+            }
+        };
         let arr = self
             .scan()
             .with_row_indices(rows)

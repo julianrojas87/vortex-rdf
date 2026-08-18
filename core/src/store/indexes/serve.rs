@@ -356,6 +356,22 @@ pub(crate) struct FileServePlan {
     /// The index component child's cached layout reader.
     reader: vortex_layout::LayoutReaderRef,
     constraints: Vec<(&'static str, Scalar)>,
+    /// The file handle's bind memo — the plan binds its projection and
+    /// filter through it on FIRST READ, not at construction: a match-only
+    /// call builds the plan without ever scanning through it, and must not
+    /// pay for binds a count-only consumer will never use. The memo keys
+    /// the bound trees by shape, so every plan for a repeated pattern
+    /// carries the same identity and hits the child reader's
+    /// identity-keyed caches (see `BoundExprMemo`).
+    memo: Arc<crate::store::native_file::BoundExprMemo>,
+    /// The lazily bound (projection, filter) pair, shared across clones so
+    /// the first reader's bind serves them all.
+    bound: Arc<
+        std::sync::OnceLock<(
+            vortex_array::expr::BoundExpression,
+            vortex_array::expr::BoundExpression,
+        )>,
+    >,
     /// The serving component's name, addressing its cached chunk probes on
     /// the file handle for point-read serving.
     component: &'static str,
@@ -367,12 +383,32 @@ pub(crate) struct FileServePlan {
     row_range: Option<Range<u64>>,
 }
 
+/// The conjunction of a plan's term equalities — the filter selecting
+/// exactly the served rows within the index's columns.
+#[cfg(feature = "file-io")]
+fn filter_of(constraints: &[(&'static str, Scalar)]) -> Expression {
+    let mut filter: Option<Expression> = None;
+    for (column, value) in constraints {
+        let expr = eq(get_item(*column, root()), lit(value.clone()));
+        filter = Some(match filter.take() {
+            Some(f) => and(f, expr),
+            None => expr,
+        });
+    }
+    // A serve plan always carries at least one constraint (the resolved
+    // lead component), so the conjunction is never empty.
+    filter.expect("a serve plan constrains at least one column")
+}
+
 #[cfg(feature = "file-io")]
 impl FileServePlan {
     /// A plan serving a file's index columns by a pushed-down scan filtered to
     /// the rows where every `constraints` equality holds — or, over a located
     /// `row_range`, by point reads through the component's cached chunk
     /// probes.
+    // The parameters are the plan: the column roles, the reader, the
+    // constraints, and the bind memo — a builder would only rename the arity.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         primary_columns: [&'static str; 4],
         rid_column: &'static str,
@@ -381,6 +417,7 @@ impl FileServePlan {
         constraints: Vec<(&'static str, Scalar)>,
         component: &'static str,
         row_range: Option<Range<u64>>,
+        memo: Arc<crate::store::native_file::BoundExprMemo>,
     ) -> Self {
         Self {
             decode: ServeDecode {
@@ -390,9 +427,42 @@ impl FileServePlan {
             },
             reader,
             constraints,
+            memo,
+            bound: Arc::new(std::sync::OnceLock::new()),
             component,
             row_range,
         }
+    }
+
+    /// The plan's (projection, filter), bound through the handle's memo on
+    /// first use and shared across clones thereafter.
+    fn bound_exprs(
+        &self,
+    ) -> Result<(
+        vortex_array::expr::BoundExpression,
+        vortex_array::expr::BoundExpression,
+    )> {
+        if let Some(bound) = self.bound.get() {
+            return Ok(bound.clone());
+        }
+        let projection = {
+            let [s, p, o, g] = self.decode.primary_columns;
+            select([s, p, o, g, self.decode.rid_column], root())
+        };
+        let filter = filter_of(&self.constraints);
+        let scope = self.reader.dtype();
+        let bound_projection = self
+            .memo
+            .bind(self.component, &projection, scope)
+            .map_err(VortexRdfError::Vortex)?;
+        let bound_filter = self
+            .memo
+            .bind(self.component, &filter, scope)
+            .map_err(VortexRdfError::Vortex)?;
+        Ok(self
+            .bound
+            .get_or_init(|| (bound_projection, bound_filter))
+            .clone())
     }
 
     /// The serving component's name on the file handle.
@@ -421,38 +491,16 @@ impl FileServePlan {
         )
     }
 
-    /// [`Self::file_scan`] with the plan's projection and filter already
-    /// bound against the index child's scope — the form the streaming reads
-    /// consume.
+    /// [`Self::file_scan`] with the plan's projection and filter — bound on
+    /// first use — applied. The form the streaming reads consume.
     pub(crate) fn projected_filtered_scan(
         &self,
-    ) -> crate::error::Result<vortex_layout::scan::scan_builder::ScanBuilder<ArrayRef>> {
-        use crate::error::VortexRdfError;
-        let scope = self.reader.dtype().clone();
+    ) -> Result<vortex_layout::scan::scan_builder::ScanBuilder<ArrayRef>> {
+        let (projection, filter) = self.bound_exprs()?;
         Ok(self
             .file_scan()
-            .with_projection(
-                select(self.projection(), root())
-                    .bind(&scope)
-                    .map_err(VortexRdfError::Vortex)?,
-            )
-            .with_filter(self.filter().bind(&scope).map_err(VortexRdfError::Vortex)?))
-    }
-
-    /// The filter selecting exactly the served rows within the index's columns
-    /// — the conjunction of this plan's term equalities.
-    pub(crate) fn filter(&self) -> Expression {
-        let mut filter: Option<Expression> = None;
-        for (column, value) in &self.constraints {
-            let expr = eq(get_item(*column, root()), lit(value.clone()));
-            filter = Some(match filter.take() {
-                Some(f) => and(f, expr),
-                None => expr,
-            });
-        }
-        // A serve plan always carries at least one constraint (the resolved
-        // lead component), so the conjunction is never empty.
-        filter.expect("a serve plan constrains at least one column")
+            .with_projection(projection)
+            .with_filter(filter))
     }
 
     /// Decode the `(s, p, o, g)` quads out of a chunk of this plan's projected

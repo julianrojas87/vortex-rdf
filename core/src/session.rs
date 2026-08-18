@@ -51,7 +51,7 @@ fn enable_store_edition(session: &VortexSession) {
     use vortex_edition::{Edition, EditionId, EditionInclusion, EditionSessionExt as _};
     use vortex_error::{VortexExpect as _, vortex_err};
 
-    const STORE_EDITION: EditionId = EditionId::new("vortex-rdf", 2026, 8, 0);
+    const STORE_EDITION: EditionId = EditionId::new("vortexrdf", 2026, 8, 0);
 
     let editions = session.editions();
     editions
