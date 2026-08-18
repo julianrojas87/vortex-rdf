@@ -578,9 +578,12 @@ pub(crate) async fn scan_index_row_ids(
     let Some(filter) = filter else {
         return Ok(Buffer::empty());
     };
+    let filter = filter
+        .bind(reader.dtype())
+        .map_err(VortexRdfError::Vortex)?;
 
     read_scanned_row_ids(
-        rid_scan(reader, row_id_column).with_filter(filter),
+        rid_scan(reader, row_id_column)?.with_filter(filter),
         row_id_column,
     )
     .await
@@ -602,7 +605,7 @@ pub(crate) async fn scan_located_row_ids(
     range: Range<u64>,
 ) -> Result<Buffer<u64>> {
     read_scanned_row_ids(
-        rid_scan(reader, row_id_column).with_row_range(range),
+        rid_scan(reader, row_id_column)?.with_row_range(range),
         row_id_column,
     )
     .await
@@ -615,10 +618,15 @@ pub(crate) async fn scan_located_row_ids(
 fn rid_scan(
     reader: vortex_layout::LayoutReaderRef,
     row_id_column: &'static str,
-) -> vortex_layout::scan::scan_builder::ScanBuilder<ArrayRef> {
-    vortex_layout::scan::scan_builder::ScanBuilder::new(VORTEX_SESSION.clone(), reader)
-        .with_projection(select([row_id_column], root()))
-        .with_ordered(false)
+) -> Result<vortex_layout::scan::scan_builder::ScanBuilder<ArrayRef>> {
+    let projection = select([row_id_column], root())
+        .bind(reader.dtype())
+        .map_err(VortexRdfError::Vortex)?;
+    Ok(
+        vortex_layout::scan::scan_builder::ScanBuilder::new(VORTEX_SESSION.clone(), reader)
+            .with_projection(projection)
+            .with_ordered(false),
+    )
 }
 
 /// Run a rid-only scan and decode its row-id column into the ascending,

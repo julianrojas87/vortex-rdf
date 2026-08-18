@@ -126,7 +126,7 @@ mod tests {
         use vortex_layout::session::LayoutSessionExt;
         let id = <RdfStoreLayoutVTable as VTable>::id(&RdfStoreLayoutVTable);
         assert_eq!(id.as_ref(), STORE_LAYOUT_ID);
-        assert!(VORTEX_SESSION.layouts().registry().find(&id).is_some());
+        assert!(VORTEX_SESSION.layouts().registry().get(&id).is_some());
     }
 
     #[test]

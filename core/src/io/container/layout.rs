@@ -111,7 +111,10 @@ impl VTable for RdfStoreLayoutVTable {
         // The root's scan IS the quad-source scan; auxiliary components stay
         // independently addressable through `store_component`.
         layout
-            .child(QUAD_SOURCE_CHILD)?
+            .slot(QUAD_SOURCE_CHILD)?
+            .ok_or_else(|| {
+                vortex_error::vortex_err!("store root is missing its quad-source child")
+            })?
             .new_reader(name, segment_source, session, ctx)
     }
 }
@@ -128,9 +131,7 @@ pub(crate) fn quads_sorted(layout: &RdfStoreLayout) -> bool {
 pub(crate) fn register(session: &VortexSession) {
     use vortex_layout::session::LayoutSessionExt;
     static LAYOUT: RdfStoreLayoutVTable = RdfStoreLayoutVTable;
-    session
-        .layouts()
-        .register((&LAYOUT as &dyn LayoutEncoding).into());
+    session.layouts().register(&LAYOUT as &dyn LayoutEncoding);
 }
 
 pub(crate) fn is_native_root(layout: &LayoutRef) -> bool {
@@ -155,9 +156,10 @@ pub(crate) fn store_component(
         return Ok(None);
     };
     let descriptor = layout.data().components[index].clone();
-    layout
-        .child(index + 1)
-        .map(|child| Some((descriptor, child)))
+    let child = layout.slot(index + 1)?.ok_or_else(|| {
+        vortex_error::vortex_err!("store component {name} is missing its child layout")
+    })?;
+    Ok(Some((descriptor, child)))
 }
 
 /// Test-only: the parsed root metadata of serialized store bytes — the
@@ -195,8 +197,10 @@ pub(crate) fn subtree_bytes(
                 .unwrap_or(0)
         })
         .sum();
-    for idx in 0..layout.nchildren() {
-        total += subtree_bytes(&layout.child(idx)?, segment_map)?;
+    for idx in 0..layout.nslots() {
+        if let Some(child) = layout.slot(idx)? {
+            total += subtree_bytes(&child, segment_map)?;
+        }
     }
     Ok(total)
 }

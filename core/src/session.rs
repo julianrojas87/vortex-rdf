@@ -37,5 +37,42 @@ pub(crate) static VORTEX_SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
     let session = session.with_handle(vortex_io::runtime::wasm::WasmRuntime::handle());
     vortex_file::register_default_encodings(&session);
     crate::io::container::register(&session);
+    enable_store_edition(&session);
     session
 });
+
+/// Enroll every registered encoding in one enabled edition. The file writer
+/// refuses encodings outside the session's enabled editions (reading is
+/// covered by registration alone), and this store's wire contract is
+/// "whatever the registered compressor emits" — not a vortex edition
+/// boundary — so the edition spans the full registry.
+fn enable_store_edition(session: &VortexSession) {
+    use vortex_array::session::ArraySessionExt as _;
+    use vortex_edition::{Edition, EditionId, EditionInclusion, EditionSessionExt as _};
+    use vortex_error::{VortexExpect as _, vortex_err};
+
+    const STORE_EDITION: EditionId = EditionId::new("vortex-rdf", 2026, 8, 0);
+
+    let editions = session.editions();
+    editions
+        .declare_edition(Edition {
+            id: STORE_EDITION,
+            min_vortex_version: None,
+        })
+        .map_err(|error| vortex_err!("{error}"))
+        .vortex_expect("the store edition is valid");
+    let ids = session
+        .arrays()
+        .registry()
+        .read(|map| map.keys().copied().collect::<Vec<_>>());
+    for id in ids {
+        editions
+            .declare_inclusion(EditionInclusion::new(&id, STORE_EDITION))
+            .map_err(|error| vortex_err!("{error}"))
+            .vortex_expect("every registered encoding joins the store edition once");
+    }
+    session
+        .enable_edition(STORE_EDITION)
+        .map_err(|error| vortex_err!("{error}"))
+        .vortex_expect("the store edition was just declared");
+}

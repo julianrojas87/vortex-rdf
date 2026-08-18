@@ -58,7 +58,7 @@ struct ChunkSpec {
 /// Descend through zoned wrappers to their data child (child 0).
 fn unwrap_zoned(mut node: LayoutRef) -> Option<LayoutRef> {
     while node.is::<Zoned>() {
-        node = node.child(0).ok()?;
+        node = node.slot(0).ok().flatten()?;
     }
     Some(node)
 }
@@ -70,9 +70,9 @@ impl TermChunks {
     /// anything else — the caller keeps the scan paths.
     pub(crate) fn resolve(dict: &LayoutRef, source: Arc<dyn SegmentSource>) -> Option<Self> {
         dict.as_opt::<StructLayout>()?;
-        let column = (0..dict.nchildren()).find_map(|i| {
-            matches!(dict.child_type(i), LayoutChildType::Field(ref n) if n.as_ref() == TERM_FIELD)
-                .then(|| dict.child(i).ok())
+        let column = (0..dict.nslots()).find_map(|i| {
+            matches!(dict.slot_type(i), Some(LayoutChildType::Field(ref n)) if n.as_ref() == TERM_FIELD)
+                .then(|| dict.slot(i).ok().flatten())
                 .flatten()
         })?;
         let data = unwrap_zoned(column)?;
@@ -91,11 +91,11 @@ impl TermChunks {
                 cell: OnceLock::new(),
             });
         } else if data.is::<ChunkedLayout>() {
-            for i in 0..data.nchildren() {
-                let LayoutChildType::Chunk((_, row_offset)) = data.child_type(i) else {
+            for i in 0..data.nslots() {
+                let Some(LayoutChildType::Chunk((_, row_offset))) = data.slot_type(i) else {
                     return None;
                 };
-                let leaf = unwrap_zoned(data.child(i).ok()?)?;
+                let leaf = unwrap_zoned(data.slot(i).ok().flatten()?)?;
                 let rows = leaf.row_count();
                 if rows == 0 {
                     continue;
@@ -293,10 +293,15 @@ impl FileBackedDict {
             return self.chunks.resolve_terms(codes).await;
         }
         let rows: vortex_buffer::Buffer<u64> = codes.iter().map(|&code| code as u64).collect();
+        let rows = vortex_scan::strict_sorted_buffer::StrictSortedBuffer::try_new(rows)
+            .map_err(VortexRdfError::Vortex)?;
+        let projection = select([TERM_FIELD], root())
+            .bind(self.reader.dtype())
+            .map_err(VortexRdfError::Vortex)?;
         let arr = self
             .scan()
             .with_row_indices(rows)
-            .with_projection(select([TERM_FIELD], root()))
+            .with_projection(projection)
             .into_array_stream()
             .map_err(VortexRdfError::Vortex)?
             .read_all()

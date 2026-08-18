@@ -761,8 +761,11 @@ pub(crate) async fn dict_from_reader(
     if reader.row_count() == 0 {
         return Ok(TermDictionary::empty());
     }
+    let projection = select([TERM_FIELD], root())
+        .bind(reader.dtype())
+        .map_err(VortexRdfError::Vortex)?;
     let scan = vortex_layout::scan::scan_builder::ScanBuilder::new(VORTEX_SESSION.clone(), reader)
-        .with_projection(select([TERM_FIELD], root()));
+        .with_projection(projection);
     let mut ctx = VORTEX_SESSION.create_execution_ctx();
     let tasks = scan.build().map_err(VortexRdfError::Vortex)?;
     let mut chunks = Vec::new();

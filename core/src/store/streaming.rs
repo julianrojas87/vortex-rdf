@@ -17,7 +17,6 @@ use oxrdf::Quad;
 
 use vortex_array::ArrayRef;
 #[cfg(feature = "file-io")]
-use vortex_array::expr::{root, select};
 #[cfg(feature = "file-io")]
 use vortex_array::stream::ArrayStreamExt as _;
 #[cfg(feature = "file-io")]
@@ -127,10 +126,7 @@ impl VortexRdfStore {
                         && (range.end - range.start) as usize
                             <= crate::store::selection::POINT_GATHER_MAX_ROWS
                     {
-                        let scan = serve
-                            .file_scan()
-                            .with_projection(select(serve.projection(), root()))
-                            .with_filter(serve.filter());
+                        let scan = serve.projected_filtered_scan()?;
                         let serve = serve.clone();
                         let deleted = deleted.clone();
                         let file = std::sync::Arc::clone(file);
@@ -174,10 +170,7 @@ impl VortexRdfStore {
                     }
                     let serve = serve.clone();
                     let deleted = deleted.clone();
-                    let scan = serve
-                        .file_scan()
-                        .with_projection(select(serve.projection(), root()))
-                        .with_filter(serve.filter());
+                    let scan = serve.projected_filtered_scan()?;
                     // A file-backed dictionary resolves each chunk's codes
                     // with a scan of its own, so the decode must await.
                     if self.has_file_backed_dictionary() {

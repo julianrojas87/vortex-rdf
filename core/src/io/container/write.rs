@@ -112,7 +112,7 @@ impl RdfStoreWriteStrategy {
 impl vortex_layout::LayoutStrategy for RdfStoreWriteStrategy {
     async fn write_stream(
         &self,
-        ctx: vortex_array::ArrayContext,
+        ctx: vortex_layout::LayoutWriterContext,
         segment_sink: vortex_layout::segments::SegmentSinkRef,
         stream: vortex_layout::sequence::SendableSequentialStream,
         mut eof: vortex_layout::sequence::SequencePointer,
@@ -132,6 +132,10 @@ impl vortex_layout::LayoutStrategy for RdfStoreWriteStrategy {
             let child_sink = Arc::clone(&segment_sink);
             let child_session = session.clone();
             jobs.push(async move {
+                // A source's retained chunks are writer-buffered memory for
+                // as long as this component drains; the reservation releases
+                // when the job completes.
+                let _reserved = child_ctx.reserve_buffered_bytes(component.source.buffered_bytes());
                 let child_stream = component.source.open()?;
                 vortex_ensure_eq!(child_stream.dtype(), &component.descriptor.dtype);
                 let layout = component
@@ -168,15 +172,6 @@ impl vortex_layout::LayoutStrategy for RdfStoreWriteStrategy {
             new_store_layout_with_components(quad_source, self.quads_sorted, components)?
                 .into_layout(),
         )
-    }
-
-    fn buffered_bytes(&self) -> u64 {
-        self.quad_source.buffered_bytes()
-            + self
-                .components
-                .iter()
-                .map(|c| c.source.buffered_bytes() + c.strategy.buffered_bytes())
-                .sum::<u64>()
     }
 }
 

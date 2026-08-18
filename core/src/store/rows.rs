@@ -413,12 +413,17 @@ impl VortexRdfStore {
         deleted: Option<&Mask>,
     ) -> Result<ScanBuilder<ArrayRef>> {
         let proj = self.layout.primary_column_names();
-        let mut scan = file
-            .scan()
-            .map_err(VortexRdfError::Vortex)?
-            .with_projection(select(proj, root()));
+        let mut scan = file.scan().map_err(VortexRdfError::Vortex)?;
+        // The scan's scope (the quad-source root dtype) is what filters and
+        // projections bind against — read it before the projection replaces it.
+        let scope = scan.dtype().map_err(VortexRdfError::Vortex)?;
+        scan = scan.with_projection(
+            select(proj, root())
+                .bind(&scope)
+                .map_err(VortexRdfError::Vortex)?,
+        );
         if let Some(f) = filter {
-            scan = scan.with_filter(f.clone());
+            scan = scan.with_filter(f.bind(&scope).map_err(VortexRdfError::Vortex)?);
         }
         Ok(selection.restrict_scan(scan, deleted))
     }

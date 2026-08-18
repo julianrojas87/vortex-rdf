@@ -54,9 +54,9 @@ impl ColumnChunks {
     /// the field's dtype (non-nullable unsigned integer) is unsupported.
     pub fn from_struct_layout(root: &LayoutRef, field: &str) -> Option<Self> {
         root.as_opt::<StructLayout>()?;
-        let column = (0..root.nchildren()).find_map(|i| {
-            matches!(root.child_type(i), LayoutChildType::Field(ref name) if name.as_ref() == field)
-                .then(|| root.child(i).ok())
+        let column = (0..root.nslots()).find_map(|i| {
+            matches!(root.slot_type(i), Some(LayoutChildType::Field(ref name)) if name.as_ref() == field)
+                .then(|| root.slot(i).ok().flatten())
                 .flatten()
         })?;
         let dtype = column.dtype().clone();
@@ -75,11 +75,11 @@ impl ColumnChunks {
                 cell: OnceLock::new(),
             });
         } else if data.is::<ChunkedLayout>() {
-            for i in 0..data.nchildren() {
-                let LayoutChildType::Chunk((_, row_offset)) = data.child_type(i) else {
+            for i in 0..data.nslots() {
+                let Some(LayoutChildType::Chunk((_, row_offset))) = data.slot_type(i) else {
                     return None;
                 };
-                let leaf = unwrap_zoned(data.child(i).ok()?)?;
+                let leaf = unwrap_zoned(data.slot(i).ok().flatten()?)?;
                 let chunk_rows = leaf.row_count();
                 if chunk_rows == 0 {
                     continue;
@@ -299,7 +299,7 @@ impl std::fmt::Debug for ColumnChunks {
 /// Descend through zoned wrappers to their data child (child 0).
 fn unwrap_zoned(mut node: LayoutRef) -> Option<LayoutRef> {
     while node.is::<Zoned>() {
-        node = node.child(0).ok()?;
+        node = node.slot(0).ok().flatten()?;
     }
     Some(node)
 }

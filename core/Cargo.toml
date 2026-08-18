@@ -21,6 +21,7 @@ vortex-session.workspace = true
 vortex-fsst.workspace = true
 vortex-mask.workspace = true
 vortex-layout.workspace = true
+vortex-edition.workspace = true
 vortex-file.workspace = true
 vortex-scan.workspace = true
 vortex-buffer.workspace = true

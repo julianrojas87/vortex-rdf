@@ -164,7 +164,7 @@ pub(crate) fn resolve_node<'a>(arr: &'a ArrayRef) -> Option<Node<'a>> {
 
     if let Some(view) = arr.as_opt::<Chunked>() {
         let nchunks = view.nchunks();
-        let offsets: Vec<usize> = view.chunk_offsets().to_vec();
+        let offsets: Vec<usize> = view.chunk_offset_values().to_vec();
         let slots = view.slots();
         let first_chunk_slot = slots.len() - nchunks;
         let mut chunks = Vec::with_capacity(nchunks);

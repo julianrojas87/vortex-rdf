@@ -116,7 +116,7 @@ impl NativeStoreFile {
         memo.entry(column.to_owned())
             .or_insert_with(|| {
                 let typed = self.file.footer().layout().as_::<RdfStoreLayoutVTable>();
-                let quads = typed.child(0).ok()?;
+                let quads = typed.slot(0).ok().flatten()?;
                 vortex_rdf_encoded_search::ColumnChunks::from_struct_layout(&quads, column)
                     .map(std::sync::Arc::new)
             })
@@ -140,7 +140,7 @@ impl NativeStoreFile {
             .or_insert_with(|| {
                 let index = self.components.iter().position(|c| c.name == component)?;
                 let typed = self.file.footer().layout().as_::<RdfStoreLayoutVTable>();
-                let child = typed.child(index + 1).ok()?;
+                let child = typed.slot(index + 1).ok().flatten()?;
                 vortex_rdf_encoded_search::ColumnChunks::from_struct_layout(&child, column)
                     .map(std::sync::Arc::new)
             })
@@ -208,7 +208,9 @@ impl NativeStoreFile {
         };
         if self.child_readers[index].get().is_none() {
             let typed = self.file.footer().layout().as_::<RdfStoreLayoutVTable>();
-            let child = typed.child(index + 1)?;
+            let child = typed.slot(index + 1)?.ok_or_else(|| {
+                vortex_error::vortex_err!("store component {name} is missing its child layout")
+            })?;
             let reader = child.new_reader(
                 self.components[index].name.as_str().into(),
                 self.file.segment_source(),
@@ -233,7 +235,9 @@ impl NativeStoreFile {
             return Ok(None);
         };
         let typed = self.file.footer().layout().as_::<RdfStoreLayoutVTable>();
-        let child = typed.child(index + 1)?;
+        let child = typed.slot(index + 1)?.ok_or_else(|| {
+            vortex_error::vortex_err!("store component {name} is missing its child layout")
+        })?;
         subtree_bytes(&child, self.file.footer().segment_map()).map(Some)
     }
 }

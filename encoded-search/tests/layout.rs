@@ -23,6 +23,29 @@ fn session() -> VortexSession {
         .with::<RuntimeSession>()
         .with_tokio();
     vortex_file::register_default_encodings(&session);
+
+    // 0.84 gates the file writer on the session's enabled editions; declare
+    // one covering every registered encoding, as vortex-file's own tests do.
+    use vortex_array::session::ArraySessionExt as _;
+    use vortex_edition::{Edition, EditionId, EditionInclusion, EditionSessionExt as _};
+    const TEST_EDITION: EditionId = EditionId::new("test", 2026, 7, 0);
+    let editions = session.editions();
+    editions
+        .declare_edition(Edition {
+            id: TEST_EDITION,
+            min_vortex_version: None,
+        })
+        .unwrap();
+    let ids = session
+        .arrays()
+        .registry()
+        .read(|map| map.keys().copied().collect::<Vec<_>>());
+    for id in ids {
+        editions
+            .declare_inclusion(EditionInclusion::new(&id, TEST_EDITION))
+            .unwrap();
+    }
+    session.enable_edition(TEST_EDITION).unwrap();
     session
 }
 

@@ -35,7 +35,7 @@ use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::struct_::{StructArray, StructArrayExt};
 use vortex_array::dtype::FieldNames;
 #[cfg(feature = "file-io")]
-use vortex_array::expr::{Expression, and, eq, get_item, lit, root};
+use vortex_array::expr::{Expression, and, eq, get_item, lit, root, select};
 #[cfg(feature = "file-io")]
 use vortex_array::scalar::Scalar;
 use vortex_array::validity::Validity;
@@ -419,6 +419,24 @@ impl FileServePlan {
             VORTEX_SESSION.clone(),
             self.reader.clone(),
         )
+    }
+
+    /// [`Self::file_scan`] with the plan's projection and filter already
+    /// bound against the index child's scope — the form the streaming reads
+    /// consume.
+    pub(crate) fn projected_filtered_scan(
+        &self,
+    ) -> crate::error::Result<vortex_layout::scan::scan_builder::ScanBuilder<ArrayRef>> {
+        use crate::error::VortexRdfError;
+        let scope = self.reader.dtype().clone();
+        Ok(self
+            .file_scan()
+            .with_projection(
+                select(self.projection(), root())
+                    .bind(&scope)
+                    .map_err(VortexRdfError::Vortex)?,
+            )
+            .with_filter(self.filter().bind(&scope).map_err(VortexRdfError::Vortex)?))
     }
 
     /// The filter selecting exactly the served rows within the index's columns

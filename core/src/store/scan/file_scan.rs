@@ -10,13 +10,15 @@ use std::sync::Arc;
 use futures::{StreamExt, stream};
 use oxrdf::{GraphName, NamedNode, NamedOrBlankNode, Term};
 use vortex_array::expr::forms::conjuncts;
-use vortex_array::expr::{Expression, and, eq, get_item, lit, root};
+use vortex_array::expr::{BoundExpression, Expression, and, eq, get_item, lit, root};
 use vortex_array::{ArrayRef, MaskFuture};
 use vortex_buffer::Buffer;
+use vortex_error::VortexExpect as _;
 use vortex_layout::LayoutReader;
 use vortex_layout::scan::scan_builder::ScanBuilder;
 use vortex_mask::{AllOr, Mask};
 use vortex_scan::selection::Selection;
+use vortex_scan::strict_sorted_buffer::StrictSortedBuffer;
 
 use crate::error::{Result, VortexRdfError};
 use crate::store::layouts::{Constraints, PatternCodes};
@@ -54,7 +56,7 @@ impl RowSelection {
             (RowSelection::Range(range), Some(deleted)) => scan
                 .with_row_range(range.clone())
                 .with_selection(Selection::ExcludeByIndex(deleted_ids(deleted))),
-            (RowSelection::Ids(ids), None) => scan.with_row_indices(ids.clone()),
+            (RowSelection::Ids(ids), None) => scan.with_row_indices(strict_ids(ids)),
             (RowSelection::Ids(ids), Some(deleted)) => {
                 scan.with_row_indices(subtract_deleted(ids, deleted))
             }
@@ -64,22 +66,32 @@ impl RowSelection {
 
 /// The set positions of a tombstone mask as an ascending id list — the sparse
 /// form the scan wants for an exclusion.
-fn deleted_ids(deleted: &Mask) -> Buffer<u64> {
-    match deleted.indices() {
+fn deleted_ids(deleted: &Mask) -> StrictSortedBuffer<u64> {
+    let ids = match deleted.indices() {
         AllOr::All => Buffer::from_iter(0..deleted.len() as u64),
         AllOr::None => Buffer::empty(),
         AllOr::Some(indices) => Buffer::from_iter(indices.iter().map(|&i| i as u64)),
-    }
+    };
+    StrictSortedBuffer::try_new(ids).vortex_expect("mask indices are ascending and unique")
 }
 
 /// An ascending id list with the tombstoned rows removed — used when a sparse
 /// id selection and the deletions would both want the scan's selection knob.
-fn subtract_deleted(ids: &Buffer<u64>, deleted: &Mask) -> Buffer<u64> {
-    Buffer::from_iter(
+fn subtract_deleted(ids: &Buffer<u64>, deleted: &Mask) -> StrictSortedBuffer<u64> {
+    let ids = Buffer::from_iter(
         ids.iter()
             .copied()
             .filter(|&id| !deleted.value(id as usize)),
-    )
+    );
+    StrictSortedBuffer::try_new(ids).vortex_expect("a RowSelection id list is ascending and unique")
+}
+
+/// A [`RowSelection::Ids`] list as the strictly-sorted buffer the scan wants —
+/// ascending and unique is that variant's construction invariant (index
+/// resolutions answer in ascending unique row ids).
+fn strict_ids(ids: &Buffer<u64>) -> StrictSortedBuffer<u64> {
+    StrictSortedBuffer::try_new(ids.clone())
+        .vortex_expect("a RowSelection id list is ascending and unique")
 }
 
 /// Split a file view's [`RowSelection`] into the two knobs the per-split filter
@@ -90,7 +102,7 @@ fn split_bounds(selection: &RowSelection, row_count: u64) -> (Selection, Range<u
     match selection {
         RowSelection::All => (Selection::All, 0..row_count),
         RowSelection::Range(range) => (Selection::All, range.clone()),
-        RowSelection::Ids(ids) => (Selection::IncludeByIndex(ids.clone()), 0..row_count),
+        RowSelection::Ids(ids) => (Selection::IncludeByIndex(strict_ids(ids)), 0..row_count),
     }
 }
 
@@ -129,11 +141,18 @@ pub(crate) async fn evaluate_filter_split(
     range: &Range<u64>,
     start_mask: Mask,
 ) -> Result<Mask> {
+    // The readers evaluate type-checked expressions; bind every conjunct
+    // against the reader's scope once, ahead of both phases.
+    let bound: Vec<BoundExpression> = filter_conjuncts
+        .iter()
+        .map(|conjunct| conjunct.bind(reader.dtype()))
+        .collect::<vortex_error::VortexResult<_>>()
+        .map_err(VortexRdfError::Vortex)?;
     let mut mask = start_mask;
     // Phase 1: prune using zone-map/footer stats only — no I/O beyond the
     // cached stats tables. Each conjunct narrows the mask; stop once nothing
     // survives.
-    for conjunct in filter_conjuncts {
+    for conjunct in &bound {
         if mask.all_false() {
             return Ok(mask);
         }
@@ -147,7 +166,7 @@ pub(crate) async fn evaluate_filter_split(
     // Phase 2: for whatever the stats couldn't rule out, read and evaluate each
     // conjunct for real, threading the narrowing mask so later conjuncts see
     // fewer rows.
-    for conjunct in filter_conjuncts {
+    for conjunct in &bound {
         if mask.all_false() {
             return Ok(mask);
         }
@@ -554,6 +573,9 @@ pub(crate) async fn row_range_from_pruning(
         if mask.all_false() {
             break;
         }
+        let conjunct = conjunct
+            .bind(reader.dtype())
+            .map_err(VortexRdfError::Vortex)?;
         // Evaluate this conjunct's prunability over the *entire* file in one
         // call: the zoned reader vectorizes this over all its zones and the
         // file-stats wrapper checks footer-level bounds first.
