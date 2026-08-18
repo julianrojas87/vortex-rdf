@@ -41,6 +41,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Measure both cache regimes, on one dataset and one repetition count (bench) ([`d82a635`](https://github.com/vortex-rdf/vortex-rdf/commit/d82a635b3bbcfd2d0fc22a302abb470a10e6cb43) by julianrojas87)
 - Debug for the probe types, and docs for publication (encoded-search) ([`ca5e4c4`](https://github.com/vortex-rdf/vortex-rdf/commit/ca5e4c4954f8e23d4e71732565221fa636c34217) by julianrojas87)
 - Upgrade the vortex engine to 0.84 ([`9e70186`](https://github.com/vortex-rdf/vortex-rdf/commit/9e7018649aa981e60b7d04088edd49af94bf4f4c) by julianrojas87)
+- One structure across tabs, and figures the run reports (dashboard) ([`f666e29`](https://github.com/vortex-rdf/vortex-rdf/commit/f666e299d1b06bea12f074e1b60573de800fcdd8) by julianrojas87)
 
 ### Changed
 
@@ -66,6 +67,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Make components the one form index data takes (core) ([`fb8a354`](https://github.com/vortex-rdf/vortex-rdf/commit/fb8a35487c004ea87e0dcbb068d17a57b59a57c5) by julianrojas87)
 - Rename the crate to vortex-rdf-encoded-search (encoded-search) ([`a3479cf`](https://github.com/vortex-rdf/vortex-rdf/commit/a3479cf86b1d6a4a6048bf4402273fee3d7ec806) by julianrojas87)
 - Pin one bound-expression identity per filter shape (core) ([`0565c9a`](https://github.com/vortex-rdf/vortex-rdf/commit/0565c9af8f6b45aeec2abbeb9776599c730e5d4f) by julianrojas87)
+- Compress chunked children and resolve probes at construction (core) ([`f983d3f`](https://github.com/vortex-rdf/vortex-rdf/commit/f983d3f4a74e37914dc0532041e0b8217432b5ab) by julianrojas87)
 
 ### Removed
 
