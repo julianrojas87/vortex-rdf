@@ -294,6 +294,15 @@ impl VortexRdfStore {
         // The queryable index set follows the component roster, exactly as
         // the file path follows its child roster.
         let indexes = crate::store::indexes::indexes_from_components(&components);
+        // Resolve the encoded-search probes here rather than leaving them to
+        // whichever query runs first: the walk scales with the encoding tree,
+        // so on a compressed chunked base it is the dominant cost of a first
+        // point read, and it is negligible beside the construction it joins.
+        let store_probes = probes::BaseProbes::new();
+        store_probes.warm(&base);
+        for component in components.iter() {
+            component.warm_probes();
+        }
         Ok(Self {
             layout,
             indexes,
@@ -302,7 +311,7 @@ impl VortexRdfStore {
                 selection: ViewSelection::all(),
                 components,
                 deleted: None,
-                probes: probes::BaseProbes::new(),
+                probes: store_probes,
                 serve: None,
             },
             tail: None,

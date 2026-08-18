@@ -394,6 +394,22 @@ impl IndexComponent {
         Arc::clone(&self.probes)
     }
 
+    /// Resolve this component's probes now rather than on the first query —
+    /// the component half of the eager resolution every in-memory
+    /// construction does (see [`BaseProbes::warm`]). A *deferred* component
+    /// is left alone: materializing it here would undo the deferral that
+    /// `from_bytes` adoption exists for.
+    ///
+    /// [`BaseProbes::warm`]: crate::store::probes::BaseProbes::warm
+    pub(crate) fn warm_probes(&self) {
+        if matches!(self.rows, ComponentRows::Deferred(_)) {
+            return;
+        }
+        if let Ok(rows) = self.rows() {
+            self.probes.warm(&rows.clone().into_array());
+        }
+    }
+
     /// Look a component up by name, gated on its sortedness provenance — the
     /// shared front gate of the in-memory resolvers: absent and
     /// not-globally-sorted both mean the index declines (per-chunk-sorted

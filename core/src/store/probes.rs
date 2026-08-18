@@ -40,6 +40,18 @@ impl BaseProbes {
         Some(&self.cells(base)?.get(idx)?.1).and_then(Option::as_ref)
     }
 
+    /// Resolve `base`'s children now rather than on the first query.
+    ///
+    /// The walk is proportional to the encoding tree, so on a compressed
+    /// chunked base it is per-chunk per-column work that otherwise lands
+    /// entirely on whichever query happens to be first — measured at 2M rows
+    /// as several times the cost of the point query it hid behind. Every
+    /// in-memory construction pays it up front instead, where it is a rounding
+    /// error beside the encoding pass it follows.
+    pub(crate) fn warm(&self, base: &ArrayRef) {
+        let _ = self.cells(base);
+    }
+
     /// The resolved probe for `base`'s child named `name`; `None` exactly as
     /// for [`Self::child`].
     pub(crate) fn by_name(&self, base: &ArrayRef, name: &str) -> Option<&Arc<OwnedSortedProbe>> {

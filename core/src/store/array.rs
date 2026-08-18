@@ -225,7 +225,10 @@ pub(crate) fn with_searchable_int_children(rows: ArrayRef) -> Result<ArrayRef> {
 /// outside the probe-supported set, which would put the column back on the
 /// per-call generic-kernel fallback this crate's fast paths exist to avoid.
 /// Sortedness stamps carry across; non-u32 and nullable children pass
-/// through untouched.
+/// through untouched. A chunked column is compressed chunk by chunk (see
+/// [`compress_u32_child`]) — the builders assemble anything over
+/// `DEFAULT_CHUNK_SIZE` rows into a `ChunkedArray`, so without that every
+/// build past one chunk would keep the canonical form.
 ///
 /// `payload_lazy` wraps each compressed column in a `vortex.shared` lazy
 /// wrapper: the match fast paths probe the compressed source through the
@@ -252,16 +255,11 @@ pub(crate) fn with_compressed_int_children(rows: ArrayRef, payload_lazy: bool) -
         let child = struct_arr
             .unmasked_field_by_name(name.as_ref())
             .map_err(VortexRdfError::Vortex)?;
-        let Ok(prim) = child.clone().try_downcast::<Primitive>() else {
+        let sorted = column_is_sorted(child);
+        let Some(mut encoded) = compress_u32_child(child, sorted, &mut ctx)? else {
             children.push(child.clone());
             continue;
         };
-        if prim.ptype() != vortex_array::dtype::PType::U32 || child.dtype().is_nullable() {
-            children.push(child.clone());
-            continue;
-        }
-        let sorted = column_is_sorted(child);
-        let mut encoded = compress_u32_column(&prim, sorted, &mut ctx)?;
         if payload_lazy && !encoded.is::<Primitive>() {
             encoded = SharedArray::new(encoded).into_array();
         }
@@ -340,6 +338,61 @@ fn canonical_u32(arr: &ArrayRef) -> Option<vortex_array::arrays::PrimitiveArray>
     }
     let prim = arr.clone().try_downcast::<Primitive>().ok()?;
     (prim.ptype() == vortex_array::dtype::PType::U32).then_some(prim)
+}
+
+/// One child column's compressed form, or `None` for a column this helper
+/// leaves alone (non-u32, nullable, or an encoding that is already not a
+/// canonical primitive).
+///
+/// A chunked column is compressed chunk by chunk and reassembled, which is
+/// what makes the compressed-resident form reach builds above
+/// `DEFAULT_CHUNK_SIZE` rows at all: the builders assemble anything larger
+/// into a `ChunkedArray`, and a downcast straight to `Primitive` sees only
+/// the wrapper. Per-chunk is also the natural granularity — the bounds pass
+/// that picks the encoding is per-chunk regardless, and a chunk of a globally
+/// sorted column is itself sorted, so the RunEnd choice stays valid.
+fn compress_u32_child(
+    child: &ArrayRef,
+    sorted: bool,
+    ctx: &mut vortex_array::ExecutionCtx,
+) -> Result<Option<ArrayRef>> {
+    use vortex_array::arrays::chunked::ChunkedArrayExt as _;
+    use vortex_array::arrays::{Chunked, ChunkedArray, Primitive};
+
+    if child.dtype().is_nullable() || !child.dtype().is_unsigned_int() {
+        return Ok(None);
+    }
+    if let Some(chunked) = child.as_opt::<Chunked>() {
+        let mut out = Vec::with_capacity(chunked.nchunks());
+        let mut compressed_any = false;
+        for chunk in chunked.chunks() {
+            match compress_u32_child(&chunk, sorted, ctx)? {
+                Some(encoded) => {
+                    if sorted {
+                        stamp_is_sorted(&encoded);
+                    }
+                    out.push(encoded);
+                    compressed_any = true;
+                }
+                None => out.push(chunk),
+            }
+        }
+        if !compressed_any {
+            return Ok(None);
+        }
+        return Ok(Some(
+            ChunkedArray::try_new(out, child.dtype().clone())
+                .map_err(VortexRdfError::Vortex)?
+                .into_array(),
+        ));
+    }
+    let Ok(prim) = child.clone().try_downcast::<Primitive>() else {
+        return Ok(None);
+    };
+    if prim.ptype() != vortex_array::dtype::PType::U32 {
+        return Ok(None);
+    }
+    Ok(Some(compress_u32_column(&prim, sorted, ctx)?))
 }
 
 /// One column's encoding choice; see [`with_compressed_int_children`].
