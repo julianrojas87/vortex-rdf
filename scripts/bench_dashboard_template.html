@@ -337,25 +337,13 @@
       <h2>Build &amp; open</h2>
     </div>
     <p class="group-desc">
-      This store against RDF library alternatives in Rust. Every entrant ingests the <em>same N-Triples file</em>
-      at the same scale (<span id="rc-size">—</span> rows), one library
-      per process. The Vortex-internal panels further down generate the same quads in process
-      instead of parsing them from a file — that suite is uploaded to CodSpeed, where a
-      multi-hundred-MB read inside a measured region would swamp the instruction counts — so a
-      pattern matches the same quads in both halves of this tab, and matching file variants
-      agree between them. Two build differences to know when crossing: files here come from
-      the streaming writer while the internals suite serializes an already-built store (the
-      two artifacts differ ~2× on warm file points), and the in-memory rows here reopen
-      through the serialized parts, as the bindings do — so their <em>cold</em> cells price the
-      first query on a freshly <em>adopted</em> store: first-touch probe setup over the file
-      writer's compressed chunks, where the internals' built stores hold canonical columns.
-      Measured 4–8×, and isolated to the arrays' encodings — the parts round-trip itself is
-      free, and both bases are chunked alike.
+      This store against RDF library alternatives in Rust. Every library ingests the <em>same N-Triples file</em>
+      at the same scale (<span id="rc-size">—</span> triples).
       <strong>oxigraph</strong> enters twice — its in-memory store and its RocksDB-backed
       one, the same library across the residency axis the Vortex (file, memory) pairs
-      cross; <strong>sophia</strong> holds its data in memory;
-      <strong>hdt</strong> is the closest thing here to a peer — a compressed, read-only RDF
-      file format, and the other entrant with a persisted artifact to open.
+      cross; <strong>sophia</strong> only holds its data in memory;
+      <strong>hdt</strong> is a compressed, read-only RDF
+      file format, with a persisted artifact to open.
     </p>
     <p class="lede mono" id="compare-provenance"></p>
     <div class="panel-grid" id="compare-ingest-panels"></div>
@@ -1183,9 +1171,16 @@ function renderRust(){
   // sequence. The cross-library figures come from `compare.rs`, which is the part
   // of this tab comparable with theirs; the Vortex-internal headlines follow.
   const rcLibs = RC_ADAPTERS.filter(a => !a.slug.startsWith("vortex"));
+  // Drop a label's parenthetical only where it is decoration. One library can
+  // enter twice across the residency axis — oxigraph brings both its in-memory
+  // and its rocksdb store — and there the parenthetical is the whole
+  // distinction, so stripping it would list the same name twice.
+  const bare = (label) => label.replace(/ \(.*\)$/, "");
+  const libName = (a) =>
+    rcLibs.filter(o => bare(o.label) === bare(a.label)).length > 1 ? a.label : bare(a.label);
   const tiles = [
     ...(RC_DATA.length ? [{ label:"Libraries", value:String(rcLibs.length),
-      sub:rcLibs.map(a => a.label.replace(/ \(.*\)$/, "")).join(" · ") }] : []),
+      sub:rcLibs.map(libName).join(" · ") }] : []),
     // The cross-library variant count, so the tile means on this tab what it means
     // on the other two. The internals suite's own 18-cell matrix is described in
     // the sections below, not here.
