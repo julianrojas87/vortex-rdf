@@ -38,8 +38,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Measure the dictionary regimes the residency axis now turns on (bench) ([`876b4d5`](https://github.com/vortex-rdf/vortex-rdf/commit/876b4d5f878e5ff6ab97ca70c71c1664f285a164) by @julianrojas87)
 - Build every store sorted, chosen by the target (core) ([`1573187`](https://github.com/vortex-rdf/vortex-rdf/commit/1573187e65fde559f1468bc9badc76cb642329cd) by @julianrojas87)
 - Add a light/dark theme switch to the dashboard (bench) ([`9628229`](https://github.com/vortex-rdf/vortex-rdf/commit/96282293e211f63835db6ed4a15e3d356e1132b3) by @julianrojas87)
-- Measure both cache regimes, on one dataset and one repetition count (bench) ([`d82a635`](https://github.com/vortex-rdf/vortex-rdf/commit/d82a635b3bbcfd2d0fc22a302abb470a10e6cb43) by @julianrojas87)
-- Debug for the probe types, and docs for publication (encoded-search) ([`ca5e4c4`](https://github.com/vortex-rdf/vortex-rdf/commit/ca5e4c4954f8e23d4e71732565221fa636c34217) by @julianrojas87)
+- Measure both cache regimes, on one dataset and one repetition count (bench) ([`d82a635`](https://github.com/vortex-rdf/vortex-rdf/commit/d82a635b3bbcfd2d0fc22a302abb470a10e6cb43) by julianrojas87)
+- Debug for the probe types, and docs for publication (encoded-search) ([`ca5e4c4`](https://github.com/vortex-rdf/vortex-rdf/commit/ca5e4c4954f8e23d4e71732565221fa636c34217) by julianrojas87)
+- Upgrade the vortex engine to 0.84 ([`9e70186`](https://github.com/vortex-rdf/vortex-rdf/commit/9e7018649aa981e60b7d04088edd49af94bf4f4c) by julianrojas87)
 
 ### Changed
 
@@ -61,9 +62,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Drop the resident compression size gate (core) ([`34fcd71`](https://github.com/vortex-rdf/vortex-rdf/commit/34fcd718aa6ae1f1fa9389abe8c7f0924713e803) by @julianrojas87)
 - Drop "sorted" from every benchmark name and label (bench) ([`dd2564b`](https://github.com/vortex-rdf/vortex-rdf/commit/dd2564b88072bef20767989394b387e408d274b5) by @julianrojas87)
 - Locate reference-index runs through cached chunk probes (core) ([`b4a1e4f`](https://github.com/vortex-rdf/vortex-rdf/commit/b4a1e4f9d96f2f5399265c52f78cbd0e97bd16b0) by @julianrojas87)
-- Cold measures the first query, not the open before it (bench) ([`397f92c`](https://github.com/vortex-rdf/vortex-rdf/commit/397f92c3b70b0d8f274c0cee1186b958b2f97a69) by @julianrojas87)
-- Make components the one form index data takes (core) ([`fb8a354`](https://github.com/vortex-rdf/vortex-rdf/commit/fb8a35487c004ea87e0dcbb068d17a57b59a57c5) by @julianrojas87)
-- Rename the crate to vortex-rdf-encoded-search (encoded-search) ([`a3479cf`](https://github.com/vortex-rdf/vortex-rdf/commit/a3479cf86b1d6a4a6048bf4402273fee3d7ec806) by @julianrojas87)
+- Cold measures the first query, not the open before it (bench) ([`397f92c`](https://github.com/vortex-rdf/vortex-rdf/commit/397f92c3b70b0d8f274c0cee1186b958b2f97a69) by julianrojas87)
+- Make components the one form index data takes (core) ([`fb8a354`](https://github.com/vortex-rdf/vortex-rdf/commit/fb8a35487c004ea87e0dcbb068d17a57b59a57c5) by julianrojas87)
+- Rename the crate to vortex-rdf-encoded-search (encoded-search) ([`a3479cf`](https://github.com/vortex-rdf/vortex-rdf/commit/a3479cf86b1d6a4a6048bf4402273fee3d7ec806) by julianrojas87)
+- Pin one bound-expression identity per filter shape (core) ([`0565c9a`](https://github.com/vortex-rdf/vortex-rdf/commit/0565c9af8f6b45aeec2abbeb9776599c730e5d4f) by julianrojas87)
 
 ### Removed
 
@@ -81,8 +83,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Search only the asserted window in sliced probes (encoded-search) ([`fca93f1`](https://github.com/vortex-rdf/vortex-rdf/commit/fca93f1504c431556b68f55c9b272972fd017ec5) by @julianrojas87)
 - Drop the removed builder argument from the Python adapters (bench) ([`db92557`](https://github.com/vortex-rdf/vortex-rdf/commit/db925576fc93c9221ffcf40fe0bbd23d099c770b) by @julianrojas87)
 - Drop the removed builder option from the bench suites (bench) ([`d3a0560`](https://github.com/vortex-rdf/vortex-rdf/commit/d3a0560bf290d88e975bfc959392a54514191a6d) by @julianrojas87)
-- Stamp every dashboard tab in UTC, to the minute (bench) ([`68df60d`](https://github.com/vortex-rdf/vortex-rdf/commit/68df60dc79f6c2ee588a9cf7e8f0d2b72f944ec8) by @julianrojas87)
-- Give the JS cold regime its own process (bench) ([`20590cd`](https://github.com/vortex-rdf/vortex-rdf/commit/20590cd8c52556333e7684c1e53729954ed5e99c) by @julianrojas87)
+- Stamp every dashboard tab in UTC, to the minute (bench) ([`68df60d`](https://github.com/vortex-rdf/vortex-rdf/commit/68df60dc79f6c2ee588a9cf7e8f0d2b72f944ec8) by julianrojas87)
+- Give the JS cold regime its own process (bench) ([`20590cd`](https://github.com/vortex-rdf/vortex-rdf/commit/20590cd8c52556333e7684c1e53729954ed5e99c) by julianrojas87)
+- Name tags in CHANGELOG ([`ccebf21`](https://github.com/vortex-rdf/vortex-rdf/commit/ccebf215857e5fe2d6b32e3b75540fb34523280d) by julianrojas87)
 
 ## [0.5.0](https://github.com/vortex-rdf/vortex-rdf/compare/v0.4.0...v0.5.0) - 2026-07-29
 
