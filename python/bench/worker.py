@@ -36,6 +36,15 @@ QUERY_WARMUP = int(os.environ.get("PY_BENCH_QUERY_WARMUP", 5))
 HEAVY_ITERS = int(os.environ.get("PY_BENCH_HEAVY_ITERS", 3))
 FULL_SCAN_ITERS = int(os.environ.get("PY_BENCH_FULL_SCAN_ITERS", 3))
 
+#: A phase whose single execution already exceeds this stops after one sample
+#: (and skips any remaining warmup); ``0`` disables the rule. Repetition exists
+#: to average out noise that is small relative to the reading -- on a
+#: 40-second deterministic bulk parse the extra runs cost minutes to remove
+#: noise three orders of magnitude below the number. The reduced count is
+#: reported honestly through the row's ``samples`` field, which the dashboard
+#: displays. Same knob and default as the JS worker and ``compare.rs``.
+SLOW_PHASE_NS = float(os.environ.get("BENCH_SLOW_PHASE_MS", 30_000)) * 1e6
+
 
 def fmt_ns(ns: float) -> str:
     """Match the JS harness's formatting so both tabs read identically."""
@@ -80,7 +89,8 @@ def measure(
     gc.collect()
     gc.freeze()
     try:
-        for i in range(warmup + iters):
+        remaining_warmup = warmup
+        while len(samples) < iters:
             if setup:
                 setup()
             # Keeps an automatic collection from firing inside a timed call.
@@ -93,8 +103,17 @@ def measure(
                 teardown(out)
             else:
                 del out
-            if i >= warmup:
-                samples.append(float(elapsed))
+            if remaining_warmup > 0:
+                remaining_warmup -= 1
+                # A warmup run this long says the phase needs no more warming:
+                # whatever caches move is noise beside a 30 s+ reading.
+                if SLOW_PHASE_NS and elapsed > SLOW_PHASE_NS:
+                    remaining_warmup = 0
+                continue
+            samples.append(float(elapsed))
+            # See SLOW_PHASE_NS: one sample of a multi-ten-second phase.
+            if SLOW_PHASE_NS and len(samples) == 1 and elapsed > SLOW_PHASE_NS:
+                break
     finally:
         gc.unfreeze()
 

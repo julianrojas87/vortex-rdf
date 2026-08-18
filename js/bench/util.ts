@@ -59,6 +59,15 @@ const tsxBin = resolve(here, '..', 'node_modules', '.bin', 'tsx');
  *  covers the multi-million-quad datasets the workers generate. */
 const NODE_FLAGS = ['--expose-gc', '--max-old-space-size=8192'];
 
+/** Wall-clock backstop for one worker process, ms; `0` disables it.
+ *
+ *  The last line of defense behind `consumeQuads`' in-loop budget: that check
+ *  can only fire while JavaScript is running, so a phase that stalls *inside* a
+ *  single wasm call (or any future pathology outside our own loops) would hang
+ *  the run indefinitely. The default is far above any legitimate worker — the
+ *  slowest on record is oxigraph's query role at ~10 minutes. */
+const WORKER_TIMEOUT_MS = Number(process.env.WORKER_TIMEOUT_MS ?? 30 * 60_000);
+
 /**
  * Run one bench worker to completion in its own process and return its parsed
  * JSON output, or null if it could not produce one.
@@ -66,7 +75,8 @@ const NODE_FLAGS = ['--expose-gc', '--max-old-space-size=8192'];
  * The worker receives `args` followed by the path it must write its JSON to;
  * that file is this function's to name and to remove. A non-zero exit is
  * reported and skipped rather than thrown, so one failed point never costs the
- * whole run.
+ * whole run. A worker that outlives `WORKER_TIMEOUT_MS` is killed the same way
+ * — SIGKILL, because a wasm-bound death march does not answer SIGTERM.
  *
  * Process-per-worker is a correctness requirement, not an optimization — see
  * the headers of compare.bench.ts (cross-adapter memory contamination) and
@@ -78,10 +88,15 @@ export function runWorkerProcess<T>(workerPath: string, args: string[], label: s
     const res = spawnSync(tsxBin, [...NODE_FLAGS, workerPath, ...args, outFile], {
         stdio: 'inherit',
         env: process.env,
+        ...(WORKER_TIMEOUT_MS > 0 ? { timeout: WORKER_TIMEOUT_MS, killSignal: 'SIGKILL' as const } : {}),
     });
     try {
         if (res.status !== 0) {
-            console.error(`\n[${label}] worker exited ${res.status} — skipping; the rest of the run continues.`);
+            const why = res.signal
+                ? `was killed (${res.signal}${res.signal === 'SIGKILL'
+                    ? `, likely the ${WORKER_TIMEOUT_MS / 60_000}-minute WORKER_TIMEOUT_MS backstop` : ''})`
+                : `exited ${res.status}`;
+            console.error(`\n[${label}] worker ${why} — skipping; the rest of the run continues.`);
             return null;
         }
         return JSON.parse(readFileSync(outFile, 'utf8')) as T;

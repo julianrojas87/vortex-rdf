@@ -70,7 +70,9 @@ interface WorkerOutput {
 }
 
 /** One adapter, one role, one process. A worker that cannot finish is skipped:
- *  the remaining adapters still run and still produce their rows. */
+ *  the remaining adapters still run and still produce their rows. The caller
+ *  records a failure for a null return, so the missing rows stay attributed on
+ *  the page instead of reading as benchmarks nobody ran. */
 function runWorker(slug: string, role: 'query' | 'querycold' | 'fullscan' | 'mutate'): WorkerOutput | null {
     return runWorkerProcess<WorkerOutput>(workerPath, [slug, role], `${slug}/${role}`);
 }
@@ -97,6 +99,15 @@ async function main(): Promise<void> {
     // adapter reported last. Applied to every role that counts anything: the full
     // scan reports from its own process, and it is the strongest check of the set.
     const countWarnings: string[] = [];
+    // A worker that never produced output — crash or the WORKER_TIMEOUT_MS
+    // kill — still gets a failures entry, so its absent rows are attributed
+    // in the results file, exactly like an in-worker phase failure.
+    const workerLost = (a: { slug: string; label: string }, role: string): void => {
+        failures.push({
+            slug: a.slug, label: a.label, role, phase: 'worker',
+            error: 'worker process did not finish (crash or WORKER_TIMEOUT_MS backstop) — see the run log',
+        });
+    };
     const mergeMatched = (label: string, out: WorkerOutput): void => {
         for (const [pat, n] of Object.entries(out.matched ?? {})) {
             if (matched[pat] === undefined) matched[pat] = n;
@@ -114,7 +125,7 @@ async function main(): Promise<void> {
 
     for (const a of ADAPTERS) {
         const out = runWorker(a.slug, 'query');
-        if (!out) continue;
+        if (!out) { workerLost(a, 'query'); continue; }
         results.push(...out.rows);
         memory.push({
             slug: a.slug, label: a.label, role: 'query',
@@ -139,7 +150,7 @@ async function main(): Promise<void> {
     // Adapters with no persistent form return no rows here (see runQueryCold).
     for (const a of ADAPTERS) {
         const out = runWorker(a.slug, 'querycold');
-        if (!out) continue;
+        if (!out) { workerLost(a, 'querycold'); continue; }
         results.push(...out.rows);
         // Serialized-store size: every adapter gets a row, so a store with no
         // snapshot path renders as an explained cell rather than a gap.
@@ -156,7 +167,7 @@ async function main(): Promise<void> {
     // measures the residue of those rather than the scan. See runFullScan.
     for (const a of ADAPTERS) {
         const out = runWorker(a.slug, 'fullscan');
-        if (!out) continue;
+        if (!out) { workerLost(a, 'fullscan'); continue; }
         results.push(...out.rows);
         mergeMatched(a.label, out);
         for (const f of out.failures ?? []) {
@@ -167,7 +178,7 @@ async function main(): Promise<void> {
 
     for (const a of MUT_ADAPTERS) {
         const out = runWorker(a.slug, 'mutate');
-        if (!out) continue;
+        if (!out) { workerLost(a, 'mutate'); continue; }
         results.push(...out.rows);
         memory.push({ slug: a.slug, label: a.label, role: 'mutate', peakRssMb: out.peakRssMb });
         for (const f of out.failures ?? []) {

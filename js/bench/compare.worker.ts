@@ -62,6 +62,44 @@ async function bench(
  *  fixed D², so a timing is only interpretable next to its match count. */
 const matched: Record<string, number> = {};
 
+/** A phase whose single execution already exceeds this runs ONCE rather than
+ *  the full repetition count; `0` disables the rule.
+ *
+ *  Repetitions exist to average out noise that is small relative to the
+ *  measurement — on a cell that takes tens of seconds, the noise the extra
+ *  runs would remove is three orders of magnitude below the reading, while
+ *  the runs themselves cost minutes (a 34 s cell at 10 iterations + 5 warmups
+ *  is 8½ minutes for one number). The reduced count is reported honestly:
+ *  the row's `samples` field says `1`, exactly as the page displays it. */
+const SLOW_PHASE_MS = Number(process.env.BENCH_SLOW_PHASE_MS ?? 30_000);
+
+/** The repetition plan for a slow phase: one measured run, no warmup. Warmup
+ *  is not lost — every pattern measured this way already executed once in the
+ *  count pre-pass, so its caches are as warm as one run makes them. */
+const ONE_SHOT: typeof QUERY_OPTS = {
+    time: 0, iterations: 1, warmup: false, warmupIterations: 0, throws: true,
+};
+
+/** Split probes by what the count pre-pass measured: patterns under the cutoff
+ *  keep the full repetition plan, patterns over it run once. A pattern with no
+ *  pre-pass timing failed its count — benching it again would fail again, and
+ *  under `throws: true` would take the whole group's surviving tasks with it. */
+function splitBySpeed(pats: Pat[], costMs: Record<string, number>): { fast: Pat[]; slow: Pat[] } {
+    const fast: Pat[] = [];
+    const slow: Pat[] = [];
+    for (const p of pats) {
+        const c = costMs[p.name];
+        if (c === undefined) continue;
+        if (SLOW_PHASE_MS > 0 && c > SLOW_PHASE_MS) {
+            console.log(`  [${p.name}] one run took ${(c / 1000).toFixed(0)}s — measuring 1 sample (BENCH_SLOW_PHASE_MS)`);
+            slow.push(p);
+        } else {
+            fast.push(p);
+        }
+    }
+    return { fast, slow };
+}
+
 /** Byte size of the store's serialized snapshot, when this role built one --
  *  the JS store's persistent form is a byte buffer, so this is its "artifact
  *  size", the counterpart of the on-disk sizes the other tabs report. */
@@ -81,8 +119,25 @@ async function memSnapshot(isVortex: boolean): Promise<{ rss: number | null; js:
 
 const delta = (a: number | null, b: number | null) => (a === null || b === null ? null : a - b);
 
-async function countAll(a: StoreAdapter, h: unknown, pats: Pat[]): Promise<void> {
-    for (const p of pats) matched[p.name] = await a.countMatch(h, p);
+/** Count every probe once (the cross-adapter agreement check), timing each —
+ *  the timings drive [`splitBySpeed`]. A probe that cannot be counted is
+ *  recorded as a failure and excluded from the benches instead of aborting the
+ *  whole worker: this pre-pass runs the same consume the benches run, so it is
+ *  also where a consume-budget breach surfaces first. */
+async function countAll(a: StoreAdapter, h: unknown, pats: Pat[]): Promise<Record<string, number>> {
+    const costMs: Record<string, number> = {};
+    for (const p of pats) {
+        const t0 = performance.now();
+        try {
+            matched[p.name] = await a.countMatch(h, p);
+            costMs[p.name] = performance.now() - t0;
+        } catch (e) {
+            const error = e instanceof Error ? e.message : String(e);
+            console.error(`  !! count '${p.name}' failed: ${error}`);
+            failures.push({ phase: `count:${p.name}`, error });
+        }
+    }
+    return costMs;
 }
 
 async function runQuery(a: StoreAdapter): Promise<Row[]> {
@@ -106,10 +161,18 @@ async function runQuery(a: StoreAdapter): Promise<Row[]> {
         wasmHeapMb: delta(after.wasm, before.wasm),
     });
 
-    await countAll(a, th, tProbes.triples);
-    await bench('query_triples', rows, QUERY_OPTS, (b) => {
-        for (const p of tProbes.triples) b.add(`${a.slug}::${p.name}`, async () => { await a.countMatch(th, p); });
-    }, 'warm');
+    const tCost = await countAll(a, th, tProbes.triples);
+    const tSplit = splitBySpeed(tProbes.triples, tCost);
+    if (tSplit.fast.length) {
+        await bench('query_triples', rows, QUERY_OPTS, (b) => {
+            for (const p of tSplit.fast) b.add(`${a.slug}::${p.name}`, async () => { await a.countMatch(th, p); });
+        }, 'warm');
+    }
+    if (tSplit.slow.length) {
+        await bench('query_triples_slow', rows, ONE_SHOT, (b) => {
+            for (const p of tSplit.slow) b.add(`${a.slug}::${p.name}`, async () => { await a.countMatch(th, p); });
+        }, 'warm');
+    }
     reclaim(a, th);
     th = null;
 
@@ -125,10 +188,18 @@ async function runQuery(a: StoreAdapter): Promise<Row[]> {
         console.log(`[${a.label}] query (quads)…`);
         const quads = genDataset(N_QUADS, { graphs: 8 });
         let qh: unknown = await a.build(quads);
-        await countAll(a, qh, qProbes.quads);
-        await bench('query_quads', rows, QUERY_OPTS, (b) => {
-            for (const p of qProbes.quads) b.add(`${a.slug}::${p.name}`, async () => { await a.countMatch(qh, p); });
-        }, 'warm');
+        const qCost = await countAll(a, qh, qProbes.quads);
+        const qSplit = splitBySpeed(qProbes.quads, qCost);
+        if (qSplit.fast.length) {
+            await bench('query_quads', rows, QUERY_OPTS, (b) => {
+                for (const p of qSplit.fast) b.add(`${a.slug}::${p.name}`, async () => { await a.countMatch(qh, p); });
+            }, 'warm');
+        }
+        if (qSplit.slow.length) {
+            await bench('query_quads_slow', rows, ONE_SHOT, (b) => {
+                for (const p of qSplit.slow) b.add(`${a.slug}::${p.name}`, async () => { await a.countMatch(qh, p); });
+            }, 'warm');
+        }
         reclaim(a, qh);
         qh = null;
     }
@@ -263,19 +334,39 @@ async function runFullScan(a: StoreAdapter): Promise<Row[]> {
     // Record what the scan matches, as the pattern probes do — this is the one
     // column whose count the dashboard was missing, and it is also the strongest
     // cross-adapter check there is: every store must return the whole dataset.
-    matched.full = await a.countMatch(h, FULL_SCAN_PATTERN);
-    await bench('full', rows, FULL_SCAN_OPTS, (b) => {
-        b.add(`${a.slug}::full`, async () => { await a.countMatch(h, FULL_SCAN_PATTERN); });
-    }, 'warm');
-    if (a.snapshot && a.open) {
-        const snap = await a.snapshot(h);
-        await bench('full_cold', rows, FULL_SCAN_OPTS, (b) => {
-            let fresh: unknown;
-            b.add(`${a.slug}::full`, async () => { await a.countMatch(fresh, FULL_SCAN_PATTERN); }, {
-                beforeEach: async () => { fresh = await a.open!(snap); },
-                afterEach: () => { a.dispose?.(fresh); fresh = undefined; },
-            });
-        }, 'cold');
+    //
+    // Guarded: this pre-pass runs the same consume the benches below run, so a
+    // store that cannot scan at all — a trap, or the consume budget — fails
+    // HERE, once, and the benches are skipped rather than left to fail three
+    // more times. Its timing also picks the repetition plan.
+    let preMs: number | null = null;
+    try {
+        const t0 = performance.now();
+        matched.full = await a.countMatch(h, FULL_SCAN_PATTERN);
+        preMs = performance.now() - t0;
+    } catch (e) {
+        const error = e instanceof Error ? e.message : String(e);
+        console.error(`  !! full scan failed: ${error}`);
+        failures.push({ phase: 'full', error });
+    }
+    if (preMs !== null) {
+        const opts = SLOW_PHASE_MS > 0 && preMs > SLOW_PHASE_MS ? ONE_SHOT : FULL_SCAN_OPTS;
+        if (opts === ONE_SHOT) {
+            console.log(`  [full] one scan took ${(preMs / 1000).toFixed(0)}s — measuring 1 sample (BENCH_SLOW_PHASE_MS)`);
+        }
+        await bench('full', rows, opts, (b) => {
+            b.add(`${a.slug}::full`, async () => { await a.countMatch(h, FULL_SCAN_PATTERN); });
+        }, 'warm');
+        if (a.snapshot && a.open) {
+            const snap = await a.snapshot(h);
+            await bench('full_cold', rows, opts, (b) => {
+                let fresh: unknown;
+                b.add(`${a.slug}::full`, async () => { await a.countMatch(fresh, FULL_SCAN_PATTERN); }, {
+                    beforeEach: async () => { fresh = await a.open!(snap); },
+                    afterEach: () => { a.dispose?.(fresh); fresh = undefined; },
+                });
+            }, 'cold');
+        }
     }
     reclaim(a, h);
     h = null;

@@ -346,7 +346,28 @@ fn split_id(id: &str) -> (String, Option<String>) {
     }
 }
 
+/// A phase whose single execution already exceeds this stops after one sample
+/// (and skips any remaining warmup); `0` disables the rule.
+///
+/// Repetition exists to average out noise that is small relative to the
+/// reading — on a ten-second bulk phase the extra runs cost real minutes to
+/// remove noise orders of magnitude below the number. The reduced count is
+/// reported honestly through the row's `samples` field, which the dashboard
+/// displays. Same knob and default as the JS and Python workers.
+fn slow_phase_cutoff_ns() -> f64 {
+    use std::sync::OnceLock;
+    static V: OnceLock<f64> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("BENCH_SLOW_PHASE_MS")
+            .ok()
+            .and_then(|s| s.parse::<f64>().ok())
+            .unwrap_or(30_000.0)
+            * 1e6
+    })
+}
+
 /// Time `f` `iters` times after `warmup` untimed runs, and record the median.
+/// Both loops honor [`slow_phase_cutoff_ns`].
 fn measure<F: FnMut()>(
     id: &str,
     mut f: F,
@@ -355,14 +376,24 @@ fn measure<F: FnMut()>(
     warmup: usize,
     regime: Option<&'static str>,
 ) {
+    let cutoff = slow_phase_cutoff_ns();
     for _ in 0..warmup {
+        let t = Instant::now();
         f();
+        // A warmup run this long says the phase needs no more warming.
+        if cutoff > 0.0 && (t.elapsed().as_nanos() as f64) > cutoff {
+            break;
+        }
     }
     let mut samples = Vec::with_capacity(iters);
     for _ in 0..iters {
         let t = Instant::now();
         f();
-        samples.push(t.elapsed().as_nanos() as f64);
+        let ns = t.elapsed().as_nanos() as f64;
+        samples.push(ns);
+        if cutoff > 0.0 && samples.len() == 1 && ns > cutoff {
+            break;
+        }
     }
     rows.push(row_from(id, samples, regime));
 }
@@ -946,12 +977,18 @@ fn measure_with_setup<T>(
     rows: &mut Vec<Row>,
     iters: usize,
 ) {
+    let cutoff = slow_phase_cutoff_ns();
     let mut samples = Vec::with_capacity(iters);
     for _ in 0..iters {
         let target = setup();
         let t = Instant::now();
         f(target);
-        samples.push(t.elapsed().as_nanos() as f64);
+        let ns = t.elapsed().as_nanos() as f64;
+        samples.push(ns);
+        // See `slow_phase_cutoff_ns`: one sample of a multi-ten-second phase.
+        if cutoff > 0.0 && samples.len() == 1 && ns > cutoff {
+            break;
+        }
     }
     rows.push(row_from(id, samples, None));
 }
@@ -966,12 +1003,17 @@ fn measure_with_setup_regime<T>(
     iters: usize,
     regime: Option<&'static str>,
 ) {
+    let cutoff = slow_phase_cutoff_ns();
     let mut samples = Vec::with_capacity(iters);
     for _ in 0..iters {
         let target = setup();
         let t = Instant::now();
         f(&target);
-        samples.push(t.elapsed().as_nanos() as f64);
+        let ns = t.elapsed().as_nanos() as f64;
+        samples.push(ns);
+        if cutoff > 0.0 && samples.len() == 1 && ns > cutoff {
+            break;
+        }
     }
     rows.push(row_from(id, samples, regime));
 }

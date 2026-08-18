@@ -126,12 +126,51 @@ export const VORTEX_VARIANTS: { slug: string; label: string; options: BuildOptio
  *  term values makes materialization part of the measured work everywhere, and
  *  puts the wasm boundary cost — the thing worth optimizing — on the page. */
 let consumeSink = 0;
+
+/** Thrown when a consume loop exceeds [`CONSUME_BUDGET_MS`]. The message is what
+ *  lands in the run's `failures` list, so it says how far the loop got. */
+export class ConsumeBudgetExceeded extends Error {
+    constructor(done: number, total: number, ms: number) {
+        super(
+            `consume budget exceeded after ${(ms / 1000).toFixed(0)}s ` +
+            `(${done.toLocaleString()} of ${total.toLocaleString()} quads; ` +
+            `raise CONSUME_BUDGET_MS to wait longer)`,
+        );
+        this.name = 'ConsumeBudgetExceeded';
+    }
+}
+
+/** Wall-clock budget for one consume loop, ms. `0` disables the check.
+ *
+ *  The budget exists because a store that cannot materialize a result set does
+ *  not fail fast — it death-marches. oxigraph's 2M-row full scan spends ~37
+ *  minutes ballooning the heap to the V8 cap (GC falls out of concurrent mode
+ *  into back-to-back full collections; observed at 7.3 GB RSS with the machine
+ *  in swap) before its wasm module traps `unreachable` — the same deterministic
+ *  outcome every run. The loop below is where those minutes are spent, so this
+ *  is where they can be cut short: the throw surfaces through the worker's
+ *  per-phase catch as an ordinary `failures` entry and renders as the same
+ *  "failed" cell, delivered in two minutes instead of thirty-seven.
+ *
+ *  The default is far above any *successful* consume — the slowest legitimate
+ *  one on record is the 2M-row Vortex full scan at ~1.5 s. */
+const CONSUME_BUDGET_MS = Number(process.env.CONSUME_BUDGET_MS ?? 120_000);
+
 export function consumeQuads(
     quads: ArrayLike<{ subject: { value: string }; predicate: { value: string };
                        object: { value: string }; graph?: { value: string } }>,
 ): number {
     let acc = 0;
+    // Check the budget every 64Ki quads, not every iteration: a per-iteration
+    // `performance.now()` would add ~2M timer calls to a measured full scan.
+    // Result sets below 64Ki rows are never checked at all, which is fine —
+    // a death march needs a large result set to march over.
+    const t0 = CONSUME_BUDGET_MS > 0 ? performance.now() : 0;
     for (let i = 0; i < quads.length; i++) {
+        if (CONSUME_BUDGET_MS > 0 && (i & 0xffff) === 0xffff) {
+            const ms = performance.now() - t0;
+            if (ms > CONSUME_BUDGET_MS) throw new ConsumeBudgetExceeded(i, quads.length, ms);
+        }
         const q = quads[i];
         acc += q.subject.value.length + q.predicate.value.length
              + q.object.value.length + (q.graph?.value.length ?? 0);
