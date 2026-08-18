@@ -19,6 +19,13 @@ use vortex_rdf_core::{
     BuiltArray, IndexType, LayoutStrategy, SortedStreamBuilder, VortexArrayBuilder, VortexRdfStore,
 };
 
+// The dataset shape — moduli, term spellings, probe patterns — lives on its own
+// so `compare.rs` can include just that file (`#[path = "support/dataset.rs"]`)
+// without the store-building machinery it has no use for. One definition is what
+// keeps the instrumented suite's rows comparable with the comparative suite's.
+pub mod dataset;
+pub use dataset::{PATTERNS, Pattern, terms_for};
+
 /// Single dataset size for the whole suite. In simulation mode CodSpeed counts
 /// instructions deterministically, so one representative size catches
 /// regressions in every path; larger sizes only multiply valgrind cost without
@@ -269,74 +276,36 @@ pub fn make_store(source: Source, layout: Layout, index: Index, size: usize) -> 
     }
 }
 
-// ── match patterns ──────────────────────────────────────────────────────────
+// ── dataset generation ──────────────────────────────────────────────────────
 
-// Each variant names the bound components by letter (Subject/Predicate/
-// Object/Graph), so `SPOG` is consistent with its siblings, not a word to
-// re-case.
-#[allow(clippy::upper_case_acronyms)]
-#[derive(Copy, Clone, Debug)]
-pub enum Pattern {
-    S,
-    P,
-    O,
-    PO,
-    G,
-    SPOG,
+/// The moduli this process's dataset was generated with, at the size
+/// [`bench_size`] resolved. Every consumer that needs a term index — the
+/// distinct-probe walk, the shape line — derives it from here rather than
+/// assuming a cardinality, because the moduli follow from the row count.
+pub fn bench_moduli() -> dataset::Moduli {
+    static M: OnceLock<dataset::Moduli> = OnceLock::new();
+    *M.get_or_init(|| dataset::moduli(bench_size(), dataset::WANT_GRAPHS))
 }
 
-pub const PATTERNS: &[Pattern] = &[
-    Pattern::S,
-    Pattern::P,
-    Pattern::O,
-    Pattern::PO,
-    Pattern::G,
-    Pattern::SPOG,
-];
-
-/// Probe terms, all chosen to hit rows the generator actually emits (see the
-/// module docs on selectivity).
-#[allow(clippy::type_complexity)]
-pub fn terms_for(
-    pattern: Pattern,
-) -> (
-    Option<NamedOrBlankNode>,
-    Option<NamedNode>,
-    Option<Term>,
-    Option<GraphName>,
-) {
-    let s =
-        || NamedOrBlankNode::NamedNode(NamedNode::new_unchecked("http://example.org/subject/0"));
-    let p = || NamedNode::new_unchecked("http://example.org/predicate/0");
-    let o = || Term::NamedNode(NamedNode::new_unchecked("http://example.org/object/0"));
-    let g = || GraphName::NamedNode(NamedNode::new_unchecked("http://example.org/graph/0"));
-
-    match pattern {
-        Pattern::S => (Some(s()), None, None, None),
-        Pattern::P => (None, Some(p()), None, None),
-        Pattern::O => (None, None, Some(o()), None),
-        Pattern::PO => (None, Some(p()), Some(o()), None),
-        Pattern::G => (None, None, None, Some(g())),
-        Pattern::SPOG => (Some(s()), Some(p()), Some(o()), Some(g())),
-    }
-}
-
-/// Generate a stream of mock RDF quads for the bench targets.
-/// Triples are evenly distributed across 10 named graphs.
+/// Generate the bench dataset as a stream of quads — the same rows
+/// `write_dataset` writes for the comparative suites, built in process.
+///
+/// In process is not incidental: `benchmark.rs` is uploaded to CodSpeed and run
+/// under valgrind, where reading a multi-hundred-MB N-Triples file would swamp
+/// the instruction counts (and the file does not exist in CI at all). The
+/// generator is what lets the instrumented suite share the comparative suites'
+/// term shape without sharing their delivery.
 pub fn generate_rdf_data_stream(size: usize) -> impl Stream<Item = Result<RawQuad>> {
-    const EX: &str = "http://example.org/";
-    const NUM_GRAPHS: u64 = 10;
+    let m = dataset::moduli(size, dataset::WANT_GRAPHS);
 
-    stream::iter((0..size).map(|i| {
-        let subject =
-            NamedOrBlankNode::NamedNode(NamedNode::new_unchecked(format!("{}subject/{}", EX, i)));
-        let predicate = NamedNode::new_unchecked(format!("{}predicate/{}", EX, i % 100));
-        let object = Term::NamedNode(NamedNode::new_unchecked(format!("{}object/{}", EX, i % 50)));
-        let graph = GraphName::NamedNode(NamedNode::new_unchecked(format!(
-            "{}graph/{}",
-            EX,
-            (i as u64) % NUM_GRAPHS
+    stream::iter((0..size).map(move |i| {
+        let subject = NamedOrBlankNode::NamedNode(NamedNode::new_unchecked(dataset::subject_iri(
+            i % m.n_subj,
         )));
+        let predicate = NamedNode::new_unchecked(dataset::predicate_iri(i % m.n_pred));
+        let object = dataset::object_term(i % m.n_obj).into_oxrdf();
+        let graph =
+            GraphName::NamedNode(NamedNode::new_unchecked(dataset::graph_iri(i % m.n_graph)));
 
         Ok(RawQuad::from_quad(&Quad::new(
             subject, predicate, object, graph,
@@ -344,31 +313,36 @@ pub fn generate_rdf_data_stream(size: usize) -> impl Stream<Item = Result<RawQua
     }))
 }
 
-/// Like [`generate_rdf_data_stream`], but with literal objects — plain,
-/// language-tagged, typed, and escape-bearing (quotes, backslashes, newlines,
-/// and `"@`/`^^` lookalikes inside the value). The star dataset above is
-/// named-node-only, so this is what lets a benchmark reach the literal
-/// escape/unescape paths at all.
+/// Like [`generate_rdf_data_stream`], but with literal objects of every shape —
+/// plain, language-tagged, typed, and escape-bearing (quotes, backslashes,
+/// newlines, and `"@`/`^^` lookalikes inside the value). The dataset above
+/// carries plain literals only, deliberately: escaping cost inside the
+/// comparative suites would land in every external adapter's parse timing. So
+/// this is what lets a benchmark reach the escape/unescape paths at all.
+///
+/// Subject and predicate cardinality follow the shared moduli, so the only
+/// axis that differs from [`generate_rdf_data_stream`] is what the objects are.
 pub fn generate_literal_rdf_data_stream(size: usize) -> impl Stream<Item = Result<RawQuad>> {
-    const EX: &str = "http://example.org/";
+    let m = dataset::moduli(size, dataset::WANT_GRAPHS);
 
-    stream::iter((0..size).map(|i| {
-        let subject =
-            NamedOrBlankNode::NamedNode(NamedNode::new_unchecked(format!("{}subject/{}", EX, i)));
-        let predicate = NamedNode::new_unchecked(format!("{}predicate/{}", EX, i % 100));
+    stream::iter((0..size).map(move |i| {
+        let subject = NamedOrBlankNode::NamedNode(NamedNode::new_unchecked(dataset::subject_iri(
+            i % m.n_subj,
+        )));
+        let predicate = NamedNode::new_unchecked(dataset::predicate_iri(i % m.n_pred));
+        let value = i % m.n_obj;
         let object = Term::Literal(match i % 4 {
-            0 => Literal::new_simple_literal(format!("plain value {}", i % 50)),
+            0 => Literal::new_simple_literal(format!("plain value {value}")),
             1 => Literal::new_language_tagged_literal_unchecked(
-                format!("tagged value {}", i % 50),
+                format!("tagged value {value}"),
                 "en",
             ),
             2 => Literal::new_typed_literal(
-                format!("{}", i % 50),
+                format!("{value}"),
                 NamedNode::new_unchecked("http://www.w3.org/2001/XMLSchema#integer"),
             ),
             _ => Literal::new_simple_literal(format!(
-                "say \"hi\"@home ^^ line\nbreak back\\slash {}",
-                i % 50
+                "say \"hi\"@home ^^ line\nbreak back\\slash {value}"
             )),
         });
 
@@ -383,8 +357,8 @@ pub fn generate_literal_rdf_data_stream(size: usize) -> impl Stream<Item = Resul
 
 /// The literal-bearing store for `decode_all_literals`: Dictionary layout, no
 /// index — the config whose full decode term-decodes every row. Cached and
-/// handed out like the star stores: only the ingest product is cached, and
-/// each call rebuilds a fresh store from it (see
+/// handed out like the main dataset's stores: only the ingest product is
+/// cached, and each call rebuilds a fresh store from it (see
 /// [`cached_store`] for why shared clones are a contamination hazard).
 pub fn cached_literal_store(size: usize) -> VortexRdfStore {
     static CACHE: OnceLock<Mutex<HashMap<usize, BuiltArray>>> = OnceLock::new();

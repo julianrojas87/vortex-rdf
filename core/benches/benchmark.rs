@@ -38,14 +38,18 @@
 //! capability), `G` (no index covers graph, so the mask-scan / pushdown
 //! fallback), and `SPOG` (every component bound — maximum residual filtering).
 //!
-//! ## Selectivity of the generated data (`generate_rdf_data_stream`)
+//! ## Selectivity of the generated data
 //!
-//! Subjects are unique; predicates repeat every 100 rows; objects every 50;
-//! graphs every 10. Probe terms are chosen to hit rows that actually exist, so
-//! at the default `BENCH_SIZE = 32_768` the matched-row counts are: `S`→1,
-//! `P`→328, `O`→656, `PO`→328, `G`→3,277, `SPOG`→1. (The previous suite probed
-//! a graph term — `.../graph` — that the generator never emits, so every
-//! graph-bound benchmark silently matched zero rows.)
+//! The dataset is `support::dataset`, the same term shape the comparative
+//! suites read from an N-Triples file — ten triples per subject, a 32-term
+//! predicate vocabulary, one distinct object per two rows — generated in
+//! process so this target stays uploadable to CodSpeed. Probes bind index 0 of
+//! each role, which every role has, so no pattern can silently match zero rows.
+//!
+//! Selectivity therefore follows the row count rather than a fixed period, and
+//! nothing here restates it: each run prints its own moduli and matched-row
+//! counts as a `#dataset` line (see `dataset::shape_line`), which is where the
+//! dashboard's figures come from.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -55,7 +59,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use futures::stream;
-use oxrdf::{GraphName, NamedNode, NamedOrBlankNode, Term};
+use oxrdf::{NamedNode, NamedOrBlankNode};
 
 use vortex_rdf_core::{LayoutStrategy, VortexRdfError, VortexRdfStore, io};
 
@@ -67,6 +71,14 @@ mod support;
 use support::*;
 
 fn main() {
+    // What this run actually generated, before any timing: the moduli follow
+    // from the row count through a coprimality nudge, so the only reliable
+    // record of a run's selectivity is the run itself. The dashboard reads this
+    // line out of the bench log; divan's parser ignores it.
+    println!(
+        "{}",
+        dataset::shape_line(bench_size(), dataset::WANT_GRAPHS)
+    );
     divan::main();
 }
 
@@ -297,8 +309,8 @@ match_matrix!(
 #[divan::bench(args = [Source::File, Source::InMemory], sample_count = QUERY_SAMPLES)]
 fn match_chained(bencher: divan::Bencher, source: &Source) {
     let source = *source;
-    let p = NamedNode::new_unchecked("http://example.org/predicate/0");
-    let o = Term::NamedNode(NamedNode::new_unchecked("http://example.org/object/0"));
+    let (_, p, o, _) = terms_for(Pattern::PO);
+    let (p, o) = (p.unwrap(), o.unwrap());
     bencher
         .with_inputs(|| make_store(source, Layout::Default, Index::ByCopy, bench_size()))
         .bench_refs(|store| {
@@ -529,10 +541,8 @@ fn dict_open(bencher: divan::Bencher, residency: &DictResidency) {
 #[divan::bench(args = DICT_CONFIGS, sample_count = QUERY_SAMPLES)]
 fn dict_probe_cold(bencher: divan::Bencher, residency: &DictResidency) {
     let residency = *residency;
-    let s = NamedOrBlankNode::NamedNode(NamedNode::new_unchecked("http://example.org/subject/0"));
-    let p = NamedNode::new_unchecked("http://example.org/predicate/0");
-    let o = Term::NamedNode(NamedNode::new_unchecked("http://example.org/object/0"));
-    let g = GraphName::NamedNode(NamedNode::new_unchecked("http://example.org/graph/0"));
+    let (s, p, o, g) = terms_for(Pattern::SPOG);
+    let (s, p, o, g) = (s.unwrap(), p.unwrap(), o.unwrap(), g.unwrap());
     bencher
         .with_inputs(|| open_dict_store(residency, bench_size()))
         .bench_refs(|store| {
@@ -555,10 +565,8 @@ fn dict_probe_cold(bencher: divan::Bencher, residency: &DictResidency) {
 #[divan::bench(args = DICT_CONFIGS, sample_count = QUERY_SAMPLES)]
 fn dict_probe_warm(bencher: divan::Bencher, residency: &DictResidency) {
     let store = open_dict_store(*residency, bench_size());
-    let s = NamedOrBlankNode::NamedNode(NamedNode::new_unchecked("http://example.org/subject/0"));
-    let p = NamedNode::new_unchecked("http://example.org/predicate/0");
-    let o = Term::NamedNode(NamedNode::new_unchecked("http://example.org/object/0"));
-    let g = GraphName::NamedNode(NamedNode::new_unchecked("http://example.org/graph/0"));
+    let (s, p, o, g) = terms_for(Pattern::SPOG);
+    let (s, p, o, g) = (s.unwrap(), p.unwrap(), o.unwrap(), g.unwrap());
     bencher.bench(|| {
         rt().block_on(async {
             let matched = store
@@ -581,16 +589,16 @@ fn dict_probe_warm(bencher: divan::Bencher, residency: &DictResidency) {
 #[divan::bench(args = DICT_CONFIGS, sample_count = QUERY_SAMPLES)]
 fn dict_probe_distinct(bencher: divan::Bencher, residency: &DictResidency) {
     let store = open_dict_store(*residency, bench_size());
-    let subjects = bench_size();
+    let subjects = bench_moduli().n_subj;
     let next = AtomicUsize::new(0);
     bencher
         .with_inputs(|| {
-            // One row per subject in the generated data, so cycling the
-            // counter walks distinct terms that all exist.
+            // Cycle the *distinct* subjects the generator emits, not the row
+            // count: past `n_subj` the terms stop existing, and a probe that
+            // misses measures the dictionary's absent-term path instead of the
+            // search this cell is about.
             let i = next.fetch_add(1, Ordering::Relaxed) % subjects;
-            NamedOrBlankNode::NamedNode(NamedNode::new_unchecked(format!(
-                "http://example.org/subject/{i}"
-            )))
+            NamedOrBlankNode::NamedNode(NamedNode::new_unchecked(dataset::subject_iri(i)))
         })
         .bench_refs(|s| {
             rt().block_on(async {
@@ -603,15 +611,17 @@ fn dict_probe_distinct(bencher: divan::Bencher, residency: &DictResidency) {
         });
 }
 
-/// Reconstruction of a point result (subject-bound, one row): the chunk's
-/// handful of distinct codes stays under the point-read cap, so a file-backed
-/// dictionary resolves them by reading exactly those rows out of its cached
-/// wire chunks instead of scanning. The bound term is memoized after the
-/// first iteration, so this cell prices the decode, not the probe.
+/// Reconstruction of a point result (subject-bound, the ten-odd rows describing
+/// one resource): the chunk's handful of distinct codes stays under the
+/// point-read cap, so a file-backed dictionary resolves them by reading exactly
+/// those rows out of its cached wire chunks instead of scanning. The bound term
+/// is memoized after the first iteration, so this cell prices the decode, not
+/// the probe.
 #[divan::bench(args = DICT_CONFIGS, sample_count = QUERY_SAMPLES)]
 fn dict_decode_point(bencher: divan::Bencher, residency: &DictResidency) {
     let store = open_dict_store(*residency, bench_size());
-    let s = NamedOrBlankNode::NamedNode(NamedNode::new_unchecked("http://example.org/subject/0"));
+    let (s, ..) = terms_for(Pattern::S);
+    let s = s.unwrap();
     bencher.bench(|| {
         rt().block_on(async {
             let matched = store
@@ -624,16 +634,17 @@ fn dict_decode_point(bencher: divan::Bencher, residency: &DictResidency) {
     });
 }
 
-/// Reconstruction of a wide matched subset (predicate-bound, 1% of rows at
-/// the default size): resident decodes codes against the in-memory
-/// dictionary. The matched chunk holds far more distinct codes than the
-/// point-read cap admits, so a file-backed dictionary resolves them with one
-/// row-index scan — the bulk path, whose whole-leaf decode is what wins at
-/// this width. [`dict_decode_point`] covers the other side of the cap.
+/// Reconstruction of a wide matched subset (predicate-bound, one 32nd of the
+/// rows — the predicate vocabulary is 32 terms): resident decodes codes against
+/// the in-memory dictionary. The matched chunk holds far more distinct codes
+/// than the point-read cap admits, so a file-backed dictionary resolves them
+/// with one row-index scan — the bulk path, whose whole-leaf decode is what
+/// wins at this width. [`dict_decode_point`] covers the other side of the cap.
 #[divan::bench(args = DICT_CONFIGS, sample_count = QUERY_SAMPLES)]
 fn dict_decode_matched(bencher: divan::Bencher, residency: &DictResidency) {
     let store = open_dict_store(*residency, bench_size());
-    let p = NamedNode::new_unchecked("http://example.org/predicate/0");
+    let (_, p, ..) = terms_for(Pattern::P);
+    let p = p.unwrap();
     bencher.bench(|| {
         rt().block_on(async {
             let matched = store
