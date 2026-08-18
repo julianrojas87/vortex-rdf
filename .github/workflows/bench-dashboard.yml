@@ -61,25 +61,52 @@ jobs:
           cache: npm
           cache-dependency-path: js/package-lock.json
 
-      # Build the wasm bindings and run the JavaScript comparative benchmark
-      # (VortexRdfStore variants vs rdf-stores.js, oxigraph and hdt). Wall-clock
-      # via tinybench; deliberately NOT uploaded to CodSpeed. Same full scale as
-      # a local run (rdf-stores' own default: BENCH_DIM=128, 2,097,152 triples).
-      # The hdt adapter opens the .hdt artifact the Rust comparative bench above
-      # already built from the same dataset (target/bench_compare/hdt/data.hdt);
-      # its wasm bindings are read-only, so BENCH_DIM here must keep matching
-      # the Rust step's BENCH_SIZE (128³) or the hdt rows report a mismatch.
-      - name: Build wasm + run JS comparative benchmark
+      - name: Install JS dependencies
+        working-directory: js
+        run: npm ci
+
+      # The wasm bindings depend only on the Rust sources listed in the key;
+      # wasm-pack plus wasm-opt cost ~10 minutes, so a run whose Rust tree is
+      # unchanged reuses the previous artifact instead of rebuilding it.
+      - name: Cache wasm bindings
+        id: wasm-cache
+        uses: actions/cache@v4
+        with:
+          path: js/pkg/web
+          key: wasm-pkg-${{ hashFiles('core/src/**', 'core/Cargo.toml', 'encoded-search/src/**', 'encoded-search/Cargo.toml', 'js/src/**', 'js/Cargo.toml', 'Cargo.lock') }}
+
+      - name: Build wasm bindings
+        if: steps.wasm-cache.outputs.cache-hit != 'true'
+        working-directory: js
+        run: npm run build
+
+      - name: Cache hdt wasm wrapper
+        id: hdt-wasm-cache
+        uses: actions/cache@v4
+        with:
+          path: js/bench/hdt-pkg
+          key: hdt-pkg-${{ hashFiles('js/bench/hdt-wasm/src/**', 'js/bench/hdt-wasm/Cargo.toml', 'js/bench/hdt-wasm/Cargo.lock') }}
+
+      - name: Build hdt wasm wrapper
+        if: steps.hdt-wasm-cache.outputs.cache-hit != 'true'
+        working-directory: js
+        run: npm run build:hdt-wasm
+
+      # Run the JavaScript comparative benchmark (VortexRdfStore variants vs
+      # rdf-stores.js, oxigraph and hdt). Wall-clock via tinybench; deliberately
+      # NOT uploaded to CodSpeed. Same full scale as a local run (rdf-stores'
+      # own default: BENCH_DIM=128, 2,097,152 triples). The hdt adapter opens
+      # the .hdt artifact the Rust comparative bench above already built from
+      # the same dataset (target/bench_compare/hdt/data.hdt); its wasm bindings
+      # are read-only, so BENCH_DIM here must keep matching the Rust step's
+      # BENCH_SIZE (128³) or the hdt rows report a mismatch.
+      - name: Run JS comparative benchmark
         working-directory: js
         env:
           BENCH_DIM: 128
           BENCH_DIM_QUADS: 32
           MUT_BATCH: 10000
-        run: |
-          npm ci
-          npm run build
-          npm run build:hdt-wasm
-          npm run bench
+        run: npm run bench
 
       # The Python comparative benchmark (vortex_rdf vs pyoxigraph, pycottas,
       # rdflib, lightrdf). run.py provisions one uv virtualenv per library --
@@ -89,12 +116,28 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@v7
 
-      - name: Build Python bindings + run Python comparative benchmark
+      # Same idea as the wasm cache: the extension depends only on the Rust
+      # sources, and `maturin develop --release` costs ~4 minutes.
+      - name: Cache Python native extension
+        id: py-native-cache
+        uses: actions/cache@v4
+        with:
+          path: python/vortex_rdf/_native.abi3.so
+          key: py-native-${{ hashFiles('core/src/**', 'core/Cargo.toml', 'encoded-search/src/**', 'encoded-search/Cargo.toml', 'python/src/**', 'python/Cargo.toml', 'Cargo.lock') }}
+
+      # One virtualenv per external library (their dependency sets conflict —
+      # pycottas hard-pins an older pyoxigraph). Provisioning them re-downloads
+      # every library each run; the pins live in adapters.py, so its hash is
+      # the cache identity.
+      - name: Cache benchmark virtualenvs
+        uses: actions/cache@v4
+        with:
+          path: python/bench/.venvs
+          key: py-bench-venvs-${{ hashFiles('python/bench/adapters.py') }}
+
+      - name: Build Python bindings
+        if: steps.py-native-cache.outputs.cache-hit != 'true'
         working-directory: python
-        env:
-          BENCH_DIM: 128
-          BENCH_DIM_QUADS: 32
-          MUT_BATCH: 10000
         run: |
           uv venv .venv --python 3.13
           uv pip install --python .venv/bin/python maturin
@@ -103,7 +146,14 @@ jobs:
           # all the bench needs, since run.py reaches the bindings via
           # PYTHONPATH rather than installing them into each adapter's venv.
           VIRTUAL_ENV="$PWD/.venv" .venv/bin/maturin develop --release
-          python3 bench/run.py
+
+      - name: Run Python comparative benchmark
+        working-directory: python
+        env:
+          BENCH_DIM: 128
+          BENCH_DIM_QUADS: 32
+          MUT_BATCH: 10000
+        run: python3 bench/run.py
 
       - name: Render dashboard
         # --bench-size is now a fallback: each bench target stamps a `#dataset`
