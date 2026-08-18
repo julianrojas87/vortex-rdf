@@ -43,6 +43,7 @@
     "scripts": {
         "build:wasm": "wasm-pack build --target web --out-dir pkg/web --no-pack",
         "build:wasm:fast": "wasm-pack build --target web --out-dir pkg/web --no-pack --no-opt",
+        "build:hdt-wasm": "RUSTFLAGS='-C target-feature=+simd128' wasm-pack build bench/hdt-wasm --target web --out-dir ../hdt-pkg --no-pack",
         "build:reset": "node -e \"require('fs').rmSync('pkg/web',{recursive:true,force:true})\"",
         "build:clean-generated": "node -e \"const fs=require('fs');for (const f of ['pkg/web/package.json','pkg/web/.gitignore']) fs.rmSync(f,{force:true})\"",
         "build": "npm run build:reset && npm run build:wasm && npm run build:clean-generated",

@@ -1,5 +1,6 @@
-// Comparative benchmark: VortexRdfStore (JS/WASM) config variants vs. rdf-stores.js
-// and oxigraph. Emits dashboard-shaped JSON consumed by
+// Comparative benchmark: VortexRdfStore (JS/WASM) config variants vs. rdf-stores.js,
+// oxigraph and hdt (read-only wasm over a natively pre-built artifact — see the
+// hdt section in shared.ts). Emits dashboard-shaped JSON consumed by
 // scripts/render_bench_dashboard.py (the JavaScript tab of the GitHub Pages dashboard).
 //
 // Run (after `npm run build` to produce pkg/web):
@@ -7,7 +8,7 @@
 //   BENCH_DIM=25 BENCH_DIM_QUADS=10 MUT_BATCH=2000 npm run bench   # quick local check
 //
 // The dataset is synthetic but realistic in the dimension that matters for a store
-// comparison: distinct terms scale with rows (near-unique subject IRIs, a small closed
+// comparison: distinct terms scale with rows (ten triples per subject, a small closed
 // predicate vocabulary, a mix of IRI and literal objects), so each library's term
 // handling — dictionaries, interning, string storage — is actually exercised. It is
 // driven across the six routing shapes the Rust dashboard also uses (S/P/O/PO/G/SPOG)
@@ -38,7 +39,7 @@ import { dirname, resolve } from 'node:path';
 
 import {
     ADAPTERS, MUT_ADAPTERS, D, DQ, N_TRIPLES, N_QUADS, MUT_BATCH,
-    QUERY_OPTS, HEAVY_OPTS, FULL_SCAN_OPTS, moduli, type Row,
+    QUERY_OPTS, HEAVY_OPTS, FULL_SCAN_OPTS, moduli, unsupportedRow, type Row,
 } from './shared.js';
 import { runWorkerProcess } from './util.js';
 
@@ -62,6 +63,8 @@ interface WorkerOutput {
     peakRssMb: number | null;
     storeFootprint?: Record<string, number | null>;
     matched?: Record<string, number>;
+    /** Snapshot byte size from the cold-query role — the store's serialized form. */
+    artifactBytes?: number | null;
     cardinality?: Record<string, unknown>;
     failures?: { phase: string; error: string }[];
 }
@@ -88,6 +91,27 @@ async function main(): Promise<void> {
     // rather than looking like a benchmark nobody ran.
     const failures: { slug: string; label: string; role: string; phase: string; error: string }[] = [];
 
+    // Every adapter queries the same dataset with the same probes, so their match
+    // counts must agree. A disagreement is a correctness bug in one of them, not a
+    // benchmarking detail — surface it rather than silently keeping whichever
+    // adapter reported last. Applied to every role that counts anything: the full
+    // scan reports from its own process, and it is the strongest check of the set.
+    const countWarnings: string[] = [];
+    const mergeMatched = (label: string, out: WorkerOutput): void => {
+        for (const [pat, n] of Object.entries(out.matched ?? {})) {
+            if (matched[pat] === undefined) matched[pat] = n;
+            else if (matched[pat] !== n) {
+                // Into the results file, not just the console: the dashboard
+                // renders these, so a disagreement is visible where the numbers
+                // are read rather than only where the run happened to scroll by.
+                const msg = `${label} matched ${n} rows for '${pat}', an earlier adapter matched ${matched[pat]}`;
+                countWarnings.push(msg);
+                console.error(`  !! ${msg}`);
+            }
+        }
+    };
+    const sizes: { slug: string; label: string; bytes: number | null }[] = [];
+
     for (const a of ADAPTERS) {
         const out = runWorker(a.slug, 'query');
         if (!out) continue;
@@ -100,21 +124,7 @@ async function main(): Promise<void> {
             failures.push({ slug: a.slug, label: a.label, role: 'query', ...f });
             console.error(`  !! ${a.label} could not complete '${f.phase}': ${f.error}`);
         }
-        // Every adapter queries the same dataset with the same probes, so their
-        // match counts must agree. A disagreement is a correctness bug in one of
-        // them, not a benchmarking detail — surface it rather than silently
-        // keeping whichever adapter reported last.
-        if (out.matched) {
-            for (const [pat, n] of Object.entries(out.matched)) {
-                if (matched[pat] === undefined) matched[pat] = n;
-                else if (matched[pat] !== n) {
-                    console.error(
-                        `  !! ${a.label} matched ${n} rows for '${pat}', ` +
-                        `but an earlier adapter matched ${matched[pat]}`,
-                    );
-                }
-            }
-        }
+        mergeMatched(a.label, out);
         console.log(
             `[${a.label}] peak RSS: ${out.peakRssMb ?? 'unknown'} MB` +
             `, store: ${out.storeFootprint?.rssMb ?? '?'} MB RSS` +
@@ -131,6 +141,9 @@ async function main(): Promise<void> {
         const out = runWorker(a.slug, 'querycold');
         if (!out) continue;
         results.push(...out.rows);
+        // Serialized-store size: every adapter gets a row, so a store with no
+        // snapshot path renders as an explained cell rather than a gap.
+        sizes.push({ slug: a.slug, label: a.label, bytes: out.artifactBytes ?? null });
         for (const f of out.failures ?? []) {
             failures.push({ slug: a.slug, label: a.label, role: 'querycold', ...f });
             console.error(`  !! ${a.label} could not complete '${f.phase}': ${f.error}`);
@@ -145,6 +158,7 @@ async function main(): Promise<void> {
         const out = runWorker(a.slug, 'fullscan');
         if (!out) continue;
         results.push(...out.rows);
+        mergeMatched(a.label, out);
         for (const f of out.failures ?? []) {
             failures.push({ slug: a.slug, label: a.label, role: 'fullscan', ...f });
             console.error(`  !! ${a.label} could not complete '${f.phase}': ${f.error}`);
@@ -163,6 +177,16 @@ async function main(): Promise<void> {
         console.log(`[${a.label}] peak RSS: ${out.peakRssMb ?? 'unknown'} MB`);
     }
 
+    // A library whose model rules mutation out entirely (hdt: the file is
+    // immutable once built) is not in MUT_ADAPTERS, but its cells should still
+    // say why rather than read as benchmarks nobody ran.
+    for (const a of ADAPTERS) {
+        if (!a.mutationUnsupported) continue;
+        for (const id of ['add', 'add_batch', 'delete']) {
+            results.push(unsupportedRow(`${id}::${a.slug}`, a.mutationUnsupported));
+        }
+    }
+
     const config = {
         triplesCount: N_TRIPLES,
         quadsCount: N_QUADS,
@@ -171,13 +195,14 @@ async function main(): Promise<void> {
         // against the number of rows it actually touched.
         cardinality: { triples: moduli(N_TRIPLES), quads: moduli(N_QUADS, { graphs: 8 }) },
         matchedRows: matched,
+        countWarnings,
         mutBatch: MUT_BATCH,
         queryIterations: QUERY_OPTS.iterations,
         heavyIterations: HEAVY_OPTS.iterations,
         fullScanIterations: FULL_SCAN_OPTS.iterations,
     };
 
-    writeFileSync(OUT, JSON.stringify({ provenance: provenance(), results, memory, config, failures }, null, 2));
+    writeFileSync(OUT, JSON.stringify({ provenance: provenance(), results, memory, sizes, config, failures }, null, 2));
     console.log(`\nWrote ${results.length} benchmark rows, ${memory.length} memory readings`
         + `${failures.length ? `, ${failures.length} unmeasurable phase(s)` : ''} → ${OUT}`);
     for (const f of failures) console.log(`  missing: ${f.label} / ${f.role} / ${f.phase}`);
@@ -204,7 +229,7 @@ function provenance(): string {
         `triples D=${D} (${N_TRIPLES.toLocaleString()} quads, ${moduli(N_TRIPLES).terms.toLocaleString()} terms), ` +
         `quads Dq=${DQ} (${N_QUADS.toLocaleString()} quads, ${moduli(N_QUADS, { graphs: 8 }).terms.toLocaleString()} terms), ` +
         `MUT_BATCH=${MUT_BATCH.toLocaleString()} · tinybench ${depVersion('tinybench')}, wall-clock · ` +
-        `vortex-rdf-store ${require('../package.json').version}, rdf-stores ${depVersion('rdf-stores')}, oxigraph ${depVersion('oxigraph')} · ` +
+        `vortex-rdf-store ${require('../package.json').version}, rdf-stores ${depVersion('rdf-stores')}, oxigraph ${depVersion('oxigraph')}, hdt 0.7 (wasm, read-only) · ` +
         `one adapter per process, isolated`
     );
 }

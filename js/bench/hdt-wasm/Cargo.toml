@@ -1,0 +1,29 @@
+[package]
+name = "hdt-wasm-bench"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Bench-only wasm bindings over the hdt crate, for the JS comparative benchmark"
+license = "MIT"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# The same version the Rust comparative bench uses (core dev-dependency), so
+# the two tabs' hdt rows measure the same implementation.
+hdt = "0.7"
+wasm-bindgen = "0.2"
+console_error_panic_hook = "0.1"
+# Transitive dependency of hdt; on wasm32 it must be told its randomness source
+# explicitly. Enabling the feature here unifies it into the whole build.
+uuid = { version = "1", features = ["js"] }
+
+# Standalone: deliberately NOT a member of the repo's cargo workspace. Only
+# `npm run build:hdt-wasm` builds it, for the wasm32 target, and its dependency
+# tree stays out of the root Cargo.lock.
+[workspace]
+
+[profile.release]
+opt-level = 3
+lto = true

@@ -17,7 +17,9 @@
 
 import type { BenchOptions, Bench } from 'tinybench';
 import type { Quad } from '@rdfjs/types';
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { dirname, resolve } from 'node:path';
 
 import { VortexRdfStore, type BuildOptions } from '../entry/node.js';
 import { fmtNs, freeWasm } from './util.js';
@@ -53,7 +55,7 @@ export interface StoreAdapter<H = unknown> {
     addAll(h: H, quads: Quad[]): Promise<void> | void; // per-quad add loop
     addBatch?(h: H, quads: Quad[]): Promise<void> | void; // optional batch add (Vortex)
     deleteAll(h: H, quads: Quad[]): Promise<void> | void; // per-quad delete loop
-    countMatch(h: H, p: Pat): Promise<number> | number; // consume + count
+    countMatch(h: H, p: Pat): Promise<number> | number; // count by consuming — every result term is read (consumeQuads)
     // Cold-regime pair, optional: `snapshot` serializes a built store once
     // (untimed) and `open` adopts that snapshot into a fresh handle, which the
     // cold query phase does per iteration. Only the stores with a persistent
@@ -63,6 +65,16 @@ export interface StoreAdapter<H = unknown> {
     // absent from the cold rows.
     snapshot?(h: H): Promise<unknown>;
     open?(snapshot: unknown): Promise<H>;
+    // Operations a store cannot perform in this environment, as opposed to slow
+    // ones. When set, the worker emits explained `unsupported` cells instead of
+    // timing anything: `ingestUnsupported` covers build-from-quads (hdt's wasm
+    // surface is read-only — `build` opens a pre-built artifact instead),
+    // `quadsUnsupported` covers the named-graph dataset (the HDT model has no
+    // graphs), and `mutationUnsupported` covers add/delete. Same vocabulary as
+    // the Rust and Python tabs' unsupported rows.
+    ingestUnsupported?: string;
+    quadsUnsupported?: string;
+    mutationUnsupported?: string;
     // Both Vortex and oxigraph are wasm-bindgen: `.free()` deterministically drops
     // the WASM-side allocation. The generated FinalizationRegistry is a fallback
     // only — V8 has no visibility into WASM linear-memory pressure, so it can defer
@@ -103,6 +115,40 @@ export const VORTEX_VARIANTS: { slug: string; label: string; options: BuildOptio
     { slug: 'vortex_default_bycopy', label: 'Vortex Default+ByCopy', options: { layout: 'default', indexes: ['secondary-by-copy'] } },
 ];
 
+/** Count a result set by consuming it: read every term of every quad.
+ *
+ *  The stores return different amounts of *done* work: the pure-JS stores hold
+ *  eager term objects, while Vortex quads are lazy wasm-backed proxies whose
+ *  term values have not crossed the boundary yet. Counting `.length` alone lets
+ *  Vortex skip that crossing entirely — the JS tab then reads structurally
+ *  faster than the same query on the same data on the Rust and Python tabs,
+ *  which both materialize (quads_vec / N-Triples strings). Reading all four
+ *  term values makes materialization part of the measured work everywhere, and
+ *  puts the wasm boundary cost — the thing worth optimizing — on the page. */
+let consumeSink = 0;
+export function consumeQuads(
+    quads: ArrayLike<{ subject: { value: string }; predicate: { value: string };
+                       object: { value: string }; graph?: { value: string } }>,
+): number {
+    let acc = 0;
+    for (let i = 0; i < quads.length; i++) {
+        const q = quads[i];
+        acc += q.subject.value.length + q.predicate.value.length
+             + q.object.value.length + (q.graph?.value.length ?? 0);
+    }
+    consumeSink += acc; // the reads must escape, or the JIT may drop them
+    return quads.length;
+}
+export function consumedChecksum(): number { return consumeSink; }
+
+/** [`consumeQuads`]'s contract for a store whose results are term strings
+ *  rather than quad objects (hdt): read every string, escape the reads. */
+export function consumeStrings(strings: string[]): void {
+    let acc = 0;
+    for (const s of strings) acc += s.length;
+    consumeSink += acc;
+}
+
 export function vortexAdapter(variant: { slug: string; label: string; options: BuildOptions }): StoreAdapter<VortexRdfStore> {
     return {
         slug: variant.slug,
@@ -112,7 +158,7 @@ export function vortexAdapter(variant: { slug: string; label: string; options: B
         addAll: async (h, quads) => { for (const q of quads) await h.addQuad(q); },
         addBatch: (h, quads) => h.addQuads(quads),
         deleteAll: async (h, quads) => { for (const q of quads) await h.deleteQuad(q); },
-        countMatch: async (h, p) => (await h.getQuads(p.s, p.p, p.o, p.g)).length,
+        countMatch: async (h, p) => consumeQuads(await h.getQuads(p.s, p.p, p.o, p.g)),
         snapshot: (h) => h.toBytes(),
         open: (bytes) => VortexRdfStore.fromBytes(bytes as Uint8Array),
         dispose: freeWasm,
@@ -144,7 +190,7 @@ export function rdfStoresAdapter(kind: 'default' | 'single', label: string): Sto
         newEmpty: () => newRdfStore(kind),
         addAll: (h, quads) => { for (const q of quads) h.addQuad(q); },
         deleteAll: (h, quads) => { for (const q of quads) h.removeQuad(q); },
-        countMatch: (h, p) => h.getQuads(p.s, p.p, p.o, p.g).length, // synchronous array
+        countMatch: (h, p) => consumeQuads(h.getQuads(p.s, p.p, p.o, p.g)), // synchronous array
     };
 }
 
@@ -156,7 +202,100 @@ export function oxigraphAdapter(): StoreAdapter<OxiStore> {
         newEmpty: () => new OxiStore(),
         addAll: (h, quads) => { for (const q of quads) h.add(q as never); },
         deleteAll: (h, quads) => { for (const q of quads) h.delete(q as never); },
-        countMatch: (h, p) => h.match(p.s as never, p.p as never, p.o as never, p.g as never).length,
+        countMatch: (h, p) => consumeQuads(h.match(p.s as never, p.p as never, p.o as never, p.g as never)),
+        dispose: freeWasm,
+    };
+}
+
+// ─── hdt (wasm, read-only) ───────────────────────────────────────────────────
+//
+// The hdt crate's wasm surface is read-only: HDT *construction* (`read_nt`)
+// spawns OS threads and uses rayon, which trap on wasm32, so the artifact is
+// built natively and only opened here. The Rust comparative bench writes one
+// from the same shared dataset as part of its run (`cargo bench --bench
+// compare`, at BENCH_SIZE = this tab's D³) — point `HDT_FILE` elsewhere to
+// override. The wasm module itself is the bench's own build of the crate's
+// bindings: `npm run build:hdt-wasm` → bench/hdt-pkg (see bench/hdt-wasm).
+
+const here = dirname(fileURLToPath(import.meta.url));
+export const HDT_FILE = process.env.HDT_FILE
+    ?? resolve(here, '../../target/bench_compare/hdt/data.hdt');
+
+type HdtModule = typeof import('./hdt-pkg/hdt_wasm_bench.js');
+type HdtStore = import('./hdt-pkg/hdt_wasm_bench.js').HdtStore;
+let hdtModule: HdtModule | null = null;
+async function hdtMod(): Promise<HdtModule> {
+    if (!hdtModule) {
+        // Same init path as entry/node.js: hand `init` the wasm bytes directly,
+        // because Node's fetch does not speak file: URLs.
+        const mod = await import('./hdt-pkg/hdt_wasm_bench.js');
+        const wasmPath = resolve(here, 'hdt-pkg/hdt_wasm_bench_bg.wasm');
+        await mod.default({ module_or_path: readFileSync(wasmPath) });
+        hdtModule = mod;
+    }
+    return hdtModule;
+}
+
+/** A probe term in HDT dictionary spelling: IRIs bare, literals with their
+ *  quotes — the same conversion the Rust tab's hdt adapter applies. */
+function hdtTerm(t: { termType: string; value: string } | null): string | undefined {
+    if (!t) return undefined;
+    return t.termType === 'Literal' ? `"${t.value}"` : t.value;
+}
+
+/** Window for `ids_to_strings`: translating several million ids in one call is
+ *  that surface's documented OOM risk, so the full scan feeds it chunks. */
+const HDT_TRANSLATE_IDS = 300_000 * 3;
+
+export function hdtAdapter(): StoreAdapter<HdtStore> {
+    return {
+        slug: 'hdt',
+        label: 'hdt (file)',
+        ingestUnsupported:
+            'the wasm bindings are read-only — the artifact is built natively '
+            + '(the Rust comparative bench writes it) and only opened here',
+        quadsUnsupported: 'the HDT format has no named graphs — triples only',
+        mutationUnsupported: 'an HDT file is immutable once built',
+        // `build` opens the pre-built artifact; the quads argument is only the
+        // consistency check that the artifact and this run's generated dataset
+        // are the same rows — the probe-count cross-check then verifies the
+        // contents, not just the cardinality.
+        build: async (quads) => {
+            if (!existsSync(HDT_FILE)) {
+                throw new Error(
+                    `no HDT artifact at ${HDT_FILE} — the Rust comparative bench builds it `
+                    + '(cargo bench --bench compare), or point HDT_FILE at one');
+            }
+            const mod = await hdtMod();
+            const h = new mod.HdtStore(readFileSync(HDT_FILE));
+            const n = h.num_triples();
+            if (n !== quads.length) {
+                h.free();
+                throw new Error(
+                    `HDT artifact at ${HDT_FILE} holds ${n} triples but this run's dataset has `
+                    + `${quads.length} — rebuild it: BENCH_SIZE=${quads.length} cargo bench --bench compare`);
+            }
+            return h;
+        },
+        newEmpty: () => { throw new Error('hdt is read-only'); },
+        addAll: () => { throw new Error('hdt is read-only'); },
+        deleteAll: () => { throw new Error('hdt is read-only'); },
+        countMatch: (h, p) => {
+            const ids = h.triple_ids_with_pattern(hdtTerm(p.s), hdtTerm(p.p), hdtTerm(p.o));
+            // Materialize every term string, in windows — the counterpart of
+            // consumeQuads reading every term value on the quad-shaped stores.
+            for (let off = 0; off < ids.length; off += HDT_TRANSLATE_IDS) {
+                consumeStrings(h.ids_to_strings(ids.subarray(off, Math.min(off + HDT_TRANSLATE_IDS, ids.length))));
+            }
+            return ids.length / 3;
+        },
+        // Its persistent form IS the artifact: snapshot hands over the file's
+        // bytes, open parses them — the same reopen the other tabs measure.
+        snapshot: async () => readFileSync(HDT_FILE),
+        open: async (bytes) => {
+            const mod = await hdtMod();
+            return new mod.HdtStore(bytes as Uint8Array);
+        },
         dispose: freeWasm,
     };
 }
@@ -167,6 +306,7 @@ export const ADAPTERS: StoreAdapter[] = [
     rdfStoresAdapter('default', 'rdf-stores (default)'),
     rdfStoresAdapter('single', 'rdf-stores (1 index)'),
     oxigraphAdapter(),
+    hdtAdapter(),
 ];
 
 // Representative subset for mutations (per-quad add/delete is the fair cross-lib path).
@@ -180,12 +320,35 @@ export const MUT_ADAPTERS: StoreAdapter[] = [
 export interface Row {
     group: string; variant: string | null; id: string;
     fastest: string; slowest: string; median: string; mean: string;
-    fastest_ns: number; slowest_ns: number; median_ns: number; mean_ns: number;
+    fastest_ns: number | null; slowest_ns: number | null;
+    median_ns: number | null; mean_ns: number | null;
     samples: string;
     /** Cache regime this row was measured in — 'warm' is a repeat query on an
      *  open store, 'cold' opens one per iteration and answers its first. Absent
      *  on rows where the distinction does not apply (ingest, mutation). */
     regime?: 'cold' | 'warm';
+    /** An operation this store cannot perform, as opposed to a slow one. */
+    unsupported?: boolean;
+    /** Why, shown as the cell's tooltip. */
+    reason?: string;
+}
+
+/** A row the dashboard renders as 'unsupported' rather than as a missing cell.
+ *
+ *  Mirrors `unsupported_row` in python/bench/worker.py, down to the null
+ *  `median_ns` that keeps the row out of its column's best/ratio arithmetic:
+ *  an operation a store cannot perform is not a slow result, and a blank cell
+ *  reads as a benchmark nobody ran. */
+export function unsupportedRow(id: string, reason: string): Row {
+    const [group, variant] = id.split('::');
+    return {
+        group, variant: variant ?? null, id,
+        unsupported: true, reason,
+        fastest: 'unsupported', slowest: 'unsupported',
+        median: 'unsupported', mean: 'unsupported',
+        fastest_ns: null, slowest_ns: null, median_ns: null, mean_ns: null,
+        samples: '0',
+    };
 }
 
 export function collect(bench: Bench, results: Row[], regime?: 'cold' | 'warm'): void {

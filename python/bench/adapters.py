@@ -79,7 +79,8 @@ class Adapter:
     supports_mutation: bool = True
     #: Whether opening the built artifact is a distinct operation from building
     #: it. False for stores that live only in memory and must re-parse the
-    #: source file every process start -- which is the comparison, not a flaw.
+    #: source file every process start; those get no Open measurement, because
+    #: the re-parse is what the Build column already reports.
     has_distinct_open: bool = True
 
     def artifact_path(self, workdir: str, src: str) -> str:
@@ -181,8 +182,9 @@ class PyoxigraphAdapter(Adapter):
     """In-memory `Store` + `bulk_load`, mirroring the JavaScript tab's oxigraph.
 
     has_distinct_open is False: an in-memory Store has no artifact to reopen,
-    so a fresh process must bulk_load the source file again. The Open column
-    measures exactly that -- it is the cost the file-backed formats avoid.
+    so a fresh process must bulk_load the source file again -- which is what
+    the Build column already measures, so Open is left blank rather than
+    ranking a re-parse against a file-backed format's footer read.
     """
 
     slug, label = "pyoxigraph", "pyoxigraph"

@@ -126,6 +126,8 @@ def unsupported_row(ident: str, reason: str) -> dict:
 
     `median_ns` is None so the panel excludes it from the column's best/ratio
     arithmetic: an operation a library cannot perform is not a slow operation.
+    The reason rides along as the cell's tooltip, so one word covers every kind
+    of absence on the page and the specifics stay one hover away.
     """
     group, _, variant = ident.partition("::")
     return {
@@ -195,17 +197,30 @@ def run_query(a, args) -> dict:
     artifact_bytes = a.artifact_bytes(artifact)
 
     # --- open ---
-    # For an in-memory store this is a full re-parse of the source file, which
-    # is the honest cost of getting that library queryable in a fresh process.
-    log("open…")
-    measure(
-        f"open::{a.slug}",
-        lambda: a.open(artifact, args.triples),
-        rows,
-        HEAVY_ITERS if not a.has_distinct_open else QUERY_ITERS,
-        warmup=0 if not a.has_distinct_open else QUERY_WARMUP,
-        teardown=lambda h: a.dispose(h),
-    )
+    # Only for a library that has an artifact to open. A store that lives in
+    # memory has none: "opening" it is re-parsing the source, which is what the
+    # Build column already measures -- and measured here it was within 4% of
+    # that column for pyoxigraph and 1% for rdflib, ranked against a footer read
+    # as though the two were the same operation. The cost is real and it is
+    # Build's to report; this column stays about opening an artifact.
+    if a.has_distinct_open:
+        log("open…")
+        measure(
+            f"open::{a.slug}",
+            lambda: a.open(artifact, args.triples),
+            rows,
+            QUERY_ITERS,
+            warmup=QUERY_WARMUP,
+            teardown=lambda h: a.dispose(h),
+        )
+    else:
+        rows.append(
+            unsupported_row(
+                f"open::{a.slug}",
+                "no artifact to reopen: a fresh process re-parses the source, "
+                "which is the Build column",
+            )
+        )
 
     # --- match: triple patterns + full scan ---
     handle = a.open(artifact, args.triples)
@@ -326,6 +341,15 @@ def run_query(a, args) -> dict:
     return {
         "rows": rows,
         "counts": counts,
+        # Reported rather than assumed by the caller: these are env-tunable, so
+        # the only figure that is certainly right is the one the process that
+        # did the timing used. The dashboard shows them next to the numbers.
+        "iters": {
+            "query": QUERY_ITERS,
+            "queryWarmup": QUERY_WARMUP,
+            "heavy": HEAVY_ITERS,
+            "fullScan": FULL_SCAN_ITERS,
+        },
         "artifact_bytes": artifact_bytes,
         "peak_rss_mb": peak_rss_mb(),
     }

@@ -192,6 +192,7 @@ def main() -> int:
     sizes: list = []
     counts_by_slug: dict[str, dict[str, int]] = {}
     labels: dict[str, str] = {}
+    iters: dict[str, int] = {}
 
     for slug in ALL_SLUGS:
         res = run_worker(slug, "query", triples, quads)
@@ -201,6 +202,9 @@ def main() -> int:
         labels[slug] = res["label"]
         if res.get("counts"):
             counts_by_slug[slug] = res["counts"]
+        # Every worker runs the same counts; keep the first that reports them so
+        # the dashboard can state the repetition count the way the JS tab does.
+        iters = iters or res.get("iters") or {}
         if res.get("peak_rss_mb") is not None:
             memory.append(
                 {"slug": slug, "label": res["label"], "role": "query", "peakRssMb": res["peak_rss_mb"]}
@@ -274,6 +278,11 @@ def main() -> int:
             "cardinality": {"triples": tm.__dict__, "quads": qm.__dict__},
             "matchedRows": matched,
             "mutBatch": MUT_BATCH,
+            # Same key names the JS harness emits, so both tabs state their
+            # repetition counts identically.
+            "queryIterations": iters.get("query"),
+            "heavyIterations": iters.get("heavy"),
+            "fullScanIterations": iters.get("fullScan"),
             "countWarnings": warnings,
             "systemMemoryMb": mem.get("MemTotal"),
             "availableMemoryMb": mem.get("MemAvailable"),

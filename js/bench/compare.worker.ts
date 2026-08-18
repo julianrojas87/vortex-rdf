@@ -11,7 +11,7 @@ import {
     ADAPTERS, MUT_ADAPTERS, N_TRIPLES, N_QUADS, MUT_BATCH,
     genDataset, genFresh, genDatasetPrefix, datasetProbes, moduli,
     FULL_SCAN_PATTERN, QUERY_OPTS, COLD_QUERY_OPTS, HEAVY_OPTS, FULL_SCAN_OPTS,
-    reclaim, collect, peakRssMb, rssMb, jsHeapMb, wasmHeapMb,
+    reclaim, collect, unsupportedRow, peakRssMb, rssMb, jsHeapMb, wasmHeapMb,
     type Row, type Pat, type StoreAdapter,
 } from './shared.js';
 
@@ -62,6 +62,11 @@ async function bench(
  *  fixed D², so a timing is only interpretable next to its match count. */
 const matched: Record<string, number> = {};
 
+/** Byte size of the store's serialized snapshot, when this role built one --
+ *  the JS store's persistent form is a byte buffer, so this is its "artifact
+ *  size", the counterpart of the on-disk sizes the other tabs report. */
+let snapshotBytes: number | null = null;
+
 /** What building the store cost, over and above the input `Quad[]`. */
 const storeFootprint: Record<string, number | null> = {};
 
@@ -108,25 +113,39 @@ async function runQuery(a: StoreAdapter): Promise<Row[]> {
     reclaim(a, th);
     th = null;
 
-    console.log(`[${a.label}] query (quads)…`);
-    const quads = genDataset(N_QUADS, { graphs: 8 });
-    let qh: unknown = await a.build(quads);
-    await countAll(a, qh, qProbes.quads);
-    await bench('query_quads', rows, QUERY_OPTS, (b) => {
-        for (const p of qProbes.quads) b.add(`${a.slug}::${p.name}`, async () => { await a.countMatch(qh, p); });
-    }, 'warm');
-    reclaim(a, qh);
-    qh = null;
+    if (a.quadsUnsupported) {
+        // No quads in the model at all — say so per probe rather than leaving
+        // cells that read as benchmarks nobody ran.
+        for (const p of qProbes.quads) {
+            const r = unsupportedRow(`${a.slug}::${p.name}`, a.quadsUnsupported);
+            r.regime = 'warm';
+            rows.push(r);
+        }
+    } else {
+        console.log(`[${a.label}] query (quads)…`);
+        const quads = genDataset(N_QUADS, { graphs: 8 });
+        let qh: unknown = await a.build(quads);
+        await countAll(a, qh, qProbes.quads);
+        await bench('query_quads', rows, QUERY_OPTS, (b) => {
+            for (const p of qProbes.quads) b.add(`${a.slug}::${p.name}`, async () => { await a.countMatch(qh, p); });
+        }, 'warm');
+        reclaim(a, qh);
+        qh = null;
+    }
 
-    console.log(`[${a.label}] ingest…`);
-    await bench('ingest', rows, HEAVY_OPTS, (b) => {
-        // Dispose in `afterEach` (untimed) rather than inside the timed function, so
-        // freeing the previous store never pollutes the measured ingest cost.
-        let h: unknown;
-        b.add(`ingest::${a.slug}`, async () => { h = await a.build(triples); }, {
-            afterEach: () => { reclaim(a, h); h = undefined; },
+    if (a.ingestUnsupported) {
+        rows.push(unsupportedRow(`ingest::${a.slug}`, a.ingestUnsupported));
+    } else {
+        console.log(`[${a.label}] ingest…`);
+        await bench('ingest', rows, HEAVY_OPTS, (b) => {
+            // Dispose in `afterEach` (untimed) rather than inside the timed function, so
+            // freeing the previous store never pollutes the measured ingest cost.
+            let h: unknown;
+            b.add(`ingest::${a.slug}`, async () => { h = await a.build(triples); }, {
+                afterEach: () => { reclaim(a, h); h = undefined; },
+            });
         });
-    });
+    }
 
     return rows;
 }
@@ -166,7 +185,17 @@ async function runQuery(a: StoreAdapter): Promise<Row[]> {
  */
 async function runQueryCold(a: StoreAdapter): Promise<Row[]> {
     const rows: Row[] = [];
-    if (!a.snapshot || !a.open) return rows; // no persistent form, no cold rows
+    if (!a.snapshot || !a.open) {
+        // No persistent form: nothing to reopen, so no cold rows — and no open
+        // either. Say so in the cell rather than leaving a bare dash, which
+        // reads as a measurement nobody took. Getting this store queryable in a
+        // fresh process is a rebuild from quads, which the Ingest column reports.
+        rows.push(unsupportedRow(
+            `open::${a.slug}`,
+            'no artifact to reopen: a fresh process rebuilds from quads, which is the Ingest column',
+        ));
+        return rows;
+    }
 
     // One dataset's cold pass: adopt per iteration (untimed), query (timed).
     const coldPass = async (
@@ -188,6 +217,7 @@ async function runQueryCold(a: StoreAdapter): Promise<Row[]> {
     const tProbes = datasetProbes(N_TRIPLES);
     let th: unknown = await a.build(triples);
     const tSnap = await a.snapshot(th);
+    snapshotBytes = (tSnap as Uint8Array)?.byteLength ?? null;
     reclaim(a, th);
     th = null;
 
@@ -204,9 +234,18 @@ async function runQueryCold(a: StoreAdapter): Promise<Row[]> {
 
     await coldPass('query_triples_cold', tSnap, tProbes.triples);
 
+    const qProbes = datasetProbes(N_QUADS, { graphs: 8 });
+    if (a.quadsUnsupported) {
+        for (const p of qProbes.quads) {
+            const r = unsupportedRow(`${a.slug}::${p.name}`, a.quadsUnsupported);
+            r.regime = 'cold';
+            rows.push(r);
+        }
+        return rows;
+    }
+
     console.log(`[${a.label}] query cold (quads)…`);
     const quads = genDataset(N_QUADS, { graphs: 8 });
-    const qProbes = datasetProbes(N_QUADS, { graphs: 8 });
     let qh: unknown = await a.build(quads);
     const qSnap = await a.snapshot(qh);
     reclaim(a, qh);
@@ -221,6 +260,10 @@ async function runFullScan(a: StoreAdapter): Promise<Row[]> {
     console.log(`[${a.label}] full scan…`);
     const triples = genDataset(N_TRIPLES);
     let h: unknown = await a.build(triples);
+    // Record what the scan matches, as the pattern probes do — this is the one
+    // column whose count the dashboard was missing, and it is also the strongest
+    // cross-adapter check there is: every store must return the whole dataset.
+    matched.full = await a.countMatch(h, FULL_SCAN_PATTERN);
     await bench('full', rows, FULL_SCAN_OPTS, (b) => {
         b.add(`${a.slug}::full`, async () => { await a.countMatch(h, FULL_SCAN_PATTERN); });
     }, 'warm');
@@ -290,6 +333,7 @@ async function main(): Promise<void> {
         storeFootprint,
         matched,
         failures,
+        artifactBytes: snapshotBytes,
         cardinality: role === 'query'
             ? { triples: moduli(N_TRIPLES), quads: moduli(N_QUADS, { graphs: 8 }) }
             : undefined,
