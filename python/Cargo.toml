@@ -20,15 +20,8 @@ test = false
 doctest = false
 
 [dependencies]
-# Default features on: `file-io` is the point of these bindings (lazy
-# file-backed stores). `mimalloc` must stay off — a #[global_allocator]
-# inside a cdylib loaded by CPython is a footgun.
 vortex-rdf-core = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread"] }
-# abi3-py311: the buffer protocol slots (zero-copy u32 code columns) entered
-# the limited API in Python 3.11.
 pyo3 = { workspace = true, features = ["extension-module", "abi3-py311"] }
 oxrdf.workspace = true
-# Only for the `Buffer<u32>` backing the zero-copy code columns; every other
-# Vortex type stays behind core's API.
 vortex-buffer.workspace = true

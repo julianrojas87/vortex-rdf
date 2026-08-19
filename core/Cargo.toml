@@ -12,7 +12,6 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
-# The format engine
 vortex.workspace = true
 vortex-array.workspace = true
 vortex-error.workspace = true
@@ -40,13 +39,11 @@ thiserror.workspace = true
 uuid = { version = "1", features = ["v4"] }
 rkyv = { version = "0.8.17", features = ["std", "bytecheck"] }
 serde = { version = "1.0", features = ["derive"] }
-# The native container's wire metadata (io::store_layout) is a small JSON stamp.
 serde_json = "1.0"
 
 futures.workspace = true
 async-trait.workspace = true
 log = "0.4.33"
-# Only for the CLI-argument derives on the strategy enums (feature `clap`).
 clap = { workspace = true, optional = true }
 web-time = { workspace = true }
 
@@ -55,8 +52,6 @@ mimalloc = { workspace = true, optional = true }
 
 [features]
 default = ["file-io"]
-# No `vortex/zstd`: files must decode on every target, and the wasm reader has
-# no Zstd registered — the compressor never selects it for our columns anyway.
 file-io = [
     "vortex-io/tokio",
     "vortex/files",
@@ -74,16 +69,11 @@ clap = ["dep:clap"]
 
 [dev-dependencies]
 divan = { version = "5.0.1", package = "codspeed-divan-compat" }
-# `rocksdb` adds the file-backed `Store::open*` constructors the comparative
-# bench's oxigraph (rocksdb) adapter uses; `Store::new` stays purely in-memory.
 oxigraph = { version = "0.5.9", default-features = false, features = ["rocksdb"] }
 sophia = "0.10"
-# `nt` is what makes hdt buildable from N-Triples rather than read-only.
 hdt = { version = "0.7", features = ["nt"] }
 serde_json = "1.0"
 futures = { workspace = true }
-# RAII temp dirs for the file-io tests: cleanup must survive a panicking
-# assertion, which hand-rolled `remove_file` tails never did.
 tempfile = "3"
 tokio = { workspace = true, features = ["time", "rt-multi-thread"] }
 

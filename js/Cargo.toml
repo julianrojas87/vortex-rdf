@@ -13,17 +13,9 @@ publish = false
 [lib]
 crate-type = ["cdylib", "rlib"]
 
-# wasm-opt's default `-O` costs many minutes on this module and buys nothing we
-# want: LLVM at opt-level=3 has already done the real optimization, so `-O` only
-# shrinks the file. -O1 builds ~20x faster, gzips comparably (what npm and CDNs
-# actually ship), and is indistinguishable at runtime.
-#
-# Size history (raw / gzip after -O1): 12.22MB / 2.46MB on the 0.83 vortex tree
-# with the IPC byte format; 24.5MB / 4.7MB after the embedded-store format made
-# `toBytes`/`fromBytes` real Vortex files — the file writer's compression
-# pipeline (btrblocks + every registered encoding) is now reachable from wasm
-# and can no longer be dead-stripped. If the bundle ever matters more than
-# writer parity, a wasm-only lighter write strategy is the lever.
+# wasm-opt's default `-O` only shrinks the file and costs many minutes on this module
+# without further optimization. -O1 builds ~20x faster, gzips comparably, 
+# and is indistinguishable at runtime.
 [package.metadata.wasm-pack.profile.release]
 wasm-opt = ['-O1']
 
@@ -45,10 +37,7 @@ oxrdfio.workspace = true
 
 # The core dependency is target-conditional so that the crate builds on both
 # targets it is checked against. WebAssembly has no filesystem, so the wasm
-# build takes core without its default `file-io` feature; the host build takes
-# the default features, under which core's serialization surface
-# (`to_bytes`/`from_bytes`) — which these bindings call unconditionally — is
-# compiled in.
+# build takes core without its default `file-io` feature.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 vortex-rdf-core = { path = "../core", default-features = false }
 
