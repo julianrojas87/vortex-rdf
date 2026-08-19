@@ -338,8 +338,8 @@ pub(crate) fn gather_live(
 /// encoded search probes instead of the slice/take pipeline (see
 /// [`gather_by_point_reads`]). The pipeline's cost is fixed per column
 /// (optimizer pass, execution context, canonicalization) whatever the row
-/// count; point reads cost a fraction of a microsecond per row per column —
-/// the crossover sits in the hundreds of rows, and this stays under it.
+/// count, while point reads cost per row per column, so the crossover sits in
+/// the hundreds of rows and this threshold stays under it.
 pub(crate) const POINT_GATHER_MAX_ROWS: usize = 256;
 
 /// Rows of a small selection, read point-by-point through encoded search

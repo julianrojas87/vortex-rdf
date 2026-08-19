@@ -82,8 +82,8 @@ impl VortexArrayBuilder for SortedInMemoryBuilder {
 
     /// Streaming override for file writes: the sort still requires the whole
     /// dataset in memory as `RawQuad`s, but column chunks are built lazily as
-    /// the writer polls, so only one chunk's Vortex arrays exist at a time —
-    /// peak memory drops from ~2× dataset to ~1× dataset + one chunk.
+    /// the writer polls, so only one chunk's Vortex arrays exist at a time:
+    /// peak memory is ~1× dataset plus one chunk.
     async fn build_vortex_stream(
         quad_stream: Box<dyn Stream<Item = Result<RawQuad>> + Unpin + Send + 'static>,
         layout: LayoutStrategy,

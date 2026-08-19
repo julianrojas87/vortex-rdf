@@ -3,7 +3,7 @@
 // (copied verbatim into the generated pkg; no runtime npm dependency).
 //
 // Converting RDF/JS quads term-by-term across the wasm boundary costs ~16–20
-// Reflect calls per quad, which profiling showed dominating bulk ingestion.
+// Reflect calls per quad, which dominates bulk ingestion.
 // Instead `fromQuads`/`addQuads` flatten a range of the array host-side into
 // one length-prefixed byte buffer and cross the boundary once; the Rust side
 // (js/src/ingest.rs) decodes it with a linear cursor.

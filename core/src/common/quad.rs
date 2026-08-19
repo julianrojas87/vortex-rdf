@@ -63,9 +63,8 @@ impl RawQuad {
 }
 
 /// `<iri>` built directly with one exact-capacity allocation. IRIs need no
-/// escaping in N-Triples, so this skips the `Display`/`format!` machinery —
-/// which profiling showed costing ~17% of serialization (formatter dispatch
-/// plus incremental `String` reallocation) across `from_quad`'s callers.
+/// escaping in N-Triples, so this skips the `Display`/`format!` machinery and
+/// its formatter dispatch plus incremental `String` reallocation.
 fn named_node_string(n: &oxrdf::NamedNode) -> String {
     let iri = n.as_str();
     let mut s = String::with_capacity(iri.len() + 2);

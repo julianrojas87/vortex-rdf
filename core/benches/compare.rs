@@ -13,8 +13,8 @@
 //! # Isolation
 //!
 //! One adapter per process, re-executing this binary with `--adapter <slug>`. That
-//! is not ceremony: a cheap pattern measured after a scan-backed one reads ~3x
-//! slow in a shared process, and peak RSS is only attributable to a library that
+//! is not ceremony: in a shared process a cheap pattern is measured in the shadow
+//! of another library's scan, and peak RSS is only attributable to a library that
 //! had a process to itself. The parent merges the children's JSON.
 //!
 //! # Libraries
@@ -865,15 +865,13 @@ impl Queryable for SophiaGraph {
 
 /// "This exact term, or anything" -- the matcher sophia does not ship.
 ///
-/// Two wrong ways to spell this, both of which this suite measured before getting
-/// it right. A **closure** matcher reports no [`TermMatcher::constant`], and that
-/// constant is exactly what `FastGraph` uses to look a term up in its index, so
-/// every pattern degrades to a full scan: `S` came out at 14.19 ms against the
-/// graph's own 12.85 ms full scan -- slower than scanning, which is how the
-/// mistake announced itself. **`Option<T>`** does report a constant, but its
-/// documented meaning is "the wrapped term if any, otherwise *nothing*", so every
-/// wildcard silently matches zero rows. This reports the constant when there is
-/// one and matches everything when there is not.
+/// It reports the constant when there is one and matches everything when there
+/// is not. Neither of sophia's two near-fits does that: a **closure** matcher
+/// reports no [`TermMatcher::constant`], and that constant is exactly what
+/// `FastGraph` uses to look a term up in its index, so every pattern degrades
+/// to a full scan; **`Option<T>`** does report a constant, but its documented
+/// meaning is "the wrapped term if any, otherwise *nothing*", so every wildcard
+/// silently matches zero rows.
 enum AnyOr {
     Any,
     Exactly(SimpleTerm<'static>),
@@ -1221,10 +1219,9 @@ fn run_adapter(a: &dyn Adapter, n: usize) -> WorkerOut {
 
         // Cold: a fresh handle per iteration, so every probe/segment cache starts
         // empty -- but the open itself is UNTIMED setup. Timing it here would
-        // make every cold cell a restatement of the Open column (measured: the
-        // in-memory variants' cold S was 3.51 ms against a 3.83 ms open, i.e.
-        // ~100% open), and would mean something different from the cold columns
-        // on every other tab, which all exclude it.
+        // make every cold cell a restatement of the Open column, and would mean
+        // something different from the cold columns on every other tab, which
+        // all exclude it.
         if a.has_distinct_open() {
             log(&format!("match {} (cold)…", pat.name));
             measure_with_setup_regime(

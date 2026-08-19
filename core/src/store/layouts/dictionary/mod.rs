@@ -320,21 +320,18 @@ impl TermSource for MappedTerms<'_> {
 /// L2-resident table rather than something that grows with the data.
 const MEMO_MAX_SLOTS: usize = 1024;
 
-/// Below this many rows a chunk decodes without a memo at all: the table's
-/// own allocation would cost more than the handful of repeats it could catch,
-/// and single-row decodes (an rdflib-style probe resolving one binding) are
-/// hot enough to notice.
+/// Below this many rows a chunk decodes without a memo at all: the table's own
+/// allocation costs more than the handful of repeats it could catch.
 const MEMO_MIN_ROWS: usize = 16;
 
 /// A direct-mapped memo of one role's decoded terms, keyed by term code.
 ///
 /// Codes repeat heavily down a column — a predicate or graph name recurs on
 /// nearly every row — and each repeat would otherwise pay the dictionary read
-/// (an FSST decompress) *and* the term parse again. Direct mapping rather
-/// than a hash map because the miss path must stay nearly free: a
-/// high-cardinality column like subjects would fill any growing structure
-/// with entries it never reads again, whereas here a miss costs one compare
-/// and one overwrite, and memory is fixed regardless of the column.
+/// (an FSST decompress) *and* the term parse again. Direct-mapped: a miss
+/// costs one compare and one overwrite, and the memory is fixed whatever the
+/// column's cardinality, so a high-cardinality column like subjects cannot
+/// accumulate entries it never reads again.
 struct TermMemo<T> {
     slots: Vec<Option<(u32, T)>>,
     mask: usize,

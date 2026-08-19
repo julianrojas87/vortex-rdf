@@ -77,9 +77,8 @@ impl Drop for TempRunsGuard {
 pub(crate) struct RunWriter<T> {
     writer: BufWriter<File>,
     /// Reused per-record serialization buffer: `rkyv::to_bytes` would
-    /// allocate a fresh `AlignedVec` per spilled record, the same allocator
-    /// churn the reused `payload` buffer on [`RunReader`] was added to kill
-    /// on the read side.
+    /// allocate a fresh `AlignedVec` per spilled record — the write-side
+    /// counterpart of [`RunReader`]'s reused `payload` buffer.
     buf: AlignedVec,
     _marker: PhantomData<T>,
 }
@@ -143,9 +142,9 @@ where
 /// the filesystem at all: the ingest buffer *is* the run, already sorted and
 /// already in memory. Only once a second run exists does spilling buy anything
 /// (that is the point at which the data provably exceeds the memory budget), so
-/// the builders spill lazily and keep a lone run here instead. This is the
-/// common case for datasets up to the chunk size, where the old unconditional
-/// spill paid a full serialize + write + read + deserialize of every quad.
+/// the builders spill lazily and keep a lone run here instead. Datasets up to
+/// the chunk size therefore never pay a serialize + write + read + deserialize
+/// of every quad.
 pub(crate) enum Run<T> {
     Memory(std::vec::IntoIter<T>),
     File(RunReader<T>),
@@ -178,8 +177,7 @@ impl<T> Run<T> {
 pub(crate) struct RunReader<T> {
     reader: BufReader<File>,
     /// Reused per-record payload buffer: a fresh `vec![0u8; len]` per record
-    /// would malloc+zero on every read (profiling showed the allocator
-    /// dominating spill read-back), and `AlignedVec` also guarantees the
+    /// would malloc+zero on every read, and `AlignedVec` also guarantees the
     /// alignment rkyv's archived types require.
     payload: AlignedVec,
     _marker: PhantomData<T>,

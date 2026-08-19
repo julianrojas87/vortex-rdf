@@ -268,14 +268,12 @@ impl VortexRdfStore {
         // its component's columns (e.g. a binary search of the sorted
         // `val`/`rid` pair for a bound object). The store just folds the
         // ids it hands back into the selection.
-        // …but only while there is enough left to narrow. A fast path
-        // that already cut the view to a handful of rows makes the
-        // index a pessimization: resolving a component costs O(rows
-        // matching *that component*) — a bound predicate is 1/32nd of
-        // the store here — only to intersect it against a selection of
-        // one. Below the threshold, filtering those few rows column-wise
-        // is strictly cheaper. Nothing is lost by skipping: a view that
-        // something else narrowed already discards any serving plan.
+        // …but only while there is enough left to narrow. Resolving a
+        // component costs O(rows matching *that component*), regardless
+        // of how few rows the view still holds, so once a fast path has
+        // cut the view to a handful of rows, filtering those rows
+        // column-wise is cheaper. Nothing is lost by skipping: a view
+        // that something else narrowed already discards any serving plan.
         let worth_indexing =
             !narrowed_elsewhere || selection.len(base.len()) >= INDEX_ROUTING_MIN_ROWS;
         if !selection.is_empty(base.len()) && worth_indexing {
@@ -431,7 +429,7 @@ impl VortexRdfStore {
         // uncontested route; the subject then leaves the pattern, and the
         // residual terms ride the narrowed range. Any decline (unsorted
         // file, string-subject layout, unknown term, unsupported chunk
-        // encoding) leaves the pattern intact for today's scan path.
+        // encoding) leaves the pattern intact for the scan path.
         let mut pat = QuadPattern::new(subject, predicate, object, graph);
         let mut subject_range: Option<std::ops::Range<u64>> = None;
         if let Some(subj) = pat.subject

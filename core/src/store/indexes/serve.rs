@@ -270,12 +270,10 @@ impl InMemoryServePlan {
     /// hold terms, not codes), or any column whose encoding resolves no
     /// probe.
     ///
-    /// The width gate is the same trade [`rows_via_probes`] makes, and
-    /// measurement puts it in the same place: a point read through the probe
-    /// beats materializing row ids for the run, but per-element reads over a
-    /// compressed column lose to a bulk gather over the base's canonical
-    /// buffers once the run is large — reading a wide run here measured ~3x
-    /// the gather it replaced.
+    /// The width gate is the same trade [`rows_via_probes`] makes: a point
+    /// read through the probe beats materializing row ids for the run, but
+    /// per-element reads over a compressed column lose to a bulk gather over
+    /// the base's canonical buffers once the run is large.
     ///
     /// [`POINT_GATHER_MAX_ROWS`]: crate::store::selection::POINT_GATHER_MAX_ROWS
     /// [`rows_via_probes`]: ServeDecode::rows_via_probes
@@ -406,8 +404,8 @@ impl FileServePlan {
     /// the rows where every `constraints` equality holds — or, over a located
     /// `row_range`, by point reads through the component's cached chunk
     /// probes.
-    // The parameters are the plan: the column roles, the reader, the
-    // constraints, and the bind memo — a builder would only rename the arity.
+    // The parameters are the plan itself: the column roles, the reader, the
+    // constraints, and the bind memo.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         primary_columns: [&'static str; 4],

@@ -36,10 +36,10 @@ impl VortexRdfStore {
     /// `Vec`.
     ///
     /// Prefer this over `quads().try_collect()` when the whole result is
-    /// wanted: `try_collect` grows its `Vec` one quad at a time (doubling
-    /// reallocation copies), which measured at roughly a fifth of a full
-    /// 100k-row match-and-materialize. Collecting the decoded chunks first
-    /// makes the total length known before a single quad is moved.
+    /// wanted: `try_collect` grows its `Vec` one quad at a time, with the
+    /// doubling reallocation copies that implies. Collecting the decoded
+    /// chunks first makes the total length known before a single quad is
+    /// moved.
     pub async fn quads_vec(&self) -> Result<Vec<Quad>> {
         let chunks: Vec<Vec<Result<Quad>>> = self.quad_chunks()?.collect().await;
         let total = chunks.iter().map(Vec::len).sum();

@@ -40,10 +40,10 @@
 //                                   16 bytes/row (four u32 columns) — that
 //                                   agreement is what makes the slope credible.
 //
-// Alongside: what the first Dictionary read costs (it used to copy the whole
-// dictionary twice), what a full scan with every term materialized costs (the
-// on-demand dictionary's worst case, one boundary crossing per distinct term),
-// and whether repeated mutate-then-query grows the high-water mark.
+// Alongside: what the first Dictionary read costs, what a full scan with every
+// term materialized costs (the on-demand dictionary's worst case, one boundary
+// crossing per distinct term), and whether repeated mutate-then-query grows the
+// high-water mark.
 //
 // Every config runs in its own process because wasm memory never shrinks; see
 // dict-memory.worker.ts.
@@ -75,13 +75,11 @@ const SLUGS = (process.env.DICT_MEM_SLUGS ?? 'vortex_dict').split(',');
  *  300,037 terms at N=200k. That is deliberately not the comparative
  *  benchmark's default (0.1): this tool measures the dictionary, so it wants
  *  the configuration that makes the dictionary largest. Pass several to sweep
- *  cardinality and fit the per-term cost; two orders of magnitude is what the
- *  original fit used. */
+ *  cardinality and fit the per-term cost; two orders of magnitude is enough
+ *  for a credible fit. */
 const RATIOS = (process.env.DICT_MEM_RATIOS ?? '1.0').split(',').map(Number);
 
-/** Figures from the run that landed the interning ingest — commit
- *  `perf: intern terms at ingest ...`, at the default config above. (The FSST
- *  run this replaced measured retained 12.0 / first 93 / last 129.)
+/** Reference figures for the default config above.
  *
  *  Memory is reproducible for a given wasm build and dataset, so drift here is
  *  a real regression. Timings are not compared: they track the host.

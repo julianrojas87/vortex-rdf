@@ -52,11 +52,11 @@ impl DictAccess {
     /// before the synchronous match core — and mint the [`PatternCodes`]
     /// witness the core's probes run on.
     ///
-    /// For `Resident` the lookups are in-memory binary searches, resolved
-    /// eagerly rather than lazily at each use site: what this buys is the
-    /// invariant the match core is written against — *after the prelude,
-    /// every bound role is in the witness* — which is what lets a file-backed
-    /// dictionary do its I/O here and nowhere else.
+    /// For `Resident` the lookups are in-memory binary searches, all resolved
+    /// here so the invariant the match core is written against holds under
+    /// either residency — *after the prelude, every bound role is in the
+    /// witness* — which is what lets a file-backed dictionary do its I/O here
+    /// and nowhere else.
     pub(crate) async fn resolve_pattern(&self, pattern: QuadPattern<'_>) -> Result<PatternCodes> {
         match self {
             DictAccess::Resident(dict) => {

@@ -54,8 +54,7 @@ fn modular_quads(n: usize, p_mod: usize, o_mod: usize) -> Vec<Quad> {
 /// Serialize `quads` through builder `B` into `store.vortex` inside a fresh
 /// temp dir, handing back the dir guard beside the path. Keep the `TempDir`
 /// alive for the store's lifetime; dropping it cleans up even when an
-/// assertion panics, which the old hand-rolled `temp_dir() + uuid` pattern
-/// never did.
+/// assertion panics.
 #[cfg(feature = "file-io")]
 async fn write_store_file(
     quads: Vec<Quad>,
@@ -116,7 +115,7 @@ async fn build_array<B: VortexArrayBuilder>(
 }
 
 /// The names of a build's index children, in emission order — what a schema
-/// assertion checks now that index data never rides in the quad rows.
+/// assertion checks, since index data never rides in the quad rows.
 fn component_names(built: &BuiltArray) -> Vec<&'static str> {
     built.components.iter().map(|c| c.name).collect()
 }

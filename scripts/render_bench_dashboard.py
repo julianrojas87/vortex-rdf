@@ -112,9 +112,8 @@ def parse_dataset_shape(text):
     The moduli follow from the row count through a coprimality nudge, so the
     selectivity of a run is not something the page can restate from a formula --
     it changes with `BENCH_SIZE`. Reading the shape off the run makes the page's
-    matched-row figures a record rather than a re-derivation, which is how the
-    old hardcoded "every 100th predicate" arithmetic came to describe a
-    generator that no longer existed.
+    matched-row figures a record rather than a re-derivation, which any
+    hardcoded arithmetic would silently outlive.
 
     Both targets stamp their own line into the shared log; they run at one
     `BENCH_SIZE`, so a disagreement means the two halves of the tab measured

@@ -59,8 +59,8 @@ enum TypedEq<'a> {
 /// A string equality probe over a canonical `VarBinView` column, comparing at
 /// the view level: length first (a u32 read from the 16-byte view struct —
 /// which alone rejects almost every row), then the inline bytes or the
-/// referenced buffer range. No per-row `ByteBuffer` is materialized —
-/// profiling showed `bytes_at`'s slice/refcount traffic dominating tail scans.
+/// referenced buffer range. No per-row `ByteBuffer` is materialized, so a row
+/// costs neither a slice nor a refcount bump.
 struct StrEq<'a> {
     arr: VarBinViewArray,
     needle: &'a [u8],
@@ -156,9 +156,9 @@ impl<'a> TypedEq<'a> {
     /// The all-code specialization: when every constraint is a u32 code
     /// compare (the Dictionary layout), the row loop over plain
     /// `(&[u32], u32)` pairs — slices hoisted once, borrowing from the bound
-    /// constraints — is branch-free per constraint and vectorizes;
-    /// benchmarking showed a mixed-enum loop costing ~2× on full-column
-    /// scans. `None` when any constraint is a string compare.
+    /// constraints — is branch-free per constraint and vectorizes, which a
+    /// loop over the mixed enum does not. `None` when any constraint is a
+    /// string compare.
     fn code_views<'b>(cols: &'b [TypedEq<'a>]) -> Option<Vec<(&'b [u32], u32)>> {
         cols.iter()
             .map(|c| match c {
@@ -175,9 +175,9 @@ impl<'a> TypedEq<'a> {
 ///
 /// Above it the mask scan's SIMD comparison outruns the typed loop by enough to
 /// repay slicing and canonicalizing the base; below it the query is nothing but
-/// that fixed cost. The exact crossover depends on how many columns the store
-/// carries — a `SecondaryByCopy` store pays it over 14 — so this sits an order
-/// of magnitude under the narrowest measured crossover rather than at it.
+/// that fixed cost. The crossover moves with how many columns the store
+/// carries (the fixed cost is paid per column), so this sits an order of
+/// magnitude under the narrowest crossover rather than at it.
 const TYPED_SINGLE_EQ_MAX_ROWS: usize = 4_096;
 
 /// Typed residual filter over a store's base: when every residual equality
@@ -186,8 +186,8 @@ const TYPED_SINGLE_EQ_MAX_ROWS: usize = 4_096;
 /// surviving base row ids. Returns `None` when any constraint cannot take the
 /// typed path — the caller then falls back to the general mask scan, whose
 /// per-call pipeline (slice through the optimizer, ConstantArray compares,
-/// BoolArray canonicalization) profiling showed dominating residual-bound
-/// patterns. The base counterpart of [`typed_positions`].
+/// BoolArray canonicalization) is the fixed cost this path avoids. The base
+/// counterpart of [`typed_positions`].
 pub(crate) fn typed_residual_ids(
     struct_arr: &StructArray,
     selection: &RowSelection,
@@ -200,17 +200,14 @@ pub(crate) fn typed_residual_ids(
     //
     // With a lone constraint there is nothing to short-circuit, and the
     // row-at-a-time `views()` access (an erased-array deref per row) loses
-    // to SIMD `compare_views_constant` — profiling showed a single-column
-    // `[S]` scan running ~3× slower typed. But that holds only while the
-    // scan is what dominates. The mask pipeline's arguments cost the same
-    // whatever the selection: `selection.apply` pushes a slice through the
-    // array optimizer and `mask_for` canonicalizes the struct, over *every*
-    // column the base carries. Once a fast path has already narrowed the
-    // view to a handful of rows — a bound subject's binary search leaving
-    // one residual term, the `SP` shape — that fixed cost is the entire
-    // query, and it scales with the store's width: on a `SecondaryByCopy`
-    // store (14 columns) `SP` cost 106 µs against `SPO`'s 8 µs, purely
-    // because the second constraint let it take this path instead.
+    // to SIMD `compare_views_constant` — but only while the scan is what
+    // dominates. The mask pipeline's arguments cost the same whatever the
+    // selection: `selection.apply` pushes a slice through the array
+    // optimizer and `mask_for` canonicalizes the struct, over *every* column
+    // the base carries. Once a fast path has already narrowed the view to a
+    // handful of rows — a bound subject's binary search leaving one residual
+    // term, the `SP` shape — that fixed cost is the entire query, and it
+    // scales with the store's width.
     //
     // So the rule is about selection size, not column count: keep the mask
     // scan while there are enough rows for SIMD to pay for the setup, take
@@ -440,8 +437,8 @@ mod tests {
         assert!(crate::store::array::cached_u32_primitive(&o).is_none());
     }
 
-    /// A canonical non-u32 unsigned column (TypedObject's kind byte) now
-    /// binds through the probe instead of declining.
+    /// A canonical non-u32 unsigned column (TypedObject's kind byte) binds
+    /// through the probe rather than declining.
     #[test]
     fn canonical_u8_column_binds() {
         let kind = Buffer::from_iter((0..100u32).map(|i| (i % 3) as u8)).into_array();

@@ -11,10 +11,9 @@
 // next to the Rust benchmarks. `withCodSpeed` is a no-op when not run under the
 // action, so `npm run bench:codspeed` locally just produces wall-clock numbers.
 //
-// It supersedes the former core/benches/js_read_path.rs, which could only
-// *approximate* this read path by timing its Rust-side stages in isolation;
-// here the whole JS→WASM boundary (promise machinery, quad packing, the lazy
-// read model) is measured for real, and the flamegraph attributes the cost.
+// The whole JS→WASM boundary (promise machinery, quad packing, the lazy read
+// model) is measured for real, rather than approximated by timing the Rust-side
+// stages in isolation, and the flamegraph attributes the cost.
 //
 // Single process by design: CodSpeed measures each task deterministically, and
 // there are no competing libraries to isolate — so none of compare.bench.ts's
@@ -55,7 +54,7 @@ import {
 // shared-core regression lands in all three tabs at comparable magnitude
 // instead of showing up in one and hiding in another. It is also 4 zones of
 // 8,192 rows, the smallest round size at which zone pruning has anything to
-// prune; the previous 16³ = 4,096 was half a zone.
+// prune.
 const DIM = Number(process.env.CODSPEED_BENCH_DIM ?? 32); // triples: DIM³ rows
 const DIM_QUADS = Number(process.env.CODSPEED_BENCH_DIM_QUADS ?? 13); // quads: DIM_QUADS⁴ rows
 const MUT_N = Number(process.env.CODSPEED_MUT_N ?? 500); // add/delete batch size
@@ -110,9 +109,9 @@ async function drain(stream: unknown): Promise<number> {
 // invocations (core.optimizeFunction), then global.gc(), then exactly ONE
 // measured invocation. That single-shot model is why the runner passes
 // --no-liftoff (codspeed.yml, package.json): with background wasm tier-up
-// enabled, the measured invocation nondeterministically executed Liftoff or
-// TurboFan code — a ~2x instruction-count swing on the build tasks at
-// identical code. Reads get a time budget; the costly build/mutation phases
+// enabled, the measured invocation nondeterministically executes Liftoff or
+// TurboFan code, swinging the instruction count on identical code. Reads get a
+// time budget; the costly build/mutation phases
 // get warmup plus a fixed iteration count so local numbers are stable too.
 const READ_OPTS: BenchOptions = { time: 200, iterations: 10, warmup: true, warmupIterations: 3, throws: true };
 const HEAVY_OPTS: BenchOptions = { time: 0, iterations: 7, warmup: true, warmupIterations: 2, throws: true };

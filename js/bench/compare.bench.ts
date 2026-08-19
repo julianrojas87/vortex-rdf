@@ -13,17 +13,16 @@
 // handling — dictionaries, interning, string storage — is actually exercised. It is
 // driven across the six routing shapes the Rust dashboard also uses (S/P/O/PO/G/SPOG)
 // plus fully-bound and full-scan. Note this diverges from rdf-stores.js's own harness,
-// whose dataset draws D^3 rows from only D distinct IRIs; results before the cardinality
-// switch are not comparable with results after it.
+// whose dataset draws D^3 rows from only D distinct IRIs.
 //
 // This file is the ORCHESTRATOR only — it spawns one child process per adapter
-// (compare.worker.ts) and collects the results. Adapters used to share this process,
-// but that let earlier adapters' peak WASM/JS memory contaminate later ones (observed:
-// oxigraph's own wasm module trapping with `unreachable` only after several other
-// multi-million-quad stores had already grown and been freed in the same process — it
-// runs clean in isolation with the exact same dataset). Process-per-adapter also means
-// a crash in one adapter loses only that adapter's rows, not the whole run, and gives
-// each adapter a trustworthy, uncontaminated peak-RSS reading (see shared.ts's
+// (compare.worker.ts) and collects the results. Sharing one process lets an
+// earlier adapter's peak WASM/JS memory contaminate later ones: a wasm module
+// can trap with `unreachable` purely because other multi-million-quad stores
+// already grew and were freed in the same process, while running clean in
+// isolation on the same dataset. Process-per-adapter also means a crash in one
+// adapter loses only that adapter's rows, not the whole run, and gives each
+// adapter a trustworthy, uncontaminated peak-RSS reading (see shared.ts's
 // `peakRssMb`).
 //
 // Uses tinybench + @codspeed/tinybench-plugin — the same harness rdf-stores.js uses.
@@ -145,8 +144,8 @@ async function main(): Promise<void> {
 
     // The cold regime gets its own process per adapter: every iteration adopts a
     // fresh store, and the first query on one retains its whole buffer past
-    // free() in wasm memory that never shrinks. Sharing the query process piled
-    // those adoptions on top of a live store until the wasm allocator trapped.
+    // free() in wasm memory that never shrinks. Sharing the query process piles
+    // those adoptions on top of a live store until the wasm allocator traps.
     // Adapters with no persistent form return no rows here (see runQueryCold).
     for (const a of ADAPTERS) {
         const out = runWorker(a.slug, 'querycold');

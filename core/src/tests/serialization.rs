@@ -122,8 +122,7 @@ async fn test_tombstoned_store_serialization_keeps_indexes_and_sortedness() {
 }
 
 /// An unrefined file-backed store's `to_bytes` reads its index children
-/// wholesale, so the byte round-trip keeps the index set (previously they
-/// were silently dropped on the file→bytes path).
+/// wholesale, so the byte round-trip keeps the index set.
 #[tokio::test]
 async fn test_file_backed_to_bytes_keeps_indexes() {
     let (_dir, path) = write_store_file(
@@ -210,9 +209,8 @@ async fn test_to_bytes_is_byte_stable() {
 /// Index children whose chunks carry only local sorts are not globally
 /// sorted. Reading them back must NOT restore binary-search routing: the
 /// descriptors carry `sorted: false`, in-memory resolution declines, and the
-/// mask scan answers correctly. (Regression: an earlier `from_bytes`
-/// unconditionally re-stamped these columns sorted, making this match return
-/// 5 rows instead of 4.)
+/// mask scan answers correctly. Re-stamping such columns sorted would make
+/// this match return 5 rows instead of 4.
 #[tokio::test]
 async fn test_locally_sorted_children_from_bytes_match_correctly() {
     // Predicates interleave across chunks so per-chunk sorted != global.

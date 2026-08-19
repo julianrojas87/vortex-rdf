@@ -80,9 +80,6 @@ pub enum IndexType {
     /// [`SecondaryByReference`](Self::SecondaryByReference), routing engages
     /// only on children whose writer recorded them globally sorted, which
     /// every build here does.
-    ///
-    /// Costs roughly 2× the primary columns in extra storage — choose it over
-    /// `SecondaryByReference` when predicate/object reads dominate.
     SecondaryByCopy,
 
     /// Builds sorted secondary indexes for both predicates **and** objects.
@@ -254,8 +251,8 @@ impl IndexedComponent {
 ///
 /// [`RowSelection`]: crate::store::selection::RowSelection
 // `Resolved` dwarfs the dataless `Declined`, but the enum is a transient
-// per-match return value that is destructured immediately, never stored in
-// bulk — boxing its fields would buy nothing but an allocation per query.
+// per-match return value that is destructured immediately and never stored
+// in bulk.
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum IndexResolution<Plan> {
     /// The index does not accelerate this pattern: either its shape isn't one
@@ -521,7 +518,7 @@ pub(crate) fn component_probe_run(
 /// resolution answers in.
 ///
 /// The whole column is cast and decoded at once rather than pulled one scalar
-/// at a time — this is the dominant cost for a frequent term with many matches.
+/// at a time.
 /// Sorting is required, not incidental: the ids come out in the index's own
 /// order, and both `Selection::IncludeByIndex` and the selection algebra need
 /// them ascending. They are unique by construction (each index row references
@@ -563,12 +560,11 @@ pub(crate) fn sorted_row_ids(row_id_column: ArrayRef) -> Result<Buffer<u64>> {
 /// file-backed probe shared by the secondary indexes.
 ///
 /// Each equality is a plain `eq`, the same encoding the serve-plan filter
-/// uses: on Vortex 0.83 a binary `Eq` falsifies against the identical zone
-/// min/max envelope as a `>= probe AND <= probe` range pair (see vortex's
-/// `stats/rewrite/builtins.rs`), while the pair evaluates two conjuncts to
-/// compute the same mask — measured, `eq` was never slower on this rid-scan
-/// path. Output order is irrelevant (the ids are sorted afterwards), so the
-/// scan may run unordered.
+/// uses: a binary `Eq` falsifies against the same zone min/max envelope as a
+/// `>= probe AND <= probe` range pair (see vortex's
+/// `stats/rewrite/builtins.rs`) while evaluating a single conjunct. Output
+/// order is irrelevant (the ids are sorted afterwards), so the scan may run
+/// unordered.
 #[cfg(feature = "file-io")]
 pub(crate) async fn scan_index_row_ids(
     reader: vortex_layout::LayoutReaderRef,

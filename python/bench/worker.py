@@ -218,10 +218,10 @@ def run_query(a, args) -> dict:
     # --- open ---
     # Only for a library that has an artifact to open. A store that lives in
     # memory has none: "opening" it is re-parsing the source, which is what the
-    # Build column already measures -- and measured here it was within 4% of
-    # that column for pyoxigraph and 1% for rdflib, ranked against a footer read
-    # as though the two were the same operation. The cost is real and it is
-    # Build's to report; this column stays about opening an artifact.
+    # Build column already measures -- and measuring it here again would rank a
+    # whole re-parse against a footer read as though the two were the same
+    # operation. The cost is real and it is Build's to report; this column stays
+    # about opening an artifact.
     if a.has_distinct_open:
         log("open…")
         measure(

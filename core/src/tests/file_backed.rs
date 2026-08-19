@@ -75,10 +75,10 @@ async fn test_file_backed_secondary_index_object_predicate() {
     assert_eq!(by_both.size().await.unwrap(), 2);
 }
 
-/// Regression: predicate matches whose zone-map hits are NOT contiguous
-/// (clusters at both ends of an s-sorted file, with a middle zone whose
-/// stats exclude the predicate) must all survive the metadata row-range
-/// pre-pass. A first-gap cutoff would silently drop the trailing cluster.
+/// Predicate matches whose zone-map hits are NOT contiguous (clusters at both
+/// ends of an s-sorted file, with a middle zone whose stats exclude the
+/// predicate) must all survive the metadata row-range pre-pass. A first-gap
+/// cutoff would silently drop the trailing cluster.
 #[tokio::test]
 async fn test_file_backed_non_contiguous_predicate_matches() {
     // Three 8192-row zones. The rare predicate appears only in the first

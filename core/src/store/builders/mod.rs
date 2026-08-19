@@ -110,8 +110,8 @@ pub struct BuiltStream {
 pub(crate) mod sorted_in_memory;
 // The external-sort pipeline spills to a real filesystem, which
 // `wasm32-unknown-unknown` does not have: compiling it out (rather than
-// erroring at spill time) keeps ~1300 lines plus the rkyv serializer paths
-// and uuid out of the wasm artifact, whose size is a recorded constraint.
+// erroring at spill time) keeps it, the rkyv serializer paths, and uuid out
+// of the wasm artifact, whose size is a recorded constraint.
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub(crate) mod sorted_stream;
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]

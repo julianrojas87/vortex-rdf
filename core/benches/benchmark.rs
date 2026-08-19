@@ -17,8 +17,8 @@
 //!   cells are redundant on paper — a bound subject
 //!   declines every secondary index in favour of the primary sorted `s`
 //!   column, and a bound graph never routes through an index at all — but
-//!   index-decline routing is exactly where regressions have hidden, so the
-//!   matrix is kept whole.
+//!   index-decline routing is exactly where a regression would go unnoticed,
+//!   so the matrix is kept whole.
 //!
 //!   The regime axis is `match_cold_*` (each sample answers the first query on a
 //!   freshly opened store) against `match_warm_*` (one store, reused). Both are
@@ -199,8 +199,8 @@ fn run_match_cold(
     pattern: Pattern,
 ) {
     // Probe construction stays OUTSIDE the timed closure (as dict_probe_warm's
-    // does): its ~4 String allocations per iteration are fixed setup, and at
-    // the lazy suite's ~31 µs match floor they are visible noise.
+    // does): its handful of String allocations per iteration is fixed setup,
+    // and would otherwise show up as noise against the match itself.
     let (s, p, o, g) = terms_for(pattern);
     bencher
         .with_inputs(|| make_store(source, layout, index, bench_size()))
@@ -220,11 +220,9 @@ fn run_match_cold(
 /// iteration, so each measurement is a repeat query against caches the earlier
 /// iterations populated — the steady state a long-lived process reaches.
 ///
-/// This arm is what makes caching work visible at all. A cold-only suite
-/// measures the same store construction over and over and reports a
-/// cache-resolution improvement as noise: the by-reference index's chunk-probe
-/// location moved this suite's cold object lookup 1.15x and the warm
-/// comparative tab 188x.
+/// This arm is what makes caching work visible at all: a cold-only suite
+/// measures the same store construction over and over, and reports a
+/// cache-resolution improvement as noise.
 fn run_match_warm(
     bencher: divan::Bencher,
     layout: Layout,
@@ -332,10 +330,10 @@ fn match_chained(bencher: divan::Bencher, source: &Source) {
 // ══════════════════════════════════════════════════════════════════════════
 // Group 3 — DECODE / LOAD (read-back path)
 //
-// The full-scan decode is the single most fundamental read and was entirely
-// unbenchmarked. It is where layouts diverge most: Dictionary decodes codes to
-// terms, TypedObject reassembles the object from four columns. Load costs
-// (opening a file, decoding IPC) were previously hidden in untimed setup.
+// The full-scan decode is the single most fundamental read, and where layouts
+// diverge most: Dictionary decodes codes to terms, TypedObject reassembles the
+// object from four columns. Load costs (opening a file, decoding IPC) are
+// benchmarked in their own cells rather than sitting in untimed setup.
 // ══════════════════════════════════════════════════════════════════════════
 
 #[derive(Copy, Clone)]

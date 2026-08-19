@@ -151,17 +151,14 @@ export class ConsumeBudgetExceeded extends Error {
 /** Wall-clock budget for one consume loop, ms. `0` disables the check.
  *
  *  The budget exists because a store that cannot materialize a result set does
- *  not fail fast — it death-marches. oxigraph's 2M-row full scan spends ~37
- *  minutes ballooning the heap to the V8 cap (GC falls out of concurrent mode
- *  into back-to-back full collections; observed at 7.3 GB RSS with the machine
- *  in swap) before its wasm module traps `unreachable` — the same deterministic
- *  outcome every run. The loop below is where those minutes are spent, so this
- *  is where they can be cut short: the throw surfaces through the worker's
+ *  not fail fast — it death-marches, ballooning the heap towards the V8 cap
+ *  (GC falls out of concurrent mode into back-to-back full collections) until
+ *  its wasm module traps. The loop below is where that time is spent, so this
+ *  is where it can be cut short: the throw surfaces through the worker's
  *  per-phase catch as an ordinary `failures` entry and renders as the same
- *  "failed" cell, delivered in two minutes instead of thirty-seven.
+ *  "failed" cell, delivered in minutes rather than tens of minutes.
  *
- *  The default is far above any *successful* consume — the slowest legitimate
- *  one on record is the 2M-row Vortex full scan at ~1.5 s. */
+ *  The default is orders of magnitude above any *successful* consume. */
 const CONSUME_BUDGET_MS = Number(process.env.CONSUME_BUDGET_MS ?? 120_000);
 
 export function consumeQuads(
@@ -427,11 +424,9 @@ export function collect(bench: Bench, results: Row[], regime?: 'cold' | 'warm'):
 // 3 for the phases that cost seconds each.
 //
 // `time: 0` is what makes the query count mean 10. tinybench treats `time` as a
-// minimum duration and keeps iterating until BOTH budgets are satisfied, so the
-// previous 500 ms floor ran a microsecond-scale query tens of thousands of
-// times — the JS tab reported a mean over ~80,000 runs while the Python tab
-// reported a median of 10, and the dashboard presented them side by side as if
-// they were the same experiment.
+// minimum duration and keeps iterating until BOTH budgets are satisfied, so any
+// nonzero floor would run a microsecond-scale query tens of thousands of times
+// and report a mean over those, against the other tabs' median of 10.
 export const QUERY_OPTS: BenchOptions = { time: 0, iterations: 10, warmup: true, warmupIterations: 5, throws: true };
 export const HEAVY_OPTS: BenchOptions = { time: 0, iterations: 3, warmup: false, warmupIterations: 0, throws: true };
 // The cold arm keeps the query repetition count but drops warmup, for two
@@ -439,9 +434,8 @@ export const HEAVY_OPTS: BenchOptions = { time: 0, iterations: 3, warmup: false,
 // iteration adopts a fresh store by construction, so there is nothing for a
 // preceding run to warm. And each adoption is expensive in a way that does not
 // come back: the first query on a `fromBytes` store retains its whole buffer
-// past `free()` (measured: +32 MB per iteration at D=128, flat without the
-// query), and wasm linear memory never shrinks, so warmup runs would spend a
-// third of the budget for nothing and trip the wasm allocator.
+// past `free()`, and wasm linear memory never shrinks, so warmup runs would
+// spend a third of the budget for nothing and trip the wasm allocator.
 export const COLD_QUERY_OPTS: BenchOptions = { time: 0, iterations: 10, warmup: false, warmupIterations: 0, throws: true };
 // See the comment on FULL_SCAN_PATTERN (datasets.ts): far fewer repetitions of a
 // full-table dump.

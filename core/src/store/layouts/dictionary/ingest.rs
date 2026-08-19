@@ -65,11 +65,9 @@ impl TermDictionaryBuilder {
     /// hand back the term→ID map beside it (a term's ID is its sorted rank).
     ///
     /// The map's owned keys are the sorted strings this builder already
-    /// holds, moved rather than re-materialized: deriving the map from the
-    /// frozen dictionary instead would decode every term back out of FSST
-    /// and re-allocate it (see
-    /// [`TermDictionary::from_quads_with_map`] for the same reasoning on the
-    /// borrowed side).
+    /// holds, moved into it rather than decoded back out of the frozen
+    /// dictionary and re-allocated (see
+    /// [`TermDictionary::from_quads_with_map`] for the borrowed counterpart).
     pub(crate) fn finish(self) -> Result<(TermDictionary, TermIdMap)> {
         let total_start = Instant::now();
         let collect_start = Instant::now();
@@ -119,10 +117,9 @@ pub(crate) async fn ingest_interning(
 /// a time rather than as a `'static` stream — the wasm array path, whose
 /// quads are decoded chunk-by-chunk from a packed JS buffer.
 ///
-/// Feeding those quads through the stream builders would require collecting
-/// them into a full `Vec<RawQuad>` first (a `'static` stream cannot borrow
-/// from the decode loop), resurrecting exactly the four-Strings-per-quad
-/// ingest high-water the interning ingest removes. Pushing into the sink
+/// A `'static` stream cannot borrow from the decode loop, so feeding those
+/// quads through the stream builders would mean collecting them into a full
+/// `Vec<RawQuad>` first — four live `String`s per quad. Pushing into the sink
 /// instead lets each quad's Strings die on arrival; `finish` builds the same
 /// single-chunk array [`SortedInMemoryBuilder`] produces for the Dictionary
 /// layout.
@@ -164,12 +161,10 @@ impl DictionaryQuadSink {
 /// pass: quads are consumed as they arrive, each unique term is held once, and
 /// each quad is kept as four u32 ids.
 ///
-/// This replaces buffering the whole stream as a `Vec<RawQuad>` — four owned
-/// `String`s per quad, held live until the dictionary and codes were derived
-/// from them — which was the measured wasm ingest high-water mark (~377 B/row).
-/// The per-quad Strings still exist transiently (the stream hands them over),
-/// but they die inside [`push`](Self::push); what accumulates is one copy of
-/// each distinct term plus 16 bytes per quad.
+/// The stream's per-quad Strings exist only transiently: they die inside
+/// [`push`](Self::push), so what accumulates is one copy of each distinct
+/// term plus 16 bytes per quad, rather than four live `String`s per quad held
+/// until the dictionary and codes can be derived from them.
 ///
 /// Ids handed out during ingest are provisional (insertion order).
 /// [`finish`](Self::finish) sorts the unique terms, freezes them into the
@@ -177,8 +172,7 @@ impl DictionaryQuadSink {
 /// which *is* the dictionary code, since codes are lexicographic ranks. For
 /// sorted builders it then sorts the coded quads directly: `[u32; 4]`
 /// lexicographic order equals (s, p, o, g) term order (order-isomorphism
-/// again), and sorting 16-byte rows is far cheaper than sorting four-String
-/// structs.
+/// again), so the sort moves 16-byte rows rather than four-String structs.
 pub(crate) struct InterningQuadBuilder {
     /// term → provisional id, owning each distinct term exactly once.
     ids: HashMap<Box<str>, u32>,
@@ -232,7 +226,7 @@ impl InterningQuadBuilder {
 
         // Freeze by *consuming* the boxes: each term is freed as it is copied
         // into the plain column, so the boxes and the column never coexist in
-        // full — that stacking was the finish-phase memory peak.
+        // full.
         let freeze_start = Instant::now();
         let plain = VarBinViewArray::from_iter_str(entries.into_iter().map(|(t, _)| t));
         let dict = TermDictionary::from_sorted_column(plain)?;

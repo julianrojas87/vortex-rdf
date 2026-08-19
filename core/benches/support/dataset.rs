@@ -260,7 +260,7 @@ pub fn terms_for(
 /// The dashboard reads its selectivity figures out of this rather than
 /// re-deriving them: the moduli follow from the row count through a coprimality
 /// nudge, so any prose that names them is one `BENCH_SIZE` away from being
-/// wrong — as the page's hardcoded "every 100th predicate" arithmetic was.
+/// wrong.
 pub fn shape_line(n: usize, graphs: usize) -> String {
     let m = moduli(n, graphs);
     let rows = |p: Pattern| m.matched_rows(n, p);

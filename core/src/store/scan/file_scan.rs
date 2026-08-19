@@ -251,9 +251,8 @@ where
 }
 
 /// Count rows matching `filter` by driving the layout reader's pruning and
-/// filter evaluations directly and summing mask true-counts. A projection
-/// scan would additionally decode a data column for every matching row just
-/// to measure its length. No column is ever projected or decoded here.
+/// filter evaluations directly and summing mask true-counts. No column is
+/// ever projected or decoded.
 pub(crate) async fn count_matching_rows(
     file: &NativeStoreFile,
     filter: &Expression,

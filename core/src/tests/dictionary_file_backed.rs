@@ -209,9 +209,9 @@ async fn test_file_backed_dictionary_serializes_and_mutates() {
 /// Pins the rows-only read path's dictionary contract: a tombstoned,
 /// *indexed* owner (compacting nothing) must answer `code_columns_gathered`
 /// with codes addressing the store's cached dictionary — the one
-/// `dictionary_snapshot` hands out. The old serialization-shaped read path
-/// re-encoded exactly this shape against a fresh dictionary of the surviving
-/// terms, silently renumbering codes the caller could only decode wrongly.
+/// `dictionary_snapshot` hands out. Re-encoding this shape against a fresh
+/// dictionary of the surviving terms, as a serialization-shaped read would,
+/// silently renumbers codes the caller can then only decode wrongly.
 #[tokio::test]
 async fn test_tombstoned_indexed_codes_address_cached_dictionary() {
     let quads = dictionary_test_quads();

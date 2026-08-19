@@ -16,11 +16,10 @@ use oxrdfio::{RdfFormat, RdfParser};
 /// **Trusted-input decode path.** Every caller reconstructs a term from the
 /// store's *own* serialized columns (see [`super::super::store::layouts`]), whose
 /// IRIs were validated by oxrdf's constructors at ingestion — so this uses
-/// [`NamedNode::new_unchecked`] rather than re-running `oxiri::Iri::parse`, which
-/// profiling showed as ~48% of every many-row read (both in-memory and
-/// file-backed). `.vortex` files are likewise trusted to have been checked when
-/// written. The `Result` is kept so the decode call sites (which `?` on genuinely
-/// fallible neighbours like `buf_as_str`) stay uniform.
+/// [`NamedNode::new_unchecked`] rather than re-running `oxiri::Iri::parse` on
+/// every decoded row. `.vortex` files are likewise trusted to have been checked
+/// when written. The `Result` is kept so the decode call sites (which `?` on
+/// genuinely fallible neighbours like `buf_as_str`) stay uniform.
 pub fn parse_named_node(s: &str) -> Result<NamedNode> {
     let s = s.trim_matches(|c| c == '<' || c == '>');
     Ok(NamedNode::new_unchecked(s))
@@ -56,8 +55,7 @@ enum LiteralForm<'a> {
 /// A quote terminates the literal only when the run of backslashes directly
 /// before it has even length; an odd run means the last one escapes it. This
 /// jumps quote to quote rather than scanning byte by byte, because `str::find`
-/// is memchr-accelerated and a hand-rolled loop is not — literal decode is hot
-/// enough on long text objects for the difference to show up end to end.
+/// is memchr-accelerated and a hand-rolled loop is not.
 fn closing_quote(s: &str) -> Option<usize> {
     let b = s.as_bytes();
     if b.first() != Some(&b'"') {

@@ -39,8 +39,7 @@ const failures: { phase: string; error: string }[] = [];
  *
  * A store that cannot survive one phase can still be measured on every other,
  * and that partial result is worth far more than nothing: without this, a single
- * trap loses the adapter's entire query worker — which is how oxigraph
- * disappeared from the comparison altogether. The failure is recorded rather
+ * trap loses the adapter's entire query worker. The failure is recorded rather
  * than swallowed, so a missing row is visibly attributed instead of looking like
  * a benchmark that was never run.
  */
@@ -227,13 +226,12 @@ async function runQuery(a: StoreAdapter): Promise<Row[]> {
  *
  * Materializing every row of a multi-million-quad dataset with realistic term
  * cardinality is by far the heaviest phase, and a store's own retention makes it
- * order-dependent: oxigraph holds ~860 MB per full scan and never reclaims it
- * within a store's lifetime, while wasm linear memory never shrinks back to the
- * engine. Sharing a process with the query and ingest phases therefore left its
- * module too grown to scan at all — it trapped with `unreachable` even on a
- * freshly built store, which would have reported "oxigraph cannot full-scan this
- * dataset" when in fact a clean process does it comfortably (3 scans, peaking
- * ~5.9 GB). Measuring it here instead reports the scan rather than the residue
+ * order-dependent: a store can hold hundreds of megabytes per full scan without
+ * reclaiming them within its lifetime, and wasm linear memory never shrinks back
+ * to the engine. Sharing a process with the query and ingest phases can therefore
+ * leave a module too grown to scan at all — trapping on a freshly built store,
+ * and reporting "this store cannot full-scan the dataset" when a clean process
+ * does it comfortably. Measuring it here reports the scan rather than the residue
  * of everything that ran before it.
  */
 /**
@@ -247,11 +245,10 @@ async function runQuery(a: StoreAdapter): Promise<Row[]> {
  * mirroring the Python tab, so the two are attributable on their own.
  *
  * The process isolation is not stylistic. The first query on an adopted store
- * retains its whole buffer past `free()` (measured at D=128: +32 MB per
- * iteration, and exactly flat when the query is skipped), and wasm linear
- * memory never returns to the OS. Sharing a process with the warm phase piled a
- * live 2M-quad store plus every adoption into one address space until the wasm
- * allocator trapped ("unreachable"). Here the built store is freed the moment
+ * retains its whole buffer past `free()` (adoption alone is flat), and wasm
+ * linear memory never returns to the OS. Sharing a process with the warm phase
+ * piles a live multi-million-quad store plus every adoption into one address
+ * space until the wasm allocator traps. Here the built store is freed the moment
  * its snapshot exists, so the whole budget belongs to the measurements.
  */
 async function runQueryCold(a: StoreAdapter): Promise<Row[]> {
@@ -293,9 +290,9 @@ async function runQueryCold(a: StoreAdapter): Promise<Row[]> {
     th = null;
 
     // Open, on its own: adopting the snapshot into a queryable store, with no
-    // query behind it. The Python tab has measured this as `open::<slug>` all
-    // along; without it the cold column's context — how much of a cold start is
-    // the open — is not on the page.
+    // query behind it. It matches the Python tab's `open::<slug>`, and without
+    // it the cold column's context — how much of a cold start is the open — is
+    // not on the page.
     await bench('open', rows, HEAVY_OPTS, (b) => {
         let h: unknown;
         b.add(`open::${a.slug}`, async () => { h = await a.open!(tSnap); }, {
@@ -331,8 +328,7 @@ async function runFullScan(a: StoreAdapter): Promise<Row[]> {
     console.log(`[${a.label}] full scan…`);
     const triples = genDataset(N_TRIPLES);
     let h: unknown = await a.build(triples);
-    // Record what the scan matches, as the pattern probes do — this is the one
-    // column whose count the dashboard was missing, and it is also the strongest
+    // Record what the scan matches, as the pattern probes do — the strongest
     // cross-adapter check there is: every store must return the whole dataset.
     //
     // Guarded: this pre-pass runs the same consume the benches below run, so a

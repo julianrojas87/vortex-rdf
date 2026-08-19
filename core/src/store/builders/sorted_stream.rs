@@ -53,7 +53,7 @@ use vortex_array::{IntoArray, dtype::DType};
 /// a spill — row IDs are only known as the merge assigns them — while the
 /// `(value, row ID)` pairs are spilled as sorted runs, then chunk emission
 /// zips the re-read quads with the pair merges. This roughly doubles disk
-/// I/O; without indexes the original lazy single-pass merge is used.
+/// I/O; without indexes a lazy single-pass merge is used instead.
 pub struct SortedStreamBuilder;
 
 struct HeapItem {
@@ -421,7 +421,7 @@ struct SpilledIndexes<V> {
 /// A single input run means the whole dataset already fit in memory once, so
 /// the merged output is kept there too rather than round-tripping through
 /// `merged.bin`; with several runs the merge is unbounded by construction and
-/// spills as before.
+/// spills.
 fn merge_to_spill<V>(
     mut runs: Vec<Run<RawQuad>>,
     mut heap: BinaryHeap<HeapItem>,

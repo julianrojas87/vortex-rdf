@@ -133,7 +133,7 @@ def test_serialize_rejects_unknown_options(fixture_nt_path, tmp_path):
     out = str(tmp_path / "out.vortex")
     with pytest.raises(ValueError):
         serialize_rdf(str(fixture_nt_path), out, layout="nope")
-    # The retired builder= option is no longer part of the signature.
+    # builder= is not part of the signature.
     with pytest.raises(TypeError):
         serialize_rdf(str(fixture_nt_path), out, builder="sorted-in-memory")
     with pytest.raises(ValueError):

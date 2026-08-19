@@ -68,7 +68,7 @@ from vortex_rdf import VortexRdfStore, serialize_rdf  # noqa: E402
 # shared-core regression lands in all three tabs at comparable magnitude
 # instead of showing up in one and hiding in another. It is also 4 zones of
 # 8,192 rows, the smallest round size at which zone pruning has anything to
-# prune; the previous 16**3 = 4,096 was half a zone.
+# prune.
 DIM = int(os.environ.get("CODSPEED_BENCH_DIM", 32))  # triples: DIM**3 rows
 DIM_QUADS = int(os.environ.get("CODSPEED_BENCH_DIM_QUADS", 13))  # quads: DIM_QUADS**4 rows
 

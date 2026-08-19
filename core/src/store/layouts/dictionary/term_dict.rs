@@ -50,17 +50,17 @@ const DICT_CHUNK_ROWS: usize = 64 * 1024;
 /// How a dictionary's sorted terms are held in memory.
 ///
 /// The dictionary is *built* FSST-compressed (see [`TermDictionary::compress`])
-/// and written out that way, so `Fsst` is the normal case. `Canonical` remains
-/// reachable and is not a legacy path: Vortex picks a column's encoding when it
-/// writes, by sampling, and the selector is free to choose something other than
-/// FSST — so a dictionary read back from a file or IPC stream may arrive in any
+/// and written out that way, so `Fsst` is the normal case. `Canonical` covers
+/// every other encoding: Vortex picks a column's encoding when it writes, by
+/// sampling, and the selector is free to choose something other than FSST — so
+/// a dictionary read back from a file or IPC stream may arrive in any
 /// encoding, and the read path has to be total over that. Anything that is not
 /// FSST is canonicalized to plaintext on open.
 #[derive(Clone)]
 enum TermStore {
     /// Plaintext terms. `bytes_at` is a zero-copy read.
     Canonical(VarBinViewArray),
-    /// FSST-compressed terms: ~4x smaller, and every read decodes.
+    /// FSST-compressed terms: compact in memory, and every read decodes.
     Fsst(FsstTerms),
     /// A multi-chunk term column read back from a serialized dictionary
     /// child, each chunk kept in the encoding it was written in. Holding the
@@ -101,8 +101,8 @@ impl TermChunk {
     }
 
     /// A fresh cursor over this chunk's terms. Scratch is allocated lazily
-    /// inside `bytes_at`: one eager allocation per chunk would tax every
-    /// single-term decode with O(chunks) mallocs.
+    /// inside `bytes_at`, so a single-term decode allocates only for the
+    /// chunk it touches.
     pub(crate) fn cursor(&self) -> ChunkCursor<'_> {
         match self {
             TermChunk::Canonical(a) => ChunkCursor::Canonical(StrColReader::new(a)),
@@ -134,11 +134,6 @@ pub(crate) struct TermDictionary {
 }
 
 /// Cloning shares nothing: the memo starts empty rather than being copied.
-///
-/// The entries would still be *valid* — they describe the terms, which are
-/// cloned with them — but a dictionary is normally shared through an `Arc`, so
-/// an actual clone is rare enough that carrying the memo across is not worth
-/// the copy.
 impl Clone for TermDictionary {
     fn clone(&self) -> Self {
         Self {
@@ -192,9 +187,8 @@ impl TermDictionary {
 
     /// Adopt a term column as read back from a file or IPC stream.
     ///
-    /// Already-FSST terms are kept compressed — decoding them here would undo
-    /// the point of writing them that way, and is what made opening a store
-    /// cost a full plaintext copy of its dictionary. Any other encoding is
+    /// Already-FSST terms are kept compressed — decoding them here would cost
+    /// a full plaintext copy of the dictionary at open. Any other encoding is
     /// canonicalized: the write path compresses, but nothing in the format
     /// obliges a producer to have done so.
     fn from_terms_array(elements: ArrayRef, ctx: &mut vortex_array::ExecutionCtx) -> Result<Self> {
@@ -439,14 +433,12 @@ impl TermDictionary {
 
     /// The uncached binary search behind [`get_id`](Self::get_id).
     fn search(&self, term: &str) -> Option<u32> {
-        // Direct byte-compare binary search over the sorted terms. The generic
-        // `search_sorted` kernel would instead build a fresh `ExecutionCtx` and
-        // a `Scalar` per probe, which profiling showed dominating
-        // `match_pattern`'s fixed cost.
+        // Direct byte-compare binary search over the sorted terms — no
+        // `ExecutionCtx` and no `Scalar` allocation per probe.
         //
-        // FSST is not order-preserving — roughly half of adjacent sorted pairs
-        // invert in compressed space — so the search cannot run over the codes
-        // and every probe decodes into the reader's scratch buffer.
+        // FSST is not order-preserving, so the search cannot run over the
+        // compressed codes: every probe decodes into the reader's scratch
+        // buffer.
         let mut reader = self.reader();
         let needle = term.as_bytes();
         let (mut lo, mut hi) = (0usize, self.len());
@@ -477,10 +469,9 @@ const PROBE_CACHE_SLOTS: usize = 256;
 /// step under FSST. Repeats are common enough across matches to be worth
 /// catching.
 ///
-/// Direct-mapped rather than an LRU because the memory matters more than the
-/// hit rate here: a few KB per dictionary that never grows, against a structure
-/// that would accumulate every term ever queried. Wasm linear memory is never
-/// returned to the engine, so an unbounded cache is a leak by another name.
+/// Direct-mapped, so the memo is a few KB per dictionary that never grows.
+/// Wasm linear memory is never returned to the engine, so an unbounded cache
+/// would be a leak by another name.
 ///
 /// Entries cannot go stale. A dictionary's terms are immutable, so a term's
 /// code — or its absence, which is memoized too — is a property of the
@@ -495,10 +486,10 @@ pub(super) struct ProbeCache {
 }
 
 struct ProbeEntry {
-    /// A `String` rather than a `Box<str>` so an overwrite can reuse the
-    /// allocation: terms in a dataset are of similar length, so the replacing
-    /// term usually fits the capacity the evicted one left behind. A miss is
-    /// then a hash and a copy, with no allocator traffic.
+    /// A `String`, so an overwrite reuses the allocation: terms in a dataset
+    /// are of similar length, so the replacing term usually fits the capacity
+    /// the evicted one left behind. A miss is then a hash and a copy, with no
+    /// allocator traffic.
     term: String,
     code: Option<u32>,
 }
@@ -514,9 +505,9 @@ impl ProbeCache {
         }
     }
 
-    /// FNV-1a over the whole term. Hashing a prefix would be cheaper but
-    /// collides catastrophically on RDF data, where terms in a dataset share
-    /// long IRI prefixes and differ only near the end.
+    /// FNV-1a over the whole term: RDF terms in a dataset share long IRI
+    /// prefixes and differ only near the end, so the distinguishing bytes sit
+    /// at the tail.
     fn slot(term: &str) -> usize {
         let mut h: u64 = 0xcbf2_9ce4_8422_2325;
         for &b in term.as_bytes() {
@@ -574,9 +565,9 @@ const FSST_DECODE_HEADROOM: usize = 8 * FSST_SYMBOL_LEN;
 pub(crate) struct FsstTerms {
     /// Kept whole so the dictionary can be serialized without recompressing.
     array: FSSTArray,
-    /// Code offsets, canonicalized once at open. The array stores them
-    /// bit-packed, and unpacking a single value allocates a `Scalar` per call —
-    /// far too expensive for a per-probe read inside a binary search.
+    /// Code offsets, canonicalized once at open: the array stores them
+    /// bit-packed, and unpacking a single value allocates a `Scalar` per call,
+    /// which a per-probe read inside a binary search cannot afford.
     offsets: Arc<[u32]>,
     /// Scratch size that keeps `decompress_into` on its fast path.
     scratch_cap: usize,

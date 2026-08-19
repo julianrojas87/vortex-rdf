@@ -31,8 +31,8 @@ pub use layouts::LayoutStrategy;
 pub use layouts::dictionary::DictSnapshot;
 pub use layouts::dictionary::DictionaryQuadSink;
 // `RawQuad` lives in `common` (it is pure RDF text — see that module's
-// charter); this re-export keeps `store::RawQuad`, the path every builder
-// consumer has always used.
+// charter); this re-export makes `store::RawQuad` the path builder consumers
+// use.
 pub use crate::common::quad::RawQuad;
 
 pub(crate) use source::{QuadsSource, Tail};
@@ -268,9 +268,8 @@ impl VortexRdfStore {
 
     /// Build from a builder's output: the primary quad array plus whatever the
     /// builder carries beside it — the Dictionary layout's term dictionary and
-    /// the requested indexes' components, both adopted as they are. The direct
-    /// construction path — no padding round-trip, no re-derivation, and
-    /// nothing to split out of the rows.
+    /// the requested indexes' components, both adopted as they are. Nothing is
+    /// re-derived or split out of the rows.
     pub fn from_built(built: BuiltArray) -> Result<Self> {
         let layout = resolved_layout(built.dict, built.array.dtype())?;
         let (base, components) = compress_built_parts(built.array, built.components)?;
@@ -294,10 +293,8 @@ impl VortexRdfStore {
         // The queryable index set follows the component roster, exactly as
         // the file path follows its child roster.
         let indexes = crate::store::indexes::indexes_from_components(&components);
-        // Resolve the encoded-search probes here rather than leaving them to
-        // whichever query runs first: the walk scales with the encoding tree,
-        // so on a compressed chunked base it is the dominant cost of a first
-        // point read, and it is negligible beside the construction it joins.
+        // Resolve the encoded-search probes at construction, so no query pays
+        // the encoding-tree walk.
         let store_probes = probes::BaseProbes::new();
         store_probes.warm(&base);
         for component in components.iter() {

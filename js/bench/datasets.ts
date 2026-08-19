@@ -19,11 +19,11 @@ export const df = new DataFactory();
 
 // ─── Cardinality-controlled dataset ──────────────────────────────────────────
 //
-// Term cardinality is an explicit knob, independent of row count. The previous
-// generator drew D³ rows from a namespace of only D IRIs (128 distinct terms for
-// 2,097,152 triples), which made every store's term handling — dictionaries,
-// interning, string storage — invisible to the benchmark, and is nothing like
-// real RDF, where distinct terms scale with the data.
+// Term cardinality is an explicit knob, independent of row count. Drawing
+// millions of rows from a namespace of a few dozen IRIs makes every store's
+// term handling — dictionaries, interning, string storage — invisible to the
+// benchmark, and is nothing like real RDF, where distinct terms scale with the
+// data.
 //
 // Uniqueness: term indices are `i % k` per role, so quad i maps to the residue
 // tuple (i mod nSubj, i mod nPred, i mod nObj, i mod nGraph). By the Chinese
@@ -58,14 +58,14 @@ export interface DatasetOpts {
  *  dictionary holds `subjectRatio + objectRatio` terms per quad, so the two
  *  ratios alone say whether there are more distinct terms than rows.
  *
- *  It was 1.0 — a distinct subject for every row. That is not how RDF looks: a
+ *  A ratio of 1.0 — a distinct subject for every row — is not how RDF looks: a
  *  resource is normally described by several properties, so its subject recurs
- *  across that many triples. 1.0 also made `S` match exactly one row, and with
- *  `PO`/`SPO`/`SPOG` matching one apiece, five of the seven probes returned two
- *  rows or fewer — so the comparison measured query *setup* almost to the
+ *  across that many triples. It also makes `S` match exactly one row, and with
+ *  `PO`/`SPO`/`SPOG` matching one apiece, five of the seven probes return two
+ *  rows or fewer, so the comparison measures query *setup* almost to the
  *  exclusion of decoding, on a dictionary half again the size of the dataset.
  *
- *  Set `BENCH_SUBJ_RATIO=1.0` to get that back deliberately: it is a reasonable
+ *  Set `BENCH_SUBJ_RATIO=1.0` to ask for it deliberately: it is a reasonable
  *  dictionary-stress configuration, and `bench:dict-memory` asks for it
  *  explicitly for exactly that reason. It is a poor default. */
 export const SUBJECT_RATIO_DEFAULT = 0.1;
@@ -197,12 +197,10 @@ export const FULL_SCAN_PATTERN: Pat = { name: 'full', s: null, p: null, o: null,
  * every one matches row 0 at minimum — no pattern can silently measure a
  * zero-row query.
  *
- * Selectivity now follows the data rather than the old shared namespace: at the
- * defaults `S` matches ~1 row (subjects are near-unique), `P` ~n/32, `O` ~2, and
- * the conjunctions narrow to a handful. That spread is what real queries look
- * like, but it is *not* comparable to the pre-cardinality numbers — the workers
- * record each pattern's matched-row count alongside its timing so the figures
- * stay interpretable.
+ * Selectivity follows the data: at the defaults `S` matches ~1 row (subjects
+ * are near-unique), `P` ~n/32, `O` ~2, and the conjunctions narrow to a
+ * handful. The workers record each pattern's matched-row count alongside its
+ * timing, so the figures stay interpretable whatever the cardinality knobs.
  */
 export function datasetProbes(n: number, opts: DatasetOpts = {}): {
     triples: Pat[]; quads: Pat[]; full: Pat;

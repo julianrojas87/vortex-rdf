@@ -2,10 +2,10 @@
 //! columns.
 //!
 //! Resolving a probe walks the column's encoding tree (per-chunk on a
-//! chunked base), which measured as the dominant fixed cost of point reads
-//! on a compressed-resident store when paid per call. The base is immutable
-//! for a store's lifetime — mutation constructs a new source — so its
-//! column probes are resolved once and shared by every derived view.
+//! chunked base) — the fixed cost of a point read on a compressed-resident
+//! store, when paid per call. The base is immutable for a store's lifetime —
+//! mutation constructs a new source — so its column probes are resolved once
+//! and shared by every derived view.
 
 use std::sync::{Arc, OnceLock};
 
@@ -43,11 +43,10 @@ impl BaseProbes {
     /// Resolve `base`'s children now rather than on the first query.
     ///
     /// The walk is proportional to the encoding tree, so on a compressed
-    /// chunked base it is per-chunk per-column work that otherwise lands
-    /// entirely on whichever query happens to be first — measured at 2M rows
-    /// as several times the cost of the point query it hid behind. Every
-    /// in-memory construction pays it up front instead, where it is a rounding
-    /// error beside the encoding pass it follows.
+    /// chunked base it is per-chunk per-column work that would otherwise land
+    /// entirely on whichever query happens to be first. Every in-memory
+    /// construction pays it up front instead, alongside the encoding pass it
+    /// follows.
     pub(crate) fn warm(&self, base: &ArrayRef) {
         let _ = self.cells(base);
     }

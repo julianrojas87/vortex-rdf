@@ -44,8 +44,8 @@ fn run_lazy_match(
     pattern: Pattern,
 ) {
     // Probe construction stays OUTSIDE the timed closure: this suite times
-    // ~31 µs of pure match setup, so terms_for's ~4 String allocations per
-    // iteration would be a visible fraction of the measurement.
+    // pure match setup, so terms_for's String allocations per iteration would
+    // be a visible fraction of the measurement.
     let (s, p, o, g) = terms_for(pattern);
     bencher
         .with_inputs(|| make_store(source, layout, index, bench_size()))

@@ -349,8 +349,8 @@ describe('option validation', () => {
     });
 
     test('rejects retired spellings, naming the canonical vocabulary', async () => {
-        // Parsing is strict kebab-case: the old PascalCase inputs error, and
-        // the message lists the canonical names.
+        // Parsing is strict kebab-case: PascalCase inputs error, and the
+        // message lists the canonical names.
         await expect(VortexRdfStore.fromString(NQUADS, 'nquads', { layout: 'Dictionary' as any })).rejects
             .toThrow(/unknown layout strategy "Dictionary".*"dictionary"/);
         await expect(VortexRdfStore.fromString(NQUADS, 'nquads', { indexes: ['SecondaryByCopy'] as any })).rejects

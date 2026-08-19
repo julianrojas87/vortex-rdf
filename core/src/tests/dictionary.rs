@@ -363,8 +363,8 @@ fn term_chunk_of(chunk: &vortex_array::ArrayRef) -> vortex_array::ArrayRef {
 /// invariant this code owns rather than one it inherits: which encoding a
 /// column gets is otherwise decided by the writer's sampling and is free to
 /// be something else. Asserting on the encoding is the only way this stays
-/// true — the terms decode correctly either way, so a regression to
-/// plaintext would be silent.
+/// true — the terms decode correctly either way, so a silent fall back to
+/// plaintext would not otherwise show up.
 #[cfg(feature = "file-io")]
 #[tokio::test]
 async fn test_dictionary_terms_are_fsst_through_bytes() {

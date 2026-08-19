@@ -194,8 +194,7 @@ pub type CacheKey = (Layout, Index, usize);
 /// Cache of ingest products (`BuiltArray`, cheaply cloneable: Arc-shared
 /// buffers). Only the expensive ingest is cached — stores are rebuilt per
 /// handout, see [`cached_store`]. Only a handful of distinct configs are ever
-/// requested, so this stays naturally bounded (unlike the old full-factorial
-/// cache, which held every combination for the process lifetime).
+/// requested, so this stays naturally bounded.
 static BUILT_CACHE: OnceLock<Mutex<HashMap<CacheKey, BuiltArray>>> = OnceLock::new();
 static FILE_CACHE: OnceLock<Mutex<HashMap<CacheKey, PathBuf>>> = OnceLock::new();
 
@@ -212,16 +211,15 @@ fn cached_built(layout: Layout, index: Index, size: usize) -> BuiltArray {
 
 /// A FRESH store over a config's cached ingest product: `from_built` re-runs
 /// component adoption and store construction every call, so no store-level
-/// state is shared between the stores this returns. Handing out clones of one
-/// cached store instead already produced a documented phantom regression
-/// under CodSpeed's single-measured-invocation model (the file bench warming
-/// the shared store shifted the in-memory match baselines) — tasks must start
-/// cold and order-independent. Known residual: the immutable Arc'd buffers —
-/// and vortex's interior-mutable per-array stats riding on them — remain
-/// shared with the cache. That was the incident's actual channel (the writer
-/// computing file stats on the shared array); today's writer repartitions
-/// into copies, but any stat a read lazily computes still lands on the shared
-/// array. Closing that too would take a deep copy per handout.
+/// state is shared between the stores this returns. Under CodSpeed's
+/// single-measured-invocation model a task must start cold and
+/// order-independent, which clones of one cached store cannot be: whatever an
+/// earlier benchmark warms on the shared store shifts every later baseline.
+///
+/// Known residual: the immutable Arc'd buffers — and vortex's
+/// interior-mutable per-array stats riding on them — remain shared with the
+/// cache, so any stat a read lazily computes lands on the shared array.
+/// Closing that too would take a deep copy per handout.
 pub fn cached_store(layout: Layout, index: Index, size: usize) -> VortexRdfStore {
     VortexRdfStore::from_built(cached_built(layout, index, size))
         .expect("failed to build vortex store")

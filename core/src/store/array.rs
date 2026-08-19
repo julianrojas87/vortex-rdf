@@ -25,10 +25,9 @@ use vortex_mask::Mask;
 /// bytes are then an inline read or a plain slice of the referenced buffer.
 ///
 /// `bytes_at` instead materializes a refcounted `ByteBuffer` per row (two
-/// atomic refcount ops plus alignment bookkeeping), which profiling showed
-/// costing ~5% of every many-row decode; this reader is the loop-shaped
-/// counterpart, sharing the access pattern of the typed residual filter's
-/// `StrEq`.
+/// atomic refcount ops plus alignment bookkeeping); this reader is the
+/// loop-shaped counterpart, sharing the access pattern of the typed residual
+/// filter's `StrEq`.
 pub(crate) struct StrColReader<'a> {
     arr: &'a VarBinViewArray,
     views: &'a [BinaryView],
@@ -106,9 +105,8 @@ pub(crate) fn search_sorted_bounds(
 
     // Typed fast path: a canonical non-nullable u32 column (the Dictionary
     // layout's term codes). `partition_point` over the raw slice costs a few
-    // dozen loads; the generic kernel below builds a fresh `ExecutionCtx` and
-    // materializes a `Scalar` per probe, which profiling showed dominating
-    // `match_pattern`'s fixed per-call cost.
+    // dozen loads, where the generic kernel below builds a fresh
+    // `ExecutionCtx` and materializes a `Scalar` per probe.
     if arr.dtype().is_unsigned_int()
         && !arr.dtype().is_nullable()
         && let Ok(prim) = arr.clone().try_downcast::<Primitive>()
@@ -459,9 +457,8 @@ pub(crate) fn bool_array_to_mask(arr: ArrayRef) -> Result<Mask> {
 /// every caller reads a column whose dtype is `Utf8`, and vortex validates that
 /// invariant when the array is constructed — `VarBinViewData::validate` runs a
 /// `from_utf8` over every view on IPC decode, and the file reader validates on
-/// its own construction path. Re-validating here walks each term's bytes a
-/// second time, which profiling showed at ~7% of every many-row decode
-/// (`core::str::converts::from_utf8` under `decode_chunk`).
+/// its own construction path. Re-validating here would walk each term's bytes
+/// a second time on every decoded row.
 ///
 /// The check is kept as a `debug_assert`, so the test suite (which runs debug)
 /// still fails loudly if a non-UTF-8 column ever reaches this, while release

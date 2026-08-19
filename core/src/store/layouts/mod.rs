@@ -202,7 +202,7 @@ impl LayoutStrategy {
 /// Dictionary layout, access to the global term dictionary. Holding the state
 /// in the variant makes "Dictionary layout without a dictionary"
 /// unrepresentable; [`DictAccess`] carries *how* the dictionary is reached
-/// (resident today, file-backed planned).
+/// (resident, or left in its file).
 #[derive(Clone)]
 pub(crate) enum ResolvedLayout {
     Default,
