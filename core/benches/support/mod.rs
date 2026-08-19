@@ -296,19 +296,19 @@ pub fn bench_moduli() -> dataset::Moduli {
 pub fn generate_rdf_data_stream(size: usize) -> impl Stream<Item = Result<RawQuad>> {
     let m = dataset::moduli(size, dataset::WANT_GRAPHS);
 
-    stream::iter((0..size).map(move |i| {
-        let subject = NamedOrBlankNode::NamedNode(NamedNode::new_unchecked(dataset::subject_iri(
-            i % m.n_subj,
-        )));
-        let predicate = NamedNode::new_unchecked(dataset::predicate_iri(i % m.n_pred));
-        let object = dataset::object_term(i % m.n_obj).into_oxrdf();
-        let graph =
-            GraphName::NamedNode(NamedNode::new_unchecked(dataset::graph_iri(i % m.n_graph)));
+    stream::iter((0..size).map(move |i| Ok(RawQuad::from_quad(&dataset_quad(i, m)))))
+}
 
-        Ok(RawQuad::from_quad(&Quad::new(
-            subject, predicate, object, graph,
-        )))
-    }))
+/// Row `i` of the generated dataset, under moduli `m`: one definition of what a
+/// row *is*, shared by the generator above and by the mutation benchmarks,
+/// whose delete batch has to name rows the store actually holds.
+pub fn dataset_quad(i: usize, m: dataset::Moduli) -> Quad {
+    Quad::new(
+        NamedOrBlankNode::NamedNode(NamedNode::new_unchecked(dataset::subject_iri(i % m.n_subj))),
+        NamedNode::new_unchecked(dataset::predicate_iri(i % m.n_pred)),
+        dataset::object_term(i % m.n_obj).into_oxrdf(),
+        GraphName::NamedNode(NamedNode::new_unchecked(dataset::graph_iri(i % m.n_graph))),
+    )
 }
 
 /// Like [`generate_rdf_data_stream`], but with literal objects of every shape —

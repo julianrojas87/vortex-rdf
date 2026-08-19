@@ -27,6 +27,11 @@
 //!   never inside either measurement — it is its own benchmark (`open_file`).
 //! * **Decode/load (Group 3) and dictionary residency (Group 4)** sweep only
 //!   the axis each path actually branches on.
+//! * **Mutate (Group 5)** sweeps a star of the same three axes, because an
+//!   append's presence check and a delete's pattern resolution both route
+//!   through `match_pattern` — and separates the three costs a mutation can
+//!   carry (accretion, tombstoning, and the compaction that folds a tail back
+//!   into the base) into cells of their own.
 //!
 //! Each group below documents its baseline and what it sweeps.
 //!
@@ -59,7 +64,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use futures::stream;
-use oxrdf::{NamedNode, NamedOrBlankNode};
+use oxrdf::{GraphName, NamedNode, NamedOrBlankNode, Quad, Term};
 
 use vortex_rdf_core::{LayoutStrategy, VortexRdfError, VortexRdfStore, io};
 
@@ -653,4 +658,249 @@ fn dict_decode_matched(bencher: divan::Bencher, residency: &DictResidency) {
             black_box(quads.len())
         })
     });
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// Group 5 — MUTATE (append / delete / compact)
+//
+// Mutations are copy-on-write: appends accrete in an in-memory tail, deletes
+// tombstone, and neither rewrites the base — so what each arm costs is a
+// different thing, and they are timed as three.
+//
+// * The `add_*` pair starts from an empty store, which no layout or index knob
+//   reaches, so it is one cell per call shape (per-quad loop vs one batched
+//   call) rather than a sweep.
+// * The `append_*` and `delete_*` arms run against a populated store, where the
+//   axes do matter: every add checks presence and every delete resolves a fully
+//   bound pattern, both through `match_pattern` — so layout, index and source
+//   decide the routing they pay for.
+// * `mutate_compact` times the fold of a tail back into the base on its own.
+//   The batch is kept under the auto-compaction thresholds (see [`mut_batch`]),
+//   so the append arms measure accretion only and the rebuild they would
+//   eventually trigger is a cell of its own instead of landing in whichever
+//   iteration crossed the line.
+// ══════════════════════════════════════════════════════════════════════════
+
+/// Quads per mutation batch (`MUT_BATCH`), clamped below the store's
+/// auto-compaction floor.
+///
+/// The ceiling is what keeps the arms separable: an append that crosses the
+/// floor folds the tail into the base, which is a rebuild rather than an append
+/// — `mutate_compact` times that — and for a file-backed store the fold rewrites
+/// its source file in place, which is the shared artifact every other file
+/// benchmark here opens.
+fn mut_batch() -> usize {
+    /// One below `AUTO_COMPACT_TAIL_FLOOR`, the smallest tail the store will
+    /// fold (the ratio trigger only raises that bar).
+    const MAX: usize = 4_095;
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("MUT_BATCH")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(512)
+            .clamp(1, MAX)
+    })
+}
+
+/// A batch in a namespace disjoint from the dataset's, so every add is a
+/// genuine insert rather than a set-semantics no-op. Same spelling as the
+/// comparative suite's `fresh_quads`, down to the default graph, so an add cell
+/// here and its row on the comparative tab insert the same terms.
+fn fresh_quads(n: usize) -> Vec<Quad> {
+    let base = dataset::BASE;
+    (0..n)
+        .map(|i| {
+            Quad::new(
+                NamedNode::new_unchecked(format!("{base}/fresh/2026/subject/{i:09}")),
+                NamedNode::new_unchecked(format!("{base}/fresh/2026/property/0000")),
+                Term::NamedNode(NamedNode::new_unchecked(format!(
+                    "{base}/fresh/2026/object/{i:09}"
+                ))),
+                GraphName::DefaultGraph,
+            )
+        })
+        .collect()
+}
+
+/// Deletes per [`mutate_delete_loop`], capped well below [`mut_batch`]. Nothing
+/// accumulates across a delete loop the way an append's tail does — each delete
+/// resolves its pattern and unions a mask, so the count only averages — and a
+/// file-backed delete costs a materialization, which at the append batch's size
+/// would make that one cell dominate the suite's instrumented runtime.
+fn delete_batch() -> usize {
+    const CAP: usize = 64;
+    mut_batch().min(CAP)
+}
+
+/// The first `take` rows of the generated dataset — the delete batch has to name
+/// rows the store actually holds, or the cell prices the absent-term path
+/// instead of the tombstoning it is about.
+fn dataset_prefix(take: usize) -> Vec<Quad> {
+    let m = bench_moduli();
+    (0..take.min(bench_size()))
+        .map(|i| dataset_quad(i, m))
+        .collect()
+}
+
+#[derive(Copy, Clone)]
+struct MutCfg {
+    layout: Layout,
+    index: Index,
+    source: Source,
+}
+
+impl fmt::Debug for MutCfg {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{}_{}_{}",
+            self.layout.short(),
+            self.index.short(),
+            self.source.short()
+        )
+    }
+}
+
+/// A star around `default / no_index / in_memory`, one factor at a time — the
+/// three ways the presence check and the delete's pattern resolution route:
+/// against a secondary index, against dictionary codes (where a fresh quad's
+/// terms have no code at all), and against a file.
+const MUT_CONFIGS: &[MutCfg] = &[
+    MutCfg {
+        layout: Layout::Default,
+        index: Index::None,
+        source: Source::InMemory,
+    }, // baseline
+    MutCfg {
+        layout: Layout::Default,
+        index: Index::ByCopy,
+        source: Source::InMemory,
+    },
+    MutCfg {
+        layout: Layout::Dictionary,
+        index: Index::None,
+        source: Source::InMemory,
+    },
+    MutCfg {
+        layout: Layout::Default,
+        index: Index::None,
+        source: Source::File,
+    },
+];
+
+/// `add_quad` in a loop, into an empty store: one tail rebuild and one presence
+/// check per quad, the shape a per-quad ingest API takes.
+#[divan::bench(sample_count = HEAVY_SAMPLES)]
+fn mutate_add_loop(bencher: divan::Bencher) {
+    let fresh = fresh_quads(mut_batch());
+    bencher.bench(|| {
+        rt().block_on(async {
+            let mut store = VortexRdfStore::empty();
+            for quad in &fresh {
+                store = store.add_quad(quad.clone()).await.expect("add_quad");
+            }
+            black_box(store)
+        })
+    });
+}
+
+/// The same batch through one `add_quads` call: the presence checks are still
+/// per quad, but the tail is built once.
+#[divan::bench(sample_count = HEAVY_SAMPLES)]
+fn mutate_add_batch(bencher: divan::Bencher) {
+    let fresh = fresh_quads(mut_batch());
+    bencher.bench(|| {
+        rt().block_on(async {
+            let store = VortexRdfStore::empty()
+                .add_quads(fresh.iter().cloned())
+                .await
+                .expect("add_quads");
+            black_box(store)
+        })
+    });
+}
+
+/// `add_quad` in a loop against a *populated* store — the append the empty-store
+/// arms cannot show: each quad's presence check resolves a fully bound pattern
+/// against the base, which is where layout, index and source diverge. The store
+/// is rebuilt per iteration (untimed), so every iteration appends to the same
+/// base with the same cold caches.
+#[divan::bench(args = MUT_CONFIGS, sample_count = HEAVY_SAMPLES)]
+fn mutate_append_loop(bencher: divan::Bencher, cfg: &MutCfg) {
+    let cfg = *cfg;
+    let fresh = fresh_quads(mut_batch());
+    bencher
+        .with_inputs(|| make_store(cfg.source, cfg.layout, cfg.index, bench_size()))
+        .bench_values(|store| {
+            rt().block_on(async {
+                let mut store = store;
+                for quad in &fresh {
+                    store = store.add_quad(quad.clone()).await.expect("add_quad");
+                }
+                black_box(store)
+            })
+        });
+}
+
+/// [`mutate_append_loop`]'s batch counterpart: one `add_quads` call, so the
+/// difference against the loop is the tail rebuilds it avoids.
+#[divan::bench(args = MUT_CONFIGS, sample_count = HEAVY_SAMPLES)]
+fn mutate_append_batch(bencher: divan::Bencher, cfg: &MutCfg) {
+    let cfg = *cfg;
+    let fresh = fresh_quads(mut_batch());
+    bencher
+        .with_inputs(|| make_store(cfg.source, cfg.layout, cfg.index, bench_size()))
+        .bench_values(|store| {
+            rt().block_on(async {
+                let store = store
+                    .add_quads(fresh.iter().cloned())
+                    .await
+                    .expect("add_quads");
+                black_box(store)
+            })
+        });
+}
+
+/// `delete_quad` in a loop over rows the store holds: each one resolves a fully
+/// bound pattern and unions its rows into the tombstone mask, leaving the base
+/// and its indexes untouched. Rebuilding (or reopening) the store is untimed
+/// per-iteration setup — otherwise the cell measures the setup, since each
+/// iteration deletes the rows the next one has to find again.
+#[divan::bench(args = MUT_CONFIGS, sample_count = HEAVY_SAMPLES)]
+fn mutate_delete_loop(bencher: divan::Bencher, cfg: &MutCfg) {
+    let cfg = *cfg;
+    let doomed = dataset_prefix(delete_batch());
+    bencher
+        .with_inputs(|| make_store(cfg.source, cfg.layout, cfg.index, bench_size()))
+        .bench_values(|store| {
+            rt().block_on(async {
+                let mut store = store;
+                for quad in &doomed {
+                    store = store.delete_quad(quad).await.expect("delete_quad");
+                }
+                black_box(store)
+            })
+        });
+}
+
+/// Fold a tail into the base: gather the live rows, re-sort by (s, p, o, g) and
+/// rebuild — the O(n log n) step `add_quads` reaches for on its own once a tail
+/// outgrows the thresholds, and the amortized half of an append's cost. Only the
+/// in-memory source: a file-backed compaction rewrites its source file, which
+/// the rest of the suite reads. Dictionary is swept beside Default because
+/// compaction re-encodes the rows against a fresh term dictionary.
+#[divan::bench(args = [Layout::Default, Layout::Dictionary], sample_count = HEAVY_SAMPLES)]
+fn mutate_compact(bencher: divan::Bencher, layout: &Layout) {
+    let layout = *layout;
+    let fresh = fresh_quads(mut_batch());
+    bencher
+        .with_inputs(|| {
+            let store = make_store(Source::InMemory, layout, Index::None, bench_size());
+            rt().block_on(store.add_quads(fresh.iter().cloned()))
+                .expect("build tail")
+        })
+        .bench_refs(|store| {
+            rt().block_on(async { black_box(store.compact().await.expect("compact")) })
+        });
 }
