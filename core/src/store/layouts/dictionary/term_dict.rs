@@ -11,10 +11,10 @@
 //!
 //! [`LayoutStrategy::Dictionary`]: crate::store::layouts::LayoutStrategy::Dictionary
 
+use crate::debug;
 use std::collections::HashSet;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
-use web_time::Instant;
 
 use vortex_array::arrays::struct_::{StructArray, StructArrayExt};
 use vortex_array::arrays::{ChunkedArray, PrimitiveArray, VarBinViewArray};
@@ -271,7 +271,7 @@ impl TermDictionary {
         if plain.is_empty() {
             return Ok(Self::new(TermStore::Canonical(plain)));
         }
-        let start = Instant::now();
+        let start = debug::timer();
         let len = plain.len();
         let array = plain.into_array();
         let mut ctx = VORTEX_SESSION.create_execution_ctx();
@@ -283,7 +283,7 @@ impl TermDictionary {
             log::debug!(
                 "[Dictionary] FSST-compressed {} terms in {:?}",
                 terms.len(),
-                start.elapsed()
+                debug::elapsed(start)
             );
             return Ok(Self::new(TermStore::Fsst(terms)));
         }
@@ -313,7 +313,7 @@ impl TermDictionary {
             "[Dictionary] FSST-compressed {} terms into {} windows in {:?}",
             len,
             chunks.len(),
-            start.elapsed()
+            debug::elapsed(start)
         );
         Ok(Self::new(TermStore::Chunked(ChunkedTerms {
             chunks,
@@ -326,7 +326,7 @@ impl TermDictionary {
     /// [`from_quads_with_map`](Self::from_quads_with_map). Terms borrow from
     /// `quads`, so nothing is copied.
     fn sorted_unique_terms(quads: &[RawQuad]) -> (Vec<&str>, Duration, Duration) {
-        let collect_start = Instant::now();
+        let collect_start = debug::timer();
         let mut set: HashSet<&str> = HashSet::new();
         for q in quads {
             set.insert(&q.s);
@@ -334,11 +334,11 @@ impl TermDictionary {
             set.insert(&q.o);
             set.insert(&q.g);
         }
-        let collect_elapsed = collect_start.elapsed();
-        let sort_start = Instant::now();
+        let collect_elapsed = debug::elapsed(collect_start);
+        let sort_start = debug::timer();
         let mut terms: Vec<&str> = set.into_iter().collect();
         terms.sort_unstable();
-        (terms, collect_elapsed, sort_start.elapsed())
+        (terms, collect_elapsed, debug::elapsed(sort_start))
     }
 
     /// Build the dictionary *and* its term→ID map in one pass, with the map
@@ -354,16 +354,16 @@ impl TermDictionary {
     ///
     /// [`TermDictionaryBuilder::finish`]: super::ingest::TermDictionaryBuilder::finish
     pub(crate) fn from_quads_with_map(quads: &[RawQuad]) -> Result<(Self, BorrowedTermIdMap<'_>)> {
-        let total_start = Instant::now();
+        let total_start = debug::timer();
         let (terms, collect_elapsed, sort_elapsed) = Self::sorted_unique_terms(quads);
-        let map_start = Instant::now();
+        let map_start = debug::timer();
         let id_map: BorrowedTermIdMap<'_> = terms
             .iter()
             .enumerate()
             .map(|(id, term)| (*term, id as u32))
             .collect();
-        let map_elapsed = map_start.elapsed();
-        let freeze_start = Instant::now();
+        let map_elapsed = debug::elapsed(map_start);
+        let freeze_start = debug::timer();
         let dict = Self::from_sorted(terms.into_iter())?;
         log::debug!(
             "[Dictionary] Built dictionary + borrowed ID map from {} quads ({} unique terms): collect {:?}, sort {:?}, map {:?}, freeze {:?}, total {:?}",
@@ -372,8 +372,8 @@ impl TermDictionary {
             collect_elapsed,
             sort_elapsed,
             map_elapsed,
-            freeze_start.elapsed(),
-            total_start.elapsed()
+            debug::elapsed(freeze_start),
+            debug::elapsed(total_start)
         );
         Ok((dict, id_map))
     }

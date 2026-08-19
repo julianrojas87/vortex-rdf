@@ -19,9 +19,9 @@ use crate::store::indexes::Indexes;
 use crate::store::layouts::dictionary::{QuadCodes, TermDictionary, ingest_interning};
 use crate::store::layouts::{LayoutStrategy, dictionary};
 
+use crate::debug;
 use futures::{Stream, StreamExt, stream};
 use std::sync::Arc;
-use web_time::Instant;
 
 /// Fully in-memory, globally sorted Vortex RDF Array Builder.
 ///
@@ -37,7 +37,7 @@ impl VortexArrayBuilder for SortedInMemoryBuilder {
         layout: LayoutStrategy,
         indexes: Indexes,
     ) -> Result<BuiltArray> {
-        let start = Instant::now();
+        let start = debug::timer();
 
         // Build a single contiguous StructArray of primary columns, with each
         // requested index's child built beside it over the same sorted
@@ -51,7 +51,7 @@ impl VortexArrayBuilder for SortedInMemoryBuilder {
         if layout == LayoutStrategy::Dictionary {
             let (dict, codes) = ingest_interning(quad_stream).await?.finish()?;
             n = codes.s.len();
-            build_start = Instant::now();
+            build_start = debug::timer();
             built = BuiltArray {
                 array: dictionary::build_array(&codes)?,
                 components: build_components_from_codes(&indexes, &codes)?,
@@ -60,7 +60,7 @@ impl VortexArrayBuilder for SortedInMemoryBuilder {
         } else {
             let quads = ingest_and_sort(quad_stream).await?;
             n = quads.len();
-            build_start = Instant::now();
+            build_start = debug::timer();
             built = BuiltArray {
                 array: build_struct_array(&quads, layout, true)?,
                 components: build_components(&indexes, &quads)?,
@@ -69,12 +69,12 @@ impl VortexArrayBuilder for SortedInMemoryBuilder {
         };
         log::debug!(
             "[SortedInMemoryBuilder] Constructed StructArray in {:?}",
-            build_start.elapsed()
+            debug::elapsed(build_start)
         );
         log::debug!(
             "[SortedInMemoryBuilder] Completed serialization of {} quads in {:?}",
             n,
-            start.elapsed()
+            debug::elapsed(start)
         );
 
         Ok(built)
@@ -103,11 +103,11 @@ async fn ingest_and_sort(
     }
     log::debug!("[SortedInMemoryBuilder] Read {} quads", quads.len());
 
-    let sort_start = Instant::now();
+    let sort_start = debug::timer();
     quads.sort_unstable();
     log::debug!(
         "[SortedInMemoryBuilder] Sorted quads in {:?}",
-        sort_start.elapsed()
+        debug::elapsed(sort_start)
     );
 
     Ok(quads)

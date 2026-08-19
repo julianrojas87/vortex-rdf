@@ -15,6 +15,7 @@
 use crate::error::{Result, VortexRdfError};
 use vortex_array::ArrayRef;
 
+use crate::debug;
 use crate::io::container::{
     self, DICT_COMPONENT_NAME, NativeComponentWrite, ReplayableArraySource,
     StoreComponentDescriptor, StoreComponentRole, default_child_strategy,
@@ -24,7 +25,6 @@ use crate::store::layouts::dictionary::{TermDictionary, dict_child_chunks};
 use std::sync::Arc;
 use vortex_array::stream::ArrayStreamAdapter;
 use vortex_io::VortexWrite;
-use web_time::Instant;
 
 #[cfg(feature = "file-io")]
 use crate::error;
@@ -69,7 +69,7 @@ pub(crate) async fn serialize_parts<W: VortexWrite + Unpin + Send>(
     dict: Option<&TermDictionary>,
     mut writer: W,
 ) -> Result<()> {
-    let start = Instant::now();
+    let start = debug::timer();
 
     let layout = LayoutStrategy::from_dtype(primary.dtype());
     if matches!(layout, LayoutStrategy::Dictionary) && dict.is_none() {
@@ -110,7 +110,7 @@ pub(crate) async fn serialize_parts<W: VortexWrite + Unpin + Send>(
 
     log::debug!(
         "[ser::serialize_parts] Vortex writing took {:?}",
-        start.elapsed()
+        debug::elapsed(start)
     );
     Ok(())
 }
@@ -148,14 +148,14 @@ where
     S: Stream<Item = error::Result<RawQuad>> + Unpin + Send + 'static,
     W: VortexWrite + Unpin + Send,
 {
-    let start = Instant::now();
+    let start = debug::timer();
 
     let built = SortedStreamBuilder::build_vortex_stream(Box::new(quads), layout, indexes).await?;
     built_stream_to_vortex_writer(built, writer).await?;
 
     log::debug!(
         "[ser::quads_stream_to_vortex_writer] Streaming write took {:?}",
-        start.elapsed()
+        debug::elapsed(start)
     );
     Ok(())
 }

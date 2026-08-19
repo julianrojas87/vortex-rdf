@@ -26,6 +26,7 @@ use crate::store::indexes::{IndexComponent, IndexType, Indexes, known_component,
 use crate::store::layouts::dictionary::{TermDictionary, TermDictionaryBuilder};
 use crate::store::layouts::{LayoutStrategy, dictionary};
 
+use crate::debug;
 use futures::{Stream, StreamExt, TryStreamExt, stream};
 use rkyv::api::high::{HighDeserializer, HighSerializer};
 use rkyv::rancor::Error as RkyvError;
@@ -35,7 +36,6 @@ use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
 use std::collections::BinaryHeap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use web_time::Instant;
 
 use vortex_array::ArrayRef;
 use vortex_array::arrays::StructArray;
@@ -114,7 +114,7 @@ pub(crate) async fn build_sorted_stream_array(
 ) -> Result<BuiltArray> {
     use vortex_array::VortexSessionExecute as _;
 
-    let start = Instant::now();
+    let start = debug::timer();
 
     let built =
         build_sorted_stream_chunk_stream(quad_stream, layout, indexes.clone(), chunk_size, None)
@@ -168,7 +168,7 @@ pub(crate) async fn build_sorted_stream_array(
     log::debug!(
         "[SortedStreamBuilder] Materialized {} quads in {:?}",
         result.len(),
-        start.elapsed()
+        debug::elapsed(start)
     );
     Ok(BuiltArray {
         array: result,
@@ -197,9 +197,9 @@ pub(crate) async fn build_sorted_stream_chunk_stream(
     chunk_size: usize,
     spill_dir: Option<&Path>,
 ) -> Result<BuiltStream> {
-    let build_start = Instant::now();
+    let build_start = debug::timer();
     // ── Phase 1: Ingest and write sorted runs ──
-    let ingest_start = Instant::now();
+    let ingest_start = debug::timer();
     let temp_dir = make_temp_dir("sorted_stream", spill_dir)?;
     let guard = Arc::new(TempRunsGuard {
         dir: temp_dir.clone(),
@@ -270,7 +270,7 @@ pub(crate) async fn build_sorted_stream_chunk_stream(
         "[SortedStreamBuilder] Ingested {} quads into {} runs in {:?} (dictionary collection={})",
         total_ingested,
         runs.len(),
-        ingest_start.elapsed(),
+        debug::elapsed(ingest_start),
         dict_builder.is_some()
     );
 
@@ -294,14 +294,14 @@ pub(crate) async fn build_sorted_stream_chunk_stream(
         let want_ref = unique.contains(&IndexType::SecondaryByReference);
         let want_copy = unique.contains(&IndexType::SecondaryByCopy);
         if let Some(b) = dict_builder {
-            let dict_start = Instant::now();
+            let dict_start = debug::timer();
             let (dict, id_map) = b.finish()?;
             let (dict, id_map) = (Arc::new(dict), Arc::new(id_map));
             log::debug!(
                 "[SortedStreamBuilder] Finalized dictionary of {} terms in {:?} ({:?} since build start)",
                 dict.len(),
-                dict_start.elapsed(),
-                build_start.elapsed()
+                debug::elapsed(dict_start),
+                debug::elapsed(build_start)
             );
             let ids = id_map.clone();
             let (merged, spilled) = merge_to_spill(
@@ -344,14 +344,14 @@ pub(crate) async fn build_sorted_stream_chunk_stream(
 
     // ── No secondary indexes: lazily emit merged chunks ──
     if let Some(b) = dict_builder {
-        let dict_start = Instant::now();
+        let dict_start = debug::timer();
         let (dict, id_map) = b.finish()?;
         let (dict, id_map) = (Arc::new(dict), Arc::new(id_map));
         log::debug!(
             "[SortedStreamBuilder] Finalized dictionary of {} terms in {:?} ({:?} since build start)",
             dict.len(),
-            dict_start.elapsed(),
-            build_start.elapsed()
+            debug::elapsed(dict_start),
+            debug::elapsed(build_start)
         );
         return emit_dict_chunks(runs, heap, dict, id_map, chunk_size, guard);
     }

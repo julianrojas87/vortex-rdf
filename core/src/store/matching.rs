@@ -1,6 +1,7 @@
 //! Pattern matching: composing a pattern's restrictions into derived views
 //! over the base and the tail.
 
+use crate::debug;
 use crate::error::{Result, VortexRdfError};
 use crate::session::VORTEX_SESSION;
 use crate::store::array::{bool_array_to_mask, column_is_sorted, search_sorted_bounds};
@@ -74,6 +75,7 @@ impl VortexRdfStore {
         object: Option<&Term>,
         graph: Option<&GraphName>,
     ) -> Result<Tail> {
+        let t = debug::timer();
         let carry = |selection: RowSelection| Tail {
             rows: tail.rows.clone(),
             selection,
@@ -90,7 +92,13 @@ impl VortexRdfStore {
             .await?;
         let eqs = match codes.constraints(subject, predicate, object, graph)? {
             // A term the tail's layout can prove absent matches nothing.
-            Constraints::AlwaysFalse => return Ok(carry(RowSelection::empty())),
+            Constraints::AlwaysFalse => {
+                log::debug!(
+                    "[match_pattern] Tail proved the pattern unmatchable at {:?}",
+                    debug::elapsed(t)
+                );
+                return Ok(carry(RowSelection::empty()));
+            }
             Constraints::Eq(eqs) => eqs,
         };
         if eqs.is_empty() {
@@ -103,14 +111,22 @@ impl VortexRdfStore {
         // `contains` (and thus every `add_quad` presence check) rides.
         if let Some(positions) = typed_positions(&applied, &eqs) {
             let mask = Mask::from_indices(applied.len(), positions);
+            log::debug!(
+                "[match_pattern] Tail matched by typed positions at {:?}",
+                debug::elapsed(t)
+            );
             return Ok(carry(tail.selection.clone().refine(&mask)));
         }
-        match Self::mask_for(&applied, subject, predicate, object, graph, &mut codes)? {
-            None => Ok(carry(tail.selection.clone())),
-            Some(mask) => Ok(carry(
-                tail.selection.clone().refine(&bool_array_to_mask(mask)?),
-            )),
-        }
+        let matched = match Self::mask_for(&applied, subject, predicate, object, graph, &mut codes)?
+        {
+            None => carry(tail.selection.clone()),
+            Some(mask) => carry(tail.selection.clone().refine(&bool_array_to_mask(mask)?)),
+        };
+        log::debug!(
+            "[match_pattern] Tail matched by mask scan at {:?}",
+            debug::elapsed(t)
+        );
+        Ok(matched)
     }
 
     /// Match the pattern against the base alone, composing its restrictions
@@ -123,10 +139,7 @@ impl VortexRdfStore {
         object: Option<&Term>,
         graph: Option<&GraphName>,
     ) -> Result<Self> {
-        // Started only when debug logging will read it: on wasm
-        // `Instant::now()` is a JS-boundary `performance.now()` call sitting
-        // on the hottest path in the crate.
-        let t = log::log_enabled!(log::Level::Debug).then(Instant::now);
+        let t = debug::timer();
 
         // Resolve each bound term to its dictionary code at most once for this
         // whole match: the stages below each need the same mapping, and under
@@ -140,6 +153,10 @@ impl VortexRdfStore {
             .layout
             .prepare_pattern(QuadPattern::new(subject, predicate, object, graph))
             .await?;
+        log::debug!(
+            "[match_pattern] Prepared pattern codes at {:?}",
+            debug::elapsed(t)
+        );
 
         // A pattern the layout can prove unmatchable (e.g. a term absent from
         // the dictionary) needs no search — and no scan machinery — at all,
@@ -148,6 +165,10 @@ impl VortexRdfStore {
             codes.constraints(subject, predicate, object, graph)?,
             Constraints::AlwaysFalse
         ) {
+            log::debug!(
+                "[match_pattern] Layout proved the pattern unmatchable at {:?}",
+                debug::elapsed(t)
+            );
             return Ok(self.empty_view());
         }
 
@@ -259,7 +280,10 @@ impl VortexRdfStore {
             selection = selection.intersect_range(lo as u64..hi as u64);
             pat.subject = None;
             narrowed_elsewhere = true;
-            log::debug!("[match_pattern] s binary search {:?}", debug_elapsed(t));
+            log::debug!(
+                "[match_pattern] In-memory subject bounded by binary search at {:?}",
+                debug::elapsed(t)
+            );
         }
 
         // ── Secondary-index routing ───────────────────────────────
@@ -279,7 +303,13 @@ impl VortexRdfStore {
         if !selection.is_empty(base.len()) && worth_indexing {
             match resolve_indexes_in_memory(&self.indexes, components, &self.layout, pat, codes)? {
                 // The probed term is absent from the data — nothing matches.
-                IndexResolution::Empty => return Ok(self.empty_view()),
+                IndexResolution::Empty => {
+                    log::debug!(
+                        "[match_pattern] In-memory index proved empty at {:?}",
+                        debug::elapsed(t)
+                    );
+                    return Ok(self.empty_view());
+                }
                 // Fold the resolution into the selection, and hold onto any
                 // serving plan the index handed back to decide below
                 // whether it still describes exactly the result.
@@ -311,13 +341,18 @@ impl VortexRdfStore {
                         }
                     }
                     log::debug!(
-                        "[match_pattern] index (sorted search) {:?}",
-                        debug_elapsed(t)
+                        "[match_pattern] In-memory index resolved at {:?}",
+                        debug::elapsed(t)
                     );
                 }
                 // No index accelerates this pattern: whatever is still
                 // bound falls to the mask scan below.
-                IndexResolution::Declined => {}
+                IndexResolution::Declined => {
+                    log::debug!(
+                        "[match_pattern] In-memory index declined at {:?}",
+                        debug::elapsed(t)
+                    );
+                }
             }
         }
 
@@ -347,7 +382,10 @@ impl VortexRdfStore {
                 Some(ids) => {
                     selection = RowSelection::Ids(ids);
                     narrowed_elsewhere = true;
-                    log::debug!("[match_pattern] typed residual scan {:?}", debug_elapsed(t));
+                    log::debug!(
+                        "[match_pattern] In-memory narrowed by typed residual scan at {:?}",
+                        debug::elapsed(t)
+                    );
                 }
                 None => {
                     if let Some(mask) = Self::mask_for(
@@ -360,7 +398,10 @@ impl VortexRdfStore {
                     )? {
                         selection = selection.refine(&bool_array_to_mask(mask)?);
                         narrowed_elsewhere = true;
-                        log::debug!("[match_pattern] mask scan {:?}", debug_elapsed(t));
+                        log::debug!(
+                            "[match_pattern] In-memory narrowed by mask scan at {:?}",
+                            debug::elapsed(t)
+                        );
                     }
                 }
             }
@@ -382,6 +423,12 @@ impl VortexRdfStore {
             None => ViewSelection::Exact(selection),
         };
 
+        log::debug!(
+            "[match_pattern] In-memory view built (serve: {}, pending ids: {}) at {:?}",
+            serve.is_some(),
+            matches!(selection, ViewSelection::Pending(_)),
+            debug::elapsed(t)
+        );
         Ok(Self {
             layout: self.layout.clone(),
             indexes: self.indexes.clone(),
@@ -444,6 +491,10 @@ impl VortexRdfStore {
         {
             subject_range = Some(range);
             pat.subject = None;
+            log::debug!(
+                "[match_pattern] File subject bounded by chunk probe at {:?}",
+                debug::elapsed(t)
+            );
         }
         // With the subject already resolved to a tiny range, an index
         // resolution for the residual terms is a pessimization (its pushed
@@ -478,7 +529,13 @@ impl VortexRdfStore {
             // The probed term is absent — nothing can match. Short-
             // circuit to the empty view (an empty id set would just
             // intersect every other restriction down to nothing anyway).
-            IndexResolution::Empty => return Ok(self.empty_view()),
+            IndexResolution::Empty => {
+                log::debug!(
+                    "[match_pattern] File index proved empty at {:?}",
+                    debug::elapsed(t)
+                );
+                return Ok(self.empty_view());
+            }
             // An index resolved one component: push down a filter for
             // the rest of the pattern only, alongside its row ids.
             IndexResolution::Resolved {
@@ -495,24 +552,44 @@ impl VortexRdfStore {
                     // selection — left pending until a consumer needs them
                     // (a count, a chained match, a delete, a base-order
                     // gather); reads stream through the plan without them.
-                    ResolvedRowIds::Lazy(lazy) if serve.is_some() => ViewSelection::Pending(lazy),
+                    ResolvedRowIds::Lazy(lazy) if serve.is_some() => {
+                        log::debug!(
+                            "[match_pattern] File index resolved (served, ids pending) at {:?}",
+                            debug::elapsed(t)
+                        );
+                        ViewSelection::Pending(lazy)
+                    }
                     // No plan kept (this view was already restricted): the
                     // ids are needed now — run the deferred scan and fold
                     // it exactly as an eager resolution would be.
-                    ResolvedRowIds::Lazy(lazy) => ViewSelection::Exact(apply_subject(
-                        existing_selection
-                            .materialized()
-                            .await?
-                            .intersect_ids(lazy.materialized().await?),
-                    )),
+                    ResolvedRowIds::Lazy(lazy) => {
+                        let selection = ViewSelection::Exact(apply_subject(
+                            existing_selection
+                                .materialized()
+                                .await?
+                                .intersect_ids(lazy.materialized().await?),
+                        ));
+                        log::debug!(
+                            "[match_pattern] File index resolved (ids materialized) at {:?}",
+                            debug::elapsed(t)
+                        );
+                        selection
+                    }
                     // An index answered with exact ids: fold them into the
                     // selection, which drops it to `Ids` — narrowing
                     // whatever a previous match had established (a range,
                     // or an earlier lookup's ids) without ever setting two
                     // restrictions at once.
-                    ResolvedRowIds::Eager(ids) => ViewSelection::Exact(apply_subject(
-                        existing_selection.materialized().await?.intersect_ids(ids),
-                    )),
+                    ResolvedRowIds::Eager(ids) => {
+                        let selection = ViewSelection::Exact(apply_subject(
+                            existing_selection.materialized().await?.intersect_ids(ids),
+                        ));
+                        log::debug!(
+                            "[match_pattern] File index resolved (eager ids) at {:?}",
+                            debug::elapsed(t)
+                        );
+                        selection
+                    }
                 };
                 (
                     file_scan::build_file_filter(s, p, o, g, codes)?,
@@ -523,17 +600,23 @@ impl VortexRdfStore {
             // No index applies: the residual pattern (the subject already
             // resolved to its range, when it was) becomes the pushed-down
             // filter.
-            IndexResolution::Declined => (
-                file_scan::build_file_filter(
-                    pat.subject,
-                    pat.predicate,
-                    pat.object,
-                    pat.graph,
-                    codes,
-                )?,
-                None,
-                None,
-            ),
+            IndexResolution::Declined => {
+                log::debug!(
+                    "[match_pattern] File index declined at {:?}",
+                    debug::elapsed(t)
+                );
+                (
+                    file_scan::build_file_filter(
+                        pat.subject,
+                        pat.predicate,
+                        pat.object,
+                        pat.graph,
+                        codes,
+                    )?,
+                    None,
+                    None,
+                )
+            }
         };
         // Combine with whatever filter this view already carried
         // from earlier match_pattern calls (AND, since both must hold).
@@ -555,10 +638,18 @@ impl VortexRdfStore {
                 let existing = existing_selection.materialized().await?;
                 ViewSelection::Exact(match (&subject_range, &filter) {
                     (Some(_), _) => apply_subject(existing),
-                    (None, Some(f)) => match file_scan::row_range_from_pruning(file, f).await? {
-                        Some(range) => existing.intersect_range(range),
-                        None => existing,
-                    },
+                    (None, Some(f)) => {
+                        let pruned = file_scan::row_range_from_pruning(file, f).await?;
+                        log::debug!(
+                            "[match_pattern] File narrowed by zone-map pruning (range: {}) at {:?}",
+                            pruned.is_some(),
+                            debug::elapsed(t)
+                        );
+                        match pruned {
+                            Some(range) => existing.intersect_range(range),
+                            None => existing,
+                        }
+                    }
                     (None, None) => existing,
                 })
             }
@@ -571,10 +662,20 @@ impl VortexRdfStore {
         if let ViewSelection::Exact(exact) = &selection
             && exact.is_empty(file.row_count() as usize)
         {
+            log::debug!(
+                "[match_pattern] File selection proved empty at {:?}",
+                debug::elapsed(t)
+            );
             return Ok(self.empty_view());
         }
 
-        log::debug!("[match_pattern] file filter built {:?}", debug_elapsed(t));
+        log::debug!(
+            "[match_pattern] File view built (filter: {}, serve: {}, pending ids: {}) at {:?}",
+            filter.is_some(),
+            serve.is_some(),
+            matches!(selection, ViewSelection::Pending(_)),
+            debug::elapsed(t)
+        );
         // Build the new, more-restricted file view; no data has been
         // read yet — restrictions are only applied on the next scan.
         // The file (and thus its index columns) is shared, so the
@@ -810,13 +911,6 @@ impl VortexRdfStore {
             .await?;
         Ok(matched.size().await? > 0)
     }
-}
-
-/// The elapsed time on `match_base`'s debug-only timer — zero when the timer
-/// was never started (debug logging off, in which case `log::debug!` discards
-/// the value without formatting it anyway).
-fn debug_elapsed(t: Option<Instant>) -> std::time::Duration {
-    t.map_or(std::time::Duration::ZERO, |started| started.elapsed())
 }
 
 /// Selection size below which an *already narrowed* view should skip secondary

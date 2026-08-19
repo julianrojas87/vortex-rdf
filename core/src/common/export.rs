@@ -7,10 +7,10 @@
 use crate::error::{self, VortexRdfError};
 use crate::store::VortexRdfStore;
 
+use crate::debug;
 use futures::StreamExt;
 use oxrdfio::{RdfFormat, RdfSerializer};
 use std::io::Write;
-use web_time::Instant;
 
 /// Serialize a Vortex-RDF store to textual RDF in the specified format
 /// (Turtle, N-Triples, etc.), streaming quads sequentially into `writer`.
@@ -42,15 +42,15 @@ async fn write_raw<W: Write>(
     mut writer: W,
     format: RdfFormat,
 ) -> error::Result<()> {
-    let decode_start = Instant::now();
+    let decode_start = debug::timer();
     // The raw chunk stream (in-memory, or the lazy file-backed scan).
     let mut chunks = store.raw_quad_chunks().await?;
     log::debug!(
         "[export_rdf] Raw chunk stream setup took {:?}",
-        decode_start.elapsed()
+        debug::elapsed(decode_start)
     );
 
-    let write_start = Instant::now();
+    let write_start = debug::timer();
     let named_graphs = format == RdfFormat::NQuads;
     while let Some(chunk) = chunks.next().await {
         for quad in chunk {
@@ -70,7 +70,7 @@ async fn write_raw<W: Write>(
     }
     log::debug!(
         "[export_rdf] Raw write loop took {:?}",
-        write_start.elapsed()
+        debug::elapsed(write_start)
     );
     Ok(())
 }
@@ -83,15 +83,15 @@ async fn write_structured<W: Write>(
     writer: W,
     format: RdfFormat,
 ) -> error::Result<()> {
-    let decode_start = Instant::now();
+    let decode_start = debug::timer();
     // Retrieve the quad stream (either in-memory or lazy file-backed stream).
     let mut quads_stream = store.quads()?;
     log::debug!(
         "[export_rdf] Quad stream setup took {:?}",
-        decode_start.elapsed()
+        debug::elapsed(decode_start)
     );
 
-    let write_start = Instant::now();
+    let write_start = debug::timer();
     // Construct the oxrdf serialization helper for streaming output.
     let mut rdf_serializer = RdfSerializer::from_format(format).for_writer(writer);
 
@@ -110,7 +110,7 @@ async fn write_structured<W: Write>(
 
     log::debug!(
         "[export_rdf] Serialization/write loop took {:?}",
-        write_start.elapsed()
+        debug::elapsed(write_start)
     );
 
     Ok(())

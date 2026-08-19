@@ -6,10 +6,10 @@
 use std::collections::HashMap;
 // Only [`TermDictionaryBuilder`] collects terms as a set, and it is compiled
 // out with the external-sort builder that drives it.
+use crate::debug;
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 use std::collections::HashSet;
 use std::sync::Arc;
-use web_time::Instant;
 
 use futures::{Stream, StreamExt};
 use vortex_array::arrays::VarBinViewArray;
@@ -69,17 +69,17 @@ impl TermDictionaryBuilder {
     /// dictionary and re-allocated (see
     /// [`TermDictionary::from_quads_with_map`] for the borrowed counterpart).
     pub(crate) fn finish(self) -> Result<(TermDictionary, TermIdMap)> {
-        let total_start = Instant::now();
-        let collect_start = Instant::now();
+        let total_start = debug::timer();
+        let collect_start = debug::timer();
         let mut terms: Vec<String> = self.set.into_iter().collect();
-        let collect_elapsed = collect_start.elapsed();
-        let sort_start = Instant::now();
+        let collect_elapsed = debug::elapsed(collect_start);
+        let sort_start = debug::timer();
         terms.sort_unstable();
-        let sort_elapsed = sort_start.elapsed();
-        let freeze_start = Instant::now();
+        let sort_elapsed = debug::elapsed(sort_start);
+        let freeze_start = debug::timer();
         let dict = TermDictionary::from_sorted(terms.iter().map(String::as_str))?;
-        let freeze_elapsed = freeze_start.elapsed();
-        let map_start = Instant::now();
+        let freeze_elapsed = debug::elapsed(freeze_start);
+        let map_start = debug::timer();
         let id_map: TermIdMap = terms
             .into_iter()
             .enumerate()
@@ -91,8 +91,8 @@ impl TermDictionaryBuilder {
             collect_elapsed,
             sort_elapsed,
             freeze_elapsed,
-            map_start.elapsed(),
-            total_start.elapsed()
+            debug::elapsed(map_start),
+            debug::elapsed(total_start)
         );
         Ok((dict, id_map))
     }
@@ -209,14 +209,14 @@ impl InterningQuadBuilder {
     /// Freeze the dictionary and produce the dataset's codes in global
     /// (s, p, o, g) order.
     pub(crate) fn finish(mut self) -> Result<(TermDictionary, QuadCodes)> {
-        let total_start = Instant::now();
+        let total_start = debug::timer();
         let n = self.quads.len();
 
-        let sort_start = Instant::now();
+        let sort_start = debug::timer();
         // Unique terms, so the tuple Ord never reaches the id.
         let mut entries: Vec<(Box<str>, u32)> = self.ids.into_iter().collect();
         entries.sort_unstable();
-        let sort_terms_elapsed = sort_start.elapsed();
+        let sort_terms_elapsed = debug::elapsed(sort_start);
 
         // provisional id → sorted rank == dictionary code.
         let mut rank_of = vec![0u32; entries.len()];
@@ -227,19 +227,19 @@ impl InterningQuadBuilder {
         // Freeze by *consuming* the boxes: each term is freed as it is copied
         // into the plain column, so the boxes and the column never coexist in
         // full.
-        let freeze_start = Instant::now();
+        let freeze_start = debug::timer();
         let plain = VarBinViewArray::from_iter_str(entries.into_iter().map(|(t, _)| t));
         let dict = TermDictionary::from_sorted_column(plain)?;
-        let freeze_elapsed = freeze_start.elapsed();
+        let freeze_elapsed = debug::elapsed(freeze_start);
 
-        let remap_start = Instant::now();
+        let remap_start = debug::timer();
         for quad in &mut self.quads {
             for id in quad.iter_mut() {
                 *id = rank_of[*id as usize];
             }
         }
         self.quads.sort_unstable();
-        let remap_elapsed = remap_start.elapsed();
+        let remap_elapsed = debug::elapsed(remap_start);
 
         let mut codes = QuadCodes {
             s: Vec::with_capacity(n),
@@ -261,7 +261,7 @@ impl InterningQuadBuilder {
             sort_terms_elapsed,
             freeze_elapsed,
             remap_elapsed,
-            total_start.elapsed()
+            debug::elapsed(total_start)
         );
         Ok((dict, codes))
     }

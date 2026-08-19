@@ -20,12 +20,12 @@
 //!
 //! [`LayoutStrategy::Dictionary`]: super::LayoutStrategy::Dictionary
 
+use crate::debug;
 use std::borrow::Borrow;
 use std::collections::HashMap;
 use std::hash::Hash;
 use std::ops::Range;
 use std::sync::Arc;
-use web_time::Instant;
 
 use oxrdf::Quad;
 use vortex_array::arrays::PrimitiveArray;
@@ -105,7 +105,7 @@ pub(crate) fn encode_quads<K>(
 where
     K: Borrow<str> + Eq + Hash,
 {
-    let start = Instant::now();
+    let start = debug::timer();
     let encode_column = |term_of: fn(&RawQuad) -> &str| -> Result<Vec<u32>> {
         let mut ids: Vec<u32> = Vec::with_capacity(quads.len());
         for q in quads {
@@ -130,7 +130,7 @@ where
         quads.len(),
         quads.len().saturating_mul(4),
         dict.len(),
-        start.elapsed()
+        debug::elapsed(start)
     );
     Ok(codes)
 }
@@ -184,24 +184,24 @@ pub(crate) fn build_chunk<K>(
 where
     K: Borrow<str> + Eq + Hash,
 {
-    let total_start = Instant::now();
+    let total_start = debug::timer();
     let n = quads.len();
-    let encode_start = Instant::now();
+    let encode_start = debug::timer();
     let codes = encode_quads(quads, dict, id_map)?;
-    let encode_elapsed = encode_start.elapsed();
-    let primary_start = Instant::now();
+    let encode_elapsed = debug::elapsed(encode_start);
+    let primary_start = debug::timer();
     let (names, arrays) = chunk_parts(&codes, 0..n, s_sorted);
-    let primary_elapsed = primary_start.elapsed();
+    let primary_elapsed = debug::elapsed(primary_start);
 
-    let finish_start = Instant::now();
+    let finish_start = debug::timer();
     let chunk = finish_chunk(names, arrays, n)?;
     log::debug!(
         "[Dictionary] Built chunk of {} rows: encode {:?}, code columns {:?}, struct {:?}, total {:?}",
         n,
         encode_elapsed,
         primary_elapsed,
-        finish_start.elapsed(),
-        total_start.elapsed()
+        debug::elapsed(finish_start),
+        debug::elapsed(total_start)
     );
     Ok(chunk)
 }
@@ -229,14 +229,14 @@ pub(crate) fn build_code_chunk(
     range: Range<usize>,
     s_sorted: bool,
 ) -> Result<ArrayRef> {
-    let start = Instant::now();
+    let start = debug::timer();
     let n = range.len();
     let (names, arrays) = chunk_parts(codes, range, s_sorted);
     let chunk = finish_chunk(names, arrays, n)?;
     log::debug!(
         "[Dictionary] Built encoded chunk of {} rows in {:?}",
         n,
-        start.elapsed()
+        debug::elapsed(start)
     );
     Ok(chunk)
 }

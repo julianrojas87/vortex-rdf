@@ -53,6 +53,7 @@
 //! ```
 
 pub mod common;
+pub mod debug;
 pub mod error;
 pub mod io;
 mod session;
