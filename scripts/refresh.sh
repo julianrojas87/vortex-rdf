@@ -19,11 +19,11 @@
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 
-# The dashboard scale: 2,097,152 quads everywhere (BENCH_DIM 128 = 128^3), the
-# same numbers .github/workflows/bench-dashboard.yml pins.
-BENCH_SIZE="${BENCH_SIZE:-2097152}"
-BENCH_DIM="${BENCH_DIM:-128}"
-BENCH_DIM_QUADS="${BENCH_DIM_QUADS:-32}"
+# The dashboard scale — the indicative-overview default every suite shares
+# (all three read BENCH_SIZE / BENCH_SIZE_QUADS): 2^20 triples, 2^19 quads.
+# Same numbers .github/workflows/bench-dashboard.yml pins.
+BENCH_SIZE="${BENCH_SIZE:-1048576}"
+BENCH_SIZE_QUADS="${BENCH_SIZE_QUADS:-524288}"
 MUT_BATCH="${MUT_BATCH:-10000}"
 
 ONLY="rust,compare,js,python,render"
@@ -65,11 +65,11 @@ fi
 
 if has compare; then
   stage "Rust cross-library (compare → core/bench/results.json)"
-  BENCH_SIZE="$BENCH_SIZE" cargo bench --bench compare
+  BENCH_SIZE="$BENCH_SIZE" BENCH_SIZE_QUADS="$BENCH_SIZE_QUADS" cargo bench --bench compare
 fi
 
 if has js; then
-  stage "JavaScript comparative (BENCH_DIM=$BENCH_DIM)"
+  stage "JavaScript comparative (BENCH_SIZE=$BENCH_SIZE)"
   (
     cd js
     [ -d node_modules ] || npm ci
@@ -86,12 +86,12 @@ if has js; then
     else
       npm run build:hdt-wasm
     fi
-    BENCH_DIM="$BENCH_DIM" BENCH_DIM_QUADS="$BENCH_DIM_QUADS" MUT_BATCH="$MUT_BATCH" npm run bench
+    BENCH_SIZE="$BENCH_SIZE" BENCH_SIZE_QUADS="$BENCH_SIZE_QUADS" MUT_BATCH="$MUT_BATCH" npm run bench
   )
 fi
 
 if has python; then
-  stage "Python comparative (BENCH_DIM=$BENCH_DIM)"
+  stage "Python comparative (BENCH_SIZE=$BENCH_SIZE)"
   (
     cd python
     if [ ! -x .venv/bin/maturin ]; then
@@ -107,7 +107,7 @@ if has python; then
       # bindings via PYTHONPATH and would happily measure a stale extension.
       VIRTUAL_ENV="$PWD/.venv" .venv/bin/maturin develop --release
     fi
-    BENCH_DIM="$BENCH_DIM" BENCH_DIM_QUADS="$BENCH_DIM_QUADS" MUT_BATCH="$MUT_BATCH" python3 bench/run.py
+    BENCH_SIZE="$BENCH_SIZE" BENCH_SIZE_QUADS="$BENCH_SIZE_QUADS" MUT_BATCH="$MUT_BATCH" python3 bench/run.py
   )
 fi
 

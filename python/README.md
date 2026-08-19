@@ -134,7 +134,7 @@ uv run pytest tests   # or: maturin develop && pip install pytest && pytest test
 for the dashboard's Python tab.
 
 ```bash
-python3 python/bench/run.py                 # full run (D=128, 2,097,152 triples)
+python3 python/bench/run.py                 # full run (1,048,576 triples)
 BENCH_DIM=32 python3 python/bench/run.py    # quick pilot
 ```
 

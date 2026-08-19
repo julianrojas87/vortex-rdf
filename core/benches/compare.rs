@@ -37,13 +37,14 @@ use vortex_rdf_core::{IndexType, LayoutStrategy, VortexRdfStore};
 
 // ─── Scale ──────────────────────────────────────────────────────────────────
 
-/// Rows in the comparative dataset. Matches `BENCH_DIM=128` on the JavaScript and
-/// Python tabs (128^3), so the three comparative tables share a scale.
+/// Rows in the comparative dataset — 2^20 by default, the dashboard's
+/// indicative-overview scale. The JavaScript and Python suites read the same
+/// `BENCH_SIZE` variable, so the three comparative tables share it.
 fn dataset_size() -> usize {
     std::env::var("BENCH_SIZE")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(2_097_152)
+        .unwrap_or(1_048_576)
 }
 
 /// Repetitions, matching `QUERY_SAMPLES`/`HEAVY_SAMPLES` in `support/mod.rs` and
@@ -83,12 +84,13 @@ fn object_term(i: usize) -> String {
 }
 
 /// Rows in the named-graph dataset — the quads the G/SPOG probes run against.
-/// 32^4, matching `BENCH_DIM_QUADS=32` on the other two tabs.
+/// 2^19 by default, half the triples dataset; the other two tabs read the same
+/// `BENCH_SIZE_QUADS` variable.
 fn quads_size() -> usize {
     std::env::var("BENCH_SIZE_QUADS")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(1_048_576)
+        .unwrap_or(524_288)
 }
 
 /// The N-Quads file for the named-graph patterns. Shared with the Python suite

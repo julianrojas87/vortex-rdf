@@ -35,12 +35,20 @@ import { Store as OxiStore } from 'oxigraph';
 export * from './datasets.js';
 
 // ─── Config (env-tunable) ────────────────────────────────────────────────────
-export const D = Number(process.env.BENCH_DIM ?? 128); // triples dataset: D³ triples
-export const DQ = Number(process.env.BENCH_DIM_QUADS ?? 32); // quads dataset: DQ⁴ quads
-export const MUT_BATCH = Number(process.env.MUT_BATCH ?? 10_000); // add/delete batch, independent of D
-/** Row counts, kept as D³/DQ⁴ so the existing scale knobs mean what they always did. */
-export const N_TRIPLES = D ** 3;
-export const N_QUADS = DQ ** 4;
+//
+// Scale, as row counts: BENCH_SIZE / BENCH_SIZE_QUADS — the same env names the
+// Rust suites read, so one pair of knobs sets every environment. BENCH_DIM /
+// BENCH_DIM_QUADS remain as cube shorthand for quick pilots (BENCH_DIM=16 →
+// 4,096 rows) and lose to an explicit row count. The defaults are the
+// dashboard's indicative-overview scale: 2^20 triples and 2^19 quads — the
+// benchmarks exist to show where vortex-rdf stands, not to be a stress test,
+// and this size keeps a full refresh under an hour while still exercising
+// term handling at ~630k distinct terms.
+const dim = Number(process.env.BENCH_DIM ?? 0);
+const dimQuads = Number(process.env.BENCH_DIM_QUADS ?? 0);
+export const N_TRIPLES = Number(process.env.BENCH_SIZE ?? 0) || (dim > 0 ? dim ** 3 : 1_048_576);
+export const N_QUADS = Number(process.env.BENCH_SIZE_QUADS ?? 0) || (dimQuads > 0 ? dimQuads ** 4 : 524_288);
+export const MUT_BATCH = Number(process.env.MUT_BATCH ?? 10_000); // add/delete batch, independent of scale
 
 // The dataset-generation layer (genDataset and friends, the probe patterns,
 // and the dense-cube generators) lives in ./datasets.ts — pure, so the

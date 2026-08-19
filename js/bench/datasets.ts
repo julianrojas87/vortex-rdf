@@ -182,7 +182,7 @@ export function genFresh(n: number): Quad[] {
 export type Pat = { name: string; s: Term | null; p: Term | null; o: Term | null; g: Term | null };
 // 'full' (every variable unbound) is measured separately from the selective patterns,
 // under FULL_SCAN_OPTS's much lower repetition count (see shared.ts): repeating a
-// full-table materialization (all D³ rows, ~2M at the default D=128) ~15x (QUERY_OPTS's
+// full-table materialization (every row — 1,048,576 at the default scale) ~15x (QUERY_OPTS's
 // 5 warmup + 10 timed) reproducibly trips an internal `unreachable` trap in oxigraph's
 // wasm build around the 5th repetition on the same store — confirmed in isolation with
 // nothing else in the process, so it's not a cross-adapter memory issue. No other

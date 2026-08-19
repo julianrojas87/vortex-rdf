@@ -40,12 +40,15 @@ REPO_ROOT = BENCH_DIR.parent.parent
 VENV_ROOT = BENCH_DIR / ".venvs"
 DATA_DIR = BENCH_DIR / ".data"
 
-# Scale knobs mirror the JavaScript comparative bench so the two tabs describe
-# the same dataset: D**3 triples and DQ**4 quads.
-D = int(os.environ.get("BENCH_DIM", 128))
-DQ = int(os.environ.get("BENCH_DIM_QUADS", 32))
-N_TRIPLES = D**3
-N_QUADS = DQ**4
+# Scale, as row counts: BENCH_SIZE / BENCH_SIZE_QUADS -- the same env names
+# every suite reads (the Rust benches included), so one pair of knobs sets the
+# whole dashboard's scale. BENCH_DIM / BENCH_DIM_QUADS remain as cube shorthand
+# for quick pilots (BENCH_DIM=16 -> 4,096 rows) and lose to an explicit row
+# count. Defaults are the indicative-overview scale: 2**20 triples, 2**19 quads.
+_dim = int(os.environ.get("BENCH_DIM", 0))
+_dim_quads = int(os.environ.get("BENCH_DIM_QUADS", 0))
+N_TRIPLES = int(os.environ.get("BENCH_SIZE", 0)) or (_dim**3 if _dim else 1_048_576)
+N_QUADS = int(os.environ.get("BENCH_SIZE_QUADS", 0)) or (_dim_quads**4 if _dim_quads else 524_288)
 GRAPHS = int(os.environ.get("BENCH_GRAPHS_QUADS", 8))
 MUT_BATCH = int(os.environ.get("MUT_BATCH", 10_000))
 PYTHON_VERSION = os.environ.get("BENCH_PYTHON", "3.13")
@@ -258,8 +261,8 @@ def main() -> int:
     measured = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     provenance = (
         f"Measured {measured} · Python {py_ver} · {cpu_model()}, {os.cpu_count()} threads · "
-        f"triples D={D} ({N_TRIPLES:,} quads, {tm.terms:,} terms), "
-        f"quads Dq={DQ} ({N_QUADS:,} quads, {qm.terms:,} terms), MUT_BATCH={MUT_BATCH:,} · "
+        f"triples {N_TRIPLES:,} ({tm.terms:,} terms), "
+        f"quads {N_QUADS:,} ({qm.terms:,} terms), MUT_BATCH={MUT_BATCH:,} · "
         f"wall-clock (perf_counter_ns) · {lib_str} · one adapter per process and per virtualenv, isolated"
     )
 

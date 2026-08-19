@@ -109,8 +109,9 @@ fn gcd(mut a: usize, mut b: usize) -> usize {
 
 /// Per-role term counts: the requested cardinalities nudged up until pairwise
 /// coprime. `graphs` is the *wanted* named-graph count before that nudge — 8
-/// becomes 9 at 32,768 rows and 13 at 2,097,152, which is why nothing here reads
-/// a remembered constant.
+/// becomes 9 at 32,768 rows and 17 at 1,048,576 (where even the 32-predicate
+/// vocabulary nudges to 33), which is why nothing here reads a remembered
+/// constant.
 pub fn moduli(n: usize, graphs: usize) -> Moduli {
     let want = [
         (((n as f64) * SUBJECT_RATIO).round() as usize).max(1),

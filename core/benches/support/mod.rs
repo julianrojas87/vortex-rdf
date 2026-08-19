@@ -38,8 +38,8 @@ pub use dataset::{PATTERNS, Pattern, terms_for};
 /// another. It is also 4 zones of 8,192 rows, the smallest round size at which
 /// zone pruning has anything to prune.
 ///
-/// Override for a different scale: `BENCH_SIZE=2097152 cargo bench` matches the
-/// comparative suites' D=128, which is what the dashboard workflow runs.
+/// Override for a different scale: `BENCH_SIZE=1048576 cargo bench` matches the
+/// comparative suites' default, which is what the dashboard workflow runs.
 pub fn bench_size() -> usize {
     static SIZE: OnceLock<usize> = OnceLock::new();
     *SIZE.get_or_init(|| {

@@ -38,15 +38,15 @@ jobs:
         # concatenated divan outputs. match_lazy is the local/dashboard-only
         # lazy match matrix (never uploaded to CodSpeed).
         #
-        # BENCH_SIZE puts the Rust tab on the same 2,097,152 quads the JS and
-        # Python comparative suites use (D=128), so a row means the same thing
-        # on all three tabs. The suites' own default is the much smaller
-        # CodSpeed size, which stays that way — instrumented runs there measure
-        # instructions, where a bigger dataset only multiplies valgrind cost.
-        # Repetition counts need no env: they are per-bench in the source
+        # BENCH_SIZE puts the Rust tab on the same 1,048,576 quads the JS and
+        # Python comparative suites default to, so a row means the same thing
+        # on all three tabs. The internals suites' own default is the much
+        # smaller CodSpeed size, which stays that way — instrumented runs there
+        # measure instructions, where a bigger dataset only multiplies valgrind
+        # cost. Repetition counts need no env: they are per-bench in the source
         # (QUERY_SAMPLES / HEAVY_SAMPLES), matching the other two suites.
         env:
-          BENCH_SIZE: 2097152
+          BENCH_SIZE: 1048576
         run: |
           cargo bench --bench benchmark | tee bench_output.txt
           cargo bench --bench match_lazy | tee -a bench_output.txt
@@ -94,17 +94,16 @@ jobs:
 
       # Run the JavaScript comparative benchmark (VortexRdfStore variants vs
       # rdf-stores.js, oxigraph and hdt). Wall-clock via tinybench; deliberately
-      # NOT uploaded to CodSpeed. Same full scale as a local run (rdf-stores'
-      # own default: BENCH_DIM=128, 2,097,152 triples). The hdt adapter opens
-      # the .hdt artifact the Rust comparative bench above already built from
-      # the same dataset (target/bench_compare/hdt/data.hdt); its wasm bindings
-      # are read-only, so BENCH_DIM here must keep matching the Rust step's
-      # BENCH_SIZE (128³) or the hdt rows report a mismatch.
+      # NOT uploaded to CodSpeed. BENCH_SIZE / BENCH_SIZE_QUADS are the same
+      # variables (and values) as the Rust step — the hdt adapter opens the
+      # .hdt artifact that step built from the same dataset
+      # (target/bench_compare/hdt/data.hdt), and a size mismatch makes its
+      # rows report an error instead of numbers.
       - name: Run JS comparative benchmark
         working-directory: js
         env:
-          BENCH_DIM: 128
-          BENCH_DIM_QUADS: 32
+          BENCH_SIZE: 1048576
+          BENCH_SIZE_QUADS: 524288
           MUT_BATCH: 10000
         run: npm run bench
 
@@ -150,8 +149,8 @@ jobs:
       - name: Run Python comparative benchmark
         working-directory: python
         env:
-          BENCH_DIM: 128
-          BENCH_DIM_QUADS: 32
+          BENCH_SIZE: 1048576
+          BENCH_SIZE_QUADS: 524288
           MUT_BATCH: 10000
         run: python3 bench/run.py
 
@@ -166,7 +165,7 @@ jobs:
             --js js/bench/results.json \
             --python python/bench/results.json \
             --rust-compare core/bench/results.json \
-            --bench-size 2097152
+            --bench-size 1048576
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v5

@@ -4,8 +4,8 @@
 // scripts/render_bench_dashboard.py (the JavaScript tab of the GitHub Pages dashboard).
 //
 // Run (after `npm run build` to produce pkg/web):
-//   npm run bench                         # full rdf-stores-scale run (D=128 — heavy)
-//   BENCH_DIM=25 BENCH_DIM_QUADS=10 MUT_BATCH=2000 npm run bench   # quick local check
+//   npm run bench                         # full run (1,048,576 triples by default)
+//   BENCH_DIM=25 BENCH_DIM_QUADS=10 MUT_BATCH=2000 npm run bench   # quick local check (25³ rows)
 //
 // The dataset is synthetic but realistic in the dimension that matters for a store
 // comparison: distinct terms scale with rows (ten triples per subject, a small closed
@@ -38,7 +38,7 @@ import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
 
 import {
-    ADAPTERS, MUT_ADAPTERS, D, DQ, N_TRIPLES, N_QUADS, MUT_BATCH,
+    ADAPTERS, MUT_ADAPTERS, N_TRIPLES, N_QUADS, MUT_BATCH,
     QUERY_OPTS, HEAVY_OPTS, FULL_SCAN_OPTS, moduli, unsupportedRow, type Row,
 } from './shared.js';
 import { runWorkerProcess } from './util.js';
@@ -81,9 +81,9 @@ async function main(): Promise<void> {
     const tm = moduli(N_TRIPLES);
     const qm = moduli(N_QUADS, { graphs: 8 });
     console.log(
-        `Dataset shape: triples D=${D} (${N_TRIPLES.toLocaleString()} quads, ` +
-        `${tm.terms.toLocaleString()} distinct terms), ` +
-        `quads Dq=${DQ} (${N_QUADS.toLocaleString()} quads, ${qm.terms.toLocaleString()} distinct terms)…`);
+        `Dataset shape: ${N_TRIPLES.toLocaleString()} triples ` +
+        `(${tm.terms.toLocaleString()} distinct terms), ` +
+        `${N_QUADS.toLocaleString()} quads (${qm.terms.toLocaleString()} distinct terms)…`);
 
     const results: Row[] = [];
     const memory: MemoryRow[] = [];
@@ -237,8 +237,8 @@ function provenance(): string {
     const cpu = cpus()[0]?.model ?? 'unknown CPU';
     return (
         `Measured ${measured} · node ${process.version} · ${cpu}, ${cpus().length} threads · ` +
-        `triples D=${D} (${N_TRIPLES.toLocaleString()} quads, ${moduli(N_TRIPLES).terms.toLocaleString()} terms), ` +
-        `quads Dq=${DQ} (${N_QUADS.toLocaleString()} quads, ${moduli(N_QUADS, { graphs: 8 }).terms.toLocaleString()} terms), ` +
+        `triples ${N_TRIPLES.toLocaleString()} (${moduli(N_TRIPLES).terms.toLocaleString()} terms), ` +
+        `quads ${N_QUADS.toLocaleString()} (${moduli(N_QUADS, { graphs: 8 }).terms.toLocaleString()} terms), ` +
         `MUT_BATCH=${MUT_BATCH.toLocaleString()} · tinybench ${depVersion('tinybench')}, wall-clock · ` +
         `vortex-rdf-store ${require('../package.json').version}, rdf-stores ${depVersion('rdf-stores')}, oxigraph ${depVersion('oxigraph')}, hdt 0.7 (wasm, read-only) · ` +
         `one adapter per process, isolated`
