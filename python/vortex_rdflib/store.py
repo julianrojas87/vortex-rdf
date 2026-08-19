@@ -83,9 +83,13 @@ class VortexStore(Store):
         return VALID_STORE
 
     def close(self, commit_pending_transaction=False):
-        if self._backend is not None:
-            self._backend.close()
-            self._backend = None
+        backend = self._backend
+        self._backend = None
+        if backend is None:
+            return
+        close = getattr(backend, "close", None)
+        if close is not None:
+            close()
 
     def triples(self, triple_pattern, context=None):
         """
