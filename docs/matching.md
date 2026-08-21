@@ -64,30 +64,52 @@ then overwrites it with the real result.
 
 Every match begins with
 [`ResolvedLayout::prepare_pattern`](../core/src/store/layouts/mod.rs), which
-resolves each bound term once and returns a `PatternCodes` **witness**. This is
-the single point in a match where a dictionary may perform I/O; every stage
-after it probes the witness synchronously.
+returns a `PatternCodes` **witness** — the object every later stage probes for a
+term's column value. All three layouts produce one; only `Dictionary` does any
+work to build it. This is the single point in a match where a dictionary may
+perform I/O, and the only reason the prelude is async at all.
 
 | Layout | Residency | What the prelude does | Probe value |
 |---|---|---|---|
-| `Default` | — | nothing (never suspends) | the N-Triples string |
-| `TypedObject` | — | nothing (never suspends) | the N-Triples string; the object decomposes into `o_kind`/`o_value`/`o_datatype`/`o_lang` |
+| `Default` | — | nothing but tag the resolver (never suspends) | the N-Triples string |
+| `TypedObject` | — | nothing but tag the resolver (never suspends) | the N-Triples string; the object decomposes into `o_kind`/`o_value`/`o_datatype`/`o_lang` |
 | `Dictionary` | resident | seeds the role cache by in-memory binary search | `u32` code |
 | `Dictionary` | file-backed | four **concurrent** point-read binary searches of the dictionary child (`futures::join!`), seeding every bound role | `u32` code |
 
-The witness memoizes per role, so a fully-bound pattern costs one dictionary
-search and one render per term no matter how many stages ask for it. A
-file-backed witness has *no* synchronous resolver: probing a role the prelude
-never bound is an error, not a silent `None`.
+What the witness saves is likewise layout-dependent. Its **role cache holds
+codes**, so under `Dictionary` a fully-bound pattern costs one dictionary search
+per term however many stages and indexes ask for the same probe. The string
+layouts have no code to cache: each probe re-renders the term's N-Triples form,
+into a scratch buffer the witness owns so the render does not allocate.
+
+The residency split is a contract, not just a cost difference. A file-backed
+witness has *no* synchronous resolver, so probing a role the prelude never bound
+is an error rather than a silent `None` — `None` is reserved for "resolved, and
+absent from the dictionary", and fabricating it would turn an unresolvable probe
+into an empty match result.
 
 `PatternCodes::constraints(...)` lowers the pattern into per-column equalities —
 the one source of truth shared by the in-memory mask scan and the pushed-down
-file filter:
+file filter. **Only bound roles emit an equality**; an unbound role emits
+nothing, which is precisely what makes it a wildcard. The right-hand side of
+each equality is the layout's probe value: the rendered N-Triples string for the
+string layouts, the dictionary code for `Dictionary`.
 
-- `Default` → `s = "<iri>"`, `p = …`, `o = …`, `g = …`
-- `TypedObject` → `s`, `p`, `g` as strings; the object as 2–4 equalities
-- `Dictionary` → `s = 42u32`, … or **`Constraints::AlwaysFalse`** if any bound
-  term is absent from the dictionary
+For the pattern `(<http://ex/a>, ?, "hi"@en, ?)` — subject and object bound,
+predicate and graph free:
+
+| Layout | Emitted equalities |
+|---|---|
+| `Default` | `s = "<http://ex/a>"`, `o = "\"hi\"@en"` |
+| `TypedObject` | `s = "<http://ex/a>"`, `o_kind = 3u8`, `o_value = "hi"`, `o_lang = "en"` |
+| `Dictionary` | `s = 42u32`, `o = 25u32` |
+
+The string layouts compare one column per bound role; `TypedObject` is the
+exception, expanding a bound object into the 2–4 sub-column equalities its
+decomposition implies (`o_datatype` and `o_lang` appear only when the literal
+has them). `Dictionary` compares `u32` codes, and short-circuits the whole
+pattern to **`Constraints::AlwaysFalse`** the moment any bound term is absent
+from the dictionary.
 
 ---
 
@@ -127,52 +149,61 @@ flowchart LR
 
 ## 6. The in-memory path
 
-[`match_base_in_memory`](../core/src/store/matching.rs) runs four stages over the
-base `StructArray`, each narrowing the same `RowSelection` and clearing whatever
-pattern components it answered.
+[`match_base_in_memory`](../core/src/store/matching.rs#L193) runs four stages
+over the base `StructArray`. Each one asks the same two questions — *can I answer
+part of this pattern cheaply?* and *which rows survive?* — narrowing the shared
+`RowSelection` and clearing whatever pattern components it answered, so the next
+stage only sees what is left.
 
 ```mermaid
 flowchart TD
-    S0["base.try_downcast::&lt;Struct&gt;()<br/>selection.materialized_sync()<br/>unrefined = selection is All"] --> S1
+    S0["<b>Prelude</b> — canonicalize the base struct, materialize a chained<br/>view's deferred ids, and remember whether this view started unrestricted"] --> S1
 
-    S1{"subject bound<br/>AND s column stamped sorted<br/>AND probe casts to s dtype?"}
-    S1 -- yes --> S1a["binary search bounds → [lo, hi)<br/>cached probe, else search_sorted_bounds<br/>selection ∩= lo..hi<br/>pat.subject = None; narrowed_elsewhere = true"]
-    S1 -- no --> S2
-    S1a --> S2
+    S1{"<b>Stage 1</b><br/>Can the sorted s column locate the bound subject?"}
+    S1 -- "yes — binary-search its row run and keep only those rows" --> S2
+    S1 -- "no — subject unbound, column not sorted, or probe not comparable" --> S2
 
-    S2{"selection non-empty<br/>AND (not narrowed_elsewhere<br/>OR len ≥ 4096)?"}
-    S2 -- no --> S3
-    S2 -- yes --> S2a["resolve_indexes_in_memory(indexes, components, layout, pat, codes)"]
-    S2a --> S2b{"resolution"}
-    S2b -- "Empty" --> X["return empty_view()"]
-    S2b -- "Declined" --> S3
-    S2b -- "Resolved" --> S2c["pat = resolves.clear(pat)<br/>serve = candidate"]
-    S2c --> S2d{"row_ids"}
-    S2d -- "Eager(ids)" --> S2e["selection ∩= ids"]
-    S2d -- "Lazy + unrefined + not narrowed<br/>+ nothing still bound + serve" --> S2f["pending = lazy<br/>(ids stay uncomputed)"]
-    S2d -- "Lazy otherwise" --> S2g["selection ∩= lazy.materialized_sync()"]
-    S2e --> S3
-    S2f --> S3
-    S2g --> S3
+    S2{"<b>Stage 2</b><br/>Enough rows still in play to be worth an index lookup?"}
+    S2 -- "no — a fast path already cut the view below the threshold" --> S3
+    S2 -- "yes — ask the indexes to resolve what is still bound" --> S2r
 
-    S3{"selection non-empty<br/>AND anything still bound?"}
-    S3 -- no --> S4
-    S3 -- yes --> S3a{"constraints(residual)"}
-    S3a -- "AlwaysFalse" --> X
-    S3a -- "Eq(eqs)" --> S3b{"typed_residual_ids binds<br/>every residual column?"}
-    S3b -- yes --> S3c["typed row loop over selected rows<br/>selection = Ids(...); narrowed_elsewhere = true"]
-    S3b -- no --> S3d["mask_for over selection.apply(base)<br/>selection = selection.refine(mask)<br/>narrowed_elsewhere = true"]
-    S3c --> S4
-    S3d --> S4
+    S2r{"What did the indexes answer?"}
+    S2r -- "the term is absent from the indexed data" --> X
+    S2r -- "declined — no index fits this pattern shape" --> S3
+    S2r -- "resolved — fold its row ids into the selection (or leave<br/>them deferred) and hold onto the serve plan it offered" --> S3
 
-    S4["serve kept only if unrefined AND not narrowed_elsewhere<br/>selection = Pending(lazy) if pending, else Exact"] --> S5["build the derived InMemory view"]
+    S3{"<b>Stage 3</b><br/>Anything still bound after the fast paths?"}
+    S3 -- "no — the fast paths answered the whole pattern" --> S4
+    S3 -- "yes — compare the residual columns, over the selected rows only" --> S4
+
+    S4["<b>Stage 4</b> — drop the serve plan unless the index's own resolution is<br/>the only thing that narrowed this view; leave deferred ids pending, else exact"] --> S5["the derived in-memory view"]
+
+    X["empty view — no rows, indexes and components dropped"]
 ```
+
+Each stage in the code, and where the details are below:
+
+| Stage | Code | Details |
+|---|---|---|
+| Prelude | [`matching.rs:224-252`](../core/src/store/matching.rs#L224-L252) | — |
+| 1 · subject binary search | [`matching.rs:259-281`](../core/src/store/matching.rs#L259-L281), [`search_sorted_bounds`](../core/src/store/array.rs#L99) | [§6.1](#61-subject-binary-search) |
+| 2 · secondary-index routing | [`matching.rs:295-351`](../core/src/store/matching.rs#L295-L351), [`resolve_indexes_in_memory`](../core/src/store/indexes/mod.rs#L706) | [§6.2](#62-secondary-index-routing) |
+| 3 · residual column filtering | [`matching.rs:362-394`](../core/src/store/matching.rs#L362-L394), [`typed_residual_ids`](../core/src/store/scan/typed_eq.rs#L191), [`mask_for`](../core/src/store/matching.rs#L703) | [§6.3](#63-residual-column-filtering) |
+| 4 · finalize | [`matching.rs:396-410`](../core/src/store/matching.rs#L396-L410) | [§6.4](#64-keeping-or-dropping-the-serve-plan) |
 
 ### 6.1 Subject binary search
 
 Engages when the subject is bound **and** the base's `s` column carries the
-`IsSorted` stamp (written by the sorted builders). It resolves the exact
-`[lo, hi)` run in `O(log n)`:
+`IsSorted` stamp. Nothing this crate writes lacks it: every builder sorts, a
+tombstoned gather preserves the order it inherits, and a rebuild that merges an
+append tail re-establishes it
+([`order_for_rebuild`](../core/src/store/serialize.rs)). So the stage is skipped
+only for rows that arrived without the provenance — a foreign or older writer's
+file, whose `quads_sorted: false` keeps
+[`with_subject_stamp`](../core/src/store/rows.rs#L452) from inventing a stamp
+those rows never earned. Compacting such a store restores the fast path.
+
+When it does engage, it resolves the exact `[lo, hi)` run in `O(log n)`:
 
 - through the store's **cached encoded-search probe**
   (`probes.by_name(base, "s")`) when the column resolves one and the probe value
@@ -199,12 +230,32 @@ by something else discards any serving plan anyway.
 
 `resolve_indexes_in_memory` tries the store's indexes **in preference order**
 (`SecondaryByCopy` before `SecondaryByReference`; the in-memory index set is
-sorted by `preference_rank`) and takes the first that does not decline.
+sorted by `preference_rank`) and takes the first that does not decline. It
+answers with one of three resolutions:
+
+| `IndexResolution` | Meaning | What the stage does |
+|---|---|---|
+| `Empty` | the probed term is absent from the index's data | returns `empty_view()` immediately |
+| `Declined` | no index accelerates this pattern shape | nothing; the residual falls to stage 3 |
+| `Resolved` | exact base row ids, plus the components they answer and an optional serve plan | clears those components from the pattern and folds the ids in |
+
+A `Resolved` resolution carries its ids in one of two forms. `Eager(ids)` is
+intersected into the selection there and then. `Lazy(lazy)` is left
+**uncomputed** — becoming the view's `Pending` selection — but only when that
+resolution is this view's sole restriction: the view started as `All`, no
+subject search narrowed it, nothing is left bound, and a serve plan came with
+it. Reads then go through the plan, so decoding and sorting the run's row ids
+can wait for a consumer that actually needs them. In every other case the lazy
+ids are materialized and intersected immediately.
 
 ### 6.3 Residual column filtering
 
-Whatever no fast path answered is compared column-wise, over **only the rows the
-view still selects**. Two implementations, in order:
+Whatever no fast path answered is compiled to constraints ([§3](#3-stage-a--the-prelude-prepare_pattern))
+and compared column-wise, over **only the rows the view still selects**. The
+compile can in principle answer `AlwaysFalse` — an empty view — but not here:
+the residual binds a subset of roles the [stage B gate](#4-stage-b--the-provable-emptiness-gate)
+already resolved, so that arm exists for totality. Two implementations, in
+order:
 
 1. **Typed residual** ([`scan/typed_eq.rs`](../core/src/store/scan/typed_eq.rs))
    — a direct row loop yielding exact base ids, no slice/compare/mask pipeline.
@@ -307,8 +358,9 @@ chunks the bisection touches. It requires `u64::try_from(&probe)` to succeed, so
 it engages **only under the Dictionary layout** — a string-subject file falls
 through to zone-map pruning.
 
-It also declines for an unsorted file, a missing chunk handle, or an unsupported
-chunk encoding. Both index resolvers decline bound-subject patterns, so this
+It also declines for a missing chunk handle, an unsupported chunk encoding, or a
+file whose `quads_sorted` provenance is false — which, as in
+[§6.1](#61-subject-binary-search), no writer of ours produces. Both index resolvers decline bound-subject patterns, so this
 fast path takes an uncontested route.
 
 ### 7.2 Zone-map pruning
