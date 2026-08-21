@@ -468,7 +468,76 @@ trait Adapter {
 }
 
 trait Queryable {
+    /// Resolve a pattern and *consume* what it matched: every term of every
+    /// matched row is read, and the row count returned.
+    ///
+    /// Advancing an iterator is not the same measurement across these
+    /// libraries. sophia keeps its terms materialized and interned, oxigraph
+    /// and hdt keep them encoded, Vortex keeps columns — so a bare `.count()`
+    /// lets the first answer from index entries alone while the others decode,
+    /// and the column reads "count" while measuring four different things. Each
+    /// implementation below therefore reads the lexical bytes of every matched
+    /// term into a `black_box`ed accumulator, which is the same rule the
+    /// JavaScript tab's `consumeQuads` applies. What is timed is producing the
+    /// terms; what is returned is the row count the harness cross-checks.
     fn count(&self, pat: &Pat) -> usize;
+}
+
+/// The lexical bytes of one oxrdf term — the read that forces a matched row's
+/// terms to exist. Written over `oxrdf` for the Vortex adapter; oxigraph's
+/// model is its own re-export of the same shapes, so it has its own twin.
+fn oxrdf_quad_bytes(q: &oxrdf::Quad) -> usize {
+    use oxrdf::{GraphName, NamedOrBlankNode, Term};
+    let subject = match &q.subject {
+        NamedOrBlankNode::NamedNode(n) => n.as_str().len(),
+        NamedOrBlankNode::BlankNode(b) => b.as_str().len(),
+    };
+    let object = match &q.object {
+        Term::NamedNode(n) => n.as_str().len(),
+        Term::BlankNode(b) => b.as_str().len(),
+        Term::Literal(l) => l.value().len(),
+    };
+    let graph = match &q.graph_name {
+        GraphName::NamedNode(n) => n.as_str().len(),
+        GraphName::BlankNode(b) => b.as_str().len(),
+        GraphName::DefaultGraph => 0,
+    };
+    subject + q.predicate.as_str().len() + object + graph
+}
+
+/// [`oxrdf_quad_bytes`] over oxigraph's model.
+fn oxigraph_quad_bytes(q: &oxigraph::model::Quad) -> usize {
+    use oxigraph::model::{GraphName, NamedOrBlankNode, Term};
+    let subject = match &q.subject {
+        NamedOrBlankNode::NamedNode(n) => n.as_str().len(),
+        NamedOrBlankNode::BlankNode(b) => b.as_str().len(),
+    };
+    let object = match &q.object {
+        Term::NamedNode(n) => n.as_str().len(),
+        Term::BlankNode(b) => b.as_str().len(),
+        Term::Literal(l) => l.value().len(),
+    };
+    let graph = match &q.graph_name {
+        GraphName::NamedNode(n) => n.as_str().len(),
+        GraphName::BlankNode(b) => b.as_str().len(),
+        GraphName::DefaultGraph => 0,
+    };
+    subject + q.predicate.as_str().len() + object + graph
+}
+
+/// The lexical bytes of one sophia term. Its terms are already materialized in
+/// the graph's interned store, so this is what reading one costs there — the
+/// counterpart of a decode in the libraries that keep terms encoded.
+fn sophia_term_bytes<T: sophia::api::term::Term>(t: T) -> usize {
+    if let Some(iri) = t.iri() {
+        iri.len()
+    } else if let Some(lex) = t.lexical_form() {
+        lex.len()
+    } else if let Some(id) = t.bnode_id() {
+        id.len()
+    } else {
+        0
+    }
 }
 
 // ── Vortex ──
@@ -568,13 +637,15 @@ impl Queryable for VortexStore {
                 .match_pattern(s.as_ref(), p.as_ref(), o.as_ref(), g.as_ref())
                 .await
                 .expect("match");
-            // Materialize, don't just read a row count. Every other library
-            // here iterates its results to count them, and the view's `size`
-            // would answer a full scan from metadata in nanoseconds -- a
-            // number that compares nothing. `quads_vec` builds four terms per
-            // row, so on a triple pattern Vortex does strictly more work than
-            // the libraries returning triples, not less.
-            view.quads_vec().await.expect("materialize").len()
+            // Materialize, don't just read a row count: the view's `size`
+            // would answer a full scan from metadata in nanoseconds -- a number
+            // that compares nothing. `quads_vec` builds four terms per row, and
+            // the fold below reads them, which is what every other adapter here
+            // now does too (see `Queryable::count`).
+            let quads = view.quads_vec().await.expect("materialize");
+            let bytes: usize = quads.iter().map(oxrdf_quad_bytes).sum();
+            std::hint::black_box(bytes);
+            quads.len()
         })
     }
 }
@@ -672,8 +743,22 @@ impl Queryable for OxStore {
                 return self.count_named_object(&s_ref, &p_ref, &stripped, &g_ref);
             }
         };
-        self.0.quads_for_pattern(s_ref, p_ref, o_ref, g_ref).count()
+        consume_oxigraph(self.0.quads_for_pattern(s_ref, p_ref, o_ref, g_ref))
     }
+}
+
+/// Drain an oxigraph result iterator, reading every term it decodes.
+fn consume_oxigraph<E: std::fmt::Debug>(
+    quads: impl Iterator<Item = Result<oxigraph::model::Quad, E>>,
+) -> usize {
+    let mut rows = 0usize;
+    let mut bytes = 0usize;
+    for q in quads {
+        bytes += oxigraph_quad_bytes(&q.expect("oxigraph quad"));
+        rows += 1;
+    }
+    std::hint::black_box(bytes);
+    rows
 }
 
 impl OxStore {
@@ -686,7 +771,7 @@ impl OxStore {
     ) -> usize {
         use oxigraph::model::{NamedNodeRef, TermRef};
         let o_ref = TermRef::NamedNode(NamedNodeRef::new_unchecked(o));
-        self.0.quads_for_pattern(*s, *p, Some(o_ref), *g).count()
+        consume_oxigraph(self.0.quads_for_pattern(*s, *p, Some(o_ref), *g))
     }
 }
 
@@ -822,7 +907,19 @@ impl Queryable for SophiaDataset {
             .g
             .as_ref()
             .map_or(AnyOr::Any, |t| AnyOr::Exactly(simple_iri(t)));
-        self.0.quads_matching(s, p, o, g.gn()).count()
+        use sophia::api::quad::Quad;
+        let mut rows = 0usize;
+        let mut bytes = 0usize;
+        for q in self.0.quads_matching(s, p, o, g.gn()) {
+            let q = q.expect("sophia quad");
+            bytes += sophia_term_bytes(q.s())
+                + sophia_term_bytes(q.p())
+                + sophia_term_bytes(q.o())
+                + q.g().map_or(0, sophia_term_bytes);
+            rows += 1;
+        }
+        std::hint::black_box(bytes);
+        rows
     }
 }
 
@@ -859,7 +956,16 @@ impl Queryable for SophiaGraph {
             .o
             .as_ref()
             .map_or(AnyOr::Any, |t| AnyOr::Exactly(simple_object(t)));
-        self.0.triples_matching(s, p, o).count()
+        use sophia::api::triple::Triple;
+        let mut rows = 0usize;
+        let mut bytes = 0usize;
+        for t in self.0.triples_matching(s, p, o) {
+            let t = t.expect("sophia triple");
+            bytes += sophia_term_bytes(t.s()) + sophia_term_bytes(t.p()) + sophia_term_bytes(t.o());
+            rows += 1;
+        }
+        std::hint::black_box(bytes);
+        rows
     }
 }
 
@@ -961,9 +1067,17 @@ impl Queryable for HdtStore {
                 strip_iri(t)
             }
         });
-        self.0
+        let mut rows = 0usize;
+        let mut bytes = 0usize;
+        for t in self
+            .0
             .triples_with_pattern(s.as_deref(), p.as_deref(), o.as_deref())
-            .count()
+        {
+            bytes += t[0].len() + t[1].len() + t[2].len();
+            rows += 1;
+        }
+        std::hint::black_box(bytes);
+        rows
     }
 }
 
