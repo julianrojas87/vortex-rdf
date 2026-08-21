@@ -118,6 +118,7 @@ def parse_dataset_shape(text):
     Both targets stamp their own line into the shared log; they run at one
     `BENCH_SIZE`, so a disagreement means the two halves of the tab measured
     different data and is worth saying out loud.
+
     """
     found = []
     for line in text.splitlines():
@@ -233,29 +234,24 @@ def sample_counts(results):
     return [c for c, _ in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))]
 
 
-def build_rust_config(results, bench_size=None, dataset=None):
+def build_rust_config(bench_size=None, dataset=None):
     """Context the Rust tab needs but divan's text output does not carry.
 
     The JavaScript and Python harnesses emit their own config alongside their
-    results; the Rust suite is scraped from stdout, so its dataset size and
-    repetition counts have to be reconstructed here and injected -- otherwise
-    the template can only hardcode them, which is how it came to claim 100,000
-    quads and 3 samples long after both had changed.
+    results; the Rust suite is scraped from stdout, so its dataset size has to
+    be reconstructed here and injected -- otherwise the template can only
+    hardcode it, which is how it came to claim 100,000 quads long after that had
+    changed. The run's repetition counts go into the provenance line instead
+    (see `build_provenance`), which is where every tab now states them.
 
     `dataset` is the run's own `#dataset` stamp and outranks both the CLI
     override and the source default: it is the row count the binary generated,
     not the one the caller meant to ask for.
     """
-    samples = sample_counts(results)
     size = bench_size if bench_size is not None else default_bench_size()
     if dataset:
         size = dataset.get("quads", size)
-    return {
-        "benchSize": size,
-        "querySamples": samples[0] if samples else None,
-        "heavySamples": samples[1] if len(samples) > 1 else None,
-        "dataset": dataset,
-    }
+    return {"benchSize": size, "dataset": dataset}
 
 
 def build_provenance(results, timer_precision, bench_size=None, source=None):
@@ -447,7 +443,7 @@ def main():
         .replace("__BENCH_DATA__", json.dumps(results))
         .replace("__PROVENANCE__", json.dumps(provenance))
         .replace("__RUST_CONFIG_DATA__",
-                 json.dumps(build_rust_config(results, bench_size_override, rust_dataset)))
+                 json.dumps(build_rust_config(bench_size_override, rust_dataset)))
         .replace("__RUST_COMPARE_DATA__", json.dumps(rc_results))
         .replace("__RUST_COMPARE_SIZES__", json.dumps(rc_sizes))
         .replace("__RUST_COMPARE_MEMORY__", json.dumps(rc_memory))
