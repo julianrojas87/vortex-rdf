@@ -117,11 +117,8 @@ impl VortexRdfStore {
             );
             return Ok(carry(tail.selection.clone().refine(&mask)));
         }
-        let matched = match Self::mask_for(&applied, subject, predicate, object, graph, &mut codes)?
-        {
-            None => carry(tail.selection.clone()),
-            Some(mask) => carry(tail.selection.clone().refine(&bool_array_to_mask(mask)?)),
-        };
+        let mask = Self::mask_for(&applied, &eqs)?;
+        let matched = carry(tail.selection.clone().refine(&bool_array_to_mask(mask)?));
         log::debug!(
             "[match_pattern] Tail matched by mask scan at {:?}",
             debug::elapsed(t)
@@ -149,10 +146,8 @@ impl VortexRdfStore {
         // every synchronous probe below runs on — the one point where a
         // dictionary may perform I/O (a file-backed one will scan here), so
         // every stage below reads `codes` synchronously.
-        let mut codes = self
-            .layout
-            .prepare_pattern(QuadPattern::new(subject, predicate, object, graph))
-            .await?;
+        let pattern = QuadPattern::new(subject, predicate, object, graph);
+        let mut codes = self.layout.prepare_pattern(pattern).await?;
         log::debug!(
             "[match_pattern] Prepared pattern codes at {:?}",
             debug::elapsed(t)
@@ -160,11 +155,10 @@ impl VortexRdfStore {
 
         // A pattern the layout can prove unmatchable (e.g. a term absent from
         // the dictionary) needs no search — and no scan machinery — at all,
-        // whichever backend holds the rows.
-        if matches!(
-            codes.constraints(subject, predicate, object, graph)?,
-            Constraints::AlwaysFalse
-        ) {
+        // whichever backend holds the rows. The gate reads the prelude's role
+        // cache rather than compiling constraints, which every stage below
+        // compiles for itself over whatever the fast paths leave residual.
+        if codes.provably_empty(pattern) {
             log::debug!(
                 "[match_pattern] Layout proved the pattern unmatchable at {:?}",
                 debug::elapsed(t)
@@ -371,14 +365,14 @@ impl VortexRdfStore {
             // loops yielding exact base ids — no slice/compare/mask
             // pipeline. Rows outside the selection are never tested,
             // so the ids are already the intersection.
-            let typed =
-                match codes.constraints(pat.subject, pat.predicate, pat.object, pat.graph)? {
-                    Constraints::AlwaysFalse => return Ok(self.empty_view()),
-                    Constraints::Eq(eqs) => {
-                        typed_residual_ids(&struct_arr, &selection, base.len(), &eqs)
-                    }
-                };
-            match typed {
+            // The residual binds a subset of the roles the caller's gate
+            // already resolved to codes, so the unmatchable arm cannot fire
+            // here — it stays for totality.
+            let eqs = match codes.constraints(pat.subject, pat.predicate, pat.object, pat.graph)? {
+                Constraints::AlwaysFalse => return Ok(self.empty_view()),
+                Constraints::Eq(eqs) => eqs,
+            };
+            match typed_residual_ids(&struct_arr, &selection, base.len(), &eqs) {
                 Some(ids) => {
                     selection = RowSelection::Ids(ids);
                     narrowed_elsewhere = true;
@@ -388,21 +382,13 @@ impl VortexRdfStore {
                     );
                 }
                 None => {
-                    if let Some(mask) = Self::mask_for(
-                        &selection.apply(base)?,
-                        pat.subject,
-                        pat.predicate,
-                        pat.object,
-                        pat.graph,
-                        codes,
-                    )? {
-                        selection = selection.refine(&bool_array_to_mask(mask)?);
-                        narrowed_elsewhere = true;
-                        log::debug!(
-                            "[match_pattern] In-memory narrowed by mask scan at {:?}",
-                            debug::elapsed(t)
-                        );
-                    }
+                    let mask = Self::mask_for(&selection.apply(base)?, &eqs)?;
+                    selection = selection.refine(&bool_array_to_mask(mask)?);
+                    narrowed_elsewhere = true;
+                    log::debug!(
+                        "[match_pattern] In-memory narrowed by mask scan at {:?}",
+                        debug::elapsed(t)
+                    );
                 }
             }
         }
@@ -702,42 +688,24 @@ impl VortexRdfStore {
     // ── pattern matching helpers ─────────────────────────────────────────────
 
     /// Build an in-memory boolean mask (one bit per row of `array`, in its own
-    /// order) marking which of its rows satisfy the given pattern. Returns
-    /// `None` when the pattern is fully unconstrained (every row matches, so no
-    /// mask is needed).
+    /// order) marking which of its rows satisfy `eqs` — the per-column
+    /// equalities a pattern compiled to under the layout of `array`'s rows
+    /// (the store's own for the base, [`Self::tail_layout`] for the tail,
+    /// which stores strings under a Dictionary-encoded base).
     ///
     /// The mask is positional, so it only means anything against the array it
     /// was computed over: callers holding a view must translate it back to base
     /// row ids via [`RowSelection::refine`].
     ///
-    /// `codes` is the match's witness, prepared under the layout of `array`'s
-    /// rows — the store's own for the base, [`Self::tail_layout`] for the
-    /// tail (which stores strings under a Dictionary-encoded base).
-    fn mask_for(
-        array: &ArrayRef,
-        subject: Option<&NamedOrBlankNode>,
-        predicate: Option<&NamedNode>,
-        object: Option<&Term>,
-        graph: Option<&GraphName>,
-        codes: &mut PatternCodes,
-    ) -> Result<Option<ArrayRef>> {
+    /// Callers compile the constraints and pass them in, because each has
+    /// already consulted them — to rule out an unmatchable pattern, and to try
+    /// the typed comparison paths this is the fallback for.
+    fn mask_for(array: &ArrayRef, eqs: &[(&'static str, Scalar)]) -> Result<ArrayRef> {
         let mut ctx = VORTEX_SESSION.create_execution_ctx();
         let struct_arr = array
             .clone()
             .execute::<StructArray>(&mut ctx)
             .map_err(VortexRdfError::Vortex)?;
-
-        // Translate the RDF pattern into column equality constraints (e.g.
-        // "s == <iri>"). A pattern that can never match (like a term missing
-        // from a dictionary) short-circuits to an all-false mask without
-        // touching any column.
-        let eqs = match codes.constraints(subject, predicate, object, graph)? {
-            Constraints::AlwaysFalse => {
-                let none = ConstantArray::new(Scalar::from(false), struct_arr.len()).into_array();
-                return Ok(Some(none));
-            }
-            Constraints::Eq(eqs) => eqs,
-        };
 
         // AND together one equality comparison per constrained column.
         let mut mask: Option<ArrayRef> = None;
@@ -761,7 +729,12 @@ impl VortexRdfStore {
                 None => m,
             });
         }
-        Ok(mask)
+        Ok(match mask {
+            Some(mask) => mask,
+            // An unconstrained pattern matches every row. Both callers gate on
+            // a non-empty constraint set, so the fold always starts.
+            None => ConstantArray::new(Scalar::from(true), struct_arr.len()).into_array(),
+        })
     }
 
     /// Test-only hook: whether this view carries an index serving plan for

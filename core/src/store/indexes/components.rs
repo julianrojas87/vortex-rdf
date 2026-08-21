@@ -384,8 +384,9 @@ impl IndexComponent {
         &self,
         column: &str,
     ) -> Option<Arc<vortex_rdf_encoded_search::OwnedSortedProbe>> {
-        let rows = self.rows().ok()?.clone().into_array();
-        self.probes.by_name(&rows, column).cloned()
+        self.probes
+            .by_name(self.rows().ok()?.as_ref(), column)
+            .cloned()
     }
 
     /// The component's shared probe cache, for a serve plan that outlives
@@ -406,7 +407,7 @@ impl IndexComponent {
             return;
         }
         if let Ok(rows) = self.rows() {
-            self.probes.warm(&rows.clone().into_array());
+            self.probes.warm(rows.as_ref());
         }
     }
 

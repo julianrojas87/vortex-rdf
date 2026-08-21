@@ -464,6 +464,34 @@ impl PatternCodes {
         Ok(self.code(term)?.map(Scalar::from))
     }
 
+    /// Whether the layout can prove the pattern matches no row: a bound term
+    /// that resolved to no dictionary code.
+    ///
+    /// The allocation-free form of testing [`Constraints::AlwaysFalse`] — the
+    /// async prelude resolved every bound role into the role cache, so this
+    /// reads it instead of compiling the per-column equalities only to
+    /// discard them. The string layouts probe with the term itself and have
+    /// no code to miss, so they answer without touching the cache.
+    ///
+    /// A role the prelude left unresolved answers `false`, deferring to the
+    /// constraint path rather than fabricating an empty result.
+    pub(crate) fn provably_empty(&self, pattern: QuadPattern<'_>) -> bool {
+        if matches!(
+            self.resolver,
+            CodeResolver::Default | CodeResolver::TypedObject
+        ) {
+            return false;
+        }
+        [
+            (Role::S, pattern.subject.is_some()),
+            (Role::P, pattern.predicate.is_some()),
+            (Role::O, pattern.object.is_some()),
+            (Role::G, pattern.graph.is_some()),
+        ]
+        .into_iter()
+        .any(|(role, bound)| bound && matches!(self.roles[role as usize], Some(None)))
+    }
+
     /// Compile a quad pattern into per-column equality constraints — the
     /// layout-specific term → (column, scalar) mapping, the single source of
     /// truth consumed by both the in-memory mask scan and the pushed-down
