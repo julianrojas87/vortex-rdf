@@ -434,31 +434,26 @@ async fn test_file_subject_probe_chained() {
 /// no sortedness, no binary search — while subject matches stay correct
 /// through the scan path.
 ///
-/// The unsorted file comes from serializing a store that still carries an
-/// append tail: the tail's rows are interleaved into the written order, so
-/// the wire records no sorted provenance and the reread store's `s` column
-/// carries no stamp.
+/// No writer of ours emits such a file any more — every build sorts, and a
+/// tailed store's serialization re-sorts the merged rows — so the rows are
+/// encoded and written directly here, rotated out of order and unstamped, the
+/// way a foreign (or older) writer's file arrives.
 #[tokio::test]
 async fn test_file_subject_probe_requires_sorted() {
-    let quads = probe_path_quads(50);
-    let arr = build_array::<SortedInMemoryBuilder>(
-        quad_stream(quads.clone()),
-        LayoutStrategy::Dictionary,
-        vec![],
-    )
-    .await
-    .unwrap();
-    let tailed = VortexRdfStore::from_built(arr)
-        .unwrap()
-        .add_quad(make_quad(
-            "http://example.org/fresh",
-            "http://example.org/p0",
-            "object 0",
-            GraphName::DefaultGraph,
-        ))
+    use crate::store::layouts::dictionary::{self, TermDictionary};
+
+    let mut raws: Vec<crate::store::RawQuad> = probe_path_quads(50)
+        .iter()
+        .map(crate::store::RawQuad::from_quad)
+        .collect();
+    raws.rotate_left(7);
+    let (dict, id_map) = TermDictionary::from_quads_with_map(&raws).unwrap();
+    let codes = dictionary::encode_quads(&raws, &dict, &id_map).unwrap();
+    let primary = dictionary::build_code_chunk(&codes, 0..raws.len(), false).unwrap();
+    let mut bytes: Vec<u8> = Vec::new();
+    crate::io::ser::serialize_parts(primary, &[], Some(&dict), &mut bytes)
         .await
         .unwrap();
-    let bytes = tailed.to_bytes().await.unwrap();
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("unsorted.vortex");
     std::fs::write(&path, &bytes).unwrap();

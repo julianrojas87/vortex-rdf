@@ -453,36 +453,117 @@ async fn test_from_parts_adopts_searchable_children() {
     );
 
     // Rows with no sorted provenance: adoption must not invent a stamp they
-    // never earned. Serializing a store that still carries an append tail
-    // interleaves the tail into the written order, so the wire records none.
-    let arr = build_array::<SortedInMemoryBuilder>(
-        quad_stream(quads),
-        LayoutStrategy::Dictionary,
+    // never earned. No writer of ours emits such a store any more — every
+    // build sorts and every rebuild re-sorts — so the shape is written
+    // directly here, as a foreign (or older) writer's file would arrive.
+    let mut raws: Vec<crate::store::RawQuad> = quads
+        .iter()
+        .rev()
+        .map(crate::store::RawQuad::from_quad)
+        .collect();
+    raws.rotate_left(3);
+    let unsorted =
+        crate::store::builders::build_struct_array(&raws, LayoutStrategy::Default, false).unwrap();
+    let dtype = unsorted.dtype().clone();
+    let mut bytes: Vec<u8> = Vec::new();
+    container::write_store(
+        &crate::session::VORTEX_SESSION,
+        &mut bytes,
+        vortex_array::stream::ArrayStreamAdapter::new(
+            dtype,
+            Box::pin(futures::stream::once(async move { Ok(unsorted) })),
+        ),
+        container::default_child_strategy(),
+        false,
         vec![],
     )
     .await
     .unwrap();
-    let bytes = VortexRdfStore::from_built(arr)
-        .unwrap()
-        .add_quad(make_quad(
-            "http://example.org/s00",
-            "http://example.org/p9",
-            "object 9",
-            GraphName::DefaultGraph,
-        ))
-        .await
-        .unwrap()
-        .to_bytes()
-        .await
-        .unwrap();
     let adopted = VortexRdfStore::from_bytes(&bytes).await.unwrap();
-    let parts = adopted.to_serializable_parts().await.unwrap();
-    let store = VortexRdfStore::from_parts(parts).unwrap();
-    assert!(store.debug_base_probe_resolvable());
     assert!(
-        !store.debug_base_subject_sorted(),
+        !VortexRdfStore::from_parts(adopted.to_serializable_parts().await.unwrap())
+            .unwrap()
+            .debug_base_subject_sorted(),
         "rows with no sorted provenance must stay unstamped through adoption"
     );
+}
+
+/// Serializing a store that still carries an append tail re-establishes the
+/// sorted order the tail broke: the rebuild it already runs (fresh dictionary,
+/// re-sorted index children) now orders the primary rows too, so the artifact
+/// claims `quads_sorted` and every later reader keeps the subject fast path
+/// without having to compact first.
+#[tokio::test]
+async fn test_tailed_serialization_restores_sorted_order() {
+    for layout in [
+        LayoutStrategy::Default,
+        LayoutStrategy::TypedObject,
+        LayoutStrategy::Dictionary,
+    ] {
+        for indexes in [vec![], vec![IndexType::SecondaryByCopy]] {
+            let arr = build_array::<SortedInMemoryBuilder>(
+                quad_stream(modular_quads(12, 3, 4)),
+                layout,
+                indexes.clone(),
+            )
+            .await
+            .unwrap();
+            // A subject that sorts BEFORE the tail's own position in the
+            // base, so an appended-at-the-end row must move to claim order.
+            let appended = make_quad(
+                "http://example.org/s00",
+                "http://example.org/p9",
+                "object 9",
+                GraphName::DefaultGraph,
+            );
+            let tailed = VortexRdfStore::from_built(arr)
+                .unwrap()
+                .add_quad(appended.clone())
+                .await
+                .unwrap();
+            assert_eq!(tailed.size().await.unwrap(), 13);
+
+            let bytes = tailed.to_bytes().await.unwrap();
+            let (quads_sorted, _) = container::store_metadata_of_bytes(&bytes);
+            assert!(
+                quads_sorted,
+                "{layout:?}/{indexes:?}: a tailed store's serialization must claim sorted order"
+            );
+
+            let reread = VortexRdfStore::from_bytes(&bytes).await.unwrap();
+            assert_eq!(reread.size().await.unwrap(), 13);
+            let subjects: Vec<String> = reread
+                .quads()
+                .unwrap()
+                .try_collect::<Vec<Quad>>()
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|q| q.subject.to_string())
+                .collect();
+            let mut expected = subjects.clone();
+            expected.sort();
+            assert_eq!(
+                subjects, expected,
+                "{layout:?}/{indexes:?}: rewritten rows must be in subject order"
+            );
+            // The appended row is reachable through the subject fast path the
+            // stamp unlocks, not just through a scan.
+            let s = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/s00").unwrap());
+            let p = NamedNode::new("http://example.org/p9").unwrap();
+            assert_eq!(
+                reread
+                    .match_pattern(Some(&s), Some(&p), None, None)
+                    .await
+                    .unwrap()
+                    .size()
+                    .await
+                    .unwrap(),
+                1,
+                "{layout:?}/{indexes:?}: the appended row survives the reorder"
+            );
+        }
+    }
 }
 
 /// A lean `from_bytes` store — wire-encoded base, deferred components — must
