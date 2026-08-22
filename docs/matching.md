@@ -161,9 +161,9 @@ flowchart TD
 
     S1{"<b>Stage 1</b><br/>Can the sorted s column locate the bound subject?"}
     S1 -- "yes — binary-search its row run and keep only those rows" --> S2
-    S1 -- "no — see §6.1 for when it engages" --> S2
+    S1 -- "no — check if indexes can help" --> S2
 
-    S2{"<b>Stage 2</b><br/>Worth asking the indexes?<br/>Only a view stage 1 narrowed has a row count to clear"}
+    S2{"<b>Stage 2</b><br/>Are there indexes for this pattern?<br/>"}
     S2 -- "no — stage 1 left an empty selection, or under 4,096 rows" --> S3
     S2 -- "yes — ask the indexes to resolve what is still bound" --> S2r
 
@@ -172,9 +172,9 @@ flowchart TD
     S2r -- "declined — no index fits this pattern shape" --> S3
     S2r -- "resolved — fold its row ids into the selection (or leave<br/>them deferred) and hold onto the serve plan it offered" --> S3
 
-    S3{"<b>Stage 3</b><br/>Anything still bound, over a non-empty selection?"}
-    S3 -- "no — the fast paths answered the whole pattern" --> S4
-    S3 -- "yes — compare the residual columns, over the selected rows only" --> S4
+    S3{"<b>Stage 3</b><br/>Any bound term the fast paths did not answer,<br/>and any row left to test it on?"}
+    S3 -- "no — nothing left to compare, or nothing left to compare it against" --> S4
+    S3 -- "yes — compare those columns, over the selected rows only" --> S4
 
     S4["<b>Stage 4</b> — drop the serve plan unless the index's own resolution is<br/>the only thing that narrowed this view; leave deferred ids pending, else exact"] --> S5["the derived in-memory view"]
 
@@ -289,10 +289,13 @@ order:
    per column, `And` them together, then `RowSelection::refine` translates the
    positional mask back into base row ids.
 
-The whole stage is skipped when the fast paths resolved every component —
-`mask_for` would return `None` without reading a row, but its arguments
-(`selection.apply` through the array optimizer, plus a struct canonicalization)
-are exactly the per-call cost the gate saves.
+The whole stage is skipped unless **both** halves of its gate hold: some term
+is still bound (stages 1 and 2 clear the components they answer, so a pattern
+they fully resolved arrives with nothing to compare) and the selection is still
+non-empty (nothing to compare it against). Skipping on the first half is a real
+saving, not just a formality: `mask_for` would return `None` without reading a
+row, but its arguments — `selection.apply` through the array optimizer, plus a
+struct canonicalization — are exactly the per-call cost the gate avoids.
 
 > **Tombstones are deliberately not consulted here.** Every read path applies
 > them instead, so a match may name deleted rows without any result showing
