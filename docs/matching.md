@@ -161,10 +161,10 @@ flowchart TD
 
     S1{"<b>Stage 1</b><br/>Can the sorted s column locate the bound subject?"}
     S1 -- "yes — binary-search its row run and keep only those rows" --> S2
-    S1 -- "no — subject unbound, column not sorted, or probe not comparable" --> S2
+    S1 -- "no — see §6.1 for when it engages" --> S2
 
-    S2{"<b>Stage 2</b><br/>Enough rows still in play to be worth an index lookup?"}
-    S2 -- "no — a fast path already cut the view below the threshold" --> S3
+    S2{"<b>Stage 2</b><br/>Worth asking the indexes?<br/>Only a view stage 1 narrowed has a row count to clear"}
+    S2 -- "no — stage 1 left an empty selection, or under 4,096 rows" --> S3
     S2 -- "yes — ask the indexes to resolve what is still bound" --> S2r
 
     S2r{"What did the indexes answer?"}
@@ -172,7 +172,7 @@ flowchart TD
     S2r -- "declined — no index fits this pattern shape" --> S3
     S2r -- "resolved — fold its row ids into the selection (or leave<br/>them deferred) and hold onto the serve plan it offered" --> S3
 
-    S3{"<b>Stage 3</b><br/>Anything still bound after the fast paths?"}
+    S3{"<b>Stage 3</b><br/>Anything still bound, over a non-empty selection?"}
     S3 -- "no — the fast paths answered the whole pattern" --> S4
     S3 -- "yes — compare the residual columns, over the selected rows only" --> S4
 
@@ -227,6 +227,20 @@ The gate `worth_indexing = !narrowed_elsewhere || selection.len() >= 4096`
 holds. Once the subject search has cut the view to a handful of rows, filtering
 those rows column-wise is cheaper. Nothing is lost by skipping: a view narrowed
 by something else discards any serving plan anyway.
+
+Note the disjunction: `narrowed_elsewhere` is false on entry and **stage 1 is
+the only thing that can set it** by this point, so the row count is consulted
+only after a successful subject search. A pattern with no bound subject never
+runs stage 1, and so reaches the indexes whatever the view's size — chained or
+not.
+
+That leaves one case for the count to guard, and it is the reason the stage
+sees such patterns at all: stage 1 clears `pat.subject` when it succeeds, so an
+`s`-and-`p`-bound pattern arrives here as a bare predicate the indexes *would*
+resolve — at a cost proportional to every row carrying that predicate, to
+narrow a view the binary search has already cut to a handful of rows. Below the
+threshold, filtering those rows in stage 3 is cheaper. The separate
+`!selection.is_empty()` guard is what skips an already-empty view.
 
 `resolve_indexes_in_memory` tries the store's indexes **in preference order**
 (`SecondaryByCopy` before `SecondaryByReference`; the in-memory index set is
