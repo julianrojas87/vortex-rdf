@@ -1,12 +1,15 @@
-//! Quad streaming: the chunk-granularity decode stream behind `quads` and
-//! `quads_vec`.
+//! Quad streaming: the chunk-granularity decode stream behind `quads`,
+//! `quads_vec` and their shared-term twins.
 
 use crate::error::Result;
 #[cfg(feature = "file-io")]
 use crate::error::VortexRdfError;
+#[cfg(feature = "file-io")]
+use crate::store::indexes::FileServePlan;
+use crate::store::indexes::InMemoryServePlan;
 use crate::store::layouts::ResolvedLayout;
 use crate::store::selection::gather_live;
-use crate::store::{QuadsSource, RawQuad};
+use crate::store::{QuadsSource, RawQuad, SharedQuad};
 
 #[cfg(feature = "file-io")]
 use futures::FutureExt as _;
@@ -17,19 +20,112 @@ use oxrdf::Quad;
 
 use vortex_array::ArrayRef;
 #[cfg(feature = "file-io")]
-#[cfg(feature = "file-io")]
 use vortex_array::stream::ArrayStreamExt as _;
 #[cfg(feature = "file-io")]
 use vortex_layout::scan::scan_builder::ScanBuilder;
+use vortex_mask::Mask;
 
 use super::VortexRdfStore;
+
+/// The two row representations the chunk pipeline can decode into: owned
+/// oxrdf [`Quad`]s, or [`SharedQuad`]s whose terms are shared strings. One
+/// hook per decode site of [`VortexRdfStore::decoded_chunks`], so the
+/// pipeline's arms — the serve plans, the point-read fast paths, the sync and
+/// async scan streams — are written once for both.
+trait ChunkDecode: Sized + Send + 'static {
+    fn decode_chunk(layout: &ResolvedLayout, chunk: &ArrayRef) -> Vec<Result<Self>>;
+    fn serve_in_memory(plan: &InMemoryServePlan, deleted: Option<&Mask>) -> Vec<Result<Self>>;
+    #[cfg(feature = "file-io")]
+    fn decode_chunk_async<'a>(
+        layout: &'a ResolvedLayout,
+        chunk: &'a ArrayRef,
+    ) -> BoxFuture<'a, Vec<Result<Self>>>;
+    #[cfg(feature = "file-io")]
+    fn serve_columns(
+        plan: &FileServePlan,
+        chunk: &ArrayRef,
+        deleted: Option<&Mask>,
+    ) -> Vec<Result<Self>>;
+    #[cfg(feature = "file-io")]
+    fn serve_columns_async<'a>(
+        plan: &'a FileServePlan,
+        chunk: &'a ArrayRef,
+        deleted: Option<&'a Mask>,
+    ) -> BoxFuture<'a, Vec<Result<Self>>>;
+}
+
+impl ChunkDecode for Quad {
+    fn decode_chunk(layout: &ResolvedLayout, chunk: &ArrayRef) -> Vec<Result<Self>> {
+        layout.decode_chunk(chunk)
+    }
+    fn serve_in_memory(plan: &InMemoryServePlan, deleted: Option<&Mask>) -> Vec<Result<Self>> {
+        plan.decode(deleted)
+    }
+    #[cfg(feature = "file-io")]
+    fn decode_chunk_async<'a>(
+        layout: &'a ResolvedLayout,
+        chunk: &'a ArrayRef,
+    ) -> BoxFuture<'a, Vec<Result<Self>>> {
+        layout.decode_chunk_async(chunk).boxed()
+    }
+    #[cfg(feature = "file-io")]
+    fn serve_columns(
+        plan: &FileServePlan,
+        chunk: &ArrayRef,
+        deleted: Option<&Mask>,
+    ) -> Vec<Result<Self>> {
+        plan.decode_columns(chunk, deleted)
+    }
+    #[cfg(feature = "file-io")]
+    fn serve_columns_async<'a>(
+        plan: &'a FileServePlan,
+        chunk: &'a ArrayRef,
+        deleted: Option<&'a Mask>,
+    ) -> BoxFuture<'a, Vec<Result<Self>>> {
+        plan.decode_columns_async(chunk, deleted).boxed()
+    }
+}
+
+impl ChunkDecode for SharedQuad {
+    fn decode_chunk(layout: &ResolvedLayout, chunk: &ArrayRef) -> Vec<Result<Self>> {
+        layout.decode_chunk_shared(chunk)
+    }
+    fn serve_in_memory(plan: &InMemoryServePlan, deleted: Option<&Mask>) -> Vec<Result<Self>> {
+        plan.decode_shared(deleted)
+    }
+    #[cfg(feature = "file-io")]
+    fn decode_chunk_async<'a>(
+        layout: &'a ResolvedLayout,
+        chunk: &'a ArrayRef,
+    ) -> BoxFuture<'a, Vec<Result<Self>>> {
+        layout.decode_chunk_shared_async(chunk).boxed()
+    }
+    #[cfg(feature = "file-io")]
+    fn serve_columns(
+        plan: &FileServePlan,
+        chunk: &ArrayRef,
+        deleted: Option<&Mask>,
+    ) -> Vec<Result<Self>> {
+        plan.decode_columns_shared(chunk, deleted)
+    }
+    #[cfg(feature = "file-io")]
+    fn serve_columns_async<'a>(
+        plan: &'a FileServePlan,
+        chunk: &'a ArrayRef,
+        deleted: Option<&'a Mask>,
+    ) -> BoxFuture<'a, Vec<Result<Self>>> {
+        plan.decode_columns_shared_async(chunk, deleted).boxed()
+    }
+}
 
 impl VortexRdfStore {
     // ── quads streaming ───────────────────────────────────────────────────────
 
     /// Stream every quad this view covers, one at a time.
     pub fn quads(&self) -> Result<Box<dyn Stream<Item = Result<Quad>> + Unpin + Send + '_>> {
-        Ok(Box::new(self.quad_chunks()?.flat_map(stream::iter)))
+        Ok(Box::new(
+            self.decoded_chunks::<Quad>()?.flat_map(stream::iter),
+        ))
     }
 
     /// Every quad this view covers, materialized into one exactly-sized
@@ -41,34 +137,61 @@ impl VortexRdfStore {
     /// chunks first makes the total length known before a single quad is
     /// moved.
     pub async fn quads_vec(&self) -> Result<Vec<Quad>> {
-        let chunks: Vec<Vec<Result<Quad>>> = self.quad_chunks()?.collect().await;
-        let total = chunks.iter().map(Vec::len).sum();
-        let mut quads = Vec::with_capacity(total);
-        for chunk in chunks {
-            for quad in chunk {
-                quads.push(quad?);
-            }
-        }
-        Ok(quads)
+        self.decoded_vec::<Quad>().await
     }
 
-    /// The decode-granularity stream behind [`quads`](Self::quads) and
-    /// [`quads_vec`](Self::quads_vec): each item is one decoded chunk (a
-    /// scan split, the in-memory base, or the tail), so consumers that want
-    /// whole batches can take them without paying per-quad stream overhead.
-    /// A chunk-level scan error arrives as a one-element `vec![Err(..)]`.
-    fn quad_chunks(&self) -> Result<Box<dyn Stream<Item = Vec<Result<Quad>>> + Unpin + Send + '_>> {
+    /// Every quad this view covers as [`SharedQuad`]s, materialized into one
+    /// exactly-sized `Vec` — the same rows in the same order as
+    /// [`quads_vec`](Self::quads_vec), with each term decoded once per
+    /// distinct term of a chunk and shared by reference count across the
+    /// rows repeating it, and no per-row parse into oxrdf terms.
+    pub async fn shared_quads_vec(&self) -> Result<Vec<SharedQuad>> {
+        self.decoded_vec::<SharedQuad>().await
+    }
+
+    /// The chunk-granularity stream of [`SharedQuad`]s behind
+    /// [`shared_quads_vec`](Self::shared_quads_vec): each item is one decoded
+    /// chunk (a scan split, the in-memory base, or the tail), so a consumer
+    /// converting whole batches — a binding interning each distinct term
+    /// once — takes them without per-quad stream overhead. A chunk-level
+    /// scan error arrives as a one-element `vec![Err(..)]`.
+    pub fn shared_quad_chunks(
+        &self,
+    ) -> Result<Box<dyn Stream<Item = Vec<Result<SharedQuad>>> + Unpin + Send + '_>> {
+        self.decoded_chunks::<SharedQuad>()
+    }
+
+    /// Collect every decoded chunk, then flatten into one exactly-sized `Vec`.
+    async fn decoded_vec<T: ChunkDecode>(&self) -> Result<Vec<T>> {
+        let chunks: Vec<Vec<Result<T>>> = self.decoded_chunks::<T>()?.collect().await;
+        let total = chunks.iter().map(Vec::len).sum();
+        let mut rows = Vec::with_capacity(total);
+        for chunk in chunks {
+            for row in chunk {
+                rows.push(row?);
+            }
+        }
+        Ok(rows)
+    }
+
+    /// The decode-granularity stream behind [`quads`](Self::quads),
+    /// [`quads_vec`](Self::quads_vec) and their shared-term twins: each item
+    /// is one decoded chunk (a scan split, the in-memory base, or the tail),
+    /// so consumers that want whole batches can take them without paying
+    /// per-quad stream overhead. A chunk-level scan error arrives as a
+    /// one-element `vec![Err(..)]`.
+    fn decoded_chunks<T: ChunkDecode>(
+        &self,
+    ) -> Result<Box<dyn Stream<Item = Vec<Result<T>>> + Unpin + Send + '_>> {
         let layout = self.layout.clone();
         // Tail rows are in memory and few: decode them eagerly, to be appended
         // after whatever the base yields.
-        let tail_quads: Vec<Result<Quad>> = match &self.tail {
+        let tail_quads: Vec<Result<T>> = match &self.tail {
             None => vec![],
-            Some(tail) => self.tail_layout().decode_chunk(&gather_live(
-                &tail.rows,
-                &tail.selection,
-                tail.deleted.as_ref(),
-                None,
-            )?),
+            Some(tail) => T::decode_chunk(
+                &self.tail_layout(),
+                &gather_live(&tail.rows, &tail.selection, tail.deleted.as_ref(), None)?,
+            ),
         };
         match &self.quads {
             QuadsSource::InMemory {
@@ -87,15 +210,18 @@ impl VortexRdfStore {
                     // instead of gathering the primary columns at scattered row
                     // ids; tombstones are applied through the rid column. The
                     // selection may still be pending — the plan never needs it.
-                    Some(serve) => serve.decode(deleted.as_ref()),
+                    Some(serve) => T::serve_in_memory(serve, deleted.as_ref()),
                     // Without a plan the selection is exact (pending ids only
                     // ever ride alongside one).
-                    None => layout.decode_chunk(&gather_live(
-                        base,
-                        selection.expect_exact(),
-                        deleted.as_ref(),
-                        Some(probes),
-                    )?),
+                    None => T::decode_chunk(
+                        &layout,
+                        &gather_live(
+                            base,
+                            selection.expect_exact(),
+                            deleted.as_ref(),
+                            Some(probes),
+                        )?,
+                    ),
                 };
                 quads.extend(tail_quads);
                 Ok(Box::new(stream::iter([quads])))
@@ -158,9 +284,7 @@ impl VortexRdfStore {
                                     }
                                     Err(e) => return vec![Err(e)],
                                 };
-                            serve
-                                .decode_columns_async(&chunk_arr, deleted.as_ref())
-                                .await
+                            T::serve_columns_async(&serve, &chunk_arr, deleted.as_ref()).await
                         };
                         return Ok(Box::new(
                             stream::once(chunk)
@@ -180,7 +304,7 @@ impl VortexRdfStore {
                                 let serve = serve.clone();
                                 let deleted = deleted.clone();
                                 async move {
-                                    serve.decode_columns_async(&chunk, deleted.as_ref()).await
+                                    T::serve_columns_async(&serve, &chunk, deleted.as_ref()).await
                                 }
                                 .boxed()
                             },
@@ -189,7 +313,7 @@ impl VortexRdfStore {
                     }
                     return scan_chunk_stream(
                         scan,
-                        move |chunk| serve.decode_columns(&chunk, deleted.as_ref()),
+                        move |chunk| T::serve_columns(&serve, &chunk, deleted.as_ref()),
                         tail_quads,
                     );
                 }
@@ -248,7 +372,7 @@ impl VortexRdfStore {
                             }
                             Err(e) => return vec![Err(e)],
                         };
-                        layout.decode_chunk_async(&rows).await
+                        T::decode_chunk_async(&layout, &rows).await
                     };
                     return Ok(Box::new(
                         stream::once(chunk)
@@ -274,12 +398,16 @@ impl VortexRdfStore {
                         scan,
                         move |chunk| {
                             let layout = layout.clone();
-                            async move { layout.decode_chunk_async(&chunk).await }.boxed()
+                            async move { T::decode_chunk_async(&layout, &chunk).await }.boxed()
                         },
                         tail_quads,
                     );
                 }
-                scan_chunk_stream(scan, move |chunk| layout.decode_chunk(&chunk), tail_quads)
+                scan_chunk_stream(
+                    scan,
+                    move |chunk| T::decode_chunk(&layout, &chunk),
+                    tail_quads,
+                )
             }
         }
     }

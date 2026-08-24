@@ -72,27 +72,49 @@ impl VortexRdfStore {
                 filter,
                 selection,
                 deleted,
+                serve,
                 ..
             } => {
-                // A count needs the selection itself — the serve plan cannot
-                // answer it — so a served match's deferred index-child scan
-                // runs here, once, and is cached on the view.
-                let selection = selection.materialized().await?;
-                match filter {
-                    // No filter pending: the selection is exact, minus whatever
-                    // the tombstones have removed from it.
-                    None => match deleted {
-                        None => selection.len(file.row_count() as usize),
-                        Some(d) => selection
-                            .live_mask(d, file.row_count() as usize)
-                            .true_count(),
-                    },
-                    // A filter is pending: its selectivity is unknown ahead of
-                    // time, so the rows actually have to be evaluated (with the
-                    // tombstoned rows excluded before counting).
-                    Some(f) => {
-                        file_scan::count_matching_rows(file, f, &selection, deleted.as_ref())
-                            .await?
+                // A located serve plan knows the width of the child run it
+                // serves — exactly the constrained rows — so a pending
+                // selection over one counts from the plan, without the
+                // deferred index-child scan the selection itself would run.
+                // Tombstones are defined over primary row ids the plan does
+                // not hold, and a pending filter's selectivity is unknown, so
+                // either sends the count through the selection.
+                let located = match (selection, serve, filter, deleted) {
+                    (
+                        crate::store::selection::ViewSelection::Pending(_),
+                        Some(plan),
+                        None,
+                        None,
+                    ) => plan.row_range(),
+                    _ => None,
+                };
+                if let Some(range) = located {
+                    (range.end - range.start) as usize
+                } else {
+                    // A count needs the selection itself, so a served match's
+                    // deferred index-child scan runs here, once, and is
+                    // cached on the view.
+                    let selection = selection.materialized().await?;
+                    match filter {
+                        // No filter pending: the selection is exact, minus
+                        // whatever the tombstones have removed from it.
+                        None => match deleted {
+                            None => selection.len(file.row_count() as usize),
+                            Some(d) => selection
+                                .live_mask(d, file.row_count() as usize)
+                                .true_count(),
+                        },
+                        // A filter is pending: its selectivity is unknown
+                        // ahead of time, so the rows actually have to be
+                        // evaluated (with the tombstoned rows excluded before
+                        // counting).
+                        Some(f) => {
+                            file_scan::count_matching_rows(file, f, &selection, deleted.as_ref())
+                                .await?
+                        }
                     }
                 }
             }

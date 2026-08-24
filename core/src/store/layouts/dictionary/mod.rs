@@ -431,9 +431,12 @@ pub(crate) fn decode_chunk(chunk: &ArrayRef, dict: &TermDictionary) -> Vec<Resul
 /// read (an FSST decompress) again.
 ///
 /// [`raw_quads`]: crate::store::layouts::ResolvedLayout::raw_quads
-pub(super) fn decode_code_column(dict: &TermDictionary, codes: &[u32]) -> Result<Vec<String>> {
+pub(super) fn decode_code_column<T: Clone + for<'a> From<&'a str>>(
+    dict: &TermDictionary,
+    codes: &[u32],
+) -> Result<Vec<T>> {
     let mut reader = dict.reader();
-    let mut memo: TermMemo<String> = TermMemo::new(codes.len());
+    let mut memo: TermMemo<T> = TermMemo::new(codes.len());
     codes
         .iter()
         .map(|&code| {
@@ -445,10 +448,46 @@ pub(super) fn decode_code_column(dict: &TermDictionary, codes: &[u32]) -> Result
                         dict.len()
                     )));
                 }
-                reader.str_at(code as usize).map(str::to_string)
+                reader.str_at(code as usize).map(T::from)
             })
         })
         .collect()
+}
+
+/// The rows of a Dictionary-layout chunk as [`SharedQuad`]s: each role's
+/// codes decoded through [`decode_code_column`] with `Arc<str>` terms, so a
+/// code repeating down a column is decoded once and shared by reference
+/// count — and nothing is parsed into oxrdf terms.
+///
+/// [`SharedQuad`]: crate::common::quad::SharedQuad
+fn shared_rows(
+    chunk: &ArrayRef,
+    dict: &TermDictionary,
+) -> Result<Vec<crate::common::quad::SharedQuad>> {
+    let (s_col, p_col, o_col, g_col) = code_columns(chunk)?;
+    let s = decode_code_column::<std::sync::Arc<str>>(dict, s_col.as_slice::<u32>())?;
+    let p = decode_code_column::<std::sync::Arc<str>>(dict, p_col.as_slice::<u32>())?;
+    let o = decode_code_column::<std::sync::Arc<str>>(dict, o_col.as_slice::<u32>())?;
+    let g = decode_code_column::<std::sync::Arc<str>>(dict, g_col.as_slice::<u32>())?;
+    Ok(s.into_iter()
+        .zip(p)
+        .zip(o)
+        .zip(g)
+        .map(|(((s, p), o), g)| crate::common::quad::SharedQuad { s, p, o, g })
+        .collect())
+}
+
+/// [`decode_chunk`] with shared-string terms (see [`shared_rows`]); a
+/// chunk-level failure arrives as a one-element error chunk, the same
+/// convention as the quad decode.
+pub(crate) fn decode_chunk_shared(
+    chunk: &ArrayRef,
+    dict: &TermDictionary,
+) -> Vec<Result<crate::common::quad::SharedQuad>> {
+    match shared_rows(chunk, dict) {
+        Ok(rows) => rows.into_iter().map(Ok).collect(),
+        Err(e) => vec![Err(e)],
+    }
 }
 
 /// The distinct term codes a chunk's four code columns reference, ascending —
@@ -495,4 +534,44 @@ pub(crate) fn decode_chunk_mapped(
         g_col.as_slice::<u32>(),
         &mut MappedTerms(terms),
     )
+}
+
+/// [`decode_chunk_mapped`] with shared-string terms: the pre-resolved map
+/// already holds one `Arc<str>` per distinct code, so every row's term is a
+/// lookup and a reference-count bump.
+#[cfg(feature = "file-io")]
+pub(crate) fn decode_chunk_mapped_shared(
+    chunk: &ArrayRef,
+    terms: &HashMap<u32, std::sync::Arc<str>>,
+) -> Vec<Result<crate::common::quad::SharedQuad>> {
+    let rows = || -> Result<Vec<crate::common::quad::SharedQuad>> {
+        let (s_col, p_col, o_col, g_col) = code_columns(chunk)?;
+        let term = |code: u32| {
+            terms.get(&code).cloned().ok_or_else(|| {
+                VortexRdfError::Deserialization(format!(
+                    "Term code {code} missing from the chunk's resolved term map"
+                ))
+            })
+        };
+        let (s, p, o, g) = (
+            s_col.as_slice::<u32>(),
+            p_col.as_slice::<u32>(),
+            o_col.as_slice::<u32>(),
+            g_col.as_slice::<u32>(),
+        );
+        (0..s.len())
+            .map(|i| {
+                Ok(crate::common::quad::SharedQuad {
+                    s: term(s[i])?,
+                    p: term(p[i])?,
+                    o: term(o[i])?,
+                    g: term(g[i])?,
+                })
+            })
+            .collect()
+    };
+    match rows() {
+        Ok(rows) => rows.into_iter().map(Ok).collect(),
+        Err(e) => vec![Err(e)],
+    }
 }

@@ -16,6 +16,44 @@ async fn matched_strings(
     view_strings(&store.match_pattern(s, p, o, g).await.unwrap()).await
 }
 
+/// A file-backed dictionary's shared reads equal the resident open's, whole
+/// and index-served: each chunk's distinct codes resolve through one
+/// dictionary scan into shared strings, and the chunk decodes against them.
+#[tokio::test]
+async fn test_file_backed_dictionary_shared_quads_match_resident() {
+    let (_dir, path) = write_store_file(
+        modular_quads(64, 3, 4),
+        LayoutStrategy::Dictionary,
+        vec![IndexType::SecondaryByCopy],
+    )
+    .await;
+    let resident = VortexRdfStore::from_file(&path).await.unwrap();
+    let fb = VortexRdfStore::from_file_with_dict_residency(&path, 0)
+        .await
+        .unwrap();
+    assert!(fb.debug_dict_file_backed());
+
+    let p0 = NamedNode::new("http://example.org/p0").unwrap();
+    let served = |store: &VortexRdfStore| {
+        let store = store.clone();
+        let p0 = p0.clone();
+        async move {
+            store
+                .match_pattern(None, Some(&p0), None, None)
+                .await
+                .unwrap()
+        }
+    };
+    for (tag, a, b) in [
+        ("full", resident.clone(), fb.clone()),
+        ("served", served(&resident).await, served(&fb).await),
+    ] {
+        let want = assert_shared_matches_quads(&a, &format!("resident {tag}")).await;
+        let got = assert_shared_matches_quads(&b, &format!("file-backed {tag}")).await;
+        assert_eq!(got, want, "{tag}");
+    }
+}
+
 /// A store opened with the dictionary forced file-backed must answer every
 /// pattern family identically to the resident open of the same file.
 async fn assert_file_backed_matches_resident(indexes: Indexes, tag: &str) {

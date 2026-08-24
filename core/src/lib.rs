@@ -63,7 +63,7 @@ pub use error::VortexRdfError;
 
 pub use store::{
     BuiltArray, DictSnapshot, DictionaryQuadSink, IndexType, Indexes, LayoutStrategy, RawQuad,
-    SortedInMemoryBuilder, StoreParts, VortexArrayBuilder, VortexRdfStore,
+    SharedQuad, SortedInMemoryBuilder, StoreParts, VortexArrayBuilder, VortexRdfStore,
 };
 // Compiled out on wasm along with the rest of the external-sort pipeline
 // (see the module gate in `store::builders`).

@@ -75,9 +75,12 @@ pub(crate) fn make_nullable_string_array(
 
 /// Stamp the exact `IsSorted` statistic on an array.
 ///
-/// Only call when the array is sorted by construction: `match_pattern` trusts
-/// this stat to binary-search the column, so a false stamp corrupts query
-/// results.
+/// On a base's `s` column the stamp asserts more than that column's order: it
+/// is the witness that the whole base is in global `(s, p, o, g)` order — the
+/// order every writer of this crate produces — and `match_pattern` trusts it
+/// to binary-search each bound role inside the run the previous one bounded.
+/// Only call it on rows sorted that way by construction: a false stamp
+/// corrupts query results.
 pub(crate) fn stamp_is_sorted(arr: &ArrayRef) {
     arr.statistics()
         .set(Stat::IsSorted, Precision::Exact(true.into()));
@@ -85,7 +88,8 @@ pub(crate) fn stamp_is_sorted(arr: &ArrayRef) {
 
 /// Read back the `IsSorted` statistic written by [`stamp_is_sorted`]. An
 /// absent stat counts as unsorted — order is never assumed, only trusted
-/// when explicitly recorded.
+/// when explicitly recorded. On a base's `s` column, `true` licenses the
+/// prefix probe over the whole `(s, p, o, g)` order.
 pub(crate) fn column_is_sorted(arr: &ArrayRef) -> bool {
     match arr.statistics().get(Stat::IsSorted) {
         Precision::Exact(sc) | Precision::Inexact(sc) => bool::try_from(&sc).unwrap_or(false),

@@ -43,6 +43,7 @@ use vortex_array::{ArrayRef, IntoArray, VortexSessionExecute};
 use vortex_buffer::Buffer;
 use vortex_mask::Mask;
 
+use crate::common::quad::SharedQuad;
 use crate::error::{Result, VortexRdfError};
 use crate::session::VORTEX_SESSION;
 use crate::store::layouts::ResolvedLayout;
@@ -87,6 +88,32 @@ impl ServeDecode {
     ) -> Vec<Result<Quad>> {
         match self.chunk_rows(chunk, deleted) {
             Ok(rows) => self.decode_layout.decode_chunk_async(&rows).await,
+            Err(e) => vec![Err(e)],
+        }
+    }
+
+    /// [`decode_columns`](Self::decode_columns) into shared-string quads.
+    fn decode_columns_shared(
+        &self,
+        chunk: &ArrayRef,
+        deleted: Option<&Mask>,
+    ) -> Vec<Result<SharedQuad>> {
+        match self.chunk_rows(chunk, deleted) {
+            Ok(rows) => self.decode_layout.decode_chunk_shared(&rows),
+            Err(e) => vec![Err(e)],
+        }
+    }
+
+    /// [`decode_columns_async`](Self::decode_columns_async) into shared-string
+    /// quads.
+    #[cfg(feature = "file-io")]
+    async fn decode_columns_shared_async(
+        &self,
+        chunk: &ArrayRef,
+        deleted: Option<&Mask>,
+    ) -> Vec<Result<SharedQuad>> {
+        match self.chunk_rows(chunk, deleted) {
+            Ok(rows) => self.decode_layout.decode_chunk_shared_async(&rows).await,
             Err(e) => vec![Err(e)],
         }
     }
@@ -336,6 +363,24 @@ impl InMemoryServePlan {
             Err(e) => vec![Err(VortexRdfError::Vortex(e))],
         }
     }
+
+    /// [`decode`](Self::decode) into shared-string quads — the same
+    /// acquisition (point reads for a small run, else the slice), decoding
+    /// each distinct term once.
+    pub(crate) fn decode_shared(&self, deleted: Option<&Mask>) -> Vec<Result<SharedQuad>> {
+        match self
+            .decode
+            .rows_via_probes(&self.array, self.range.clone(), &self.probes, deleted)
+        {
+            Ok(Some(rows)) => return self.decode.decode_layout.decode_chunk_shared(&rows),
+            Ok(None) => {}
+            Err(e) => return vec![Err(e)],
+        }
+        match self.array.slice(self.range.clone()) {
+            Ok(rows) => self.decode.decode_columns_shared(&rows, deleted),
+            Err(e) => vec![Err(VortexRdfError::Vortex(e))],
+        }
+    }
 }
 
 /// An index's serving plan for a file-backed view: the matched rows are those
@@ -521,5 +566,26 @@ impl FileServePlan {
         deleted: Option<&Mask>,
     ) -> Vec<Result<Quad>> {
         self.decode.decode_columns_async(chunk, deleted).await
+    }
+
+    /// [`decode_columns`](Self::decode_columns) into shared-string quads.
+    pub(crate) fn decode_columns_shared(
+        &self,
+        chunk: &ArrayRef,
+        deleted: Option<&Mask>,
+    ) -> Vec<Result<SharedQuad>> {
+        self.decode.decode_columns_shared(chunk, deleted)
+    }
+
+    /// [`decode_columns_async`](Self::decode_columns_async) into
+    /// shared-string quads.
+    pub(crate) async fn decode_columns_shared_async(
+        &self,
+        chunk: &ArrayRef,
+        deleted: Option<&Mask>,
+    ) -> Vec<Result<SharedQuad>> {
+        self.decode
+            .decode_columns_shared_async(chunk, deleted)
+            .await
     }
 }

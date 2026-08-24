@@ -174,3 +174,83 @@ fn quad_strings(quads: &[Quad]) -> Vec<String> {
     v.sort();
     v
 }
+
+/// An in-memory Default-layout store holding `quads` in exactly the order
+/// given, adopted from bytes written *without* sorted provenance — the shape
+/// a foreign or older writer's file arrives in. No writer of this crate emits
+/// such a store any more (every build sorts, every rebuild re-sorts), so
+/// tests that need rows without the stamp write them this way.
+#[cfg(feature = "file-io")]
+async fn unstamped_store(quads: &[Quad]) -> VortexRdfStore {
+    let raws: Vec<crate::store::RawQuad> =
+        quads.iter().map(crate::store::RawQuad::from_quad).collect();
+    let rows =
+        crate::store::builders::build_struct_array(&raws, LayoutStrategy::Default, false).unwrap();
+    let dtype = rows.dtype().clone();
+    let mut bytes: Vec<u8> = Vec::new();
+    crate::io::container::write_store(
+        &crate::session::VORTEX_SESSION,
+        &mut bytes,
+        vortex_array::stream::ArrayStreamAdapter::new(
+            dtype,
+            Box::pin(futures::stream::once(async move { Ok(rows) })),
+        ),
+        crate::io::container::default_child_strategy(),
+        false,
+        vec![],
+    )
+    .await
+    .unwrap();
+    VortexRdfStore::from_bytes(&bytes).await.unwrap()
+}
+
+/// Quads as `(s, p, o, g)` N-Triples tuples, the default graph as `""` —
+/// the spelling [`SharedQuad`](crate::store::SharedQuad) rows carry, so the
+/// two decodes compare directly.
+fn tuple_rows(quads: &[Quad]) -> Vec<(String, String, String, String)> {
+    quads
+        .iter()
+        .map(|q| {
+            let r = crate::store::RawQuad::from_quad(q);
+            (r.s, r.p, r.o, r.g)
+        })
+        .collect()
+}
+
+fn shared_tuple_rows(rows: &[crate::store::SharedQuad]) -> Vec<(String, String, String, String)> {
+    rows.iter()
+        .map(|r| {
+            (
+                r.s.to_string(),
+                r.p.to_string(),
+                r.o.to_string(),
+                r.g.to_string(),
+            )
+        })
+        .collect()
+}
+
+/// A view's shared rows must be `quads_vec`'s rows — same content, same
+/// order — whether materialized or streamed by chunk, and each must parse
+/// back to the quad it came from. Hands the rows back for further checks.
+async fn assert_shared_matches_quads(
+    view: &VortexRdfStore,
+    tag: &str,
+) -> Vec<crate::store::SharedQuad> {
+    let quads = view.quads_vec().await.unwrap();
+    let shared = view.shared_quads_vec().await.unwrap();
+    assert_eq!(shared_tuple_rows(&shared), tuple_rows(&quads), "{tag}");
+    let chunked: Vec<crate::store::SharedQuad> = view
+        .shared_quad_chunks()
+        .unwrap()
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .flatten()
+        .map(|row| row.unwrap())
+        .collect();
+    assert_eq!(chunked, shared, "{tag}: chunk stream");
+    let parsed: Vec<Quad> = shared.iter().map(|r| r.to_quad().unwrap()).collect();
+    assert_eq!(parsed, quads, "{tag}: to_quad");
+    shared
+}

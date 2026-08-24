@@ -647,6 +647,62 @@ impl ResolvedLayout {
         self.decode_chunk(chunk)
     }
 
+    /// [`decode_chunk`](Self::decode_chunk) into [`SharedQuad`]s — terms as
+    /// shared N-Triples strings, decoded once per distinct code under the
+    /// Dictionary layout; the string layouts read their columns as
+    /// [`raw_quads`](Self::raw_quads) does, one string per row.
+    ///
+    /// [`SharedQuad`]: crate::common::quad::SharedQuad
+    pub(crate) fn decode_chunk_shared(
+        &self,
+        chunk: &ArrayRef,
+    ) -> Vec<Result<crate::common::quad::SharedQuad>> {
+        match self {
+            ResolvedLayout::Default | ResolvedLayout::TypedObject => match self.raw_quads(chunk) {
+                Ok(raws) => raws
+                    .into_iter()
+                    .map(|raw| Ok(crate::common::quad::SharedQuad::from(raw)))
+                    .collect(),
+                Err(e) => vec![Err(e)],
+            },
+            ResolvedLayout::Dictionary(access) => match access.resident() {
+                Some(dict) => dictionary::decode_chunk_shared(chunk, dict),
+                None => vec![Err(VortexRdfError::Deserialization(
+                    "a file-backed dictionary decodes chunks through the async read path"
+                        .to_string(),
+                ))],
+            },
+        }
+    }
+
+    /// [`decode_chunk_shared`](Self::decode_chunk_shared) with the file-backed
+    /// Dictionary case handled exactly as
+    /// [`decode_chunk_async`](Self::decode_chunk_async) does: one dictionary
+    /// scan resolves the chunk's distinct codes into shared strings, and the
+    /// chunk decodes against that map.
+    #[cfg(feature = "file-io")]
+    pub(crate) async fn decode_chunk_shared_async(
+        &self,
+        chunk: &ArrayRef,
+    ) -> Vec<Result<crate::common::quad::SharedQuad>> {
+        if let ResolvedLayout::Dictionary(DictAccess::FileBacked(fb)) = self {
+            let codes = match dictionary::unique_codes(chunk) {
+                Ok(codes) => codes,
+                Err(e) => return vec![Err(e)],
+            };
+            let terms: std::collections::HashMap<u32, std::sync::Arc<str>> =
+                match fb.resolve_terms(&codes).await {
+                    Ok(terms) => codes
+                        .into_iter()
+                        .zip(terms.into_iter().map(std::sync::Arc::from))
+                        .collect(),
+                    Err(e) => return vec![Err(e)],
+                };
+            return dictionary::decode_chunk_mapped_shared(chunk, &terms);
+        }
+        self.decode_chunk_shared(chunk)
+    }
+
     /// Prepare `pattern` for the synchronous match core: pre-resolve every
     /// bound term the layout probes by code, and hand back the
     /// [`PatternCodes`] witness the core's probes run on. The one point in a

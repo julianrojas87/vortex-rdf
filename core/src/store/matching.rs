@@ -251,11 +251,16 @@ impl VortexRdfStore {
         // becoming the view's `Pending` selection below.
         let mut pending: Option<LazyRowIds> = None;
 
-        // ── Subject binary search on sorted s column ──────────────
-        // If a subject is bound and the base's primary `s` column is
-        // known to be sorted (stamped by sorted builders), binary
-        // search finds the exact [lo, hi) row range for that subject in
-        // O(log n) instead of scanning every row.
+        // ── Prefix probe over the (s, p, o, g) order ──────────────
+        // The base's rows are in (s, p, o, g) order whenever its `s`
+        // column carries the sorted stamp (see `stamp_is_sorted`), so a
+        // pattern bound on a prefix of that order — the subject, then the
+        // predicate within its run, and so on — is one contiguous row
+        // run, found by nested binary search instead of a scan. The
+        // subject searches the whole column, every further role only the
+        // run the previous one left; each answered role is cleared from
+        // the pattern, and the first the probes cannot answer ends the
+        // prefix, leaving whatever is still bound to the stages below.
         if let Some(subj) = pat.subject
             && let Ok(s_col) = struct_arr.unmasked_field_by_name(schema::COL_S)
             && column_is_sorted(s_col)
@@ -265,7 +270,8 @@ impl VortexRdfStore {
             // Left/right binary search bounds the run of rows equal to
             // the probe value — through the store's cached probe when the
             // column resolves (skipping the per-call encoding-tree walk),
-            // else the per-call search.
+            // else the per-call search, which also serves the string
+            // layouts' `VarBinView` subjects.
             let cached = probes.by_name(base, schema::COL_S);
             let (lo, hi) = match (cached, u64::try_from(&scalar)) {
                 (Some(owned), Ok(needle)) => owned.bounds(needle),
@@ -278,6 +284,56 @@ impl VortexRdfStore {
                 "[match_pattern] In-memory subject bounded by binary search at {:?}",
                 debug::elapsed(t)
             );
+
+            // The roles behind the subject, in sort order, while the
+            // selection is still one run (a chained view's id list has
+            // no window to search) and the role has a code and a cached
+            // probe — the string layouts stop here, their columns
+            // resolving none.
+            if let RowSelection::Range(range) = &selection {
+                let mut run = range.start as usize..range.end as usize;
+                let roles = [
+                    (pat.predicate.map(TermRef::Predicate), schema::COL_P),
+                    (pat.object.map(TermRef::Object), schema::COL_O),
+                    (pat.graph.map(TermRef::Graph), schema::COL_G),
+                ];
+                let mut answered = 0;
+                for (term, column) in roles {
+                    let Some(term) = term else { break };
+                    let Some(owned) = probes.by_name(base, column) else {
+                        break;
+                    };
+                    let Some(needle) = codes
+                        .probe_scalar(term)?
+                        .and_then(|scalar| u64::try_from(&scalar).ok())
+                    else {
+                        break;
+                    };
+                    // `bounds_in` consults only the window's order: a
+                    // sub-run of the sorted base is sorted by its next key.
+                    let (lo, hi) = owned.bounds_in(run.clone(), needle);
+                    run = lo..hi;
+                    answered += 1;
+                    if run.is_empty() {
+                        break;
+                    }
+                }
+                if answered > 0 {
+                    selection = RowSelection::Range(run.start as u64..run.end as u64);
+                    // Exactly the roles the run now satisfies, in order.
+                    pat.predicate = None;
+                    if answered > 1 {
+                        pat.object = None;
+                    }
+                    if answered > 2 {
+                        pat.graph = None;
+                    }
+                    log::debug!(
+                        "[match_pattern] In-memory prefix of {answered} more roles bounded by binary search at {:?}",
+                        debug::elapsed(t)
+                    );
+                }
+            }
         }
 
         // ── Secondary-index routing ───────────────────────────────
@@ -292,9 +348,11 @@ impl VortexRdfStore {
         // cut the view to a handful of rows, filtering those rows
         // column-wise is cheaper. Nothing is lost by skipping: a view
         // that something else narrowed already discards any serving plan.
+        // A pattern the prefix probe answered in full leaves the indexes
+        // nothing to resolve at all.
         let worth_indexing =
             !narrowed_elsewhere || selection.len(base.len()) >= INDEX_ROUTING_MIN_ROWS;
-        if !selection.is_empty(base.len()) && worth_indexing {
+        if !selection.is_empty(base.len()) && pat.any_bound() && worth_indexing {
             match resolve_indexes_in_memory(&self.indexes, components, &self.layout, pat, codes)? {
                 // The probed term is absent from the data — nothing matches.
                 IndexResolution::Empty => {
@@ -778,6 +836,23 @@ impl VortexRdfStore {
         match selection {
             ViewSelection::Exact(_) => None,
             ViewSelection::Pending(lazy) => Some(lazy.debug_materialized()),
+        }
+    }
+
+    /// Test-only hook: the exact row range this view's base selection is,
+    /// when it is one — what the prefix probe leaves behind — so tests can
+    /// pin that a pattern was answered by binary search rather than by a scan
+    /// that happens to agree on the count. `None` for every other shape.
+    #[cfg(test)]
+    pub(crate) fn debug_selection_range(&self) -> Option<std::ops::Range<u64>> {
+        let selection = match &self.quads {
+            QuadsSource::InMemory { selection, .. } => selection,
+            #[cfg(feature = "file-io")]
+            QuadsSource::File { selection, .. } => selection,
+        };
+        match selection {
+            ViewSelection::Exact(RowSelection::Range(range)) => Some(range.clone()),
+            _ => None,
         }
     }
 

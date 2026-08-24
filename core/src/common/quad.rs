@@ -1,4 +1,52 @@
+use std::sync::Arc;
+
 use oxrdf::Quad;
+
+use crate::common::terms::{get_as_term, parse_graph_name, parse_named_node, parse_subject};
+use crate::error::{Result, VortexRdfError};
+
+/// A quad whose terms are shared N-Triples strings: a decoder produces one
+/// `Arc<str>` per distinct term of a chunk and hands it to every row that
+/// repeats the term by reference count, so materializing a wide result costs
+/// a refcount bump per term rather than an allocation. `g` is `""` for the
+/// default graph, as the columns store it.
+///
+/// Pointer identity between equal terms is an optimization the decoders
+/// make where they can (a memo hit), never a guarantee: equal content is the
+/// contract.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct SharedQuad {
+    pub s: Arc<str>,
+    pub p: Arc<str>,
+    pub o: Arc<str>,
+    pub g: Arc<str>,
+}
+
+impl SharedQuad {
+    /// Parse the four terms into an owned oxrdf [`Quad`].
+    pub fn to_quad(&self) -> Result<Quad> {
+        let object = get_as_term(&self.o).ok_or_else(|| {
+            VortexRdfError::Deserialization(format!("Invalid object: {}", self.o))
+        })?;
+        Ok(Quad::new(
+            parse_subject(&self.s)?,
+            parse_named_node(&self.p)?,
+            object,
+            parse_graph_name(&self.g)?,
+        ))
+    }
+}
+
+impl From<RawQuad> for SharedQuad {
+    fn from(raw: RawQuad) -> Self {
+        Self {
+            s: Arc::from(raw.s),
+            p: Arc::from(raw.p),
+            o: Arc::from(raw.o),
+            g: Arc::from(raw.g),
+        }
+    }
+}
 
 /// A raw (un-encoded) quad holding term strings in N-Triples form.
 /// This is the shared in-memory (and on-disk, for external sorting)

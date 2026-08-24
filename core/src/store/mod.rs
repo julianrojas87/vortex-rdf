@@ -33,7 +33,7 @@ pub use layouts::dictionary::DictionaryQuadSink;
 // `RawQuad` lives in `common` (it is pure RDF text — see that module's
 // charter); this re-export makes `store::RawQuad` the path builder consumers
 // use.
-pub use crate::common::quad::RawQuad;
+pub use crate::common::quad::{RawQuad, SharedQuad};
 
 pub(crate) use source::{QuadsSource, Tail};
 
@@ -163,6 +163,12 @@ impl VortexRdfStore {
     /// [`with_searchable_int_children`](array::with_searchable_int_children));
     /// every index component is materialized into the same resident form, so
     /// its sorted probes bind directly too.
+    ///
+    /// The array's statistics are trusted as provenance: an `IsSorted` stamp
+    /// on its `s` column asserts the rows are in global `(s, p, o, g)` order —
+    /// the order every builder of this crate produces — and the match fast
+    /// paths search every bound role on that basis. Rows sorted by subject
+    /// alone must not carry it.
     pub fn from_parts(parts: StoreParts) -> Result<Self> {
         let layout = resolved_layout(parts.dict, parts.array.dtype())?;
         let base = array::with_searchable_int_children(parts.array)?;

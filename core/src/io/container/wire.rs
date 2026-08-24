@@ -177,11 +177,12 @@ struct WireComponent {
 #[derive(Serialize, Deserialize)]
 struct WireMetadata {
     version: u32,
-    /// Whether the quad child's `s` column is GLOBALLY sorted — the writer's
-    /// provenance (a sorted builder produced the rows). A reader
-    /// materializing the quads may only restore the subject binary-search
-    /// stamp when this is set; the file's own statistics do not record
-    /// sortedness, and a false stamp corrupts matches.
+    /// Whether the quad rows are in GLOBAL `(s, p, o, g)` order — the
+    /// writer's provenance (a sorted builder or rebuild produced them). A
+    /// reader materializing the quads may only restore the sorted stamp when
+    /// this is set, and that stamp licenses binary search on every role of a
+    /// bound prefix, not the subject alone; the file's own statistics do not
+    /// record sortedness, and a false claim corrupts matches.
     #[serde(default)]
     quads_sorted: bool,
     components: Vec<WireComponent>,
