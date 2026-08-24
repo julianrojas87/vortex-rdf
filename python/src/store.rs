@@ -266,6 +266,31 @@ impl VortexRdfStore {
         Ok(rows)
     }
 
+    /// Number of quads matching a pattern, counted from the match's row
+    /// selection alone -- no term is materialized into Python.
+    #[pyo3(signature = (s=None, p=None, o=None, g=None))]
+    fn count_quads(
+        &self,
+        py: Python<'_>,
+        s: Option<&str>,
+        p: Option<&str>,
+        o: Option<&str>,
+        g: Option<&str>,
+    ) -> PyResult<usize> {
+        let pattern = parse_pattern_checked(s, p, o, g).map_err(parse_err)?;
+        py.detach(|| -> Result<usize, VortexRdfError> {
+            RUNTIME.block_on(async {
+                let (s, p, o, g) = &pattern;
+                self.store
+                    .match_pattern(s.as_ref(), p.as_ref(), o.as_ref(), g.as_ref())
+                    .await?
+                    .size()
+                    .await
+            })
+        })
+        .map_err(store_err)
+    }
+
     /// Match a pattern and return the matching quads as four parallel columns
     /// of N-Triples strings — `(subjects, predicates, objects, graphs)`, each
     /// as long as the result.

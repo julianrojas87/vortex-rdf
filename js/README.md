@@ -78,6 +78,12 @@ const quads = store.getQuads(null, myPredicate, null, null);
 console.log(`Found ${quads.length} results`);
 ```
 
+When you only need how many quads match, `countQuads` answers from the match's row selection without materializing a quad:
+
+```javascript
+const n = store.countQuads(null, myPredicate, null, null);
+```
+
 **Quads are lazy and zero-copy.** `match`/`getQuads` don't build eager term objects — they hand back quads backed by the store's columnar data. A term's string is decoded only when you read `.value`/`.termType`, and then interned, so iterating, counting, filtering, and `.equals` never materialize strings you don't use. Under the default `dictionary` layout, `.equals` between terms of the same store is an **integer code compare** (no decoding at all). 
 
 The quads implement the RDF/JS `Quad`/`Term` interface (`.subject.value`, `.equals`, …) and interoperate with foreign RDF/JS terms via `.equals` in both directions. (They're lazy views into the producing store, so — unlike a plain data object — don't `structuredClone`

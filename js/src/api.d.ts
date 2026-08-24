@@ -86,6 +86,11 @@ export class VortexRdfStore {
      */
     getQuads(subject?: Term | null, predicate?: Term | null, object?: Term | null, graph?: Term | null): Quad[];
     /**
+     * Number of quads matching a pattern — counted from the match's row
+     * selection alone, no term string materialized.
+     */
+    countQuads(subject?: Term | null, predicate?: Term | null, object?: Term | null, graph?: Term | null): number;
+    /**
      * Low-level prototype: an alternative read path to `match`/`getQuads`,
      * which build their own columnar payload rather than going through this.
      * Resolves a pattern to the matched rows' raw u32 term codes — four

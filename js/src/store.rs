@@ -323,6 +323,30 @@ impl VortexRdfStore {
         Ok(build_lazy_quads(&payload))
     }
 
+    /// Number of quads matching a pattern, counted from the match's row
+    /// selection alone — no term string is materialized.
+    #[wasm_bindgen(js_name = countQuads, skip_typescript)]
+    pub fn count_quads(
+        &self,
+        subject: JsValue,
+        predicate: JsValue,
+        object: JsValue,
+        graph: JsValue,
+    ) -> Result<usize, JsValue> {
+        let s = js_to_subject(subject);
+        let p = js_to_named_node(predicate);
+        let o = js_to_term(object);
+        let g = js_to_graph(graph);
+        let inner = self.inner.clone();
+        resolve_now(async move {
+            let view = inner
+                .match_pattern(s.as_ref(), p.as_ref(), o.as_ref(), g.as_ref())
+                .await
+                .map_err(js_err)?;
+            view.size().await.map_err(js_err)
+        })?
+    }
+
     /// **Prototype (Dictionary layout only).** Resolve a pattern and hand back
     /// the matched rows as raw `u32` term codes — four `Uint32Array` columns
     /// `{ s, p, o, g, length }`, or `null` unless this store is Dictionary

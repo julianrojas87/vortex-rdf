@@ -47,6 +47,7 @@ store = VortexRdfStore("data.vortex")   # lazy open; file layout is auto-detecte
 len(store)                              # number of quads
 store.get_quads(p="<http://xmlns.com/foaf/0.1/name>")       # [(s, p, o, g), ...]
 store.match_columns(p="<http://xmlns.com/foaf/0.1/name>")   # (subjects, predicates, objects, graphs)
+store.count_quads(p="<http://xmlns.com/foaf/0.1/name>")     # match count, no terms materialized
 ```
 
 Terms cross the boundary as N-Triples strings (`<iri>`, `_:b0`, `"lit"@en`,
