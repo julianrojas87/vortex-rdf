@@ -44,6 +44,26 @@ def test_get_quads_patterns(vortex_files, layout):
     assert store.get_quads(s="<http://ex.org/nobody>") == []
 
 
+@pytest.mark.parametrize("layout", LAYOUTS)
+@pytest.mark.parametrize("in_memory", [False, True])
+def test_count_quads_agrees_with_get_quads(vortex_files, layout, in_memory):
+    """`count_quads` answers from the match's row selection alone -- on a
+    file-backed store an object pattern is a pushed-down filter it must still
+    evaluate -- and has to agree with materializing the same match."""
+    store = VortexRdfStore(str(vortex_files[layout]), in_memory=in_memory)
+    for pattern in (
+        {},
+        {"p": NAME},
+        {"s": "<http://ex.org/bob>"},
+        {"o": '"Bob"@en'},
+        {"o": '"Bob"'},
+        {"s": "<http://ex.org/bob>", "p": NAME},
+        {"s": "<http://ex.org/nobody>"},
+    ):
+        assert store.count_quads(**pattern) == len(store.get_quads(**pattern)), pattern
+    assert store.count_quads() == len(store) == 5
+
+
 def test_code_path_matches_decoded_rows(vortex_files):
     """Decoding the code columns position by position reproduces `get_quads`.
 

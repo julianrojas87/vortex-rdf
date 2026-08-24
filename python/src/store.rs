@@ -1,8 +1,11 @@
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use pyo3::exceptions::{PyFileNotFoundError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyString};
 use vortex_rdf_core::common::terms::{Pattern, parse_pattern_checked};
-use vortex_rdf_core::{VortexRdfError, VortexRdfStore as CoreStore};
+use vortex_rdf_core::{SharedQuad, VortexRdfError, VortexRdfStore as CoreStore};
 
 use crate::codes::{TermDict, U32Column};
 use crate::{RUNTIME, parse_err, store_err};
@@ -69,14 +72,16 @@ pub struct VortexRdfStore {
 }
 
 impl VortexRdfStore {
-    /// Runs the pattern match off the GIL and returns the matched quads.
-    async fn matched_quads(&self, pattern: &Pattern) -> Result<Vec<oxrdf::Quad>, VortexRdfError> {
+    /// Runs the pattern match off the GIL and returns the matched quads with
+    /// shared-string terms — each distinct term of a decoded chunk is one
+    /// `Arc<str>`, handed to every row repeating it.
+    async fn matched_shared(&self, pattern: &Pattern) -> Result<Vec<SharedQuad>, VortexRdfError> {
         let (s, p, o, g) = pattern;
         let view = self
             .store
             .match_pattern(s.as_ref(), p.as_ref(), o.as_ref(), g.as_ref())
             .await?;
-        view.quads_vec().await
+        view.shared_quads_vec().await
     }
 
     /// The matched rows as four columns of N-Triples strings, in
@@ -112,26 +117,36 @@ impl VortexRdfStore {
             }
         }
 
-        let quads = py
-            .detach(|| RUNTIME.block_on(self.matched_quads(pattern)))
+        let rows = py
+            .detach(|| RUNTIME.block_on(self.matched_shared(pattern)))
             .map_err(store_err)?;
+        // One `PyString` per distinct term, as the code path's `decode_owned`
+        // does: the shared rows hand equal terms out as one `Arc<str>`
+        // wherever the decoder could, so the allocation's address keys the
+        // interning. Those keys are valid only while `rows` keeps every `Arc`
+        // alive — it is held for the whole loop, so no address is recycled —
+        // and a term the decoder did not share simply gets an equal-content
+        // string of its own. `rows` is also the only holder of every `Arc`
+        // (the decoder's memo is gone by now), so a strong count of one means
+        // no other row carries the term and it skips the map altogether — on
+        // a string layout that is every term. The shared rows spell the
+        // default graph as the empty string already, which is what the
+        // pattern parser accepts.
+        let mut interned: HashMap<usize, Py<PyString>> = HashMap::new();
         let mut out: [Vec<Py<PyString>>; 4] =
-            std::array::from_fn(|_| Vec::with_capacity(quads.len()));
-        for quad in quads {
-            // `GraphName`'s own `Display` spells the default graph as a term;
-            // the empty string is what the pattern parser accepts for it, so
-            // both paths agree and a returned graph can be fed straight back.
-            let graph = match &quad.graph_name {
-                oxrdf::GraphName::DefaultGraph => String::new(),
-                named => named.to_string(),
-            };
-            for (column, term) in out.iter_mut().zip([
-                quad.subject.to_string(),
-                quad.predicate.to_string(),
-                quad.object.to_string(),
-                graph,
-            ]) {
-                column.push(PyString::new(py, &term).unbind());
+            std::array::from_fn(|_| Vec::with_capacity(rows.len()));
+        for row in &rows {
+            for (column, term) in out.iter_mut().zip([&row.s, &row.p, &row.o, &row.g]) {
+                if Arc::strong_count(term) == 1 {
+                    column.push(PyString::new(py, term).unbind());
+                    continue;
+                }
+                let key = Arc::as_ptr(term) as *const u8 as usize;
+                let py_term = interned
+                    .entry(key)
+                    .or_insert_with(|| PyString::new(py, term).unbind())
+                    .clone_ref(py);
+                column.push(py_term);
             }
         }
         Ok(out)
@@ -241,8 +256,9 @@ impl VortexRdfStore {
     /// Served from the term-code columns when the store supports them
     /// (Dictionary layout, resident dictionary, no append tail), reading terms
     /// out of the dictionary and sharing one Python string across repeats of a
-    /// code; otherwise every matched quad is re-serialized through `oxrdf`'s
-    /// `Display`. Both paths return the same rows.
+    /// code; otherwise from the store's shared-term rows, where a term the
+    /// decoder handed to several rows is likewise one Python string. Both
+    /// paths return the same rows.
     #[pyo3(signature = (s=None, p=None, o=None, g=None))]
     fn get_quads(
         &self,
@@ -299,7 +315,7 @@ impl VortexRdfStore {
     /// work a position at a time (filtering on objects, collecting distinct
     /// subjects) and would otherwise build a tuple per row to take it apart
     /// again. Unlike [`Self::match_codes`] it is available on every layout,
-    /// falling back to re-serialized quads when the code path does not apply.
+    /// falling back to the shared-term rows when the code path does not apply.
     #[pyo3(signature = (s=None, p=None, o=None, g=None))]
     fn match_columns(
         &self,
