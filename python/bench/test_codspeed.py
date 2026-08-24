@@ -79,6 +79,7 @@ TRIPLE_PATTERNS = [
     Pat("S", T0, None, None, None),
     Pat("P", None, T0, None, None),
     Pat("O", None, None, T0, None),
+    Pat("SP", T0, T0, None, None),
     Pat("PO", None, T0, T0, None),
     Pat("SPO", T0, T0, T0, None),
 ]

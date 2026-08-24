@@ -37,11 +37,14 @@
 //!
 //! ## Query patterns, reduced to routing classes
 //!
-//! The 15 pattern shapes collapse to the six the resolver actually branches on:
-//! `S` (primary binary search), `P` and `O` (single-column index probes), `PO`
-//! (the two-column family prefix probe — `SecondaryByCopy`'s distinguishing
-//! capability), `G` (no index covers graph, so the mask-scan / pushdown
-//! fallback), and `SPOG` (every component bound — maximum residual filtering).
+//! The 15 pattern shapes collapse to the eight the resolver actually branches
+//! on: `S` (primary binary search), `SP` and `SPO` (the prefix probe over the
+//! `(s, p, o, g)` order — each further bound role narrows the subject range in
+//! place), `P` and `O` (single-column index probes), `PO` (the two-column
+//! family prefix probe — `SecondaryByCopy`'s distinguishing capability), `G`
+//! (no index covers graph, so the mask-scan / pushdown fallback), and `SPOG`
+//! (every component bound — the prefix probe's full-width case in memory,
+//! maximum residual filtering on file).
 //!
 //! ## Selectivity of the generated data
 //!
@@ -179,7 +182,7 @@ fn serialize(bencher: divan::Bencher, cfg: &SerCfg) {
 // Group 2 — MATCH (query path)
 //
 // Baseline: default / by_copy / file. Each config sweeps the
-// six routing patterns. SortedInMemory is omitted because it is
+// eight routing patterns. SortedInMemory is omitted because it is
 // query-indistinguishable from SortedStream (identical stamped columns).
 // ══════════════════════════════════════════════════════════════════════════
 

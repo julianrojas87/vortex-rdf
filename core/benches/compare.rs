@@ -208,6 +208,13 @@ fn probes(n: usize) -> Vec<Pat> {
             g: None,
         },
         Pat {
+            name: "SP",
+            s: Some(s0.clone()),
+            p: Some(p0.clone()),
+            o: None,
+            g: None,
+        },
+        Pat {
             name: "PO",
             s: None,
             p: Some(p0.clone()),

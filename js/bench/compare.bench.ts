@@ -11,8 +11,8 @@
 // comparison: distinct terms scale with rows (ten triples per subject, a small closed
 // predicate vocabulary, a mix of IRI and literal objects), so each library's term
 // handling — dictionaries, interning, string storage — is actually exercised. It is
-// driven across the six routing shapes the Rust dashboard also uses (S/P/O/PO/G/SPOG)
-// plus fully-bound and full-scan. Note this diverges from rdf-stores.js's own harness,
+// driven across the eight routing shapes the Rust dashboard also uses
+// (S/P/O/G/SP/PO/SPO/SPOG) plus the full scan. Note this diverges from rdf-stores.js's own harness,
 // whose dataset draws D^3 rows from only D distinct IRIs.
 //
 // This file is the ORCHESTRATOR only — it spawns one child process per adapter

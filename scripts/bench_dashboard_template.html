@@ -372,8 +372,8 @@
     <p class="group-desc">
       Resolving each pattern over the shared dataset — <span class="mono">S</span>/<span
       class="mono">P</span>/<span class="mono">O</span>/<span class="mono">G</span>/<span
-      class="mono">PO</span>/<span class="mono">SPO</span>/<span class="mono">SPOG</span>/<span
-      class="mono">full</span> — in two units per cache regime.
+      class="mono">SP</span>/<span class="mono">PO</span>/<span class="mono">SPO</span>/<span
+      class="mono">SPOG</span>/<span class="mono">full</span> — in two units per cache regime.
       <strong>Materialized</strong> delivers the results: every library reads the lexical bytes
       of every term it matched. 
       <strong>hdt</strong> alone returns triples, and materializes three.
@@ -427,6 +427,7 @@
       same named graphs the shared file does. Its job is
       localizing a slow cell to one axis: layout, secondary index, source, or cache regime.
     </p>
+    <p class="lede mono" id="internals-matched-rows"></p>
   </section>
 
   <section id="query" class="group">
@@ -524,7 +525,7 @@
     </div>
     <p class="group-desc">
       Resolving <code>match</code> across routing shapes:
-      <span class="mono">S</span>/<span class="mono">P</span>/<span class="mono">O</span>/<span class="mono">G</span>/<span class="mono">PO</span>/<span class="mono">SPO</span>/<span class="mono">SPOG</span>/<span class="mono">full</span>,
+      <span class="mono">S</span>/<span class="mono">P</span>/<span class="mono">O</span>/<span class="mono">G</span>/<span class="mono">SP</span>/<span class="mono">PO</span>/<span class="mono">SPO</span>/<span class="mono">SPOG</span>/<span class="mono">full</span>,
       all on the one dataset — in two units per cache regime.
       <strong>Materialized</strong> reads every result term's value. Vortex terms are lazy wasm-backed
       values that cross the boundary on read, while the pure-JS stores hold eager objects —
@@ -638,7 +639,7 @@
     </div>
     <p class="group-desc">
       Resolving each pattern:
-      <span class="mono">S</span>/<span class="mono">P</span>/<span class="mono">O</span>/<span class="mono">G</span>/<span class="mono">PO</span>/<span class="mono">SPO</span>/<span class="mono">SPOG</span>/<span class="mono">full</span>,
+      <span class="mono">S</span>/<span class="mono">P</span>/<span class="mono">O</span>/<span class="mono">G</span>/<span class="mono">SP</span>/<span class="mono">PO</span>/<span class="mono">SPO</span>/<span class="mono">SPOG</span>/<span class="mono">full</span>,
       all on the one dataset — in two units per cache regime.
       <strong>Materialized</strong> delivers the results by
       iterating its matches in Python and reading every term's string 
@@ -774,8 +775,8 @@ function fmtBytes(n){
   return `${(n / 1024 ** 3).toFixed(2)} GB`;
 }
 
-const RUST_PATTERNS = ["S","P","O","G","PO","SPOG"];
-const JS_PATTERNS = ["S","P","O","G","PO","SPO","SPOG","full"];
+const RUST_PATTERNS = ["S","P","O","G","SP","PO","SPO","SPOG"];
+const JS_PATTERNS = ["S","P","O","G","SP","PO","SPO","SPOG","full"];
 
 function get(map, id){
   const r = map.get(id);
@@ -928,7 +929,7 @@ function patternCellIds(group, patterns){
 
 // The consolidated match matrix: every layout × source × index variant
 // as rows, grouped by secondary-index
-// configuration, the six routing patterns as columns.
+// configuration, the eight routing patterns as columns.
 const MATCH_INDEXES = [["No index","noindex"],["By reference","byref"],["By copy","bycopy"]];
 const MATCH_LAYOUTS = [
   {labels:["Default","in-memory"],         group: (ix, re) => `match_${re}_default_${ix}_mem`},
@@ -1174,8 +1175,6 @@ function renderRust(){
   // came to explain an i%100 predicate long after that generator was gone. The
   // bench targets print what they built; RUST_CONFIG.dataset carries it here.
   const DS = RUST_CONFIG.dataset || null;
-  const rows = n => n == null ? "—" : n.toLocaleString() + (n === 1 ? " row" : " rows");
-  const matched = k => rows(DS && DS.matched ? DS.matched[k] : null);
   const setText = (id, text) => {
     const el = document.getElementById(id);
     if (el) el.textContent = text;
@@ -1187,11 +1186,7 @@ function renderRust(){
     : "dataset shape unavailable";
   setText("ds-shape", shape);
   setText("ds-shape-internals", shape);
-  setText("match-rows-s", matched("S"));
-  setText("match-rows-po", matched("P") + " / " + matched("O"));
-  setText("match-rows-pair", matched("PO"));
-  setText("match-rows-g", matched("G"));
-  setText("match-rows-spog", matched("SPOG"));
+  renderMatchedRows(DS ? DS.matched : null, "internals-matched-rows");
   makeTable(RUST_DATA, "#data-table", "#table-filter", "#table-count");
   document.getElementById("provenance").textContent = RUST_PROVENANCE;
   renderRustCompare();
@@ -1213,7 +1208,7 @@ const RC_ADAPTERS = [
   { slug:"sophia",                 label:"sophia (memory)" },
   { slug:"hdt",                    label:"hdt (memory)" },
 ];
-const RC_PATTERNS = ["S","P","O","G","PO","SPO","SPOG","full"];
+const RC_PATTERNS = ["S","P","O","G","SP","PO","SPO","SPOG","full"];
 
 function renderRustCompare(){
   const host = document.getElementById("compare-ingest-panels");
@@ -1438,7 +1433,7 @@ const PY_ADAPTERS = [...PY_VORTEX, ...PY_OTHER_LIBS];
 // One row per library, for the facts that are about a library rather than a
 // build: whether it has a mutation API, and how many libraries there are.
 const PY_LIBRARIES = [{ slug:PY_VORTEX[0].slug, label:"vortex-rdf" }, ...PY_OTHER_LIBS];
-const PY_PATTERNS = ["S","P","O","G","PO","SPO","SPOG","full"];
+const PY_PATTERNS = ["S","P","O","G","SP","PO","SPO","SPOG","full"];
 
 function renderPy(){
   if (!PY_DATA.length){

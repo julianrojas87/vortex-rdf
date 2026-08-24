@@ -216,6 +216,7 @@ export function datasetProbes(n: number, opts: DatasetOpts = {}): {
             { name: 'S', s: s0, p: null, o: null, g: null },
             { name: 'P', s: null, p: p0, o: null, g: null },
             { name: 'O', s: null, p: null, o: o0, g: null },
+            { name: 'SP', s: s0, p: p0, o: null, g: null },
             { name: 'PO', s: null, p: p0, o: o0, g: null },
             { name: 'SPO', s: s0, p: p0, o: o0, g: null },
         ],

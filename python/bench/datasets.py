@@ -247,6 +247,7 @@ def dataset_probes(n: int, opts: Optional[DatasetOpts] = None) -> dict[str, list
             Pat("S", s0, None, None, None),
             Pat("P", None, p0, None, None),
             Pat("O", None, None, o0, None),
+            Pat("SP", s0, p0, None, None),
             Pat("PO", None, p0, o0, None),
             Pat("SPO", s0, p0, o0, None),
         ],

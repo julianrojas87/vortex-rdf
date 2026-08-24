@@ -62,12 +62,14 @@ const MUT_N = Number(process.env.CODSPEED_MUT_N ?? 500); // add/delete batch siz
 // ─── Query patterns (probe terms fixed at index 0, so they always hit rows) ──
 const t0 = nn(0);
 const g0 = nn(0);
-// The six routing classes the resolver branches on, split by which dataset can
-// exercise them: S/P/O/PO/SPO on the triples store, G/SPOG on the quads store.
+// The routing classes the resolver branches on, split by which dataset can
+// exercise them: S/P/O/SP/PO/SPO on the triples store, G/SPOG on the quads
+// store.
 const TRIPLE_PATTERNS: Pat[] = [
     { name: 'S', s: t0, p: null, o: null, g: null },
     { name: 'P', s: null, p: t0, o: null, g: null },
     { name: 'O', s: null, p: null, o: t0, g: null },
+    { name: 'SP', s: t0, p: t0, o: null, g: null },
     { name: 'PO', s: null, p: t0, o: t0, g: null },
     { name: 'SPO', s: t0, p: t0, o: t0, g: null },
 ];

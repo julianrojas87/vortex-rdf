@@ -4,7 +4,7 @@
 //! kept algorithmically identical: same moduli, same term spellings, same index-0
 //! probes. That is what lets a row on the Rust tab measure the same data as its
 //! twin on the Python and JavaScript tabs, and what lets the instrumented suite's
-//! `S`/`P`/`O`/`PO` cells be read beside the comparative suite's — they resolve
+//! `S`/`P`/`O`/`SP`/`PO`/`SPO` cells be read beside the comparative suite's — they resolve
 //! the same probe over the same term shape at the same row count, differing only
 //! in how the rows are delivered (generated in-process here, read from an
 //! N-Triples file there). Any drift here silently breaks that.
@@ -82,6 +82,8 @@ impl Moduli {
         let both = |a: usize, b: usize| a.saturating_mul(b);
         match pattern {
             Pattern::S => Self::rows_every(n, self.n_subj),
+            Pattern::SP => Self::rows_every(n, both(self.n_subj, self.n_pred)),
+            Pattern::SPO => Self::rows_every(n, both(both(self.n_subj, self.n_pred), self.n_obj)),
             Pattern::P => Self::rows_every(n, self.n_pred),
             Pattern::O => Self::rows_every(n, self.n_obj),
             // Pairwise coprime, so the lcm of any subset is its product.
@@ -211,6 +213,8 @@ impl ObjectTerm {
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Pattern {
     S,
+    SP,
+    SPO,
     P,
     O,
     PO,
@@ -220,6 +224,8 @@ pub enum Pattern {
 
 pub const PATTERNS: &[Pattern] = &[
     Pattern::S,
+    Pattern::SP,
+    Pattern::SPO,
     Pattern::P,
     Pattern::O,
     Pattern::PO,
@@ -246,6 +252,8 @@ pub fn terms_for(
 
     match pattern {
         Pattern::S => (Some(s()), None, None, None),
+        Pattern::SP => (Some(s()), Some(p()), None, None),
+        Pattern::SPO => (Some(s()), Some(p()), Some(o()), None),
         Pattern::P => (None, Some(p()), None, None),
         Pattern::O => (None, None, Some(o()), None),
         Pattern::PO => (None, Some(p()), Some(o()), None),
@@ -266,8 +274,8 @@ pub fn shape_line(n: usize, graphs: usize) -> String {
     let rows = |p: Pattern| m.matched_rows(n, p);
     format!(
         "#dataset {{\"quads\":{},\"subjects\":{},\"predicates\":{},\"objects\":{},\
-         \"graphs\":{},\"terms\":{},\"matched\":{{\"S\":{},\"P\":{},\"O\":{},\"PO\":{},\
-         \"G\":{},\"SPOG\":{}}}}}",
+         \"graphs\":{},\"terms\":{},\"matched\":{{\"S\":{},\"SP\":{},\"SPO\":{},\"P\":{},\
+         \"O\":{},\"PO\":{},\"G\":{},\"SPOG\":{}}}}}",
         n,
         m.n_subj,
         m.n_pred,
@@ -275,6 +283,8 @@ pub fn shape_line(n: usize, graphs: usize) -> String {
         m.n_graph,
         m.terms(),
         rows(Pattern::S),
+        rows(Pattern::SP),
+        rows(Pattern::SPO),
         rows(Pattern::P),
         rows(Pattern::O),
         rows(Pattern::PO),

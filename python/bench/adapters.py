@@ -200,6 +200,9 @@ class VortexAdapter(Adapter):
         # `get_quads` is the idiomatic read, and it materializes four terms per
         # row. On a triple pattern the libraries whose result is a triple build
         # three, so Vortex is doing strictly more work per row here, not less.
+        # Which path builds the strings follows the variant: the Dictionary
+        # builds read their matched term codes and decode each distinct code
+        # once, the Default build reads the store's shared-term rows.
         acc = rows = 0
         for s, p, o, g in handle.get_quads(pat.s, pat.p, pat.o, pat.g):
             acc += len(s) + len(p) + len(o) + len(g)
