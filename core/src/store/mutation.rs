@@ -25,7 +25,9 @@ impl VortexRdfStore {
     // ── mutations ─────────────────────────────────────────────────────────────
 
     /// Append a single quad — [`add_quads`] with a batch of one. Prefer the
-    /// batch form when adding several: each call rebuilds the tail once.
+    /// batch form when adding several: each call pays the fixed cost of a
+    /// one-row column build, a new store value, and a presence check against
+    /// everything added so far.
     ///
     /// [`add_quads`]: Self::add_quads
     pub async fn add_quad(&self, quad: Quad) -> Result<Self> {
@@ -44,8 +46,10 @@ impl VortexRdfStore {
     /// terms as strings and patterns probe the base by code and the tail by
     /// string.
     ///
-    /// Each append rebuilds the tail into one contiguous chunk (O(tail +
-    /// batch) — hence batching), and each presence check is one fully-bound
+    /// An append accretes: the fresh rows join the tail as one more chunk and
+    /// the flatten is deferred, so a copy costs amortized O(1) per appended
+    /// row. Batching still wins — it pays one column build and one store value
+    /// for the whole batch — and each presence check is one fully-bound
     /// `match_pattern` — cheap where the store has a sorted subject column, an
     /// index, or file pruning; a scan per quad where it has none, in which
     /// case bulk-loading through the builders is the better tool.

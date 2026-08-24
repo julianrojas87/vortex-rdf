@@ -63,8 +63,8 @@ export class VortexRdfStore {
     /** Add one quad in place (a quad already present is ignored, per RDF/JS). */
     addQuad(quad: Quad): Promise<void>;
     /**
-     * Add many quads in one call — one tail rebuild for the whole batch,
-     * where a loop over addQuad pays one per quad.
+     * Add many quads in one call — one column build and one store value for
+     * the whole batch, where a loop over addQuad pays those per quad.
      */
     addQuads(quads: Quad[]): Promise<void>;
     deleteQuad(quad: Quad): Promise<void>;
