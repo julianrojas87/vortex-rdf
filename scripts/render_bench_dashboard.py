@@ -335,10 +335,9 @@ def load_js_results(path):
     That file is already dashboard-shaped. It may be either a bare list of result
     rows, or an object `{"provenance": str, "results": [...], "memory": [...],
     "config": {...}}` (`memory` holds one `{slug, label, role, peakRssMb}` entry per
-    adapter process -- see shared.ts's `peakRssMb`; `sizes` holds each store's
-    serialized-snapshot byte size (null where no serialization path exists);
-    `config` holds the dataset sizes and iteration counts the run used). Returns
-    `(results_list, provenance_str, memory_list, sizes_list, config_dict)`.
+    adapter process -- see shared.ts's `peakRssMb`; `config` holds the dataset
+    sizes and iteration counts the run used). Returns
+    `(results_list, provenance_str, memory_list, failures_list, config_dict)`.
     """
     data = json.loads(Path(path).read_text(encoding="utf-8"))
     if isinstance(data, dict):
@@ -346,11 +345,10 @@ def load_js_results(path):
             data.get("results", []),
             data.get("provenance", ""),
             data.get("memory", []),
-            data.get("sizes", []),
             data.get("failures", []),
             data.get("config", {}),
         )
-    return data, "", [], [], [], {}
+    return data, "", [], [], {}
 
 
 def load_python_results(path):
@@ -419,9 +417,9 @@ def main():
         print("no benchmark results parsed -- is the input the raw `cargo bench` output?", file=sys.stderr)
         return 1
 
-    js_results, js_provenance, js_memory, js_sizes, js_failures, js_config = ([], "", [], [], [], {})
+    js_results, js_provenance, js_memory, js_failures, js_config = ([], "", [], [], {})
     if js_path:
-        js_results, js_provenance, js_memory, js_sizes, js_failures, js_config = load_js_results(js_path)
+        js_results, js_provenance, js_memory, js_failures, js_config = load_js_results(js_path)
 
     rc_results, rc_sizes, rc_memory, rc_config = ([], [], [], {})
     if rc_path:
@@ -451,7 +449,6 @@ def main():
         .replace("__JS_BENCH_DATA__", json.dumps(js_results))
         .replace("__JS_PROVENANCE__", json.dumps(js_provenance))
         .replace("__JS_MEMORY_DATA__", json.dumps(js_memory))
-        .replace("__JS_SIZE_DATA__", json.dumps(js_sizes))
         .replace("__JS_FAILURE_DATA__", json.dumps(js_failures))
         .replace("__JS_CONFIG_DATA__", json.dumps(js_config))
         .replace("__PY_BENCH_DATA__", json.dumps(py_results))
