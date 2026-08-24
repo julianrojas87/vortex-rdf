@@ -139,8 +139,10 @@ impl TermDict {
                 )));
             }
             let codes: Vec<u32> = bytes
-                .chunks_exact(4)
-                .map(|b| u32::from_ne_bytes(b.try_into().expect("chunks_exact(4)")))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|b| u32::from_ne_bytes(*b))
                 .collect();
             return Ok(self.decode_owned(py, &codes));
         }

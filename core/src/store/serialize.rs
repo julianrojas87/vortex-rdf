@@ -2,7 +2,9 @@
 //! path produces (`to_serializable_parts`, `to_bytes`, the bindings'
 //! in-memory round-trips).
 
-use crate::error::{Result, VortexRdfError};
+use crate::error::Result;
+#[cfg(feature = "file-io")]
+use crate::error::VortexRdfError;
 #[cfg(feature = "file-io")]
 use crate::io::native_file;
 use crate::store::QuadsSource;
