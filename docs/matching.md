@@ -159,8 +159,8 @@ stage only sees what is left.
 flowchart TD
     S0["<b>Prelude</b> — canonicalize the base struct, materialize a chained<br/>view's deferred ids, and remember whether this view started unrestricted"] --> S1
 
-    S1{"<b>Stage 1</b><br/>Can the sorted s column locate the bound subject?"}
-    S1 -- "yes — binary-search its row run and keep only those rows" --> S2
+    S1{"<b>Stage 1</b><br/>Is the subject bound, on a base stamped sorted?"}
+    S1 -- "yes — binary-search its row run, then each further bound role in<br/>(p, o, g) order inside it, and keep only those rows" --> S2
     S1 -- "no — check if indexes can help" --> S2
 
     S2{"<b>Stage 2</b><br/>Are there indexes for this pattern?<br/>"}
@@ -186,24 +186,26 @@ Each stage in the code, and where the details are below:
 | Stage | Code | Details |
 |---|---|---|
 | Prelude | [`matching.rs:224-252`](../core/src/store/matching.rs#L224-L252) | — |
-| 1 · subject binary search | [`matching.rs:259-281`](../core/src/store/matching.rs#L259-L281), [`search_sorted_bounds`](../core/src/store/array.rs#L99) | [§6.1](#61-subject-binary-search) |
-| 2 · secondary-index routing | [`matching.rs:295-351`](../core/src/store/matching.rs#L295-L351), [`resolve_indexes_in_memory`](../core/src/store/indexes/mod.rs#L706) | [§6.2](#62-secondary-index-routing) |
-| 3 · residual column filtering | [`matching.rs:362-394`](../core/src/store/matching.rs#L362-L394), [`typed_residual_ids`](../core/src/store/scan/typed_eq.rs#L191), [`mask_for`](../core/src/store/matching.rs#L703) | [§6.3](#63-residual-column-filtering) |
-| 4 · finalize | [`matching.rs:396-410`](../core/src/store/matching.rs#L396-L410) | [§6.4](#64-keeping-or-dropping-the-serve-plan) |
+| 1 · prefix probe | [`matching.rs:254-335`](../core/src/store/matching.rs#L254-L335), [`search_sorted_bounds`](../core/src/store/array.rs#L99) | [§6.1](#61-prefix-probe) |
+| 2 · secondary-index routing | [`matching.rs:337-405`](../core/src/store/matching.rs#L337-L405), [`resolve_indexes_in_memory`](../core/src/store/indexes/mod.rs#L706) | [§6.2](#62-secondary-index-routing) |
+| 3 · residual column filtering | [`matching.rs:407-450`](../core/src/store/matching.rs#L407-L450), [`typed_residual_ids`](../core/src/store/scan/typed_eq.rs#L191), [`mask_for`](../core/src/store/matching.rs#L757) | [§6.3](#63-residual-column-filtering) |
+| 4 · finalize | [`matching.rs:452-466`](../core/src/store/matching.rs#L452-L466) | [§6.4](#64-keeping-or-dropping-the-serve-plan) |
 
-### 6.1 Subject binary search
+### 6.1 Prefix probe
 
 Engages when the subject is bound **and** the base's `s` column carries the
-`IsSorted` stamp. Nothing this crate writes lacks it: every builder sorts, a
-tombstoned gather preserves the order it inherits, and a rebuild that merges an
-append tail re-establishes it
+`IsSorted` stamp. The stamp witnesses more than the subject column's order: the
+rows are in global `(s, p, o, g)` order — nothing this crate writes lacks it:
+every builder sorts, a tombstoned gather preserves the order it inherits, and a
+rebuild that merges an append tail re-establishes it
 ([`order_for_rebuild`](../core/src/store/serialize.rs)). So the stage is skipped
 only for rows that arrived without the provenance — a foreign or older writer's
 file, whose `quads_sorted: false` keeps
 [`with_subject_stamp`](../core/src/store/rows.rs#L452) from inventing a stamp
 those rows never earned. Compacting such a store restores the fast path.
 
-When it does engage, it resolves the exact `[lo, hi)` run in `O(log n)`:
+When it engages, the **subject** resolves to its exact `[lo, hi)` run in
+`O(log n)`:
 
 - through the store's **cached encoded-search probe**
   (`probes.by_name(base, "s")`) when the column resolves one and the probe value
@@ -212,8 +214,21 @@ When it does engage, it resolves the exact `[lo, hi)` run in `O(log n)`:
   [`search_sorted_bounds`](../core/src/store/array.rs), which also handles the
   string layouts' `VarBinView` subject columns.
 
-So unlike its file counterpart, the in-memory subject fast path works under
-**every** layout.
+Then the **roles behind it narrow the run in sort order** — `p` inside the
+subject's run, `o` inside that, `g` inside that — each by a windowed binary
+search (`bounds_in`, which consults only the window's order: a sub-run of the
+sorted base is sorted by its next key) through the cached probe of that column.
+The prefix ends at the first role that is unbound, or that has no code or
+cached probe (the string layouts stop after the subject; a chained view whose
+selection is an id list rather than a range has no window to search). Every
+answered role is cleared from the pattern; whatever is still bound falls to
+the stages below. So `S???`, `SP??`, `SPO?` and `SPOG` each become one exact
+`Range` with nothing residual, while `S?O?` narrows by the subject and leaves
+`o` to stage 3.
+
+Unlike its file counterpart, the in-memory subject fast path works under
+**every** layout; the deeper prefix needs the Dictionary layout's code
+columns.
 
 ### 6.2 Secondary-index routing
 
@@ -319,53 +334,57 @@ selection always rides with a plan.
 
 ## 7. The file path
 
-[`match_base_file`](../core/src/store/matching.rs) composes the same
-restrictions, but nothing is read: the result is a filter expression plus a row
-selection, applied by the *next* scan.
+[`match_base_file`](../core/src/store/matching.rs#L495) composes the same
+restrictions as the in-memory path, but **nothing is read**: each stage decides
+what the *next* scan will do, and the result is a filter expression plus a row
+selection.
 
 ```mermaid
 flowchart TD
-    F0["destructure QuadsSource::File<br/>(existing filter, selection, tombstones)"] --> F1
+    F0["<b>Prelude</b> — take the filter, selection and tombstones this view already<br/>carries from earlier matches; every stage below only adds to them"] --> F1
 
-    F1{"subject bound<br/>AND file.quads_sorted()<br/>AND probe is an integer code<br/>AND subject column chunk probes resolve?"}
-    F1 -- yes --> F1a["chunks.bounds(needle) → exact row range<br/>subject_range = range; pat.subject = None"]
-    F1 -- no --> F2
-    F1a --> F2
+    F1{"<b>Stage 1</b><br/>Is the subject bound, on a sorted file, and does it probe as a code?"}
+    F1 -- "yes — binary-search the subject column's encoded chunks for its exact<br/>row range, and drop the subject from the pattern" --> F2
+    F1 -- "no — see §7.1 for when it engages" --> F2
 
-    F2["worth_indexing = subject_range is None<br/>OR its width ≥ 4096"] --> F3
-    F3{"worth_indexing?"}
-    F3 -- no --> F4["resolution = Declined"]
-    F3 -- yes --> F3a["resolve_indexes_file(indexes, file, layout, pat, codes)"]
-    F3a --> F4
+    F2{"<b>Stage 2</b><br/>Worth asking the indexes?<br/>Only a subject range stage 1 already cut small says no"}
+    F2 -- "no — fewer rows left than an index lookup would have to read" --> F3
+    F2 -- "yes — ask the indexes to resolve what is still bound" --> F2r
 
-    F4["keep_serve = no existing filter<br/>AND existing selection is All<br/>AND no subject_range"] --> F5
-    F5{"resolution"}
-    F5 -- "Empty" --> X["return empty_view()"]
-    F5 -- "Resolved" --> F5a["pat = resolves.clear(pat)<br/>serve = keep_serve ? plan : None<br/>next_filter = build_file_filter(residual)"]
-    F5a --> F5b{"row_ids"}
-    F5b -- "Lazy + serve kept" --> F5c["selection = Pending(lazy)"]
-    F5b -- "Lazy, no plan" --> F5d["selection = Exact(existing ∩ lazy.materialized() ∩ subject_range)"]
-    F5b -- "Eager(ids)" --> F5e["selection = Exact(existing ∩ ids ∩ subject_range)"]
-    F5 -- "Declined" --> F6["next_filter = build_file_filter(pat)<br/>no resolved selection, no plan"]
+    F2r{"What did the indexes answer?"}
+    F2r -- "the term is absent from the indexed data" --> X
+    F2r -- "declined — no index fits this pattern shape" --> F3
+    F2r -- "resolved — take its row ids (or leave them deferred) and the serve<br/>plan it offered, and drop what it answered from the pattern" --> F3
 
-    F5c --> F7
-    F5d --> F7
-    F5e --> F7
-    F6 --> F7
+    F3["<b>Stage 3</b> — lower whatever is still bound into a pushed-down filter,<br/>ANDed onto the filter this view already carried"] --> F4
 
-    F7["filter = AND(existing_filter, next_filter)"] --> F8
-    F8{"selection already resolved by an index?"}
-    F8 -- yes --> F10
-    F8 -- "no, subject_range present" --> F9a["selection = existing ∩ subject_range"]
-    F8 -- "no, filter present" --> F9b["row_range_from_pruning(file, filter)<br/>selection = existing ∩ envelope"]
-    F8 -- "no, neither" --> F9c["selection = existing"]
-    F9a --> F10
-    F9b --> F10
-    F9c --> F10
+    F4{"<b>Stage 4</b><br/>What names the rows the scan will read?"}
+    F4 -- "an index resolved them — its ids, folded into the existing selection" --> F5
+    F4 -- "stage 1 bounded the subject — that row range" --> F5
+    F4 -- "neither, but there is a filter — the envelope its zone maps prune to" --> F5
+    F4 -- "neither — whatever the view already selected" --> F5
 
-    F10{"Exact selection is empty?"} -- yes --> X
-    F10 -- no --> F11["build the derived File view"]
+    F5{"Is the selection now provably empty?"}
+    F5 -- yes --> X
+    F5 -- "no — keep the serve plan only if this match is the view's sole restriction" --> F6["the derived file view: a filter plus a selection,<br/>both applied by the next scan"]
+
+    X["empty view — no rows, indexes and components dropped"]
 ```
+
+Each stage in the code, and where the details are below:
+
+| Stage | Code | Details |
+|---|---|---|
+| Prelude | [`matching.rs:504-515`](../core/src/store/matching.rs#L504-L515) | — |
+| 1 · subject chunk probe | [`matching.rs:524-542`](../core/src/store/matching.rs#L524-L542), [`sorted_subject_chunks`](../core/src/store/native_file.rs#L161) | [§7.1](#71-subject-chunk-probe) |
+| 2 · secondary-index routing | [`matching.rs:543-559`](../core/src/store/matching.rs#L543-L559), [`resolve_indexes_file`](../core/src/store/indexes/mod.rs#L730) | [§8](#8-the-index-resolvers) |
+| 3 · pushed-down filter | [`matching.rs:572-671`](../core/src/store/matching.rs#L572-L671), [`build_file_filter`](../core/src/store/scan/file_scan.rs#L309) | [§7.3](#73-what-ends-up-on-the-view) |
+| 4 · selection and serve plan | [`matching.rs:565-566`](../core/src/store/matching.rs#L565-L566) and [`673-714`](../core/src/store/matching.rs#L673-L714), [`row_range_from_pruning`](../core/src/store/scan/file_scan.rs#L553) | [§7.2](#72-zone-map-pruning), [§7.3](#73-what-ends-up-on-the-view) |
+
+The two paths differ in what a stage produces, not in what it asks. In memory a
+stage narrows a `RowSelection` directly; here stage 3 can only *describe* the
+residual as a filter, and stage 4 turns whatever remains into row bounds the
+scan can honour without reading data.
 
 ### 7.1 Subject chunk probe
 
@@ -377,8 +396,11 @@ through to zone-map pruning.
 
 It also declines for a missing chunk handle, an unsupported chunk encoding, or a
 file whose `quads_sorted` provenance is false — which, as in
-[§6.1](#61-subject-binary-search), no writer of ours produces. Both index resolvers decline bound-subject patterns, so this
-fast path takes an uncontested route.
+[§6.1](#61-prefix-probe), no writer of ours produces. Both index resolvers
+decline bound-subject patterns, so this fast path takes an uncontested route.
+
+Unlike its in-memory counterpart it stops at the subject: the residual terms
+ride the narrowed range as filter conjuncts rather than being bounded within it.
 
 ### 7.2 Zone-map pruning
 
@@ -398,10 +420,24 @@ nothing.
 - **Filter** — the residual pattern, ANDed onto whatever earlier matches left.
   Components an index resolved are *excluded*: the row ids already are exactly
   their matches, so re-filtering would only re-read and re-compare that column.
-- **Selection** — index ids, a subject range, a pruning envelope, or `All`.
-- **Serve plan** — kept only when this match is the view's sole restriction.
+- **Selection** — the first of these that applies: an index's row ids folded
+  into what the view already selected, stage 1's subject range, the envelope
+  zone-map pruning collapses the filter to, or the selection the view arrived
+  with. An index's ids stay **`Pending`** — never computed — when the serve
+  plan below survives, because the plan answers reads without them; in every
+  other case they materialize here.
+- **Serve plan** — kept only when this match is the view's sole restriction: no
+  filter carried in, the incoming selection was `All`, and stage 1 found no
+  subject range. The plan reads a contiguous run of the index's own columns,
+  which stops being exactly the result the moment anything else narrows the
+  view.
 - **Tombstones** — a property of the file, not the pattern; they carry across
   unchanged and every read path applies them.
+
+An `Exact` selection that is provably empty normalizes to `empty_view()` before
+the view is built. A `Pending` one is left alone: its coverage is unknown by
+design, and it may still materialize to nothing later, which every consumer
+handles like any other narrow selection.
 
 ---
 
@@ -534,18 +570,19 @@ indexes. `→` reads "then".
 | Pattern | Dictionary layout, `SecondaryByCopy` | Dictionary layout, `SecondaryByReference` | No indexes |
 |---|---|---|---|
 | `????` (nothing bound) | no work: selection stays `All` | same | same |
-| `S???` | subject binary search → `Range` | same | same |
+| `S???` | prefix probe → `Range` | same | same |
 | `?P??` | POSG lead probe → lazy ids **+ serve plan** | ref-p probe → eager ids | typed/mask scan of `p` over all rows |
 | `??O?` | OSPG lead probe → lazy ids **+ serve plan** | ref-o probe → eager ids | typed/mask scan of `o` |
 | `?PO?` | POSG `(p, o)` prefix probe → both resolved, lazy ids **+ serve plan** | ref-o probe (object preferred) → eager ids → residual `p` scan | typed/mask scan of `p ∧ o` |
 | `???G` | indexes decline → typed/mask scan of `g` | same | same |
 | `?P?G` | POSG lead probe → residual `g` scan **drops the plan**, ids materialize | ref-p probe → residual `g` scan | typed/mask scan |
-| `SP??` / `S?O?` / `SPO?` | subject range; indexes decline (subject bound); residual scan over the range — index routing skipped entirely if the range is < 4096 rows | same | same |
-| `SPOG` (`contains`) | subject range → residual `p ∧ o ∧ g` typed loop over a handful of rows | same | same |
+| `SP??` / `SPO?` / `SPOG` (`contains`) | prefix probe → exact `Range`, nothing residual; indexes never consulted (nothing left bound) | same | same |
+| `S?O?` / `S??G` | prefix probe narrows by the subject; residual scan of `o` (or `g`) over the range — index routing skipped entirely if the range is < 4096 rows | same | same |
 
-Under the string layouts (`Default`, `TypedObject`) the same routes apply; only
-the probe values change (strings instead of codes), and the object of a
-`TypedObject` store expands into 2–4 residual equalities.
+Under the string layouts (`Default`, `TypedObject`) the prefix probe stops after
+the subject (their columns resolve no probe), so `SP??`…`SPOG` become subject
+range → residual scan; the probe values change too (strings instead of codes),
+and the object of a `TypedObject` store expands into 2–4 residual equalities.
 
 ### 10.2 File-backed
 
@@ -608,7 +645,8 @@ the ids pays for them once and every clone of the view reads them back for free.
 |---|---|---|---|
 | 1 | `match_base` | `codes.provably_empty(pattern)` — a bound role resolved to no code | `empty_view()`, no backend work |
 | 2 | in memory | `s` bound ∧ `s` stamped sorted ∧ probe casts | binary-search `[lo, hi)`; subject cleared |
-| 3 | in memory | selection non-empty ∧ (`!narrowed_elsewhere` ∨ `len ≥ 4096`) | try index routing |
+| 2b | in memory | selection is a `Range` ∧ next role in (p, o, g) bound ∧ it has a code and a cached probe | `bounds_in` narrows the run; that role cleared; repeat until a role declines |
+| 3 | in memory | selection non-empty ∧ something bound ∧ (`!narrowed_elsewhere` ∨ `len ≥ 4096`) | try index routing |
 | 4 | in memory | resolution `Lazy` ∧ unrefined ∧ untouched ∧ nothing bound ∧ plan | defer the ids (`Pending`) |
 | 5 | in memory | selection non-empty ∧ something still bound | residual filtering |
 | 6 | in memory | every residual column typed-bindable ∧ not (single eq over > 4096 rows) ∧ no probe-bound column over a wide selection | typed row loop, else mask scan |
