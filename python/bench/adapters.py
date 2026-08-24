@@ -8,14 +8,23 @@ the one the JavaScript tab compares against. A module-level import here would
 break that isolation on the first `import adapters`.
 
 MEASURED UNIT. `count` consumes a pattern's results and returns how many there
-were, which is the only unit all five libraries share. What that materializes
-differs by library and is not normalized away: Vortex builds N-Triples strings
-in Rust, pyoxigraph yields Quad objects, rdflib yields term objects, and
-pycottas/lightrdf yield tuples of strings. Each pays for its own natural
-result form, the same contract the JavaScript tab's `countMatch` uses.
+were: every matched term's lexical string is read in Python and its length
+folded into a sink -- the same rule the Rust and JavaScript harnesses apply --
+so what a cell times is producing results, not walking index entries. Each
+library still delivers its own natural result form (Vortex N-Triples strings
+built in Rust, pyoxigraph Quad objects whose `.value` reads build the Python
+strings, rdflib str-subclass terms, pycottas/lightrdf tuples of strings);
+producing that form for every matched row is exactly the measured work.
 
-That contract cuts against Vortex on triple patterns: its result is a quad, so
-it materializes a graph term per row that rdflib, lightrdf and pycottas do not.
+On a triple pattern the result widths differ, and that is not normalized away:
+Vortex, pyoxigraph and rdflib all deliver quads (four terms per row), while
+pycottas returns 3-tuples and lightrdf, reading the triples projection, has no
+graph to return.
+
+`count_only` is the COUNT/ASK twin: resolve the same pattern and return only
+how many rows matched, reading nothing else -- each library's cheapest correct
+count path. Vortex counts from the match's row selection without materializing
+a term; the others walk their iterators or result lists unread.
 
 TERM SPELLING. The canonical form throughout the harness is N-Triples
 (`<iri>`, `"literal"`) -- what `datasets.py` writes and what the generated file
@@ -29,6 +38,19 @@ import os
 from typing import Any, Iterable, Optional
 
 from datasets import Pat
+
+# ─── The uniform consume rule ───────────────────────────────────────────────
+
+#: Where every consumed term length lands. Python never dead-code-eliminates
+#: the reads, but the sink keeps the contract identical to the Rust and
+#: JavaScript harnesses' black-boxed accumulators.
+_consumed = 0
+
+
+def consume(acc: int) -> None:
+    global _consumed
+    _consumed += acc
+
 
 # ─── Canonical term parsing ─────────────────────────────────────────────────
 
@@ -95,6 +117,12 @@ class Adapter:
         raise NotImplementedError
 
     def count(self, handle: Any, pat: Pat) -> int:
+        raise NotImplementedError
+
+    def count_only(self, handle: Any, pat: Pat) -> int:
+        """Resolve the same pattern and return only the match count -- no term
+        is read. Each library's cheapest correct count path: the COUNT/ASK
+        shape of the workload."""
         raise NotImplementedError
 
     def add(self, handle: Any, quads: Iterable[tuple]) -> None:
@@ -172,7 +200,15 @@ class VortexAdapter(Adapter):
         # `get_quads` is the idiomatic read, and it materializes four terms per
         # row. On a triple pattern the libraries whose result is a triple build
         # three, so Vortex is doing strictly more work per row here, not less.
-        return len(handle.get_quads(pat.s, pat.p, pat.o, pat.g))
+        acc = rows = 0
+        for s, p, o, g in handle.get_quads(pat.s, pat.p, pat.o, pat.g):
+            acc += len(s) + len(p) + len(o) + len(g)
+            rows += 1
+        consume(acc)
+        return rows
+
+    def count_only(self, handle: Any, pat: Pat) -> int:
+        return handle.count_quads(pat.s, pat.p, pat.o, pat.g)
 
 
 # ─── pyoxigraph ─────────────────────────────────────────────────────────────
@@ -224,6 +260,20 @@ class PyoxigraphAdapter(Adapter):
         return self.build(src, artifact)
 
     def count(self, handle: Any, pat: Pat) -> int:
+        acc = rows = 0
+        for q in handle.quads_for_pattern(
+            self._term(pat.s), self._term(pat.p), self._term(pat.o), self._term(pat.g)
+        ):
+            acc += len(q.subject.value) + len(q.predicate.value) + len(q.object.value)
+            gn = q.graph_name
+            acc += len(gn.value) if hasattr(gn, "value") else 0
+            rows += 1
+        consume(acc)
+        return rows
+
+    def count_only(self, handle: Any, pat: Pat) -> int:
+        # No count API: the iterator still yields quad wrappers, which is this
+        # store's floor for a count; their term strings stay unbuilt.
         g = self._term(pat.g)
         return sum(
             1
@@ -287,10 +337,24 @@ class PycottasAdapter(Adapter):
         return pycottas.COTTASDocument(artifact)
 
     def count(self, handle: Any, pat: Pat) -> int:
+        acc = rows = 0
+        for row in handle.search(tuple(self._pattern(pat))):
+            for t in row:
+                acc += len(t)
+            rows += 1
+        consume(acc)
+        return rows
+
+    def count_only(self, handle: Any, pat: Pat) -> int:
+        # `search` builds its full result list either way -- pycottas's floor
+        # for a count; the strings just go unread.
+        return len(handle.search(tuple(self._pattern(pat))))
+
+    def _pattern(self, pat: Pat) -> list:
         terms = [self._term(pat.s), self._term(pat.p), self._term(pat.o)]
         if pat.g is not None:
             terms.append(self._term(pat.g))
-        return len(handle.search(tuple(terms)))
+        return terms
 
 
 # ─── lightrdf ───────────────────────────────────────────────────────────────
@@ -332,6 +396,14 @@ class LightrdfAdapter(Adapter):
         return lightrdf.RDFDocument(src)
 
     def count(self, handle: Any, pat: Pat) -> int:
+        acc = rows = 0
+        for s, p, o in handle.search_triples(pat.s, pat.p, pat.o):
+            acc += len(s) + len(p) + len(o)
+            rows += 1
+        consume(acc)
+        return rows
+
+    def count_only(self, handle: Any, pat: Pat) -> int:
         return sum(1 for _ in handle.search_triples(pat.s, pat.p, pat.o))
 
 
@@ -374,7 +446,31 @@ class RdflibAdapter(Adapter):
 
     def count(self, handle: Any, pat: Pat) -> int:
         s, p, o = self._term(pat.s), self._term(pat.p), self._term(pat.o)
-        if pat.g is not None:
+        # `Dataset.triples` searches the default graph only, and every row of
+        # the shared dataset sits in a named one -- so an unbound graph has to
+        # go through `quads` with a `None` graph, which spans all of them.
+        from rdflib import Dataset
+
+        acc = rows = 0
+        if isinstance(handle, Dataset):
+            for s2, p2, o2, g2 in handle.quads((s, p, o, self._term(pat.g))):
+                # rdflib terms subclass str; the graph position is a Graph
+                # whose identifier is the name.
+                gid = getattr(g2, "identifier", g2)
+                acc += len(s2) + len(p2) + len(o2) + len(gid)
+                rows += 1
+        else:
+            for s2, p2, o2 in handle.triples((s, p, o)):
+                acc += len(s2) + len(p2) + len(o2)
+                rows += 1
+        consume(acc)
+        return rows
+
+    def count_only(self, handle: Any, pat: Pat) -> int:
+        s, p, o = self._term(pat.s), self._term(pat.p), self._term(pat.o)
+        from rdflib import Dataset
+
+        if isinstance(handle, Dataset):
             return sum(1 for _ in handle.quads((s, p, o, self._term(pat.g))))
         return sum(1 for _ in handle.triples((s, p, o)))
 

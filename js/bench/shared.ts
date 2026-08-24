@@ -36,18 +36,24 @@ export * from './datasets.js';
 
 // ─── Config (env-tunable) ────────────────────────────────────────────────────
 //
-// Scale, as row counts: BENCH_SIZE / BENCH_SIZE_QUADS — the same env names the
-// Rust suites read, so one pair of knobs sets every environment. BENCH_DIM /
-// BENCH_DIM_QUADS remain as cube shorthand for quick pilots (BENCH_DIM=16 →
-// 4,096 rows) and lose to an explicit row count. The defaults are the
-// dashboard's indicative-overview scale: 2^20 triples and 2^19 quads — the
+// Scale, as a row count: BENCH_SIZE — the same env name the Rust suites read, so
+// one knob sets every environment. BENCH_DIM remains as cube shorthand for quick
+// pilots (BENCH_DIM=16 → 4,096 rows) and loses to an explicit row count. The
+// default is the
+// dashboard's indicative-overview scale: 2^20 rows — the
 // benchmarks exist to show where vortex-rdf stands, not to be a stress test,
 // and this size keeps a full refresh under an hour while still exercising
 // term handling at ~630k distinct terms.
 const dim = Number(process.env.BENCH_DIM ?? 0);
-const dimQuads = Number(process.env.BENCH_DIM_QUADS ?? 0);
+/** One dataset for the whole run: every store whose model has graphs builds
+ *  from it and answers every pattern on it, and one whose model does not (hdt)
+ *  reads the same rows with the graph dropped. */
 export const N_TRIPLES = Number(process.env.BENCH_SIZE ?? 0) || (dim > 0 ? dim ** 3 : 1_048_576);
-export const N_QUADS = Number(process.env.BENCH_SIZE_QUADS ?? 0) || (dimQuads > 0 ? dimQuads ** 4 : 524_288);
+export const N_QUADS = N_TRIPLES;
+/** Named graphs in that dataset, before the generator's coprimality nudge.
+ *  Matches the Rust suite's `WANT_GRAPHS` and the Python suite's
+ *  BENCH_GRAPHS_QUADS, so all three tabs describe the same shape. */
+export const GRAPHS = Number(process.env.BENCH_GRAPHS_QUADS ?? 8);
 export const MUT_BATCH = Number(process.env.MUT_BATCH ?? 10_000); // add/delete batch, independent of scale
 
 // The dataset-generation layer (genDataset and friends, the probe patterns,
@@ -64,6 +70,10 @@ export interface StoreAdapter<H = unknown> {
     addBatch?(h: H, quads: Quad[]): Promise<void> | void; // optional batch add (Vortex)
     deleteAll(h: H, quads: Quad[]): Promise<void> | void; // per-quad delete loop
     countMatch(h: H, p: Pat): Promise<number> | number; // count by consuming — every result term is read (consumeQuads)
+    /** Resolve the pattern and return only the match count — no term value is
+     *  read. Each store's cheapest correct count path (a count API where one
+     *  exists, the result set's length otherwise): the COUNT/ASK shape. */
+    countOnly(h: H, p: Pat): Promise<number> | number;
     // Cold-regime pair, optional: `snapshot` serializes a built store once
     // (untimed) and `open` adopts that snapshot into a fresh handle, which the
     // cold query phase does per iteration. Only the stores with a persistent
@@ -183,8 +193,6 @@ export function consumeQuads(
     consumeSink += acc; // the reads must escape, or the JIT may drop them
     return quads.length;
 }
-export function consumedChecksum(): number { return consumeSink; }
-
 /** [`consumeQuads`]'s contract for a store whose results are term strings
  *  rather than quad objects (hdt): read every string, escape the reads. */
 export function consumeStrings(strings: string[]): void {
@@ -203,6 +211,7 @@ export function vortexAdapter(variant: { slug: string; label: string; options: B
         addBatch: (h, quads) => h.addQuads(quads),
         deleteAll: async (h, quads) => { for (const q of quads) await h.deleteQuad(q); },
         countMatch: async (h, p) => consumeQuads(await h.getQuads(p.s, p.p, p.o, p.g)),
+        countOnly: (h, p) => h.countQuads(p.s, p.p, p.o, p.g),
         snapshot: (h) => h.toBytes(),
         open: (bytes) => VortexRdfStore.fromBytes(bytes as Uint8Array),
         dispose: freeWasm,
@@ -235,6 +244,7 @@ export function rdfStoresAdapter(kind: 'default' | 'single', label: string): Sto
         addAll: (h, quads) => { for (const q of quads) h.addQuad(q); },
         deleteAll: (h, quads) => { for (const q of quads) h.removeQuad(q); },
         countMatch: (h, p) => consumeQuads(h.getQuads(p.s, p.p, p.o, p.g)), // synchronous array
+        countOnly: (h, p) => h.countQuads(p.s, p.p, p.o, p.g),
     };
 }
 
@@ -247,6 +257,9 @@ export function oxigraphAdapter(): StoreAdapter<OxiStore> {
         addAll: (h, quads) => { for (const q of quads) h.add(q as never); },
         deleteAll: (h, quads) => { for (const q of quads) h.delete(q as never); },
         countMatch: (h, p) => consumeQuads(h.match(p.s as never, p.p as never, p.o as never, p.g as never)),
+        // No count API: match() materializes its result array either way, so
+        // walking its length is this store's floor for a count.
+        countOnly: (h, p) => h.match(p.s as never, p.p as never, p.o as never, p.g as never).length,
         dispose: freeWasm,
     };
 }
@@ -294,7 +307,9 @@ const HDT_TRANSLATE_IDS = 300_000 * 3;
 export function hdtAdapter(): StoreAdapter<HdtStore> {
     return {
         slug: 'hdt',
-        label: 'hdt (file)',
+        // Not "(file)": the wasm bindings parse the artifact's bytes into wasm
+        // linear memory, so this store answers from memory like the others.
+        label: 'hdt',
         ingestUnsupported:
             'the wasm bindings are read-only — the artifact is built natively '
             + '(the Rust comparative bench writes it) and only opened here',
@@ -333,6 +348,9 @@ export function hdtAdapter(): StoreAdapter<HdtStore> {
             }
             return ids.length / 3;
         },
+        // The id-level read: pattern resolution over the dictionary-encoded
+        // triples, no string translated.
+        countOnly: (h, p) => h.triple_ids_with_pattern(hdtTerm(p.s), hdtTerm(p.p), hdtTerm(p.o)).length / 3,
         // Its persistent form IS the artifact: snapshot hands over the file's
         // bytes, open parses them — the same reopen the other tabs measure.
         snapshot: async () => readFileSync(HDT_FILE),

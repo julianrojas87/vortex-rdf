@@ -5,7 +5,7 @@
 //
 // Run (after `npm run build` to produce pkg/web):
 //   npm run bench                         # full run (1,048,576 triples by default)
-//   BENCH_DIM=25 BENCH_DIM_QUADS=10 MUT_BATCH=2000 npm run bench   # quick local check (25³ rows)
+//   BENCH_DIM=25 MUT_BATCH=2000 npm run bench   # quick local check (25³ rows)
 //
 // The dataset is synthetic but realistic in the dimension that matters for a store
 // comparison: distinct terms scale with rows (ten triples per subject, a small closed
@@ -37,7 +37,7 @@ import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
 
 import {
-    ADAPTERS, MUT_ADAPTERS, N_TRIPLES, N_QUADS, MUT_BATCH,
+    ADAPTERS, MUT_ADAPTERS, N_TRIPLES, N_QUADS, GRAPHS, MUT_BATCH,
     QUERY_OPTS, HEAVY_OPTS, FULL_SCAN_OPTS, moduli, unsupportedRow, type Row,
 } from './shared.js';
 import { runWorkerProcess } from './util.js';
@@ -62,8 +62,6 @@ interface WorkerOutput {
     peakRssMb: number | null;
     storeFootprint?: Record<string, number | null>;
     matched?: Record<string, number>;
-    /** Snapshot byte size from the cold-query role — the store's serialized form. */
-    artifactBytes?: number | null;
     cardinality?: Record<string, unknown>;
     failures?: { phase: string; error: string }[];
 }
@@ -77,12 +75,10 @@ function runWorker(slug: string, role: 'query' | 'querycold' | 'fullscan' | 'mut
 }
 
 async function main(): Promise<void> {
-    const tm = moduli(N_TRIPLES);
-    const qm = moduli(N_QUADS, { graphs: 8 });
+    const qm = moduli(N_QUADS, { graphs: GRAPHS });
     console.log(
-        `Dataset shape: ${N_TRIPLES.toLocaleString()} triples ` +
-        `(${tm.terms.toLocaleString()} distinct terms), ` +
-        `${N_QUADS.toLocaleString()} quads (${qm.terms.toLocaleString()} distinct terms)…`);
+        `Dataset shape: ${N_QUADS.toLocaleString()} quads over ${qm.nGraph} named graphs ` +
+        `(${qm.terms.toLocaleString()} distinct terms)…`);
 
     const results: Row[] = [];
     const memory: MemoryRow[] = [];
@@ -120,7 +116,6 @@ async function main(): Promise<void> {
             }
         }
     };
-    const sizes: { slug: string; label: string; bytes: number | null }[] = [];
 
     for (const a of ADAPTERS) {
         const out = runWorker(a.slug, 'query');
@@ -151,9 +146,6 @@ async function main(): Promise<void> {
         const out = runWorker(a.slug, 'querycold');
         if (!out) { workerLost(a, 'querycold'); continue; }
         results.push(...out.rows);
-        // Serialized-store size: every adapter gets a row, so a store with no
-        // snapshot path renders as an explained cell rather than a gap.
-        sizes.push({ slug: a.slug, label: a.label, bytes: out.artifactBytes ?? null });
         for (const f of out.failures ?? []) {
             failures.push({ slug: a.slug, label: a.label, role: 'querycold', ...f });
             console.error(`  !! ${a.label} could not complete '${f.phase}': ${f.error}`);
@@ -200,10 +192,10 @@ async function main(): Promise<void> {
     const config = {
         triplesCount: N_TRIPLES,
         quadsCount: N_QUADS,
-        // Term cardinality is now an explicit property of the dataset, and
-        // selectivity follows from it — record both so a timing can be read
+        // Term cardinality is an explicit property of the dataset, and
+        // selectivity follows from it — record it so a timing can be read
         // against the number of rows it actually touched.
-        cardinality: { triples: moduli(N_TRIPLES), quads: moduli(N_QUADS, { graphs: 8 }) },
+        cardinality: moduli(N_QUADS, { graphs: GRAPHS }),
         matchedRows: matched,
         countWarnings,
         mutBatch: MUT_BATCH,
@@ -212,7 +204,7 @@ async function main(): Promise<void> {
         fullScanIterations: FULL_SCAN_OPTS.iterations,
     };
 
-    writeFileSync(OUT, JSON.stringify({ provenance: provenance(), results, memory, sizes, config, failures }, null, 2));
+    writeFileSync(OUT, JSON.stringify({ provenance: provenance(), results, memory, config, failures }, null, 2));
     console.log(`\nWrote ${results.length} benchmark rows, ${memory.length} memory readings`
         + `${failures.length ? `, ${failures.length} unmeasurable phase(s)` : ''} → ${OUT}`);
     for (const f of failures) console.log(`  missing: ${f.label} / ${f.role} / ${f.phase}`);
@@ -236,8 +228,8 @@ function provenance(): string {
     const cpu = cpus()[0]?.model ?? 'unknown CPU';
     return (
         `Measured ${measured} · node ${process.version} · ${cpu}, ${cpus().length} threads · ` +
-        `triples ${N_TRIPLES.toLocaleString()} (${moduli(N_TRIPLES).terms.toLocaleString()} terms), ` +
-        `quads ${N_QUADS.toLocaleString()} (${moduli(N_QUADS, { graphs: 8 }).terms.toLocaleString()} terms), ` +
+        `${N_QUADS.toLocaleString()} quads over ${moduli(N_QUADS, { graphs: GRAPHS }).nGraph} named graphs ` +
+        `(${moduli(N_QUADS, { graphs: GRAPHS }).terms.toLocaleString()} terms; hdt reads their triples projection), ` +
         `MUT_BATCH=${MUT_BATCH.toLocaleString()} · tinybench ${depVersion('tinybench')}, wall-clock · ` +
         `vortex-rdf-store ${require('../package.json').version}, rdf-stores ${depVersion('rdf-stores')}, oxigraph ${depVersion('oxigraph')}, hdt 0.7 (wasm, read-only) · ` +
         `one adapter per process, isolated`

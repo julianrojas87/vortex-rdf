@@ -40,15 +40,15 @@ REPO_ROOT = BENCH_DIR.parent.parent
 VENV_ROOT = BENCH_DIR / ".venvs"
 DATA_DIR = BENCH_DIR / ".data"
 
-# Scale, as row counts: BENCH_SIZE / BENCH_SIZE_QUADS -- the same env names
-# every suite reads (the Rust benches included), so one pair of knobs sets the
-# whole dashboard's scale. BENCH_DIM / BENCH_DIM_QUADS remain as cube shorthand
-# for quick pilots (BENCH_DIM=16 -> 4,096 rows) and lose to an explicit row
-# count. Defaults are the indicative-overview scale: 2**20 triples, 2**19 quads.
+# Scale, as a row count: BENCH_SIZE -- the same env name every suite reads (the
+# Rust benches included), so one knob sets the whole dashboard's scale. BENCH_DIM
+# remains as cube shorthand for quick pilots (BENCH_DIM=16 -> 4,096 rows) and
+# loses to an explicit row count. Default is the indicative-overview scale, 2**20.
 _dim = int(os.environ.get("BENCH_DIM", 0))
-_dim_quads = int(os.environ.get("BENCH_DIM_QUADS", 0))
-N_TRIPLES = int(os.environ.get("BENCH_SIZE", 0)) or (_dim**3 if _dim else 1_048_576)
-N_QUADS = int(os.environ.get("BENCH_SIZE_QUADS", 0)) or (_dim_quads**4 if _dim_quads else 524_288)
+#: One dataset for the whole run: every library that has graphs in its model
+#: builds from it, and the ones that do not read its triples projection.
+N_QUADS = int(os.environ.get("BENCH_SIZE", 0)) or (_dim**3 if _dim else 1_048_576)
+N_TRIPLES = N_QUADS
 GRAPHS = int(os.environ.get("BENCH_GRAPHS_QUADS", 8))
 MUT_BATCH = int(os.environ.get("MUT_BATCH", 10_000))
 PYTHON_VERSION = os.environ.get("BENCH_PYTHON", "3.13")
@@ -122,7 +122,7 @@ def run_worker(slug: str, role: str, triples: Path, quads: Path) -> dict | None:
         "--slug", slug, "--role", role,
         "--triples", str(triples), "--quads", str(quads),
         "--workdir", str(workdir),
-        "--n-triples", str(N_TRIPLES), "--n-quads", str(N_QUADS),
+        "--n", str(N_QUADS),
         "--graphs", str(GRAPHS), "--mut-batch", str(MUT_BATCH),
     ]
     log(f"\n[{slug}] {role}")
@@ -176,18 +176,17 @@ def main() -> int:
     # run had rather than whatever the last library left behind.
     mem = meminfo_mb()
 
-    tm = moduli(N_TRIPLES)
     qm = moduli(N_QUADS, DatasetOpts(graphs=GRAPHS))
 
-    triples = DATA_DIR / f"triples_{N_TRIPLES}.nt"
     quads = DATA_DIR / f"quads_{N_QUADS}.nq"
-    for path, n, opts in ((triples, N_TRIPLES, None), (quads, N_QUADS, DatasetOpts(graphs=GRAPHS))):
+    triples = DATA_DIR / f"triples_{N_TRIPLES}.nt"
+    for path, drop in ((quads, False), (triples, True)):
         if path.exists():
             log(f"reusing dataset {path.name} ({path.stat().st_size / 1e6:.1f} MB)")
         else:
-            log(f"generating {path.name} ({n:,} quads)…")
+            log(f"generating {path.name} ({N_QUADS:,} rows)…")
             t0 = time.perf_counter()
-            write_dataset(str(path), n, opts)
+            write_dataset(str(path), N_QUADS, DatasetOpts(graphs=GRAPHS), drop_graph=drop)
             log(f"  wrote {path.stat().st_size / 1e6:.1f} MB in {time.perf_counter() - t0:.1f}s")
 
     rows: list = []
@@ -261,8 +260,8 @@ def main() -> int:
     measured = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     provenance = (
         f"Measured {measured} · Python {py_ver} · {cpu_model()}, {os.cpu_count()} threads · "
-        f"triples {N_TRIPLES:,} ({tm.terms:,} terms), "
-        f"quads {N_QUADS:,} ({qm.terms:,} terms), MUT_BATCH={MUT_BATCH:,} · "
+        f"{N_QUADS:,} quads over {qm.n_graph} named graphs ({qm.terms:,} terms; "
+        f"lightrdf reads their triples projection), MUT_BATCH={MUT_BATCH:,} · "
         f"wall-clock (perf_counter_ns) · {lib_str} · one adapter per process and per virtualenv, isolated"
     )
 
@@ -278,7 +277,7 @@ def main() -> int:
         "config": {
             "triplesCount": N_TRIPLES,
             "quadsCount": N_QUADS,
-            "cardinality": {"triples": tm.__dict__, "quads": qm.__dict__},
+            "cardinality": qm.__dict__,
             "matchedRows": matched,
             "mutBatch": MUT_BATCH,
             # Same key names the JS harness emits, so both tabs state their

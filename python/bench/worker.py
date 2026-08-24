@@ -194,14 +194,20 @@ def run_query(a, args) -> dict:
     log = lambda msg: print(f"  [{a.label}] {msg}", file=sys.stderr, flush=True)
 
     workdir = args.workdir
-    artifact = a.artifact_path(workdir, args.triples)
+    # One dataset for the whole run. A library whose model has graphs builds
+    # from the quads file and answers every pattern on it; one whose model does
+    # not reads the triples projection of the same rows -- same subjects,
+    # predicates and objects, graph dropped -- so the two still count the same
+    # rows for every pattern that binds no graph.
+    src = args.quads if a.supports_quads else args.triples
+    artifact = a.artifact_path(workdir, src)
 
     # --- build (ingest) ---
     log("build…")
     handle_box: list = []
 
     def do_build():
-        h = a.build(args.triples, artifact)
+        h = a.build(src, artifact)
         handle_box.append(h)
         return h
 
@@ -226,7 +232,7 @@ def run_query(a, args) -> dict:
         log("open…")
         measure(
             f"open::{a.slug}",
-            lambda: a.open(artifact, args.triples),
+            lambda: a.open(artifact, src),
             rows,
             QUERY_ITERS,
             warmup=QUERY_WARMUP,
@@ -242,14 +248,48 @@ def run_query(a, args) -> dict:
         )
 
     # --- match: triple patterns + full scan ---
-    handle = a.open(artifact, args.triples)
-    probes = dataset_probes(args.n_triples)
-    for pat in probes["triples"]:
+    handle = a.open(artifact, src)
+    probes = dataset_probes(args.n, DatasetOpts(graphs=args.graphs))
+    # The graph probes are part of the one pattern set now, not a second
+    # dataset's; a library without graphs in its model reports them unsupported.
+    pattern_set = list(probes["triples"])
+    if a.supports_quads:
+        pattern_set += probes["quads"]
+    else:
+        # Both regimes, matching the cold pass this adapter does run below, so
+        # neither cell reads as a benchmark nobody bothered with.
+        regimes = ["warm", "cold"] if a.has_distinct_open else ["warm"]
+        for pat in probes["quads"]:
+            for regime in regimes:
+                for ident in (f"{a.slug}::{pat.name}", f"{a.slug}::{pat.name}::count"):
+                    rows.append(
+                        unsupported_row(
+                            ident,
+                            "this library's model has no graphs -- it reads the triples projection",
+                        )
+                        | {"regime": regime}
+                    )
+    for pat in pattern_set:
         log(f"match {pat.name}…")
         counts[pat.name] = a.count(handle, pat)
+        # A count path that resolves differently must fail loudly here, not
+        # time the wrong work below.
+        n_count = a.count_only(handle, pat)
+        if n_count != counts[pat.name]:
+            raise RuntimeError(
+                f"count_only disagrees for {pat.name}: {n_count} != {counts[pat.name]}"
+            )
         measure(
             f"{a.slug}::{pat.name}",
             lambda p=pat: a.count(handle, p),
+            rows,
+            QUERY_ITERS,
+            QUERY_WARMUP,
+            regime="warm",
+        )
+        measure(
+            f"{a.slug}::{pat.name}::count",
+            lambda p=pat: a.count_only(handle, p),
             rows,
             QUERY_ITERS,
             QUERY_WARMUP,
@@ -272,12 +312,12 @@ def run_query(a, args) -> dict:
         box: list = []
 
         def open_cold():
-            box.append(a.open(artifact, args.triples))
+            box.append(a.open(artifact, src))
 
         def drop_cold(_result):
             a.dispose(box.pop())
 
-        for pat in probes["triples"]:
+        for pat in pattern_set:
             log(f"match {pat.name} (cold)…")
             measure(
                 f"{a.slug}::{pat.name}",
@@ -289,11 +329,31 @@ def run_query(a, args) -> dict:
                 teardown=drop_cold,
                 regime="cold",
             )
+            measure(
+                f"{a.slug}::{pat.name}::count",
+                lambda p=pat: a.count_only(box[-1], p),
+                rows,
+                QUERY_ITERS,
+                QUERY_WARMUP,
+                setup=open_cold,
+                teardown=drop_cold,
+                regime="cold",
+            )
 
     log("match full…")
     full = probes["full"][0]
     counts["full"] = a.count(handle, full)
+    n_count = a.count_only(handle, full)
+    if n_count != counts["full"]:
+        raise RuntimeError(f"count_only disagrees for full: {n_count} != {counts['full']}")
     measure(f"{a.slug}::full", lambda: a.count(handle, full), rows, FULL_SCAN_ITERS, regime="warm")
+    measure(
+        f"{a.slug}::full::count",
+        lambda: a.count_only(handle, full),
+        rows,
+        FULL_SCAN_ITERS,
+        regime="warm",
+    )
 
     if a.has_distinct_open:
         log("match full (cold)…")
@@ -306,56 +366,18 @@ def run_query(a, args) -> dict:
             teardown=drop_cold,
             regime="cold",
         )
+        measure(
+            f"{a.slug}::full::count",
+            lambda: a.count_only(box[-1], full),
+            rows,
+            FULL_SCAN_ITERS,
+            setup=open_cold,
+            teardown=drop_cold,
+            regime="cold",
+        )
     a.dispose(handle)
     del handle
     gc.collect()
-
-    # --- match: quad patterns, over the separately built quads dataset ---
-    quad_probes = dataset_probes(args.n_quads, DatasetOpts(graphs=args.graphs))["quads"]
-    if not a.supports_quads:
-        for pat in quad_probes:
-            rows.append(
-                unsupported_row(f"{a.slug}::{pat.name}", "no named-graph argument in the query API")
-            )
-    else:
-        log("build (quads)…")
-        quads_artifact = a.artifact_path(workdir, args.quads)
-        qh = a.build(args.quads, quads_artifact)
-        for pat in quad_probes:
-            log(f"match {pat.name}…")
-            counts[pat.name] = a.count(qh, pat)
-            measure(
-                f"{a.slug}::{pat.name}",
-                lambda p=pat: a.count(qh, p),
-                rows,
-                QUERY_ITERS,
-                QUERY_WARMUP,
-                regime="warm",
-            )
-        if a.has_distinct_open:
-            qbox: list = []
-
-            def open_cold_quad():
-                qbox.append(a.open(quads_artifact, args.quads))
-
-            def drop_cold_quad(_result):
-                a.dispose(qbox.pop())
-
-            for pat in quad_probes:
-                log(f"match {pat.name} (cold)…")
-                measure(
-                    f"{a.slug}::{pat.name}",
-                    lambda p=pat: a.count(qbox[-1], p),
-                    rows,
-                    QUERY_ITERS,
-                    QUERY_WARMUP,
-                    setup=open_cold_quad,
-                    teardown=drop_cold_quad,
-                    regime="cold",
-                )
-        a.dispose(qh)
-        del qh
-        gc.collect()
 
     return {
         "rows": rows,
@@ -391,8 +413,9 @@ def run_mutate(a, args) -> dict:
         # mutation-workload measurement in the memory panel.
         return {"rows": rows, "counts": {}, "artifact_bytes": None, "peak_rss_mb": None}
 
+    src = args.quads if a.supports_quads else args.triples
     fresh = fresh_quads(args.mut_batch)
-    del_slice = dataset_prefix(args.n_triples, args.mut_batch)
+    del_slice = dataset_prefix(args.n, args.mut_batch, DatasetOpts(graphs=args.graphs))
 
     # add: into an empty store, so the measurement is the insert path and not a
     # lookup against however many rows the dataset happens to hold.
@@ -421,7 +444,7 @@ def run_mutate(a, args) -> dict:
 
     def setup_loaded():
         dholder.clear()
-        dholder.append(a.build(args.triples, a.artifact_path(args.workdir, args.triples)))
+        dholder.append(a.build(src, a.artifact_path(args.workdir, src)))
 
     measure(
         f"delete::{a.slug}",
@@ -442,8 +465,7 @@ def main() -> int:
     ap.add_argument("--triples", required=True)
     ap.add_argument("--quads", required=True)
     ap.add_argument("--workdir", required=True)
-    ap.add_argument("--n-triples", type=int, required=True)
-    ap.add_argument("--n-quads", type=int, required=True)
+    ap.add_argument("--n", type=int, required=True)
     ap.add_argument("--graphs", type=int, default=8)
     ap.add_argument("--mut-batch", type=int, default=10_000)
     args = ap.parse_args()

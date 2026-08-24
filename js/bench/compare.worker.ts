@@ -8,7 +8,7 @@ import { withCodSpeed } from '@codspeed/tinybench-plugin';
 import { writeFileSync } from 'node:fs';
 
 import {
-    ADAPTERS, MUT_ADAPTERS, N_TRIPLES, N_QUADS, MUT_BATCH,
+    ADAPTERS, MUT_ADAPTERS, N_TRIPLES, N_QUADS, GRAPHS, MUT_BATCH,
     genDataset, genFresh, genDatasetPrefix, datasetProbes, moduli,
     FULL_SCAN_PATTERN, QUERY_OPTS, COLD_QUERY_OPTS, HEAVY_OPTS, FULL_SCAN_OPTS,
     reclaim, collect, unsupportedRow, peakRssMb, rssMb, jsHeapMb, wasmHeapMb,
@@ -99,11 +99,6 @@ function splitBySpeed(pats: Pat[], costMs: Record<string, number>): { fast: Pat[
     return { fast, slow };
 }
 
-/** Byte size of the store's serialized snapshot, when this role built one --
- *  the JS store's persistent form is a byte buffer, so this is its "artifact
- *  size", the counterpart of the on-disk sizes the other tabs report. */
-let snapshotBytes: number | null = null;
-
 /** What building the store cost, over and above the input `Quad[]`. */
 const storeFootprint: Record<string, number | null> = {};
 
@@ -130,6 +125,12 @@ async function countAll(a: StoreAdapter, h: unknown, pats: Pat[]): Promise<Recor
         try {
             matched[p.name] = await a.countMatch(h, p);
             costMs[p.name] = performance.now() - t0;
+            // A count path that resolves differently must fail loudly here,
+            // not time the wrong work in the benches below.
+            const c = await a.countOnly(h, p);
+            if (c !== matched[p.name]) {
+                throw new Error(`countOnly disagrees: ${c} vs ${matched[p.name]}`);
+            }
         } catch (e) {
             const error = e instanceof Error ? e.message : String(e);
             console.error(`  !! count '${p.name}' failed: ${error}`);
@@ -139,13 +140,28 @@ async function countAll(a: StoreAdapter, h: unknown, pats: Pat[]): Promise<Recor
     return costMs;
 }
 
+/** The dataset options a store gets: the graph-bearing dataset where its model
+ *  has graphs, and the same rows with the graph dropped where it does not. One
+ *  dataset either way, so every store counts the same rows for every pattern
+ *  that binds no graph. */
+function datasetOptsFor(a: StoreAdapter) {
+    return a.quadsUnsupported ? undefined : { graphs: GRAPHS };
+}
+
+/** Every pattern a store answers: the triple probes always, the graph probes
+ *  where its model has graphs. */
+function patternsFor(a: StoreAdapter) {
+    const probes = datasetProbes(N_TRIPLES, datasetOptsFor(a));
+    return a.quadsUnsupported ? probes.triples : [...probes.triples, ...probes.quads];
+}
+
 async function runQuery(a: StoreAdapter): Promise<Row[]> {
     const rows: Row[] = [];
-    const tProbes = datasetProbes(N_TRIPLES);
-    const qProbes = datasetProbes(N_QUADS, { graphs: 8 });
+    const tProbes = { triples: patternsFor(a) };
+    const qProbes = datasetProbes(N_QUADS, { graphs: GRAPHS });
 
-    console.log(`[${a.label}] query (triples)…`);
-    const triples = genDataset(N_TRIPLES);
+    console.log(`[${a.label}] query…`);
+    const triples = genDataset(N_TRIPLES, datasetOptsFor(a));
     // Measure across the build only. The input array is ~a gigabyte of JS objects
     // and is identical for every adapter, so a delta isolates the store's own
     // footprint far better than any absolute reading — and unlike dropping the
@@ -164,43 +180,34 @@ async function runQuery(a: StoreAdapter): Promise<Row[]> {
     const tSplit = splitBySpeed(tProbes.triples, tCost);
     if (tSplit.fast.length) {
         await bench('query_triples', rows, QUERY_OPTS, (b) => {
-            for (const p of tSplit.fast) b.add(`${a.slug}::${p.name}`, async () => { await a.countMatch(th, p); });
+            for (const p of tSplit.fast) {
+                b.add(`${a.slug}::${p.name}`, async () => { await a.countMatch(th, p); });
+                b.add(`${a.slug}::${p.name}::count`, async () => { await a.countOnly(th, p); });
+            }
         }, 'warm');
     }
     if (tSplit.slow.length) {
         await bench('query_triples_slow', rows, ONE_SHOT, (b) => {
-            for (const p of tSplit.slow) b.add(`${a.slug}::${p.name}`, async () => { await a.countMatch(th, p); });
+            for (const p of tSplit.slow) {
+                b.add(`${a.slug}::${p.name}`, async () => { await a.countMatch(th, p); });
+                b.add(`${a.slug}::${p.name}::count`, async () => { await a.countOnly(th, p); });
+            }
         }, 'warm');
     }
     reclaim(a, th);
     th = null;
 
     if (a.quadsUnsupported) {
-        // No quads in the model at all — say so per probe rather than leaving
-        // cells that read as benchmarks nobody ran.
+        // No graph in the model at all — say so per probe rather than leaving
+        // cells that read as benchmarks nobody ran. This store answered the
+        // triple patterns above, on the projection of the same rows.
         for (const p of qProbes.quads) {
-            const r = unsupportedRow(`${a.slug}::${p.name}`, a.quadsUnsupported);
-            r.regime = 'warm';
-            rows.push(r);
+            for (const id of [`${a.slug}::${p.name}`, `${a.slug}::${p.name}::count`]) {
+                const r = unsupportedRow(id, a.quadsUnsupported);
+                r.regime = 'warm';
+                rows.push(r);
+            }
         }
-    } else {
-        console.log(`[${a.label}] query (quads)…`);
-        const quads = genDataset(N_QUADS, { graphs: 8 });
-        let qh: unknown = await a.build(quads);
-        const qCost = await countAll(a, qh, qProbes.quads);
-        const qSplit = splitBySpeed(qProbes.quads, qCost);
-        if (qSplit.fast.length) {
-            await bench('query_quads', rows, QUERY_OPTS, (b) => {
-                for (const p of qSplit.fast) b.add(`${a.slug}::${p.name}`, async () => { await a.countMatch(qh, p); });
-            }, 'warm');
-        }
-        if (qSplit.slow.length) {
-            await bench('query_quads_slow', rows, ONE_SHOT, (b) => {
-                for (const p of qSplit.slow) b.add(`${a.slug}::${p.name}`, async () => { await a.countMatch(qh, p); });
-            }, 'warm');
-        }
-        reclaim(a, qh);
-        qh = null;
     }
 
     if (a.ingestUnsupported) {
@@ -276,16 +283,20 @@ async function runQueryCold(a: StoreAdapter): Promise<Row[]> {
                     beforeEach: async () => { h = await a.open!(snap); },
                     afterEach: () => { a.dispose?.(h); h = undefined; },
                 });
+                let hc: unknown;
+                b.add(`${a.slug}::${p.name}::count`, async () => { await a.countOnly(hc, p); }, {
+                    beforeEach: async () => { hc = await a.open!(snap); },
+                    afterEach: () => { a.dispose?.(hc); hc = undefined; },
+                });
             }
         }, 'cold');
     };
 
-    console.log(`[${a.label}] query cold (triples)…`);
-    const triples = genDataset(N_TRIPLES);
-    const tProbes = datasetProbes(N_TRIPLES);
+    console.log(`[${a.label}] query cold…`);
+    const triples = genDataset(N_TRIPLES, datasetOptsFor(a));
+    const tProbes = { triples: patternsFor(a) };
     let th: unknown = await a.build(triples);
     const tSnap = await a.snapshot(th);
-    snapshotBytes = (tSnap as Uint8Array)?.byteLength ?? null;
     reclaim(a, th);
     th = null;
 
@@ -300,25 +311,17 @@ async function runQueryCold(a: StoreAdapter): Promise<Row[]> {
         });
     });
 
-    await coldPass('query_triples_cold', tSnap, tProbes.triples);
+    await coldPass('query_cold', tSnap, tProbes.triples);
 
-    const qProbes = datasetProbes(N_QUADS, { graphs: 8 });
     if (a.quadsUnsupported) {
-        for (const p of qProbes.quads) {
-            const r = unsupportedRow(`${a.slug}::${p.name}`, a.quadsUnsupported);
-            r.regime = 'cold';
-            rows.push(r);
+        for (const p of datasetProbes(N_QUADS, { graphs: GRAPHS }).quads) {
+            for (const id of [`${a.slug}::${p.name}`, `${a.slug}::${p.name}::count`]) {
+                const r = unsupportedRow(id, a.quadsUnsupported);
+                r.regime = 'cold';
+                rows.push(r);
+            }
         }
-        return rows;
     }
-
-    console.log(`[${a.label}] query cold (quads)…`);
-    const quads = genDataset(N_QUADS, { graphs: 8 });
-    let qh: unknown = await a.build(quads);
-    const qSnap = await a.snapshot(qh);
-    reclaim(a, qh);
-    qh = null;
-    await coldPass('query_quads_cold', qSnap, qProbes.quads);
 
     return rows;
 }
@@ -326,7 +329,7 @@ async function runQueryCold(a: StoreAdapter): Promise<Row[]> {
 async function runFullScan(a: StoreAdapter): Promise<Row[]> {
     const rows: Row[] = [];
     console.log(`[${a.label}] full scan…`);
-    const triples = genDataset(N_TRIPLES);
+    const triples = genDataset(N_TRIPLES, datasetOptsFor(a));
     let h: unknown = await a.build(triples);
     // Record what the scan matches, as the pattern probes do — the strongest
     // cross-adapter check there is: every store must return the whole dataset.
@@ -353,11 +356,23 @@ async function runFullScan(a: StoreAdapter): Promise<Row[]> {
         await bench('full', rows, opts, (b) => {
             b.add(`${a.slug}::full`, async () => { await a.countMatch(h, FULL_SCAN_PATTERN); });
         }, 'warm');
+        // The count twin gets its own repetition plan: a store with a real
+        // count path answers orders of magnitude below the consuming scan.
+        await bench('full_count', rows, FULL_SCAN_OPTS, (b) => {
+            b.add(`${a.slug}::full::count`, async () => { await a.countOnly(h, FULL_SCAN_PATTERN); });
+        }, 'warm');
         if (a.snapshot && a.open) {
             const snap = await a.snapshot(h);
             await bench('full_cold', rows, opts, (b) => {
                 let fresh: unknown;
                 b.add(`${a.slug}::full`, async () => { await a.countMatch(fresh, FULL_SCAN_PATTERN); }, {
+                    beforeEach: async () => { fresh = await a.open!(snap); },
+                    afterEach: () => { a.dispose?.(fresh); fresh = undefined; },
+                });
+            }, 'cold');
+            await bench('full_count_cold', rows, FULL_SCAN_OPTS, (b) => {
+                let fresh: unknown;
+                b.add(`${a.slug}::full::count`, async () => { await a.countOnly(fresh, FULL_SCAN_PATTERN); }, {
                     beforeEach: async () => { fresh = await a.open!(snap); },
                     afterEach: () => { a.dispose?.(fresh); fresh = undefined; },
                 });
@@ -420,10 +435,7 @@ async function main(): Promise<void> {
         storeFootprint,
         matched,
         failures,
-        artifactBytes: snapshotBytes,
-        cardinality: role === 'query'
-            ? { triples: moduli(N_TRIPLES), quads: moduli(N_QUADS, { graphs: 8 }) }
-            : undefined,
+        cardinality: role === 'query' ? moduli(N_QUADS, { graphs: GRAPHS }) : undefined,
     }));
 }
 

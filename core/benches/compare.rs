@@ -72,10 +72,12 @@ use dataset::{
     BASE, graph_iri as graph_term, predicate_iri as predicate_term, subject_iri as subject_term,
 };
 
-/// Moduli for the *triples* dataset: one graph, i.e. the default graph, which is
-/// what an N-Triples file can carry.
+/// Moduli for the comparative dataset. `WANT_GRAPHS` is nudged to a count
+/// coprime with the other roles, so the graph column does not track them; the
+/// triples projection uses these same moduli, which is what makes row `i` the
+/// same row in both files.
 fn moduli(n: usize) -> dataset::Moduli {
-    dataset::moduli(n, 1)
+    dataset::moduli(n, dataset::WANT_GRAPHS)
 }
 
 /// Objects in their N-Triples spelling: angle-bracketed IRI or quoted literal.
@@ -83,19 +85,13 @@ fn object_term(i: usize) -> String {
     dataset::object_term(i).to_ntriples()
 }
 
-/// Rows in the named-graph dataset — the quads the G/SPOG probes run against.
-/// 2^19 by default, half the triples dataset; the other two tabs read the same
-/// `BENCH_SIZE_QUADS` variable.
-fn quads_size() -> usize {
-    std::env::var("BENCH_SIZE_QUADS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(524_288)
-}
-
-/// The N-Quads file for the named-graph patterns. Shared with the Python suite
-/// (`quads_<n>.nq`, GRAPHS=8 — `dataset::WANT_GRAPHS`, the count the generated
-/// dataset asks for too); generated here only when missing.
+/// The comparative dataset: `n` quads over `WANT_GRAPHS` named graphs (the
+/// coprimality nudge lands it at 17 at the dashboard's size), written once and
+/// shared by all three comparative suites.
+///
+/// One dataset, not two: every library that can hold a graph builds from this
+/// file and answers every pattern on it, so a row count means the same thing in
+/// every cell of every tab.
 fn ensure_quads_dataset(n: usize) -> PathBuf {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
     let path = root
@@ -106,7 +102,7 @@ fn ensure_quads_dataset(n: usize) -> PathBuf {
     }
     eprintln!("generating {} quads -> {}", n, path.display());
     std::fs::create_dir_all(path.parent().unwrap()).expect("create data dir");
-    let m = dataset::moduli(n, dataset::WANT_GRAPHS);
+    let m = moduli(n);
     let tmp = path.with_extension("partial");
     let mut w = BufWriter::with_capacity(1 << 20, std::fs::File::create(&tmp).expect("create"));
     let mut line = String::with_capacity(256);
@@ -124,6 +120,7 @@ fn ensure_quads_dataset(n: usize) -> PathBuf {
         w.write_all(line.as_bytes()).expect("write");
     }
     w.flush().expect("flush");
+    // Never leave a half-written dataset that looks complete.
     std::fs::rename(&tmp, &path).expect("rename");
     path
 }
@@ -136,12 +133,20 @@ fn dataset_path(n: usize) -> PathBuf {
         .join(format!("triples_{n}.nt"))
 }
 
+/// The triples projection of [`ensure_quads_dataset`]: the same rows under the
+/// same moduli, with the graph dropped.
+///
+/// What a library that cannot hold graphs reads. Row `i` is row `i` of the
+/// quads file without its fourth term, so those libraries answer the triple
+/// patterns over exactly the rows the graph-capable ones do — the counts stay
+/// comparable, and what they lack is the graph, not rows. `G`/`SPOG` are
+/// unsupported for them, which is the only place the difference shows.
 fn ensure_dataset(n: usize) -> PathBuf {
     let path = dataset_path(n);
     if path.exists() {
         return path;
     }
-    eprintln!("generating {} triples -> {}", n, path.display());
+    eprintln!("projecting {} quads to triples -> {}", n, path.display());
     std::fs::create_dir_all(path.parent().unwrap()).expect("create data dir");
     let m = moduli(n);
     let tmp = path.with_extension("partial");
@@ -226,9 +231,10 @@ fn probes(n: usize) -> Vec<Pat> {
     ]
 }
 
-/// The two probes only the named-graph dataset can answer. Index-0 terms, like
-/// every other probe, so both match at least row 0.
-fn quad_probes() -> Vec<Pat> {
+/// The two probes that bind a graph. Index-0 terms, like every other probe, so
+/// both match at least row 0. Only a library whose model has graphs answers
+/// them; the rest report `unsupported` (see `Adapter::handles_graphs`).
+fn graph_probes() -> Vec<Pat> {
     let s0 = format!("<{}>", subject_term(0));
     let p0 = format!("<{}>", predicate_term(0));
     let o0 = object_term(0);
@@ -456,14 +462,30 @@ trait Adapter {
     fn build(&self, src: &Path, artifact: &Path);
     fn open(&self, artifact: &Path, src: &Path) -> Box<dyn Queryable>;
 
-    /// The named-graph dataset's artifact, or None where the model has no
-    /// quads at all (hdt) — those G/SPOG cells read `unsupported`.
-    fn quads_artifact(&self, workdir: &Path) -> Option<PathBuf> {
-        Some(workdir.join("quads.marker"))
+    /// Whether the library's model has graphs at all.
+    ///
+    /// True (the default) means it builds from the quad dataset and answers
+    /// every pattern on it. False means its model is triples-only (hdt), so it
+    /// reads the triples projection of the same rows — the same subjects,
+    /// predicates and objects, with the graph dropped — and its `G`/`SPOG`
+    /// cells read `unsupported`.
+    fn handles_graphs(&self) -> bool {
+        true
     }
-    fn build_quads(&self, _src: &Path, _artifact: &Path) {}
-    fn open_quads(&self, _artifact: &Path, _src: &Path) -> Box<dyn Queryable> {
-        unreachable!("open_quads on an adapter whose quads_artifact is None")
+}
+
+/// Which RDF format a source path carries: the dataset is N-Quads, its
+/// projection N-Triples, and every adapter parses whichever it was handed.
+fn source_is_quads(src: &Path) -> bool {
+    src.extension().is_some_and(|e| e == "nq")
+}
+
+/// [`source_is_quads`] in oxigraph's format enum.
+fn oxigraph_format(src: &Path) -> oxigraph::io::RdfFormat {
+    if source_is_quads(src) {
+        oxigraph::io::RdfFormat::NQuads
+    } else {
+        oxigraph::io::RdfFormat::NTriples
     }
 }
 
@@ -481,6 +503,11 @@ trait Queryable {
     /// JavaScript tab's `consumeQuads` applies. What is timed is producing the
     /// terms; what is returned is the row count the harness cross-checks.
     fn count(&self, pat: &Pat) -> usize;
+
+    /// Resolve the same pattern and return only how many rows matched — no
+    /// term is read. Each library's cheapest correct count path, the
+    /// COUNT/ASK shape of the workload.
+    fn count_only(&self, pat: &Pat) -> usize;
 }
 
 /// The lexical bytes of one oxrdf term — the read that forces a matched row's
@@ -571,7 +598,12 @@ impl Adapter for VortexAdapter {
     }
     fn build(&self, src: &Path, artifact: &Path) {
         let file = std::fs::File::open(src).expect("open source");
-        let quads = parse_quads_from_reader(file, oxrdfio::RdfFormat::NTriples);
+        let format = if source_is_quads(src) {
+            oxrdfio::RdfFormat::NQuads
+        } else {
+            oxrdfio::RdfFormat::NTriples
+        };
+        let quads = parse_quads_from_reader(file, format);
         rt().block_on(vortex_rdf_core::io::quads_stream_to_vortex_file(
             Box::pin(quads),
             artifact,
@@ -599,24 +631,6 @@ impl Adapter for VortexAdapter {
             VortexRdfStore::from_parts(parts).expect("load store into memory")
         });
         Box::new(VortexStore(store))
-    }
-
-    fn quads_artifact(&self, workdir: &Path) -> Option<PathBuf> {
-        Some(workdir.join(format!("{}_quads.vortex", self.slug)))
-    }
-    fn build_quads(&self, src: &Path, artifact: &Path) {
-        let file = std::fs::File::open(src).expect("open quads source");
-        let quads = parse_quads_from_reader(file, oxrdfio::RdfFormat::NQuads);
-        rt().block_on(vortex_rdf_core::io::quads_stream_to_vortex_file(
-            Box::pin(quads),
-            artifact,
-            self.layout,
-            self.indexes.clone(),
-        ))
-        .expect("build vortex quads file");
-    }
-    fn open_quads(&self, artifact: &Path, src: &Path) -> Box<dyn Queryable> {
-        self.open(artifact, src)
     }
 }
 
@@ -646,6 +660,26 @@ impl Queryable for VortexStore {
             let bytes: usize = quads.iter().map(oxrdf_quad_bytes).sum();
             std::hint::black_box(bytes);
             quads.len()
+        })
+    }
+
+    fn count_only(&self, pat: &Pat) -> usize {
+        let s = pat.s.as_ref().map(|t| parse_subject(t));
+        let p = pat.p.as_ref().map(|t| parse_predicate(t));
+        let o = pat.o.as_ref().map(|t| parse_object(t));
+        let g = pat
+            .g
+            .as_ref()
+            .map(|t| oxrdf::GraphName::NamedNode(oxrdf::NamedNode::new_unchecked(strip_iri(t))));
+        rt().block_on(async {
+            let view = self
+                .0
+                .match_pattern(s.as_ref(), p.as_ref(), o.as_ref(), g.as_ref())
+                .await
+                .expect("match");
+            // The count-only read: the selection's size, evaluating the match
+            // where it was deferred but decoding no quad.
+            view.size().await.expect("size")
         })
     }
 }
@@ -686,22 +720,11 @@ impl Adapter for OxigraphAdapter {
         workdir.join("oxigraph.marker")
     }
     fn build(&self, src: &Path, artifact: &Path) {
-        let store = load_oxigraph(src, oxigraph::io::RdfFormat::NTriples);
+        let store = load_oxigraph(src, oxigraph_format(src));
         std::fs::write(artifact, format!("{}", store.len().unwrap())).ok();
     }
     fn open(&self, _artifact: &Path, src: &Path) -> Box<dyn Queryable> {
-        Box::new(OxStore(load_oxigraph(
-            src,
-            oxigraph::io::RdfFormat::NTriples,
-        )))
-    }
-
-    fn build_quads(&self, src: &Path, artifact: &Path) {
-        let store = load_oxigraph(src, oxigraph::io::RdfFormat::NQuads);
-        std::fs::write(artifact, format!("{}", store.len().unwrap())).ok();
-    }
-    fn open_quads(&self, _artifact: &Path, src: &Path) -> Box<dyn Queryable> {
-        Box::new(OxStore(load_oxigraph(src, oxigraph::io::RdfFormat::NQuads)))
+        Box::new(OxStore(load_oxigraph(src, oxigraph_format(src))))
     }
 }
 
@@ -716,6 +739,18 @@ struct OxStore(oxigraph::store::Store);
 
 impl Queryable for OxStore {
     fn count(&self, pat: &Pat) -> usize {
+        self.run(pat, true)
+    }
+
+    fn count_only(&self, pat: &Pat) -> usize {
+        // No count API in oxigraph: the iterator still decodes owned quads,
+        // which is this store's floor for answering a count.
+        self.run(pat, false)
+    }
+}
+
+impl OxStore {
+    fn run(&self, pat: &Pat, consume: bool) -> usize {
         use oxigraph::model::{GraphNameRef, NamedNodeRef, NamedOrBlankNodeRef, TermRef};
         let s = pat.s.as_ref().map(|t| strip_iri(t));
         let p = pat.p.as_ref().map(|t| strip_iri(t));
@@ -740,39 +775,33 @@ impl Queryable for OxStore {
             Some(t) => {
                 let stripped = strip_iri(t);
                 // NamedNodeRef borrows, so the owned String must outlive it.
-                return self.count_named_object(&s_ref, &p_ref, &stripped, &g_ref);
+                let o_ref = TermRef::NamedNode(NamedNodeRef::new_unchecked(&stripped));
+                return drain_oxigraph(
+                    self.0.quads_for_pattern(s_ref, p_ref, Some(o_ref), g_ref),
+                    consume,
+                );
             }
         };
-        consume_oxigraph(self.0.quads_for_pattern(s_ref, p_ref, o_ref, g_ref))
+        drain_oxigraph(self.0.quads_for_pattern(s_ref, p_ref, o_ref, g_ref), consume)
     }
 }
 
-/// Drain an oxigraph result iterator, reading every term it decodes.
-fn consume_oxigraph<E: std::fmt::Debug>(
+/// Drain an oxigraph result iterator; `consume` reads every term it decodes,
+/// the count-only arm just walks it.
+fn drain_oxigraph<E: std::fmt::Debug>(
     quads: impl Iterator<Item = Result<oxigraph::model::Quad, E>>,
+    consume: bool,
 ) -> usize {
     let mut rows = 0usize;
     let mut bytes = 0usize;
     for q in quads {
-        bytes += oxigraph_quad_bytes(&q.expect("oxigraph quad"));
+        if consume {
+            bytes += oxigraph_quad_bytes(&q.expect("oxigraph quad"));
+        }
         rows += 1;
     }
     std::hint::black_box(bytes);
     rows
-}
-
-impl OxStore {
-    fn count_named_object(
-        &self,
-        s: &Option<oxigraph::model::NamedOrBlankNodeRef<'_>>,
-        p: &Option<oxigraph::model::NamedNodeRef<'_>>,
-        o: &str,
-        g: &Option<oxigraph::model::GraphNameRef<'_>>,
-    ) -> usize {
-        use oxigraph::model::{NamedNodeRef, TermRef};
-        let o_ref = TermRef::NamedNode(NamedNodeRef::new_unchecked(o));
-        consume_oxigraph(self.0.quads_for_pattern(*s, *p, Some(o_ref), *g))
-    }
 }
 
 // ── oxigraph (rocksdb) ──
@@ -796,22 +825,12 @@ impl Adapter for OxigraphRocksAdapter {
         workdir.join("oxigraph.rocksdb")
     }
     fn build(&self, src: &Path, artifact: &Path) {
-        build_oxigraph_rocksdb(artifact, src, oxigraph::io::RdfFormat::NTriples);
+        build_oxigraph_rocksdb(artifact, src, oxigraph_format(src));
     }
     fn open(&self, artifact: &Path, _src: &Path) -> Box<dyn Queryable> {
         Box::new(OxStore(
             oxigraph::store::Store::open_read_only(artifact).expect("open rocksdb read-only"),
         ))
-    }
-
-    fn quads_artifact(&self, workdir: &Path) -> Option<PathBuf> {
-        Some(workdir.join("quads.rocksdb"))
-    }
-    fn build_quads(&self, src: &Path, artifact: &Path) {
-        build_oxigraph_rocksdb(artifact, src, oxigraph::io::RdfFormat::NQuads);
-    }
-    fn open_quads(&self, artifact: &Path, src: &Path) -> Box<dyn Queryable> {
-        self.open(artifact, src)
     }
 }
 
@@ -852,20 +871,11 @@ impl Adapter for SophiaAdapter {
         workdir.join("sophia.marker")
     }
     fn build(&self, src: &Path, artifact: &Path) {
-        let g = load_sophia(src);
-        use sophia::api::graph::Graph;
-        std::fs::write(artifact, format!("{}", g.triples().count())).ok();
-    }
-    fn open(&self, _artifact: &Path, src: &Path) -> Box<dyn Queryable> {
-        Box::new(SophiaGraph(load_sophia(src)))
-    }
-
-    fn build_quads(&self, src: &Path, artifact: &Path) {
         let d = load_sophia_dataset(src);
         use sophia::api::dataset::Dataset;
         std::fs::write(artifact, format!("{}", d.quads().count())).ok();
     }
-    fn open_quads(&self, _artifact: &Path, src: &Path) -> Box<dyn Queryable> {
+    fn open(&self, _artifact: &Path, src: &Path) -> Box<dyn Queryable> {
         Box::new(SophiaDataset(load_sophia_dataset(src)))
     }
 }
@@ -921,29 +931,10 @@ impl Queryable for SophiaDataset {
         std::hint::black_box(bytes);
         rows
     }
-}
 
-fn load_sophia(src: &Path) -> sophia::inmem::graph::FastGraph {
-    use sophia::api::parser::TripleParser;
-    use sophia::api::prelude::TripleSource;
-    let file = std::io::BufReader::new(std::fs::File::open(src).expect("open source"));
-    let parser = sophia::turtle::parser::nt::NTriplesParser::default();
-    let mut g = sophia::inmem::graph::FastGraph::new();
-    parser
-        .parse(file)
-        .add_to_graph(&mut g)
-        .expect("parse into sophia graph");
-    g
-}
-
-struct SophiaGraph(sophia::inmem::graph::FastGraph);
-
-impl Queryable for SophiaGraph {
-    fn count(&self, pat: &Pat) -> usize {
-        use sophia::api::graph::Graph;
-
-        // See `AnyOr`: getting the matcher type right is what decides whether
-        // sophia answers from its index or walks the whole graph.
+    fn count_only(&self, pat: &Pat) -> usize {
+        use sophia::api::dataset::Dataset;
+        use sophia::api::term::matcher::TermMatcher;
         let s = pat
             .s
             .as_ref()
@@ -956,16 +947,11 @@ impl Queryable for SophiaGraph {
             .o
             .as_ref()
             .map_or(AnyOr::Any, |t| AnyOr::Exactly(simple_object(t)));
-        use sophia::api::triple::Triple;
-        let mut rows = 0usize;
-        let mut bytes = 0usize;
-        for t in self.0.triples_matching(s, p, o) {
-            let t = t.expect("sophia triple");
-            bytes += sophia_term_bytes(t.s()) + sophia_term_bytes(t.p()) + sophia_term_bytes(t.o());
-            rows += 1;
-        }
-        std::hint::black_box(bytes);
-        rows
+        let g = pat
+            .g
+            .as_ref()
+            .map_or(AnyOr::Any, |t| AnyOr::Exactly(simple_iri(t)));
+        self.0.quads_matching(s, p, o, g.gn()).count()
     }
 }
 
@@ -1029,8 +1015,16 @@ impl Adapter for HdtAdapter {
     fn slug(&self) -> &'static str {
         "hdt"
     }
+    /// The HDT model is triples-only: no graph column exists to hold one, so
+    /// this adapter reads the dataset's triples projection.
+    fn handles_graphs(&self) -> bool {
+        false
+    }
     fn label(&self) -> &'static str {
-        "hdt (file)"
+        // `Hdt::read` parses the whole artifact into memory, so this answers
+        // from memory on the residency axis — the file is what it was built
+        // from, and what its cold regime reopens.
+        "hdt (memory)"
     }
     fn artifact(&self, workdir: &Path) -> PathBuf {
         workdir.join("data.hdt")
@@ -1044,10 +1038,6 @@ impl Adapter for HdtAdapter {
         let f = std::fs::File::open(artifact).expect("open hdt");
         let hdt = hdt::Hdt::read(std::io::BufReader::new(f)).expect("read hdt");
         Box::new(HdtStore(hdt))
-    }
-
-    fn quads_artifact(&self, _workdir: &Path) -> Option<PathBuf> {
-        None // triples only: the HDT format has no named graphs
     }
 }
 
@@ -1078,6 +1068,23 @@ impl Queryable for HdtStore {
         }
         std::hint::black_box(bytes);
         rows
+    }
+
+    fn count_only(&self, pat: &Pat) -> usize {
+        // The crate's iterator materializes its term strings internally either
+        // way; walking it without reading them is hdt's floor for a count.
+        let s = pat.s.as_ref().map(|t| strip_iri(t));
+        let p = pat.p.as_ref().map(|t| strip_iri(t));
+        let o = pat.o.as_ref().map(|t| {
+            if t.starts_with('"') {
+                t.clone()
+            } else {
+                strip_iri(t)
+            }
+        });
+        self.0
+            .triples_with_pattern(s.as_deref(), p.as_deref(), o.as_deref())
+            .count()
     }
 }
 
@@ -1157,8 +1164,9 @@ fn fresh_quads(n: usize) -> Vec<oxrdf::Quad> {
         .collect()
 }
 
-/// The first `take` quads of the triples dataset — the delete phase needs a
-/// batch of rows that actually exist in the store. Port of `dataset_prefix`.
+/// The first `take` quads of the dataset, graph and all — the delete phase needs
+/// a batch of rows that actually exist in the store. Port of datasets.py's
+/// `dataset_prefix`.
 fn dataset_prefix(n: usize, take: usize) -> Vec<oxrdf::Quad> {
     let m = moduli(n);
     (0..take.min(n))
@@ -1168,7 +1176,9 @@ fn dataset_prefix(n: usize, take: usize) -> Vec<oxrdf::Quad> {
                 oxrdf::NamedNode::new_unchecked(subject_term(i % m.n_subj)),
                 oxrdf::NamedNode::new_unchecked(predicate_term(i % m.n_pred)),
                 parse_object(&o),
-                oxrdf::GraphName::DefaultGraph,
+                oxrdf::GraphName::NamedNode(oxrdf::NamedNode::new_unchecked(graph_term(
+                    i % m.n_graph,
+                ))),
             )
         })
         .collect()
@@ -1260,7 +1270,13 @@ struct WorkerOut {
 }
 
 fn run_adapter(a: &dyn Adapter, n: usize) -> WorkerOut {
-    let src = ensure_dataset(n);
+    // One dataset for the whole run: the quads file for a library whose model
+    // has graphs, its triples projection for one whose model does not.
+    let src = if a.handles_graphs() {
+        ensure_quads_dataset(n)
+    } else {
+        ensure_dataset(n)
+    };
     let workdir = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .unwrap()
@@ -1313,7 +1329,25 @@ fn run_adapter(a: &dyn Adapter, n: usize) -> WorkerOut {
     }
 
     let handle = a.open(&artifact, &src);
-    let pats = probes(n);
+    let mut pats = probes(n);
+    if a.handles_graphs() {
+        pats.extend(graph_probes());
+    } else {
+        // Not a gap in the run: this library has no graph in its model, so the
+        // cells say so rather than leaving a hole that reads as unmeasured.
+        for pat in graph_probes() {
+            for regime in ["warm", "cold"] {
+                for suffix in ["", "::count"] {
+                    let mut r = unsupported_row(
+                        &format!("{}::{}{}", a.slug(), pat.name, suffix),
+                        "this library's model has no graphs — it reads the triples projection",
+                    );
+                    r.regime = Some(regime);
+                    rows.push(r);
+                }
+            }
+        }
+    }
     let mut counts = std::collections::BTreeMap::new();
 
     for pat in &pats {
@@ -1349,61 +1383,45 @@ fn run_adapter(a: &dyn Adapter, n: usize) -> WorkerOut {
                 Some("cold"),
             );
         }
+
+        // Count-only: the same resolution with no term read — the COUNT/ASK
+        // shape. Verified against the consuming count first, so a count path
+        // that resolves differently fails loudly instead of timing the wrong
+        // work.
+        let n_count = handle.count_only(pat);
+        assert_eq!(
+            n_count, counts[pat.name],
+            "count_only disagrees with count for {} on {}",
+            pat.name,
+            a.slug()
+        );
+        log(&format!("count {} (warm)…", pat.name));
+        measure(
+            &format!("{}::{}::count", a.slug(), pat.name),
+            || {
+                handle.count_only(pat);
+            },
+            &mut rows,
+            if heavy { HEAVY_ITERS } else { QUERY_ITERS },
+            if heavy { 0 } else { QUERY_WARMUP },
+            Some("warm"),
+        );
+        if a.has_distinct_open() {
+            log(&format!("count {} (cold)…", pat.name));
+            measure_with_setup_regime(
+                &format!("{}::{}::count", a.slug(), pat.name),
+                || a.open(&artifact, &src),
+                |h| {
+                    h.count_only(pat);
+                },
+                &mut rows,
+                if heavy { HEAVY_ITERS } else { QUERY_ITERS },
+                Some("cold"),
+            );
+        }
     }
 
     drop(handle);
-
-    // ── named-graph patterns, on the quads dataset ──────────────────────────
-    let nq = quads_size();
-    let qpats = quad_probes();
-    match a.quads_artifact(&workdir) {
-        Some(qartifact) => {
-            let qsrc = ensure_quads_dataset(nq);
-            log("build quads…");
-            a.build_quads(&qsrc, &qartifact); // untimed: Build is the triples column
-            let qhandle = a.open_quads(&qartifact, &qsrc);
-            for pat in &qpats {
-                counts.insert(pat.name.to_string(), qhandle.count(pat));
-                log(&format!("match {} (warm)…", pat.name));
-                measure(
-                    &format!("{}::{}", a.slug(), pat.name),
-                    || {
-                        qhandle.count(pat);
-                    },
-                    &mut rows,
-                    QUERY_ITERS,
-                    QUERY_WARMUP,
-                    Some("warm"),
-                );
-                if a.has_distinct_open() {
-                    log(&format!("match {} (cold)…", pat.name));
-                    measure_with_setup_regime(
-                        &format!("{}::{}", a.slug(), pat.name),
-                        || a.open_quads(&qartifact, &qsrc),
-                        |h| {
-                            h.count(pat);
-                        },
-                        &mut rows,
-                        QUERY_ITERS,
-                        Some("cold"),
-                    );
-                }
-            }
-        }
-        None => {
-            // No quads in the model at all. Both regime cells say so.
-            for pat in &qpats {
-                for regime in ["warm", "cold"] {
-                    let mut r = unsupported_row(
-                        &format!("{}::{}", a.slug(), pat.name),
-                        "the HDT format has no named graphs — triples only",
-                    );
-                    r.regime = Some(if regime == "cold" { "cold" } else { "warm" });
-                    rows.push(r);
-                }
-            }
-        }
-    }
 
     run_mutation_phase(a.slug(), &src, &artifact, n, &mut rows);
 
@@ -1520,7 +1538,7 @@ fn run_mutation_phase(slug: &str, src: &Path, artifact: &Path, n: usize, rows: &
             let del = dataset_prefix(n, batch);
             measure_with_setup(
                 &format!("delete::{slug}"),
-                || load_oxigraph(src, oxigraph::io::RdfFormat::NTriples),
+                || load_oxigraph(src, oxigraph_format(src)),
                 |store| {
                     for q in &del {
                         store.remove(q.as_ref()).expect("remove");
@@ -1577,7 +1595,7 @@ fn run_mutation_phase(slug: &str, src: &Path, artifact: &Path, n: usize, rows: &
             // per-iteration reload the memory arm does.
             measure_with_setup(
                 &format!("delete::{slug}"),
-                || build_oxigraph_rocksdb(&tmp, src, oxigraph::io::RdfFormat::NTriples),
+                || build_oxigraph_rocksdb(&tmp, src, oxigraph_format(src)),
                 |store| {
                     for q in &del {
                         store.remove(q.as_ref()).expect("remove");
@@ -1589,7 +1607,7 @@ fn run_mutation_phase(slug: &str, src: &Path, artifact: &Path, n: usize, rows: &
             let _ = std::fs::remove_dir_all(&tmp);
         }
         "sophia" => {
-            use sophia::api::graph::MutableGraph;
+            use sophia::api::dataset::MutableDataset;
             let fresh = fresh_quads(batch);
             let fresh_terms: Vec<[SimpleTerm<'static>; 3]> = fresh
                 .iter()
@@ -1605,9 +1623,10 @@ fn run_mutation_phase(slug: &str, src: &Path, artifact: &Path, n: usize, rows: &
             measure(
                 &format!("add::{slug}"),
                 || {
-                    let mut g = sophia::inmem::graph::FastGraph::new();
+                    let mut d = sophia::inmem::dataset::FastDataset::new();
                     for [s, p, o] in &fresh_terms {
-                        g.insert(s, p, o).expect("insert");
+                        d.insert(s, p, o, None::<&SimpleTerm<'static>>)
+                            .expect("insert");
                     }
                 },
                 rows,
@@ -1621,26 +1640,31 @@ fn run_mutation_phase(slug: &str, src: &Path, artifact: &Path, n: usize, rows: &
             ));
             log("delete…");
             let del = dataset_prefix(n, batch);
-            let del_terms: Vec<[SimpleTerm<'static>; 3]> = del
+            let del_terms: Vec<[SimpleTerm<'static>; 4]> = del
                 .iter()
                 .map(|q| {
                     let o = match &q.object {
                         oxrdf::Term::Literal(l) => simple_object(&format!("\"{}\"", l.value())),
                         other => simple_iri(other.to_string().as_str()),
                     };
+                    let g = match &q.graph_name {
+                        oxrdf::GraphName::NamedNode(n) => simple_iri(n.as_str()),
+                        _ => simple_iri(""),
+                    };
                     [
                         simple_iri(q.subject.to_string().as_str()),
                         simple_iri(q.predicate.to_string().as_str()),
                         o,
+                        g,
                     ]
                 })
                 .collect();
             measure_with_setup(
                 &format!("delete::{slug}"),
-                || load_sophia(src),
-                |mut g| {
-                    for [s, p, o] in &del_terms {
-                        g.remove(s, p, o).expect("remove");
+                || load_sophia_dataset(src),
+                |mut d| {
+                    for [s, p, o, g] in &del_terms {
+                        d.remove(s, p, o, Some(g)).expect("remove");
                     }
                 },
                 rows,
@@ -1681,7 +1705,13 @@ fn main() {
         return;
     }
 
-    eprintln!("Rust comparative benchmark: {n} triples, one process per library");
+    eprintln!(
+        "Rust comparative benchmark: {n} quads over {} named graphs, one process per library",
+        moduli(n).n_graph
+    );
+    // Both files up front: a library reads one or the other, and generating them
+    // here keeps that cost out of whichever adapter happens to run first.
+    ensure_quads_dataset(n);
     ensure_dataset(n);
 
     let exe = std::env::current_exe().expect("current exe");
@@ -1757,7 +1787,8 @@ fn main() {
         "memory": memory,
         "config": {
             "triplesCount": n,
-            "quadsCount": quads_size(),
+            "quadsCount": n,
+            "graphCount": moduli(n).n_graph,
             "mutBatch": mut_batch(),
             "distinctTerms": distinct_terms,
             "queryIterations": QUERY_ITERS,

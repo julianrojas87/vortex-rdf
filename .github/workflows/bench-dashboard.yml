@@ -94,8 +94,8 @@ jobs:
 
       # Run the JavaScript comparative benchmark (VortexRdfStore variants vs
       # rdf-stores.js, oxigraph and hdt). Wall-clock via tinybench; deliberately
-      # NOT uploaded to CodSpeed. BENCH_SIZE / BENCH_SIZE_QUADS are the same
-      # variables (and values) as the Rust step — the hdt adapter opens the
+      # NOT uploaded to CodSpeed. BENCH_SIZE is the same variable (and value)
+      # as the Rust step — the hdt adapter opens the
       # .hdt artifact that step built from the same dataset
       # (target/bench_compare/hdt/data.hdt), and a size mismatch makes its
       # rows report an error instead of numbers.
@@ -103,7 +103,6 @@ jobs:
         working-directory: js
         env:
           BENCH_SIZE: 1048576
-          BENCH_SIZE_QUADS: 524288
           MUT_BATCH: 10000
         run: npm run bench
 
@@ -150,7 +149,6 @@ jobs:
         working-directory: python
         env:
           BENCH_SIZE: 1048576
-          BENCH_SIZE_QUADS: 524288
           MUT_BATCH: 10000
         run: python3 bench/run.py
 

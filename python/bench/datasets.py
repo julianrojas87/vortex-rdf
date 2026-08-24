@@ -160,18 +160,25 @@ def iter_quads(n: int, opts: Optional[DatasetOpts] = None) -> Iterator[tuple[str
         yield quad_at(i, m, o.literal_frac)
 
 
-def write_dataset(path: str, n: int, opts: Optional[DatasetOpts] = None) -> str:
+def write_dataset(
+    path: str, n: int, opts: Optional[DatasetOpts] = None, drop_graph: bool = False
+) -> str:
     """Stream `n` distinct quads to an N-Triples (or N-Quads) file at `path`.
 
     Written once by the orchestrator and shared by every adapter process: the
     file is the common input, so no adapter pays for another's generation, and
     generation cost never lands inside a measured region.
+
+    `drop_graph` writes the same rows without their fourth term -- the triples
+    projection of the quad dataset, for the libraries whose model has no graph
+    to hold. Passing the quad options with it is what keeps row `i` the same
+    row in both files.
     """
     o = opts or dataset_opts()
     tmp = path + ".partial"
     with open(tmp, "w", encoding="utf-8", buffering=1 << 20) as f:
         for s, p, ob, g in iter_quads(n, o):
-            f.write(f"{s} {p} {ob} .\n" if g is None else f"{s} {p} {ob} {g} .\n")
+            f.write(f"{s} {p} {ob} .\n" if g is None or drop_graph else f"{s} {p} {ob} {g} .\n")
     os.replace(tmp, path)  # never leave a half-written dataset that looks complete
     return path
 
