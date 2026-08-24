@@ -1393,7 +1393,7 @@ fn run_adapter(a: &dyn Adapter, n: usize) -> WorkerOut {
         // work.
         let n_count = handle.count_only(pat);
         assert_eq!(
-            n_count, 
+            n_count,
             counts[pat.name],
             "count_only disagrees with count for {} on {}",
             pat.name,
