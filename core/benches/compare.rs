@@ -782,7 +782,10 @@ impl OxStore {
                 );
             }
         };
-        drain_oxigraph(self.0.quads_for_pattern(s_ref, p_ref, o_ref, g_ref), consume)
+        drain_oxigraph(
+            self.0.quads_for_pattern(s_ref, p_ref, o_ref, g_ref), 
+            consume
+        )
     }
 }
 
@@ -1390,7 +1393,8 @@ fn run_adapter(a: &dyn Adapter, n: usize) -> WorkerOut {
         // work.
         let n_count = handle.count_only(pat);
         assert_eq!(
-            n_count, counts[pat.name],
+            n_count, 
+            counts[pat.name],
             "count_only disagrees with count for {} on {}",
             pat.name,
             a.slug()
