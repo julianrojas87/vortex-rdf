@@ -41,17 +41,31 @@ pub(crate) static VORTEX_SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
     session
 });
 
-/// Enroll every registered encoding in one enabled edition. The file writer
-/// refuses encodings outside the session's enabled editions (reading is
-/// covered by registration alone), and this store's wire contract is
-/// "whatever the registered compressor emits" — not a vortex edition
-/// boundary — so the edition spans the full registry.
+/// Enroll every registered array encoding, layout and extension dtype, plus
+/// the zone-map aggregates the file writer emits, in one enabled edition. The
+/// file writer refuses components outside the session's enabled editions
+/// (reading is covered by registration alone), and this store's wire
+/// contract is "whatever the registered compressor emits" — not a vortex
+/// edition boundary — so the edition spans the full registries.
 fn enable_store_edition(session: &VortexSession) {
+    use vortex_array::dtype::session::DTypeSessionExt as _;
     use vortex_array::session::ArraySessionExt as _;
-    use vortex_edition::{Edition, EditionId, EditionInclusion, EditionSessionExt as _};
+    use vortex_edition::{
+        ComponentKind, Edition, EditionId, EditionInclusion, EditionSessionExt as _,
+    };
     use vortex_error::{VortexExpect as _, vortex_err};
+    use vortex_layout::session::LayoutSessionExt as _;
 
     const STORE_EDITION: EditionId = EditionId::new("vortexrdf", 2026, 8, 0);
+    /// The default zone-map aggregates written by the vortex file writer.
+    const ZONE_AGGREGATES: [&str; 6] = [
+        "vortex.bounded_max",
+        "vortex.bounded_min",
+        "vortex.max",
+        "vortex.min",
+        "vortex.nan_count",
+        "vortex.null_count",
+    ];
 
     let editions = session.editions();
     editions
@@ -61,15 +75,45 @@ fn enable_store_edition(session: &VortexSession) {
         })
         .map_err(|error| vortex_err!("{error}"))
         .vortex_expect("the store edition is valid");
-    let ids = session
-        .arrays()
-        .registry()
-        .read(|map| map.keys().copied().collect::<Vec<_>>());
-    for id in ids {
+    let registered = [
+        (
+            ComponentKind::Array,
+            session
+                .arrays()
+                .registry()
+                .read(|map| map.keys().copied().collect::<Vec<_>>()),
+        ),
+        (
+            ComponentKind::Layout,
+            session
+                .layouts()
+                .registry()
+                .read(|map| map.keys().copied().collect::<Vec<_>>()),
+        ),
+        (
+            ComponentKind::DType,
+            session
+                .dtypes()
+                .registry()
+                .read(|map| map.keys().copied().collect::<Vec<_>>()),
+        ),
+    ];
+    let inclusions = registered
+        .iter()
+        .flat_map(|(kind, ids)| {
+            ids.iter()
+                .map(move |id| EditionInclusion::new(*kind, id, STORE_EDITION))
+        })
+        .chain(
+            ZONE_AGGREGATES
+                .into_iter()
+                .map(|id| EditionInclusion::new(ComponentKind::Aggregate, id, STORE_EDITION)),
+        );
+    for inclusion in inclusions {
         editions
-            .declare_inclusion(EditionInclusion::new(&id, STORE_EDITION))
+            .declare_inclusion(inclusion)
             .map_err(|error| vortex_err!("{error}"))
-            .vortex_expect("every registered encoding joins the store edition once");
+            .vortex_expect("every registered component joins the store edition once");
     }
     session
         .enable_edition(STORE_EDITION)

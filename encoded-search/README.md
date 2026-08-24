@@ -114,9 +114,9 @@ cargo bench -p vortex-rdf-encoded-search
 
 Each release tracks one Vortex minor version — the crate reaches into encoding
 internals, which are not stable across Vortex minors. This release is built
-against Vortex `0.84`.
+against Vortex `0.85`.
 
-Minimum supported Rust version: 1.91 (edition 2024).
+Minimum supported Rust version: 1.95 (edition 2024).
 
 ## License
 

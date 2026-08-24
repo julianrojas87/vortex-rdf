@@ -24,10 +24,15 @@ fn session() -> VortexSession {
         .with_tokio();
     vortex_file::register_default_encodings(&session);
 
-    // 0.84 gates the file writer on the session's enabled editions; declare
-    // one covering every registered encoding, as vortex-file's own tests do.
+    // The file writer is gated on the session's enabled editions; declare one
+    // covering every registered array, layout and dtype plus the default
+    // zone-map aggregates, as vortex-file's own tests do.
+    use vortex_array::dtype::session::DTypeSessionExt as _;
     use vortex_array::session::ArraySessionExt as _;
-    use vortex_edition::{Edition, EditionId, EditionInclusion, EditionSessionExt as _};
+    use vortex_edition::{
+        ComponentKind, Edition, EditionId, EditionInclusion, EditionSessionExt as _,
+    };
+    use vortex_layout::session::LayoutSessionExt as _;
     const TEST_EDITION: EditionId = EditionId::new("test", 2026, 7, 0);
     let editions = session.editions();
     editions
@@ -36,13 +41,50 @@ fn session() -> VortexSession {
             min_vortex_version: None,
         })
         .unwrap();
-    let ids = session
-        .arrays()
-        .registry()
-        .read(|map| map.keys().copied().collect::<Vec<_>>());
-    for id in ids {
+    let registered = [
+        (
+            ComponentKind::Array,
+            session
+                .arrays()
+                .registry()
+                .read(|map| map.keys().copied().collect::<Vec<_>>()),
+        ),
+        (
+            ComponentKind::Layout,
+            session
+                .layouts()
+                .registry()
+                .read(|map| map.keys().copied().collect::<Vec<_>>()),
+        ),
+        (
+            ComponentKind::DType,
+            session
+                .dtypes()
+                .registry()
+                .read(|map| map.keys().copied().collect::<Vec<_>>()),
+        ),
+    ];
+    for (kind, ids) in &registered {
+        for id in ids {
+            editions
+                .declare_inclusion(EditionInclusion::new(*kind, id, TEST_EDITION))
+                .unwrap();
+        }
+    }
+    for id in [
+        "vortex.bounded_max",
+        "vortex.bounded_min",
+        "vortex.max",
+        "vortex.min",
+        "vortex.nan_count",
+        "vortex.null_count",
+    ] {
         editions
-            .declare_inclusion(EditionInclusion::new(&id, TEST_EDITION))
+            .declare_inclusion(EditionInclusion::new(
+                ComponentKind::Aggregate,
+                id,
+                TEST_EDITION,
+            ))
             .unwrap();
     }
     session.enable_edition(TEST_EDITION).unwrap();

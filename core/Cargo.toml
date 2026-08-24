@@ -50,6 +50,11 @@ web-time = { workspace = true }
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 mimalloc = { workspace = true, optional = true }
 
+# The microtask-queue `WasmRuntime` lives behind vortex-io's `wasm-bindgen`
+# feature; the wasm bindings already link wasm-bindgen, so this adds no size.
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+vortex-io = { workspace = true, features = ["wasm-bindgen"] }
+
 [features]
 default = ["file-io"]
 file-io = [
