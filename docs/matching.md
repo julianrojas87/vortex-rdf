@@ -164,7 +164,7 @@ flowchart TD
     S1 -- "no — check if indexes can help" --> S2
 
     S2{"<b>Stage 2</b><br/>Are there indexes for this pattern?<br/>"}
-    S2 -- "no — stage 1 left an empty selection, or under 4,096 rows" --> S3
+    S2 -- "no — nothing left bound, an empty selection, or under 4,096 rows" --> S3
     S2 -- "yes — ask the indexes to resolve what is still bound" --> S2r
 
     S2r{"What did the indexes answer?"}
@@ -186,10 +186,10 @@ Each stage in the code, and where the details are below:
 | Stage | Code | Details |
 |---|---|---|
 | Prelude | [`matching.rs:224-252`](../core/src/store/matching.rs#L224-L252) | — |
-| 1 · prefix probe | [`matching.rs:254-335`](../core/src/store/matching.rs#L254-L335), [`search_sorted_bounds`](../core/src/store/array.rs#L99) | [§6.1](#61-prefix-probe) |
-| 2 · secondary-index routing | [`matching.rs:337-405`](../core/src/store/matching.rs#L337-L405), [`resolve_indexes_in_memory`](../core/src/store/indexes/mod.rs#L706) | [§6.2](#62-secondary-index-routing) |
-| 3 · residual column filtering | [`matching.rs:407-450`](../core/src/store/matching.rs#L407-L450), [`typed_residual_ids`](../core/src/store/scan/typed_eq.rs#L191), [`mask_for`](../core/src/store/matching.rs#L757) | [§6.3](#63-residual-column-filtering) |
-| 4 · finalize | [`matching.rs:452-466`](../core/src/store/matching.rs#L452-L466) | [§6.4](#64-keeping-or-dropping-the-serve-plan) |
+| 1 · prefix probe | [`matching.rs:254-337`](../core/src/store/matching.rs#L254-L337), [`search_sorted_bounds`](../core/src/store/array.rs#L103) | [§6.1](#61-prefix-probe) |
+| 2 · secondary-index routing | [`matching.rs:339-409`](../core/src/store/matching.rs#L339-L409), [`resolve_indexes_in_memory`](../core/src/store/indexes/mod.rs#L706) | [§6.2](#62-secondary-index-routing) |
+| 3 · residual column filtering | [`matching.rs:411-452`](../core/src/store/matching.rs#L411-L452), [`typed_residual_ids`](../core/src/store/scan/typed_eq.rs#L191), [`mask_for`](../core/src/store/matching.rs#L761) | [§6.3](#63-residual-column-filtering) |
+| 4 · finalize | [`matching.rs:454-468`](../core/src/store/matching.rs#L454-L468) | [§6.4](#64-keeping-or-dropping-the-serve-plan) |
 
 ### 6.1 Prefix probe
 
@@ -201,7 +201,7 @@ rebuild that merges an append tail re-establishes it
 ([`order_for_rebuild`](../core/src/store/serialize.rs)). So the stage is skipped
 only for rows that arrived without the provenance — a foreign or older writer's
 file, whose `quads_sorted: false` keeps
-[`with_subject_stamp`](../core/src/store/rows.rs#L452) from inventing a stamp
+[`with_subject_stamp`](../core/src/store/rows.rs#L474) from inventing a stamp
 those rows never earned. Compacting such a store restores the fast path.
 
 When it engages, the **subject** resolves to its exact `[lo, hi)` run in
@@ -254,8 +254,10 @@ sees such patterns at all: stage 1 clears `pat.subject` when it succeeds, so an
 `s`-and-`p`-bound pattern arrives here as a bare predicate the indexes *would*
 resolve — at a cost proportional to every row carrying that predicate, to
 narrow a view the binary search has already cut to a handful of rows. Below the
-threshold, filtering those rows in stage 3 is cheaper. The separate
-`!selection.is_empty()` guard is what skips an already-empty view.
+threshold, filtering those rows in stage 3 is cheaper. Two further guards sit
+beside `worth_indexing`: the selection must still be non-empty, and something
+must still be bound (`pat.any_bound()`) — a pattern the prefix probe answered
+in full leaves the indexes nothing to resolve, so they are never consulted.
 
 `resolve_indexes_in_memory` tries the store's indexes **in preference order**
 (`SecondaryByCopy` before `SecondaryByReference`; the in-memory index set is
@@ -630,8 +632,9 @@ The match's decisions show up here
 | Consumer | With a serve plan | Without |
 |---|---|---|
 | `quads()` / `quads_vec()` | decode the plan's run (in memory: slice or point reads; file: point reads ≤ 256 rows, else projected+filtered scan) — the pending ids are never touched | gather the selection from the primaries, or run the restricted file scan |
-| `size()` | in memory a lazy component run knows its width without decoding; on file a count **must** materialize the ids (then counts filter masks if a filter is pending) | selection length, or `count_matching_rows` over the filter |
-| `code_columns()` | read the four `u32` columns straight off the index's own columns | materialize the selection, then slice/gather the base's buffers |
+| `shared_quads_vec()` / `shared_quad_chunks()` | as `quads()`, through the plan's shared-term decode twins — one `Arc<str>` per distinct term of a chunk, handed to every row repeating it | the same gather or restricted scan, decoded to shared terms |
+| `size()` | in memory a lazy component run knows its width without decoding; on file a located plan's run width answers outright when no filter or tombstones apply, otherwise the ids materialize (then filter masks are counted if a filter is pending) | selection length, or `count_matching_rows` over the filter |
+| `code_columns()` / `code_columns_gathered()` | read the four `u32` columns straight off the index's own columns | materialize the selection, then slice/gather the base's buffers — `code_columns_gathered` runs the full read pipeline where the zero-copy path declines (file-backed or non-canonical views) |
 | `raw_quad_chunks()` | plan deliberately ignored (it reorders rows; the N-Triples export is order-insignificant) | restricted scan in base row order |
 
 `LazyRowIds` caches into a shared `OnceLock`, so the first consumer that needs
