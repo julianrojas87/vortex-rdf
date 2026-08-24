@@ -783,7 +783,7 @@ impl OxStore {
             }
         };
         drain_oxigraph(
-            self.0.quads_for_pattern(s_ref, p_ref, o_ref, g_ref), 
+            self.0.quads_for_pattern(s_ref, p_ref, o_ref, g_ref),
             consume
         )
     }
