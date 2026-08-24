@@ -2,7 +2,7 @@
 //! payload construction behind `match`/`getQuads` (`match_columns`).
 
 use std::cell::RefCell;
-use std::io::{Cursor, Write};
+use std::io::Cursor;
 
 use futures::StreamExt;
 use js_sys::{Object, Reflect};
@@ -460,8 +460,11 @@ async fn match_columns(
 
     // Term payload: packed N-Triples term columns — the always-correct path,
     // taken whenever the rows cannot be described as codes against the store's
-    // cached dictionary.
-    let mut quads_stream = matched.quads().map_err(js_err)?;
+    // cached dictionary. The shared decode hands each term over in its
+    // N-Triples spelling already (the default graph as the empty string, this
+    // payload's vocabulary for it), so the bytes go straight into the
+    // column — no parse into oxrdf terms, no re-render.
+    let mut chunks = matched.shared_quad_chunks().map_err(js_err)?;
     // (offsets seeded with a leading 0, bytes) per s/p/o/g column.
     let mut cols: [(Vec<u32>, Vec<u8>); 4] = [
         (vec![0], Vec::new()),
@@ -470,26 +473,15 @@ async fn match_columns(
         (vec![0], Vec::new()),
     ];
     let mut n = 0u32;
-    while let Some(q_res) = quads_stream.next().await {
-        let q = q_res.map_err(js_err)?;
-        // Each term's N-Triples form is written straight into its column's
-        // byte buffer (oxrdf terms `Display` as N-Triples) — no per-term
-        // String transient. The default graph is the empty string in this
-        // payload's vocabulary, not the "DEFAULT" its `Display` prints.
-        let terms: [&dyn std::fmt::Display; 4] = [
-            &q.subject,
-            &q.predicate,
-            &q.object,
-            match &q.graph_name {
-                GraphName::DefaultGraph => &"",
-                other => other,
-            },
-        ];
-        for (col, term) in cols.iter_mut().zip(terms) {
-            write!(col.1, "{term}").expect("writing to a Vec<u8> cannot fail");
-            col.0.push(col.1.len() as u32);
+    while let Some(chunk) = chunks.next().await {
+        for row in chunk {
+            let row = row.map_err(js_err)?;
+            for (col, term) in cols.iter_mut().zip([&row.s, &row.p, &row.o, &row.g]) {
+                col.1.extend_from_slice(term.as_bytes());
+                col.0.push(col.1.len() as u32);
+            }
+            n += 1;
         }
-        n += 1;
     }
     Reflect::set(&payload, &"kind".into(), &"term".into())?;
     for (name, (offsets, bytes)) in ["s", "p", "o", "g"].iter().zip(cols.iter()) {

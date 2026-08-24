@@ -62,8 +62,13 @@ describe('build variants', () => {
 
             test('matches every quad-position pattern', async () => {
                 const store = await VortexRdfStore.fromString(NQUADS, 'nquads', options);
-                const count = (s: Term | null, p: Term | null, o: Term | null, g: Term | null) =>
-                    store.getQuads(s, p, o, g).length;
+                const count = (s: Term | null, p: Term | null, o: Term | null, g: Term | null) => {
+                    const n = store.getQuads(s, p, o, g).length;
+                    // countQuads answers from the match's row selection alone
+                    // and must agree with materializing the same match.
+                    expect(store.countQuads(s, p, o, g)).toBe(n);
+                    return n;
+                };
 
                 // Subject-only: exercises the sorted binary-search path.
                 expect(await count(df.namedNode('http://example.org/s1'), null, null, null)).toBe(2);
@@ -114,6 +119,7 @@ describe('build variants', () => {
 
                 const p1 = await restored.getQuads(null, df.namedNode('http://example.org/p1'), null, null);
                 expect(p1.length).toBe(3);
+                expect(restored.countQuads(null, df.namedNode('http://example.org/p1'), null, null)).toBe(3);
             });
 
             test('toRdf emits all quads back', async () => {
