@@ -162,7 +162,7 @@ impl DictionaryQuadSink {
 /// sort moves 16-byte rows rather than four-String structs.
 pub(crate) struct InterningQuadBuilder {
     /// term → provisional code, owning each distinct term exactly once.
-    ids: HashMap<Box<str>, u32>,
+    codes: HashMap<Box<str>, u32>,
     /// One `[s, p, o, g]` of provisional codes per quad, in arrival order.
     quads: Vec<[u32; 4]>,
 }
@@ -170,7 +170,7 @@ pub(crate) struct InterningQuadBuilder {
 impl InterningQuadBuilder {
     pub(crate) fn new() -> Self {
         Self {
-            ids: HashMap::new(),
+            codes: HashMap::new(),
             quads: Vec::new(),
         }
     }
@@ -190,10 +190,10 @@ impl InterningQuadBuilder {
     }
 
     fn intern(&mut self, term: String) -> u32 {
-        let next = self.ids.len() as u32;
+        let next = self.codes.len() as u32;
         // `into_boxed_str` is free for exact-capacity Strings (the common
         // case from `RawQuad::from_quad`) and shrinks the rest.
-        *self.ids.entry(term.into_boxed_str()).or_insert(next)
+        *self.codes.entry(term.into_boxed_str()).or_insert(next)
     }
 
     /// Consume one quad: intern its four terms, keep only their codes.
@@ -215,7 +215,7 @@ impl InterningQuadBuilder {
 
         let sort_start = debug::timer();
         // Unique terms, so the tuple Ord never reaches the code.
-        let mut entries: Vec<(Box<str>, u32)> = self.ids.into_iter().collect();
+        let mut entries: Vec<(Box<str>, u32)> = self.codes.into_iter().collect();
         entries.sort_unstable();
         let sort_terms_elapsed = debug::elapsed(sort_start);
 

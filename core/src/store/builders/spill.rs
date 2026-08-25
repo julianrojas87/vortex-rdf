@@ -1,14 +1,13 @@
-//! Temp-file spill machinery shared by the out-of-core builders: quads (and,
-//! for globally sorted secondary indexes, `(value, row ID)` pairs) are
-//! serialized to disk with rkyv during ingestion/merge passes and read back
-//! during chunk emission, so peak memory stays bounded by the chunk size.
+//! Temp-file spill machinery behind the out-of-core builder: quads (and, for
+//! globally sorted secondary indexes, `(value, row ID)` pairs) are serialized
+//! to disk with rkyv during ingestion/merge passes and read back during chunk
+//! emission, so peak memory stays bounded by the chunk size.
 
 use std::collections::BinaryHeap;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, ErrorKind, Read, Write};
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
-use web_time::{SystemTime, UNIX_EPOCH};
 
 use rkyv::api::high::{HighDeserializer, HighSerializer, to_bytes_in};
 use rkyv::rancor::Error as RkyvError;
@@ -24,35 +23,22 @@ use crate::error::{Result, VortexRdfError};
 /// home for runs that exist because the data outgrew memory.
 const SPILL_DIR_ENV: &str = "VORTEX_RDF_SPILL_DIR";
 
-/// Create a unique temp directory for spill files.
-///
-/// The parent directory is resolved in precedence order: the
-/// [`SPILL_DIR_ENV`] (`VORTEX_RDF_SPILL_DIR`) environment variable, then the
-/// caller-provided `base` (compaction passes the store file's own directory
-/// so spills share the output's volume), then [`std::env::temp_dir`]. The
-/// library must never write into the caller's working directory: a server or
-/// binding embedding this crate can run with an arbitrary — even read-only —
-/// cwd.
-///
-/// Spilling needs a real filesystem, which `wasm32-unknown-unknown` does not
-/// have, so this whole module is compiled out there (see the module gate in
-/// the `builders` hub); the wasm-reachable build paths never spill.
-pub(crate) fn make_temp_dir(prefix: &str, base: Option<&Path>) -> Result<PathBuf> {
-    let id = uuid::Uuid::new_v4();
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let parent = resolve_spill_parent(std::env::var_os(SPILL_DIR_ENV), base);
-    let dir = parent.join(format!("tmp_vortex_{}_{}_{}", prefix, now, id));
-    std::fs::create_dir_all(&dir)?;
-    Ok(dir)
+/// The rkyv bounds a record type needs to be spilled and read back.
+pub(crate) trait Spillable:
+    Sized
+    + Archive<Archived: RkyvDeserialize<Self, HighDeserializer<RkyvError>>>
+    + for<'a> RkyvSerialize<HighSerializer<AlignedVec, ArenaHandle<'a>, RkyvError>>
+{
 }
 
-/// The parent-directory precedence behind [`make_temp_dir`], split out so it
-/// is testable without mutating the process environment (other tests spill
-/// concurrently in this process and would race a real env override). An
-/// empty override counts as unset.
+impl<T> Spillable for T where
+    T: Archive<Archived: RkyvDeserialize<T, HighDeserializer<RkyvError>>>
+        + for<'a> RkyvSerialize<HighSerializer<AlignedVec, ArenaHandle<'a>, RkyvError>>
+{
+}
+
+/// The parent-directory precedence behind [`TempRunsGuard::create`]: the env
+/// override (empty counts as unset), then `base`, then the OS temp dir.
 fn resolve_spill_parent(env_override: Option<std::ffi::OsString>, base: Option<&Path>) -> PathBuf {
     env_override
         .filter(|v| !v.is_empty())
@@ -61,10 +47,33 @@ fn resolve_spill_parent(env_override: Option<std::ffi::OsString>, base: Option<&
         .unwrap_or_else(std::env::temp_dir)
 }
 
-/// Deletes the temporary spill directory when dropped, so spill files are
-/// cleaned up even if the chunk stream is abandoned before being fully consumed.
+/// A unique temporary spill directory, deleted when dropped so spill files are
+/// cleaned up even if the chunk stream is abandoned before being fully
+/// consumed.
 pub(crate) struct TempRunsGuard {
-    pub(crate) dir: PathBuf,
+    dir: PathBuf,
+}
+
+impl TempRunsGuard {
+    /// Create `tmp_vortex_{prefix}_{uuid}` under the spill parent.
+    ///
+    /// The parent is resolved in precedence order: the `VORTEX_RDF_SPILL_DIR`
+    /// environment variable, then the caller-provided `base` (compaction
+    /// passes the store file's own directory so spills share the output's
+    /// volume), then [`std::env::temp_dir`]. The library never writes into
+    /// the caller's working directory: an embedding server or binding can run
+    /// with an arbitrary — even read-only — cwd.
+    pub(crate) fn create(prefix: &str, base: Option<&Path>) -> Result<Self> {
+        let parent = resolve_spill_parent(std::env::var_os(SPILL_DIR_ENV), base);
+        let dir = parent.join(format!("tmp_vortex_{}_{}", prefix, uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir)?;
+        Ok(Self { dir })
+    }
+
+    /// The directory spill files go in.
+    pub(crate) fn path(&self) -> &Path {
+        &self.dir
+    }
 }
 
 impl Drop for TempRunsGuard {
@@ -76,14 +85,12 @@ impl Drop for TempRunsGuard {
 /// Incremental rkyv writer for spilling items one at a time.
 pub(crate) struct RunWriter<T> {
     writer: BufWriter<File>,
-    /// Reused per-record serialization buffer: `rkyv::to_bytes` would
-    /// allocate a fresh `AlignedVec` per spilled record — the write-side
-    /// counterpart of [`RunReader`]'s reused `payload` buffer.
+    /// Serialization buffer reused across pushes; `clear` keeps its capacity.
     buf: AlignedVec,
     _marker: PhantomData<T>,
 }
 
-impl<T> RunWriter<T> {
+impl<T: Spillable> RunWriter<T> {
     pub(crate) fn create(path: &Path) -> Result<Self> {
         let file = File::create(path)?;
         Ok(Self {
@@ -93,14 +100,9 @@ impl<T> RunWriter<T> {
         })
     }
 
-    pub(crate) fn push(&mut self, item: &T) -> Result<()>
-    where
-        T: Archive + for<'a> RkyvSerialize<HighSerializer<AlignedVec, ArenaHandle<'a>, RkyvError>>,
-        T::Archived: RkyvDeserialize<T, HighDeserializer<RkyvError>>,
-    {
-        // Serialize into the held buffer (taken and put back because rkyv
-        // consumes and returns its writer by value); `clear` keeps the
-        // capacity, so steady-state pushes never touch the allocator.
+    pub(crate) fn push(&mut self, item: &T) -> Result<()> {
+        // rkyv consumes and returns its writer by value, so the held buffer
+        // is taken and put back around each serialization.
         self.buf.clear();
         let bytes = to_bytes_in::<_, RkyvError>(item, std::mem::take(&mut self.buf))
             .map_err(|e| VortexRdfError::Serialization(e.to_string()))?;
@@ -123,11 +125,7 @@ impl<T> RunWriter<T> {
 }
 
 /// Write a whole buffer of items as one spill file.
-pub(crate) fn write_run<T>(path: &Path, items: &[T]) -> Result<()>
-where
-    T: Archive + for<'a> RkyvSerialize<HighSerializer<AlignedVec, ArenaHandle<'a>, RkyvError>>,
-    T::Archived: RkyvDeserialize<T, HighDeserializer<RkyvError>>,
-{
+fn write_run<T: Spillable>(path: &Path, items: &[T]) -> Result<()> {
     let mut writer = RunWriter::create(path)?;
     for item in items {
         writer.push(item)?;
@@ -138,53 +136,59 @@ where
 /// One sorted run of a merge, read sequentially — either still in memory or
 /// spilled to a temp file.
 ///
-/// A dataset that fits in a single run never has to round-trip through rkyv and
-/// the filesystem at all: the ingest buffer *is* the run, already sorted and
-/// already in memory. Only once a second run exists does spilling buy anything
-/// (that is the point at which the data provably exceeds the memory budget), so
-/// the builders spill lazily and keep a lone run here instead. Datasets up to
-/// the chunk size therefore never pay a serialize + write + read + deserialize
-/// of every quad.
-pub(crate) enum Run<T> {
+/// A dataset that fits in a single run never round-trips through rkyv and
+/// the filesystem: the ingest buffer *is* the run, already sorted and in
+/// memory. Only once a second run exists does spilling buy anything, so the
+/// builder spills lazily and keeps a lone run here.
+pub(crate) struct Run<T>(RunInner<T>);
+
+enum RunInner<T> {
     Memory(std::vec::IntoIter<T>),
     File(RunReader<T>),
 }
 
-impl<T> Run<T> {
+impl<T: Spillable> Run<T> {
     /// A sorted in-memory buffer, consumed in place.
     pub(crate) fn memory(items: Vec<T>) -> Self {
-        Run::Memory(items.into_iter())
+        Run(RunInner::Memory(items.into_iter()))
     }
 
     /// A run previously spilled to `path`.
     pub(crate) fn file(path: &Path) -> Result<Self> {
-        RunReader::new(path).map(Run::File)
+        RunReader::new(path).map(|r| Run(RunInner::File(r)))
     }
 
-    pub(crate) fn next(&mut self) -> Result<Option<T>>
-    where
-        T: Archive + for<'a> RkyvSerialize<HighSerializer<AlignedVec, ArenaHandle<'a>, RkyvError>>,
-        T::Archived: RkyvDeserialize<T, HighDeserializer<RkyvError>>,
-    {
-        match self {
-            Run::Memory(items) => Ok(items.next()),
-            Run::File(reader) => reader.next(),
+    pub(crate) fn next(&mut self) -> Result<Option<T>> {
+        match &mut self.0 {
+            RunInner::Memory(items) => Ok(items.next()),
+            RunInner::File(reader) => reader.next(),
         }
+    }
+
+    /// Pull up to `n` items off the run (fewer at the end of the data).
+    pub(crate) fn next_batch(&mut self, n: usize) -> Result<Vec<T>> {
+        let mut batch = Vec::with_capacity(n.min(4096));
+        while batch.len() < n {
+            match self.next()? {
+                Some(item) => batch.push(item),
+                None => break,
+            }
+        }
+        Ok(batch)
     }
 }
 
 /// Sequential rkyv reader over a spill file.
-pub(crate) struct RunReader<T> {
+struct RunReader<T> {
     reader: BufReader<File>,
-    /// Reused per-record payload buffer: a fresh `vec![0u8; len]` per record
-    /// would malloc+zero on every read, and `AlignedVec` also guarantees the
-    /// alignment rkyv's archived types require.
+    /// Payload buffer reused across reads; `AlignedVec` gives rkyv's archived
+    /// types their alignment.
     payload: AlignedVec,
     _marker: PhantomData<T>,
 }
 
-impl<T> RunReader<T> {
-    pub(crate) fn new(path: &Path) -> Result<Self> {
+impl<T: Spillable> RunReader<T> {
+    fn new(path: &Path) -> Result<Self> {
         let file = File::open(path)?;
         Ok(Self {
             reader: BufReader::new(file),
@@ -193,11 +197,7 @@ impl<T> RunReader<T> {
         })
     }
 
-    pub(crate) fn next(&mut self) -> Result<Option<T>>
-    where
-        T: Archive + for<'a> RkyvSerialize<HighSerializer<AlignedVec, ArenaHandle<'a>, RkyvError>>,
-        T::Archived: RkyvDeserialize<T, HighDeserializer<RkyvError>>,
-    {
+    fn next(&mut self) -> Result<Option<T>> {
         let mut first_len_byte = [0u8; 1];
         let n = self.reader.read(&mut first_len_byte)?;
         if n == 0 {
@@ -221,7 +221,7 @@ impl<T> RunReader<T> {
 
         let len = u32::from_le_bytes(len_bytes) as usize;
         // Resize without clearing: `read_exact` overwrites all `len` bytes, so
-        // the zero-fill only ever pays for the growth delta, not every record.
+        // the zero-fill only ever pays for the growth delta.
         self.payload.resize(len, 0);
         self.reader.read_exact(&mut self.payload).map_err(|e| {
             if e.kind() == ErrorKind::UnexpectedEof {
@@ -242,36 +242,19 @@ impl<T> RunReader<T> {
     }
 }
 
-/// External sort of `(value, row ID)` pairs: buffers pairs up to a capacity,
-/// spills each full buffer as a sorted run, and hands back a [`PairMerger`]
-/// that streams the pairs in global `(value, row ID)` order.
-///
-/// This is the machinery behind globally sorted secondary-index columns in
-/// out-of-core builds: the row IDs are only known during the quad merge, so
-/// the index order must be derived by a second sort after it.
-pub(crate) struct PairRunSpiller<V> {
+/// External sort of `T`s: buffers items up to a capacity, spills each full
+/// buffer as a sorted run, and hands back a [`RunMerger`] that streams the
+/// items in global order.
+pub(crate) struct RunSpiller<T> {
     dir: PathBuf,
     name: &'static str,
     capacity: usize,
-    buf: Vec<PairRecord<V>>,
+    buf: Vec<T>,
     run_paths: Vec<PathBuf>,
 }
 
-#[derive(
-    Clone, Debug, Eq, PartialEq, Ord, PartialOrd, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
-)]
-pub(crate) struct PairRecord<V> {
-    value: V,
-    rid: u32,
-}
-
-impl<V> PairRunSpiller<V>
-where
-    V: Ord
-        + Archive
-        + for<'a> RkyvSerialize<HighSerializer<AlignedVec, ArenaHandle<'a>, RkyvError>>,
-    V::Archived: RkyvDeserialize<V, HighDeserializer<RkyvError>>,
-{
+impl<T: Ord + Spillable> RunSpiller<T> {
+    /// Runs are written to `dir` as `{name}_run_{n}.bin`.
     pub(crate) fn new(dir: &Path, name: &'static str, capacity: usize) -> Self {
         Self {
             dir: dir.to_path_buf(),
@@ -282,15 +265,13 @@ where
         }
     }
 
-    pub(crate) fn push(&mut self, value: V, rid: u32) -> Result<()> {
-        // Spill only to make room for a record that would not fit, never merely
-        // on reaching capacity: a dataset of exactly `capacity` pairs then ends
-        // as one in-memory run and skips the spill round-trip entirely (see
-        // [`Run`]). Peak buffered records is unchanged.
+    pub(crate) fn push(&mut self, item: T) -> Result<()> {
+        // Spill only when the next item would not fit, so a dataset of exactly
+        // `capacity` items stays a single in-memory run (see [`Run`]).
         if self.buf.len() == self.capacity {
             self.flush_run()?;
         }
-        self.buf.push(PairRecord { value, rid });
+        self.buf.push(item);
         Ok(())
     }
 
@@ -300,6 +281,12 @@ where
             .dir
             .join(format!("{}_run_{}.bin", self.name, self.run_paths.len()));
         write_run(&path, &self.buf)?;
+        log::debug!(
+            "[RunSpiller] Wrote sorted run {} of {} ({} items)",
+            self.run_paths.len(),
+            self.name,
+            self.buf.len()
+        );
         self.run_paths.push(path);
         self.buf.clear();
         Ok(())
@@ -307,98 +294,162 @@ where
 
     /// Flush the tail run and set up the K-way merge over all runs.
     ///
-    /// Nothing spilled means everything still sits in `buf`: sorting it in place
-    /// is the whole merge, so it becomes a single in-memory run rather than a
-    /// file to write and immediately read back.
-    pub(crate) fn into_merger(mut self) -> Result<PairMerger<V>> {
+    /// Nothing spilled means everything still sits in `buf`: sorting it in
+    /// place is the whole merge, so it becomes a single in-memory run.
+    pub(crate) fn into_merger(mut self) -> Result<RunMerger<T>> {
         if self.run_paths.is_empty() {
             self.buf.sort_unstable();
-            return Ok(PairMerger::Memory(self.buf.into_iter()));
+            log::debug!(
+                "[RunSpiller] Kept the single sorted run of {} ({} items) in memory",
+                self.name,
+                self.buf.len()
+            );
+            return RunMerger::new(vec![Run::memory(self.buf)]);
         }
         if !self.buf.is_empty() {
             self.flush_run()?;
         }
-        let mut readers: Vec<RunReader<PairRecord<V>>> = self
+        let runs = self
             .run_paths
             .iter()
-            .map(|p| RunReader::new(p))
+            .map(|p| Run::file(p))
             .collect::<Result<_>>()?;
-        let mut heap = BinaryHeap::new();
-        for (i, r) in readers.iter_mut().enumerate() {
-            if let Some(pair) = r.next()? {
-                heap.push(PairHeapItem {
-                    pair,
-                    reader_idx: i,
-                });
-            }
-        }
-        Ok(PairMerger::Spilled { readers, heap })
+        RunMerger::new(runs)
     }
 }
 
-/// Streams `(value, row ID)` pairs in global sorted order: a K-way merge of the
-/// runs a [`PairRunSpiller`] spilled, or — when nothing had to spill — a walk
-/// over the single sorted buffer it kept in memory.
-pub(crate) enum PairMerger<V> {
-    /// Everything fit in one run; the sorted buffer *is* the merged order.
-    Memory(std::vec::IntoIter<PairRecord<V>>),
-    Spilled {
-        readers: Vec<RunReader<PairRecord<V>>>,
-        heap: BinaryHeap<PairHeapItem<V>>,
-    },
+/// Streams items in global sorted order: a K-way merge over sorted runs.
+pub(crate) struct RunMerger<T> {
+    runs: Vec<Run<T>>,
+    /// Primed with each run's head; empty while a single run is read
+    /// straight through.
+    heap: BinaryHeap<MinHeapItem<T>>,
 }
 
-impl<V> PairMerger<V>
-where
-    V: Ord
-        + Archive
-        + for<'a> RkyvSerialize<HighSerializer<AlignedVec, ArenaHandle<'a>, RkyvError>>,
-    V::Archived: RkyvDeserialize<V, HighDeserializer<RkyvError>>,
-{
-    /// Pull the next `n` pairs off the merge (fewer at the end of the data).
-    pub(crate) fn next_batch(&mut self, n: usize) -> Result<Vec<(V, u32)>> {
-        let mut batch = Vec::with_capacity(n.min(4096));
-        match self {
-            PairMerger::Memory(pairs) => {
-                batch.extend(pairs.take(n).map(|pair| (pair.value, pair.rid)));
-            }
-            PairMerger::Spilled { readers, heap } => {
-                while batch.len() < n {
-                    let Some(item) = heap.pop() else { break };
-                    let r_idx = item.reader_idx;
-                    batch.push((item.pair.value, item.pair.rid));
-                    if let Some(next_pair) = readers[r_idx].next()? {
-                        heap.push(PairHeapItem {
-                            pair: next_pair,
-                            reader_idx: r_idx,
-                        });
-                    }
+impl<T: Ord + Spillable> RunMerger<T> {
+    /// Merge `runs`, each already sorted.
+    pub(crate) fn new(mut runs: Vec<Run<T>>) -> Result<Self> {
+        let mut heap = BinaryHeap::new();
+        if runs.len() > 1 {
+            for (run_idx, run) in runs.iter_mut().enumerate() {
+                if let Some(item) = run.next()? {
+                    heap.push(MinHeapItem { item, run_idx });
                 }
+            }
+        }
+        Ok(Self { runs, heap })
+    }
+
+    /// How many runs feed the merge.
+    pub(crate) fn run_count(&self) -> usize {
+        self.runs.len()
+    }
+
+    /// The next item in global order, or `None` once every run is drained.
+    pub(crate) fn next(&mut self) -> Result<Option<T>> {
+        if self.runs.len() == 1 {
+            return self.runs[0].next();
+        }
+        let Some(MinHeapItem { item, run_idx }) = self.heap.pop() else {
+            return Ok(None);
+        };
+        if let Some(next) = self.runs[run_idx].next()? {
+            self.heap.push(MinHeapItem {
+                item: next,
+                run_idx,
+            });
+        }
+        Ok(Some(item))
+    }
+
+    /// Pull up to `n` items off the merge (fewer at the end of the data).
+    pub(crate) fn next_batch(&mut self, n: usize) -> Result<Vec<T>> {
+        let mut batch = Vec::with_capacity(n.min(4096));
+        while batch.len() < n {
+            match self.next()? {
+                Some(item) => batch.push(item),
+                None => break,
             }
         }
         Ok(batch)
     }
 }
 
-pub(crate) struct PairHeapItem<V> {
-    pair: PairRecord<V>,
-    reader_idx: usize,
+/// A run's head in the merge heap; ordered by item, then run index, both
+/// reversed so `BinaryHeap` pops the minimum.
+struct MinHeapItem<T> {
+    item: T,
+    run_idx: usize,
 }
 
-impl<V: Ord> Eq for PairHeapItem<V> {}
-impl<V: Ord> PartialEq for PairHeapItem<V> {
+impl<T: Ord> Eq for MinHeapItem<T> {}
+impl<T: Ord> PartialEq for MinHeapItem<T> {
     fn eq(&self, other: &Self) -> bool {
-        self.pair == other.pair
+        self.item == other.item && self.run_idx == other.run_idx
     }
 }
-impl<V: Ord> Ord for PairHeapItem<V> {
+impl<T: Ord> Ord for MinHeapItem<T> {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        other.pair.cmp(&self.pair) // reversed for min-heap
+        other
+            .item
+            .cmp(&self.item)
+            .then_with(|| other.run_idx.cmp(&self.run_idx))
     }
 }
-impl<V: Ord> PartialOrd for PairHeapItem<V> {
+impl<T: Ord> PartialOrd for MinHeapItem<T> {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
+    }
+}
+
+/// A `(value, row ID)` index entry, sorted by value then row ID.
+#[derive(
+    Clone, Debug, Eq, PartialEq, Ord, PartialOrd, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
+)]
+struct PairRecord<V> {
+    value: V,
+    rid: u32,
+}
+
+/// External sort of `(value, row ID)` pairs — the machinery behind globally
+/// sorted secondary-index columns in out-of-core builds: the row IDs are only
+/// known during the quad merge, so the index order is derived by a second
+/// sort after it.
+pub(crate) struct PairRunSpiller<V>(RunSpiller<PairRecord<V>>);
+
+impl<V> PairRunSpiller<V>
+where
+    V: Ord + Spillable,
+{
+    pub(crate) fn new(dir: &Path, name: &'static str, capacity: usize) -> Self {
+        Self(RunSpiller::new(dir, name, capacity))
+    }
+
+    pub(crate) fn push(&mut self, value: V, rid: u32) -> Result<()> {
+        self.0.push(PairRecord { value, rid })
+    }
+
+    /// Flush the tail run and set up the K-way merge over all runs.
+    pub(crate) fn into_merger(self) -> Result<PairMerger<V>> {
+        self.0.into_merger().map(PairMerger)
+    }
+}
+
+/// Streams `(value, row ID)` pairs in global sorted order.
+pub(crate) struct PairMerger<V>(RunMerger<PairRecord<V>>);
+
+impl<V> PairMerger<V>
+where
+    V: Ord + Spillable,
+{
+    /// Pull up to `n` pairs off the merge (fewer at the end of the data).
+    pub(crate) fn next_batch(&mut self, n: usize) -> Result<Vec<(V, u32)>> {
+        Ok(self
+            .0
+            .next_batch(n)?
+            .into_iter()
+            .map(|pair| (pair.value, pair.rid))
+            .collect())
     }
 }
 
@@ -425,7 +476,7 @@ mod tests {
     }
 
     #[test]
-    fn make_temp_dir_honors_base_and_guard_cleans_up() {
+    fn temp_runs_guard_honors_base_and_cleans_up() {
         // The env override outranks `base` by design, so a preset override in
         // the test environment would (correctly) redirect this spill; only
         // assert placement when it is absent.
@@ -434,33 +485,87 @@ mod tests {
         }
         let base = std::env::temp_dir().join(format!("vortex_spill_test_{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&base).unwrap();
-        let dir = make_temp_dir("unit", Some(&base)).unwrap();
+        let guard = TempRunsGuard::create("unit", Some(&base)).unwrap();
+        let dir = guard.path().to_path_buf();
         assert!(dir.starts_with(&base));
         assert!(dir.is_dir());
-        drop(TempRunsGuard { dir: dir.clone() });
+        drop(guard);
         assert!(!dir.exists());
         std::fs::remove_dir_all(&base).unwrap();
     }
 
-    #[test]
-    fn run_roundtrip_through_reused_buffers() {
+    fn string_records() -> Vec<PairRecord<String>> {
         // Variable-length records exercise the reused write/read buffers
         // growing and shrinking across pushes.
-        let dir = make_temp_dir("unit_roundtrip", None).unwrap();
-        let guard = TempRunsGuard { dir: dir.clone() };
-        let path = dir.join("run.bin");
-        let records: Vec<PairRecord<String>> = (0..64u32)
+        (0..64u32)
             .map(|i| PairRecord {
                 value: "x".repeat((i as usize * 7) % 41),
                 rid: i,
             })
-            .collect();
+            .collect()
+    }
+
+    #[test]
+    fn run_roundtrip_through_reused_buffers() {
+        let guard = TempRunsGuard::create("unit_roundtrip", None).unwrap();
+        let path = guard.path().join("run.bin");
+        let records = string_records();
         write_run(&path, &records).unwrap();
-        let mut reader: RunReader<PairRecord<String>> = RunReader::new(&path).unwrap();
+        let mut run: Run<PairRecord<String>> = Run::file(&path).unwrap();
         for expected in &records {
-            assert_eq!(reader.next().unwrap().as_ref(), Some(expected));
+            assert_eq!(run.next().unwrap().as_ref(), Some(expected));
         }
-        assert!(reader.next().unwrap().is_none());
-        drop(guard);
+        assert!(run.next().unwrap().is_none());
+    }
+
+    #[test]
+    fn truncated_run_is_a_deserialization_error() {
+        let guard = TempRunsGuard::create("unit_truncated", None).unwrap();
+        let path = guard.path().join("run.bin");
+        let records = string_records();
+        write_run(&path, &records).unwrap();
+        let full = std::fs::read(&path).unwrap();
+        // Record 0 is an empty string; record 1's payload starts after its
+        // 4-byte length prefix.
+        let first_len = u32::from_le_bytes(full[..4].try_into().unwrap()) as usize;
+        let second_start = 4 + first_len;
+        let second_len =
+            u32::from_le_bytes(full[second_start..second_start + 4].try_into().unwrap()) as usize;
+        assert!(second_len > 1, "test needs a multi-byte payload");
+        for (label, keep) in [
+            ("mid-length-prefix", second_start + 2),
+            ("mid-payload", second_start + 4 + second_len / 2),
+        ] {
+            std::fs::write(&path, &full[..keep]).unwrap();
+            let mut merger: RunMerger<PairRecord<String>> =
+                RunMerger::new(vec![Run::file(&path).unwrap()]).unwrap();
+            assert_eq!(
+                merger.next().unwrap().as_ref(),
+                Some(&records[0]),
+                "{label}"
+            );
+            assert!(
+                matches!(merger.next(), Err(VortexRdfError::Deserialization(_))),
+                "{label}: truncated record must not read short"
+            );
+        }
+    }
+
+    #[test]
+    fn spiller_merges_runs_in_global_order() {
+        let guard = TempRunsGuard::create("unit_merge", None).unwrap();
+        let mut spiller: RunSpiller<(u32, u32)> = RunSpiller::new(guard.path(), "pairs", 4);
+        let items: Vec<(u32, u32)> = (0..23u32).rev().map(|i| (i % 5, i)).collect();
+        for item in &items {
+            spiller.push(*item).unwrap();
+        }
+        let mut merger = spiller.into_merger().unwrap();
+        assert_eq!(merger.run_count(), 6);
+        let mut merged = merger.next_batch(7).unwrap();
+        merged.extend(merger.next_batch(usize::MAX).unwrap());
+        let mut expected = items.clone();
+        expected.sort_unstable();
+        assert_eq!(merged, expected);
+        assert!(merger.next().unwrap().is_none());
     }
 }

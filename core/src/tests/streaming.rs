@@ -1,6 +1,5 @@
 use super::*;
-use crate::store::builders::sorted_in_memory::build_sorted_chunk_stream;
-use crate::store::builders::sorted_stream::build_sorted_stream_chunk_stream;
+use crate::store::builders::{sorted_in_memory, sorted_stream};
 use vortex_array::VortexSessionExecute;
 use vortex_array::arrays::struct_::{StructArray, StructArrayExt};
 
@@ -23,12 +22,17 @@ async fn run_chunk_boundary_builders(
     for (name, result) in [
         (
             "sorted_in_memory",
-            build_sorted_chunk_stream(Box::new(quad_stream(quads.to_vec())), layout, vec![], 3)
-                .await,
+            sorted_in_memory::build_chunk_stream(
+                Box::new(quad_stream(quads.to_vec())),
+                layout,
+                vec![],
+                3,
+            )
+            .await,
         ),
         (
             "sorted_stream",
-            build_sorted_stream_chunk_stream(
+            sorted_stream::build_chunk_stream(
                 Box::new(quad_stream(quads.to_vec())),
                 layout,
                 vec![],
@@ -150,7 +154,7 @@ async fn test_dictionary_streaming_chunk_boundaries() {
         // codes, and the dictionary the stream carried beside them is
         // handed back with the reassembled array — all chunks' codes must
         // reference that same global dictionary.
-        let arr = assemble_chunks(chunks, LayoutStrategy::Dictionary).unwrap();
+        let arr = assemble_chunks(chunks).unwrap();
         let store = VortexRdfStore::from_built(crate::store::builders::BuiltArray {
             array: arr,
             components: Vec::new(),
@@ -184,7 +188,7 @@ async fn test_sorted_streaming_spilled_indexes_match_in_memory() {
 
     // The quad chunk stream is primary-only (index families stream as native
     // components beside it); chunk sizes still follow the merge windows.
-    let built = build_sorted_stream_chunk_stream(
+    let built = sorted_stream::build_chunk_stream(
         Box::new(quad_stream(quads.clone())),
         LayoutStrategy::Default,
         indexes.clone(),
@@ -213,7 +217,7 @@ async fn test_sorted_streaming_spilled_indexes_match_in_memory() {
 
     // The materializing path re-glues the streamed components into the
     // in-memory build, index routing included.
-    let built = crate::store::builders::sorted_stream::build_sorted_stream_array(
+    let built = sorted_stream::build_array(
         Box::new(quad_stream(quads.clone())),
         LayoutStrategy::Default,
         indexes.clone(),

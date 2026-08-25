@@ -6,7 +6,7 @@ use crate::error::Result;
 use crate::error::VortexRdfError;
 use crate::store::QuadsSource;
 use crate::store::RawQuad;
-use crate::store::builders::{DEFAULT_CHUNK_SIZE, build_parts_from_raws};
+use crate::store::builders::{DEFAULT_CHUNK_ROWS, build_parts_from_raws};
 use crate::store::indexes::{Indexes, unique_indexes};
 use crate::store::layouts::DictAccess;
 use crate::store::layouts::{LayoutStrategy, ResolvedLayout};
@@ -116,11 +116,11 @@ impl VortexRdfStore {
         // rather than the OS temp dir (commonly a size-capped tmpfs). The
         // `VORTEX_RDF_SPILL_DIR` override still outranks this default.
         let write = async {
-            let built = crate::store::builders::sorted_stream::build_sorted_stream_chunk_stream(
+            let built = crate::store::builders::sorted_stream::build_chunk_stream(
                 Box::new(stream),
                 strategy,
                 indexes,
-                DEFAULT_CHUNK_SIZE,
+                DEFAULT_CHUNK_ROWS,
                 path.parent(),
             )
             .await?;
@@ -198,7 +198,7 @@ const AUTO_COMPACT_BASE_RATIO: usize = 10;
 /// every query mask-scans it and every append rebuilds it — so past this size
 /// it dominates index-routed lookups on a large base, where the 10% ratio
 /// alone would let it grow a hundred times bigger.
-const AUTO_COMPACT_TAIL_CAP: usize = DEFAULT_CHUNK_SIZE;
+const AUTO_COMPACT_TAIL_CAP: usize = DEFAULT_CHUNK_ROWS;
 
 /// The auto-compaction decision (see `VortexRdfStore::add_quads`): ratio with
 /// a floor, or the absolute cap, whichever fires first.

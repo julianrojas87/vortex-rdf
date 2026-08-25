@@ -5,7 +5,7 @@
 //! [`VortexArrayBuilder`] contract and its two products ([`BuiltArray`],
 //! [`BuiltStream`]), primary chunk assembly, the sortedness stamps a build is
 //! allowed to claim, and the globally-sorted index emission
-//! ([`GlobalIndexes`]). A leaf (`sorted_in_memory`, `sorted_stream`)
+//! ([`build_components`]). A leaf (`sorted_in_memory`, `sorted_stream`)
 //! contributes only its memory profile; `spill` backs the out-of-core one.
 //!
 //! Which pipeline runs is a property of the target, never a caller's choice:
@@ -20,7 +20,7 @@
 //! `indexes::components`), which is what a store adopts and what a file
 //! writes — nothing intermediate, nothing to split. The two pipelines differ
 //! only in where the components come from: the in-memory sort builds all of
-//! them at once over the dataset ([`GlobalIndexes`]), the out-of-core one
+//! them at once over the dataset (`GlobalIndexes`), the out-of-core one
 //! streams each family off its own spill-run merger.
 //!
 //! Both sort globally, which is what lets them declare their components
@@ -47,7 +47,7 @@ use vortex_array::validity::Validity;
 use vortex_array::{ArrayRef, IntoArray};
 
 /// Number of quads per StructArray chunk in streaming/chunked builders.
-pub(crate) const DEFAULT_CHUNK_SIZE: usize = 100_000;
+pub(crate) const DEFAULT_CHUNK_ROWS: usize = 100_000;
 
 /// A stream of StructArray chunks ready for consumption by the Vortex file
 /// writer. Items use `VortexResult` because the writer polls the stream
@@ -93,13 +93,15 @@ pub struct BuiltStream {
     pub(crate) components: Vec<crate::io::container::NativeComponentWrite>,
     /// Whether the chunks are in global `(s, p, o, g)` order; written as the
     /// root's `quads_sorted` (see `WireMetadata::quads_sorted`).
+    // Read by the serializer (`io::ser`), which is compiled in under
+    // `file-io` and on wasm32.
     #[cfg_attr(
         not(any(feature = "file-io", target_arch = "wasm32")),
         allow(dead_code)
     )]
     pub(crate) quads_sorted: bool,
-    /// The Dictionary layout's terms, for the serializer to place as the
-    /// `dictionary` child.
+    /// The Dictionary layout's terms, placed as the `dictionary` child by the
+    /// serializer and carried into the materialized [`BuiltArray`].
     #[cfg_attr(
         not(any(feature = "file-io", target_arch = "wasm32")),
         allow(dead_code)
@@ -108,10 +110,8 @@ pub struct BuiltStream {
 }
 
 pub(crate) mod sorted_in_memory;
-// The out-of-core builder spills to a real filesystem, which
-// `wasm32-unknown-unknown` does not have: compiling it out keeps it, the
-// rkyv serializer paths, and uuid out of the wasm artifact, whose size is a
-// recorded constraint.
+// wasm32-unknown-unknown has no filesystem to spill to; compiling the
+// external sort out keeps rkyv and uuid out of the wasm artifact.
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub(crate) mod sorted_stream;
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
@@ -121,6 +121,12 @@ pub use sorted_in_memory::SortedInMemoryBuilder;
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub use sorted_stream::SortedStreamBuilder;
 
+/// A build pipeline from a quad stream to store parts:
+/// [`build_vortex_array`](Self::build_vortex_array) materializes the dataset
+/// (for [`VortexRdfStore::from_built`](crate::VortexRdfStore::from_built)),
+/// [`build_vortex_stream`](Self::build_vortex_stream) emits it lazily for the
+/// file writer. Both sort globally by (s, p, o, g); which implementation
+/// exists is decided by the target (see the module doc).
 pub trait VortexArrayBuilder {
     /// Build the complete dataset as a single (possibly chunked) in-memory
     /// array, together with the layout state the array alone cannot carry
@@ -144,7 +150,7 @@ pub trait VortexArrayBuilder {
 
 /// Build one StructArray chunk of primary quad columns for the given layout.
 /// Secondary indexes never ride here — they are built as components beside
-/// the quad rows (see [`GlobalIndexes`]).
+/// the quad rows (see [`build_components`]).
 ///
 /// The layout-specific column logic lives in [`crate::store::layouts`]; this
 /// function only orchestrates it.
@@ -177,63 +183,34 @@ pub(crate) fn build_struct_array(
 }
 
 /// Every requested index's columns, sorted once over the complete in-memory
-/// dataset — the in-memory builders' index emission, handed on as persisted
-/// children by [`into_components`](Self::into_components). Lives with the
-/// builders because it is pure emission machinery: nothing on the read side
-/// touches it.
-pub(crate) struct GlobalIndexes {
+/// dataset, handed on as persisted children by
+/// [`into_components`](Self::into_components).
+struct GlobalIndexes {
     by_copy: Option<secondary_by_copy::GlobalCopyArrays>,
     by_reference: Option<secondary_by_reference::GlobalReferenceArrays>,
 }
 
 impl GlobalIndexes {
-    /// Build from the dataset in final row order (term-string columns).
-    pub(crate) fn from_quads(indexes: &[IndexType], quads: &[RawQuad]) -> Self {
-        let mut by_copy = None;
-        let mut by_reference = None;
-        for idx in unique_indexes(indexes) {
-            match idx {
-                IndexType::SecondaryByCopy => {
-                    by_copy = Some(secondary_by_copy::GlobalCopyArrays::from_quads(quads));
-                }
-                IndexType::SecondaryByReference => {
-                    by_reference = Some(secondary_by_reference::GlobalReferenceArrays::from_quads(
-                        quads,
-                    ));
-                }
-            }
-        }
+    /// Build the requested families, each over the dataset in final row
+    /// order; `copy` and `reference` supply a family's arrays and run only
+    /// when that family is requested.
+    fn build(
+        indexes: &[IndexType],
+        copy: impl FnOnce() -> secondary_by_copy::GlobalCopyArrays,
+        reference: impl FnOnce() -> secondary_by_reference::GlobalReferenceArrays,
+    ) -> Self {
+        let unique = unique_indexes(indexes);
         Self {
-            by_copy,
-            by_reference,
-        }
-    }
-
-    /// Dictionary-layout variant: build from the dataset's u32 codes.
-    pub(crate) fn from_codes(indexes: &[IndexType], codes: &QuadCodes) -> Self {
-        let mut by_copy = None;
-        let mut by_reference = None;
-        for idx in unique_indexes(indexes) {
-            match idx {
-                IndexType::SecondaryByCopy => {
-                    by_copy = Some(secondary_by_copy::GlobalCopyArrays::from_codes(codes));
-                }
-                IndexType::SecondaryByReference => {
-                    by_reference = Some(secondary_by_reference::GlobalReferenceArrays::from_codes(
-                        codes,
-                    ));
-                }
-            }
-        }
-        Self {
-            by_copy,
-            by_reference,
+            by_copy: unique.contains(&IndexType::SecondaryByCopy).then(copy),
+            by_reference: unique
+                .contains(&IndexType::SecondaryByReference)
+                .then(reference),
         }
     }
 
     /// Every built index's persisted children, in index declaration order.
     /// Each is globally sorted by construction and says so.
-    pub(crate) fn into_components(self) -> Result<Vec<IndexComponent>> {
+    fn into_components(self) -> Result<Vec<IndexComponent>> {
         let mut components = Vec::new();
         if let Some(sbc) = self.by_copy {
             components.extend(sbc.into_components()?);
@@ -253,7 +230,12 @@ pub(crate) fn build_components(
     indexes: &[IndexType],
     quads: &[RawQuad],
 ) -> Result<Vec<IndexComponent>> {
-    GlobalIndexes::from_quads(indexes, quads).into_components()
+    GlobalIndexes::build(
+        indexes,
+        || secondary_by_copy::GlobalCopyArrays::from_quads(quads),
+        || secondary_by_reference::GlobalReferenceArrays::from_quads(quads),
+    )
+    .into_components()
 }
 
 /// Dictionary-layout counterpart of [`build_components`]: the children are
@@ -264,7 +246,12 @@ pub(crate) fn build_components_from_codes(
     indexes: &[IndexType],
     codes: &QuadCodes,
 ) -> Result<Vec<IndexComponent>> {
-    GlobalIndexes::from_codes(indexes, codes).into_components()
+    GlobalIndexes::build(
+        indexes,
+        || secondary_by_copy::GlobalCopyArrays::from_codes(codes),
+        || secondary_by_reference::GlobalReferenceArrays::from_codes(codes),
+    )
+    .into_components()
 }
 
 /// The parts of a store rebuilt from raw quads under `strategy`: the primary
@@ -305,16 +292,20 @@ pub(crate) fn build_parts_from_raws(
     }
 }
 
-/// Assemble a list of per-chunk StructArrays into a single ArrayRef.
-/// Returns an empty StructArray with the correct schema when `chunks` is empty.
+/// Assemble a builder's per-chunk StructArrays into a single ArrayRef. Every
+/// build emits at least one (possibly empty) chunk, so `chunks` carries the
+/// schema; an empty list is a caller bug.
 // Read only by the out-of-core builder, which is compiled out on
 // wasm32-unknown-unknown.
 #[cfg_attr(all(target_arch = "wasm32", target_os = "unknown"), allow(dead_code))]
-pub(crate) fn assemble_chunks(chunks: Vec<ArrayRef>, layout: LayoutStrategy) -> Result<ArrayRef> {
-    if chunks.is_empty() {
-        return make_empty_struct(layout);
-    }
-    let dtype = chunks[0].dtype().clone();
+pub(crate) fn assemble_chunks(chunks: Vec<ArrayRef>) -> Result<ArrayRef> {
+    let dtype = chunks
+        .first()
+        .ok_or_else(|| {
+            VortexRdfError::InvalidOperation("assemble_chunks: no chunks to assemble".to_string())
+        })?
+        .dtype()
+        .clone();
     chunked_or_single(chunks, dtype)
 }
 

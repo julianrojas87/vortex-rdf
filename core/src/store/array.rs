@@ -298,7 +298,7 @@ pub(crate) fn with_searchable_int_children(rows: ArrayRef) -> Result<ArrayRef> {
 /// Sortedness stamps carry across; non-u32 and nullable children pass
 /// through untouched. A chunked column is compressed chunk by chunk (see
 /// [`compress_u32_child`]) — the builders assemble anything over
-/// `DEFAULT_CHUNK_SIZE` rows into a `ChunkedArray`, so without that every
+/// `DEFAULT_CHUNK_ROWS` rows into a `ChunkedArray`, so without that every
 /// build past one chunk would keep the canonical form.
 ///
 /// `payload_lazy` wraps each compressed column in a `vortex.shared` lazy
@@ -417,7 +417,7 @@ fn canonical_u32(arr: &ArrayRef) -> Option<vortex_array::arrays::PrimitiveArray>
 ///
 /// A chunked column is compressed chunk by chunk and reassembled, which is
 /// what makes the compressed-resident form reach builds above
-/// `DEFAULT_CHUNK_SIZE` rows at all: the builders assemble anything larger
+/// `DEFAULT_CHUNK_ROWS` rows at all: the builders assemble anything larger
 /// into a `ChunkedArray`, and a downcast straight to `Primitive` sees only
 /// the wrapper. Per-chunk is also the natural granularity — the bounds pass
 /// that picks the encoding is per-chunk regardless, and a chunk of a globally

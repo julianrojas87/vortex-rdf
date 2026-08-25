@@ -3,14 +3,14 @@
 //!
 //! Holding everything at once is what earns the global sortedness this
 //! builder claims: the `s` column's `IsSorted` stamp, and the index children
-//! it builds through [`GlobalIndexes`] over the sorted dataset. The cost is
-//! O(dataset) memory; the out-of-core strategy with the same guarantee is
+//! it builds through [`build_components`] over the sorted dataset. The cost
+//! is O(dataset) memory; the out-of-core strategy with the same guarantee is
 //! [`sorted_stream`](super::sorted_stream). Only this file's ordering
 //! discipline lives here — the emission machinery it drives belongs to
 //! [`builders`](super).
 
 use super::{
-    BuiltArray, BuiltStream, ChunkStream, DEFAULT_CHUNK_SIZE, VortexArrayBuilder, build_components,
+    BuiltArray, BuiltStream, ChunkStream, DEFAULT_CHUNK_ROWS, VortexArrayBuilder, build_components,
     build_components_from_codes, build_struct_array, into_vortex_error, make_empty_struct,
 };
 use crate::error::Result;
@@ -26,10 +26,10 @@ use std::sync::Arc;
 
 /// Fully in-memory, globally sorted Vortex RDF Array Builder.
 ///
-/// Sorts all quads in memory by (s, p, o, g) before writing columns.
-/// Produces Reference secondary indexes when requested; their columns are
-/// emitted in global sorted order (stamped `IsSorted`), so `match_pattern`
-/// can binary-search them.
+/// Sorts all quads in memory by (s, p, o, g), builds the primary columns, and
+/// builds every requested index child (by copy and by reference) over the
+/// same sorted dataset, so each child is globally sorted and
+/// binary-searchable.
 pub struct SortedInMemoryBuilder;
 
 impl VortexArrayBuilder for SortedInMemoryBuilder {
@@ -77,16 +77,15 @@ impl VortexArrayBuilder for SortedInMemoryBuilder {
         Ok(built)
     }
 
-    /// Streaming override for file writes: the sort still requires the whole
-    /// dataset in memory as `RawQuad`s, but column chunks are built lazily as
-    /// the writer polls, so only one chunk's Vortex arrays exist at a time:
-    /// peak memory is ~1× dataset plus one chunk.
+    /// The sort holds the whole dataset as `RawQuad`s; column chunks are
+    /// built lazily as the writer polls, so only one chunk's Vortex arrays
+    /// exist at a time.
     async fn build_vortex_stream(
         quad_stream: Box<dyn Stream<Item = Result<RawQuad>> + Unpin + Send + 'static>,
         layout: LayoutStrategy,
         indexes: Indexes,
     ) -> Result<BuiltStream> {
-        build_sorted_chunk_stream(quad_stream, layout, indexes, DEFAULT_CHUNK_SIZE).await
+        build_chunk_stream(quad_stream, layout, indexes, DEFAULT_CHUNK_ROWS).await
     }
 }
 
@@ -117,7 +116,7 @@ async fn ingest_and_sort(
 /// The index children are built once over the whole sorted dataset and ride
 /// beside the stream as complete components — their row ids address the
 /// assembled array, so they cannot be cut per chunk anyway.
-pub(crate) async fn build_sorted_chunk_stream(
+pub(crate) async fn build_chunk_stream(
     quad_stream: Box<dyn Stream<Item = Result<RawQuad>> + Unpin + Send + 'static>,
     layout: LayoutStrategy,
     indexes: Indexes,
