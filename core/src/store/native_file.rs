@@ -150,18 +150,10 @@ impl NativeStoreFile {
         &self.bound_exprs
     }
 
-    /// The subject column's chunk-probe handle, for exact bound-subject row
-    /// ranges via encoded chunk probes. `None` (memoized) when the quad
-    /// child's layout shape declines — callers then keep the scan path.
-    pub(crate) fn sorted_subject_chunks(
-        &self,
-    ) -> Option<Arc<vortex_rdf_encoded_search::ColumnChunks>> {
-        self.column_chunks(crate::store::schema::COL_S)
-    }
-
-    /// A quad column's chunk-probe handle by name, for point reads through
-    /// the wire-encoded chunks. `None` (memoized) when the quad child's
-    /// layout shape or that column's dtype declines.
+    /// A quad column's chunk-probe handle by name, for point reads and exact
+    /// bound-term row ranges through the wire-encoded chunks. `None`
+    /// (memoized) when the quad child's layout shape or that column's dtype
+    /// declines — callers then keep the scan path.
     pub(crate) fn column_chunks(
         &self,
         column: &str,

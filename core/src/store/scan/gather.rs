@@ -9,7 +9,7 @@ use vortex_array::{ArrayRef, IntoArray};
 use vortex_mask::Mask;
 
 use crate::error::{Result, VortexRdfError};
-use crate::store::probes::BaseProbes;
+use crate::store::probes::StructProbes;
 use crate::store::selection::RowSelection;
 
 /// Gather the rows of `base` that `selection` covers and `deleted` has not
@@ -23,7 +23,7 @@ pub(crate) fn gather_live(
     base: &ArrayRef,
     selection: &RowSelection,
     deleted: Option<&Mask>,
-    probes: Option<&BaseProbes>,
+    probes: Option<&StructProbes>,
 ) -> Result<ArrayRef> {
     if let Some(rows) = gather_by_point_reads(base, selection, deleted, probes)? {
         return Ok(rows);
@@ -52,7 +52,7 @@ pub(crate) fn gather_by_point_reads(
     base: &ArrayRef,
     selection: &RowSelection,
     deleted: Option<&Mask>,
-    probes: Option<&BaseProbes>,
+    probes: Option<&StructProbes>,
 ) -> Result<Option<ArrayRef>> {
     use vortex_array::arrays::struct_::StructArrayExt;
     use vortex_array::arrays::{Struct, StructArray};

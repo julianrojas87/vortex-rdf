@@ -106,7 +106,7 @@ pub(crate) fn adopt_scanned_component(
             cell: OnceLock::new(),
         })),
         sorted,
-        probes: crate::store::probes::BaseProbes::new(),
+        probes: crate::store::probes::StructProbes::new(),
     })
 }
 
@@ -133,7 +133,7 @@ pub(crate) fn adopt_component_reader(
             cell: OnceLock::new(),
         })),
         sorted,
-        probes: crate::store::probes::BaseProbes::new(),
+        probes: crate::store::probes::StructProbes::new(),
     })
 }
 
@@ -170,7 +170,7 @@ pub(crate) struct IndexComponent {
     /// so the cache's array-identity guard holds for the component's
     /// lifetime; `into_resident` rebuilds the component and takes a fresh
     /// cache.
-    probes: Arc<crate::store::probes::BaseProbes>,
+    probes: Arc<crate::store::probes::StructProbes>,
 }
 
 /// How an [`IndexComponent`] holds its rows.
@@ -220,7 +220,7 @@ impl IndexComponent {
             implementation,
             rows: ComponentRows::Built(array),
             sorted,
-            probes: crate::store::probes::BaseProbes::new(),
+            probes: crate::store::probes::StructProbes::new(),
         }
     }
 
@@ -305,10 +305,9 @@ impl IndexComponent {
         .map_err(VortexRdfError::Vortex)
     }
 
-    /// Whether the rows have been canonicalized yet — the laziness probe the
-    /// deferral tests pin `from_bytes` on (those tests need `to_bytes`, hence
-    /// the file-io bound).
-    #[cfg(all(test, feature = "file-io"))]
+    /// Whether the rows have been canonicalized yet (a test-hook probe).
+    #[cfg(test)]
+    #[allow(dead_code)]
     pub(crate) fn is_materialized(&self) -> bool {
         match &self.rows {
             ComponentRows::Built(_) => true,
@@ -336,7 +335,7 @@ impl IndexComponent {
             rows: ComponentRows::Built(array),
             // The rebuilt rows are a different array; the old cache's
             // identity guard would only ever decline against them.
-            probes: crate::store::probes::BaseProbes::new(),
+            probes: crate::store::probes::StructProbes::new(),
             ..self
         })
     }
@@ -356,7 +355,7 @@ impl IndexComponent {
         let array = into_struct_array(compressed)?;
         Ok(Self {
             rows: ComponentRows::Built(array),
-            probes: crate::store::probes::BaseProbes::new(),
+            probes: crate::store::probes::StructProbes::new(),
             ..self
         })
     }
@@ -376,17 +375,17 @@ impl IndexComponent {
 
     /// The component's shared probe cache, for a serve plan that outlives
     /// this reference.
-    pub(crate) fn probes_arc(&self) -> Arc<crate::store::probes::BaseProbes> {
+    pub(crate) fn probes_arc(&self) -> Arc<crate::store::probes::StructProbes> {
         Arc::clone(&self.probes)
     }
 
     /// Resolve this component's probes now rather than on the first query —
     /// the component half of the eager resolution every in-memory
-    /// construction does (see [`BaseProbes::warm`]). A *deferred* component
+    /// construction does (see [`StructProbes::warm`]). A *deferred* component
     /// is left alone: materializing it here would undo the deferral that
     /// `from_bytes` adoption exists for.
     ///
-    /// [`BaseProbes::warm`]: crate::store::probes::BaseProbes::warm
+    /// [`StructProbes::warm`]: crate::store::probes::StructProbes::warm
     pub(crate) fn warm_probes(&self) {
         if matches!(self.rows, ComponentRows::Deferred(_)) {
             return;

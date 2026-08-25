@@ -22,9 +22,10 @@ use vortex_scan::strict_sorted_buffer::StrictSortedBuffer;
 
 use crate::error::{Result, VortexRdfError};
 use crate::io::read::available_parallelism;
-use crate::store::layouts::{Constraints, PatternCodes};
+use crate::store::layouts::{Constraints, PatternCodes, TermRef};
 use crate::store::native_file::NativeStoreFile;
 use crate::store::scan::gather::primitive_from_u64_reads;
+use crate::store::schema;
 use crate::store::selection::RowSelection;
 
 /// The bind-memo scope tag for expressions over the quad table's schema
@@ -331,6 +332,34 @@ pub(crate) fn build_file_filter(
             }
         },
     )
+}
+
+/// The exact row range of `subject`'s run in a sorted file, by binary search
+/// over the subject column's encoded chunks. `None` declines — an unsorted
+/// file, a subject without a native probe scalar (string-subject layouts, a
+/// term the dictionary lacks), a column whose chunk shape has no probe — and
+/// the caller keeps the scan path.
+pub(crate) async fn locate_subject_run(
+    file: &NativeStoreFile,
+    codes: &mut PatternCodes,
+    subject: &NamedOrBlankNode,
+) -> Result<Option<Range<u64>>> {
+    if !file.quads_sorted() {
+        return Ok(None);
+    }
+    let Ok(Some(probe)) = codes.probe_scalar(TermRef::Subject(subject)) else {
+        return Ok(None);
+    };
+    let Ok(needle) = u64::try_from(&probe) else {
+        return Ok(None);
+    };
+    let Some(chunks) = file.column_chunks(schema::COL_S) else {
+        return Ok(None);
+    };
+    chunks
+        .bounds(needle, &file.segment_source(), file.session())
+        .await
+        .map_err(VortexRdfError::Vortex)
 }
 
 /// Rows of a small exact file selection, read point-by-point through the

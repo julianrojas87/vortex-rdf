@@ -190,7 +190,7 @@ async fn test_file_backed_chained_subject_then_object_index() {
     // The sorted subject column narrows a bound subject to a sub-range of
     // the file via zone-map pruning (row 12000 lives in the middle zone).
     let s_mid = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/s012000").unwrap());
-    let range = store.debug_subject_row_range(&s_mid).await.unwrap();
+    let range = store.debug_subject_pruning_envelope(&s_mid).await.unwrap();
     let range = range.expect("sorted multi-zone file must narrow a bound subject");
     assert!(range.start <= 12000 && 12000 < range.end);
     assert!(
@@ -256,7 +256,10 @@ async fn test_file_backed_subject_metadata_range_for_missing_subject() {
 
     let store = VortexRdfStore::from_file(&path).await.unwrap();
     let missing = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/s99").unwrap());
-    let row_range = store.debug_subject_row_range(&missing).await.unwrap();
+    let row_range = store
+        .debug_subject_pruning_envelope(&missing)
+        .await
+        .unwrap();
     assert_eq!(row_range, Some(0..0));
     assert_eq!(
         store
@@ -316,7 +319,7 @@ async fn test_file_subject_probe_matches_memory() {
 
     // Engagement, pinned directly: the exact 3-row run for a mid subject.
     let mid = subject(777);
-    let range = store.debug_subject_bounds_range(&mid).await.unwrap();
+    let range = store.debug_subject_chunk_probe_range(&mid).await.unwrap();
     assert_eq!(range, Some(777 * 3..777 * 3 + 3), "fast path must engage");
 
     let p = NamedNode::new("http://example.org/p1").unwrap();
@@ -460,7 +463,10 @@ async fn test_file_subject_probe_requires_sorted() {
 
     let store = VortexRdfStore::from_file(&path).await.unwrap();
     let s = subject(10);
-    assert_eq!(store.debug_subject_bounds_range(&s).await.unwrap(), None);
+    assert_eq!(
+        store.debug_subject_chunk_probe_range(&s).await.unwrap(),
+        None
+    );
     let matched = store
         .match_pattern(Some(&s), None, None, None)
         .await

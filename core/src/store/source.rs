@@ -5,7 +5,7 @@ use vortex_mask::Mask;
 
 use crate::error::Result;
 use crate::store::indexes::{InMemoryServePlan, IndexComponent};
-use crate::store::probes::BaseProbes;
+use crate::store::probes::StructProbes;
 use crate::store::scan::gather::gather_live;
 use crate::store::selection::{RowSelection, ViewSelection};
 
@@ -63,7 +63,7 @@ pub(crate) enum QuadsSource {
         /// encoding tree per call otherwise — the fixed cost of point reads
         /// on a compressed-resident base). Carried wherever `base` itself
         /// carries; a fresh base takes a fresh cache.
-        probes: Arc<BaseProbes>,
+        probes: Arc<StructProbes>,
         /// When this view's selection came from an index resolution over an
         /// otherwise-unrefined base, and that index holds the matched rows as a
         /// contiguous run of its own columns, the plan for `quads()` to slice
@@ -138,6 +138,28 @@ pub(crate) enum QuadsSource {
         /// [`FileServePlan`]: crate::store::indexes::FileServePlan
         serve: Option<FileServePlan>,
     },
+}
+
+impl QuadsSource {
+    /// The base row ids visible through this source, whichever backend holds
+    /// the rows.
+    pub(crate) fn view_selection(&self) -> &ViewSelection {
+        match self {
+            QuadsSource::InMemory { selection, .. } => selection,
+            #[cfg(feature = "file-io")]
+            QuadsSource::File { selection, .. } => selection,
+        }
+    }
+
+    /// Whether this source carries an index serving plan for its reads.
+    #[cfg(test)]
+    pub(crate) fn serve_plan_attached(&self) -> bool {
+        match self {
+            QuadsSource::InMemory { serve, .. } => serve.is_some(),
+            #[cfg(feature = "file-io")]
+            QuadsSource::File { serve, .. } => serve.is_some(),
+        }
+    }
 }
 
 /// Rows appended after construction: the write-optimized delta over the

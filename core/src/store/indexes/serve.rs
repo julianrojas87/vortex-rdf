@@ -132,7 +132,7 @@ impl ServeDecode {
         &self,
         array: &ArrayRef,
         range: Range<usize>,
-        probes: &crate::store::probes::BaseProbes,
+        probes: &crate::store::probes::StructProbes,
         deleted: Option<&Mask>,
     ) -> Result<Option<ArrayRef>> {
         if !point_sized(range.len() as u64) {
@@ -254,7 +254,7 @@ pub(crate) struct InMemoryServePlan {
     /// The component's shared probe cache, so a small run reads
     /// point-by-point at its global positions instead of slicing (a slice's
     /// probe would be re-resolved per call).
-    probes: Arc<crate::store::probes::BaseProbes>,
+    probes: Arc<crate::store::probes::StructProbes>,
 }
 
 impl InMemoryServePlan {
@@ -266,7 +266,7 @@ impl InMemoryServePlan {
         decode_layout: ResolvedLayout,
         array: ArrayRef,
         range: Range<usize>,
-        probes: Arc<crate::store::probes::BaseProbes>,
+        probes: Arc<crate::store::probes::StructProbes>,
     ) -> Self {
         Self {
             decode: ServeDecode {

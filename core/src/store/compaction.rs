@@ -194,7 +194,7 @@ impl VortexRdfStore {
         // Compress like every other construction — a compacted store carries
         // the same resident form a freshly built one does.
         let (base, components) = super::compress_built_parts(base, components)?;
-        Self::from_parts_internal(base, components, layout)
+        Self::assemble_resident(base, components, layout)
     }
 
     /// Whether `add_quads` should fold the tail into the base now.

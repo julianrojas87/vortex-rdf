@@ -21,6 +21,8 @@ mod open;
 mod rows;
 mod serialize;
 mod streaming;
+#[cfg(test)]
+mod test_hooks;
 
 pub use builders::{
     BuiltArray, BuiltStream, ChunkStream, SortedInMemoryBuilder, VortexArrayBuilder,
@@ -181,99 +183,7 @@ impl VortexRdfStore {
             .into_iter()
             .map(crate::store::indexes::IndexComponent::into_resident)
             .collect::<Result<Vec<_>>>()?;
-        Self::from_parts_internal(base, components, layout)
-    }
-
-    /// Test-only hook: whether every non-nullable integer child of an
-    /// in-memory base is a canonical primitive — true only when adoption
-    /// decoded everything (or the children were built canonical), so tests
-    /// assert compression *retention* by negating it. Vacuously true for a
-    /// file-backed store, whose base is not held in memory at all.
-    #[cfg(all(test, feature = "file-io"))]
-    pub(crate) fn debug_base_int_children_canonical(&self) -> bool {
-        use vortex_array::arrays::Struct;
-        let QuadsSource::InMemory { base, .. } = &self.quads else {
-            return true;
-        };
-        let Ok(struct_arr) = base.clone().try_downcast::<Struct>() else {
-            return false;
-        };
-        debug_int_children_canonical(&struct_arr)
-    }
-
-    /// Test-only hook: whether one named child of an in-memory base is a
-    /// canonical primitive — the per-child counterpart of
-    /// [`debug_base_int_children_canonical`](Self::debug_base_int_children_canonical),
-    /// so tests can pin retention of a specific encoding (e.g. a
-    /// dictionary-encoded object column). `None` when the base has no such
-    /// child or is not in memory.
-    #[cfg(all(test, feature = "file-io"))]
-    pub(crate) fn debug_base_child_int_canonical(&self, name: &str) -> Option<bool> {
-        use vortex_array::arrays::struct_::StructArrayExt;
-        use vortex_array::arrays::{Primitive, Struct};
-        let QuadsSource::InMemory { base, .. } = &self.quads else {
-            return None;
-        };
-        let struct_arr = base.clone().try_downcast::<Struct>().ok()?;
-        let child = struct_arr.unmasked_field_by_name(name).ok()?;
-        child.dtype().is_int().then(|| child.is::<Primitive>())
-    }
-
-    /// Test-only hook: whether the named in-memory component's rows hold
-    /// canonical integer children — the component counterpart of
-    /// [`debug_base_int_children_canonical`](Self::debug_base_int_children_canonical),
-    /// so tests can pin that construction compresses components too. `None`
-    /// when this store holds no such in-memory component.
-    #[cfg(all(test, feature = "file-io"))]
-    pub(crate) fn debug_index_component_int_children_canonical(&self, name: &str) -> Option<bool> {
-        let QuadsSource::InMemory { components, .. } = &self.quads else {
-            return None;
-        };
-        let component = components.iter().find(|c| c.name == name)?;
-        Some(debug_int_children_canonical(component.rows().ok()?))
-    }
-
-    /// Test-only hook: whether every sorted-stamped child of an in-memory
-    /// base resolves an encoded search probe (see
-    /// [`debug_sorted_children_probe_resolvable`]) — true for canonical and
-    /// wire-encoded adoptions alike, false only when a bounds search on some
-    /// child would fall through to the generic kernel. Vacuously true for a
-    /// file-backed store.
-    #[cfg(all(test, feature = "file-io"))]
-    pub(crate) fn debug_base_probe_resolvable(&self) -> bool {
-        use vortex_array::arrays::Struct;
-        let QuadsSource::InMemory { base, .. } = &self.quads else {
-            return true;
-        };
-        let Ok(struct_arr) = base.clone().try_downcast::<Struct>() else {
-            return false;
-        };
-        debug_sorted_children_probe_resolvable(&struct_arr)
-    }
-
-    /// Test-only hook: whether an in-memory base's `s` column carries the
-    /// sorted stamp, so tests can assert the stamp survives adoption instead
-    /// of only observing (order-insensitive) match results.
-    #[cfg(all(test, feature = "file-io"))]
-    pub(crate) fn debug_base_subject_sorted(&self) -> bool {
-        match &self.quads {
-            QuadsSource::InMemory { base, .. } => array::subject_sorted(base),
-            QuadsSource::File { .. } => false,
-        }
-    }
-
-    /// Test-only hook: whether the dictionary was left in its child. A
-    /// file-backed dictionary is only ever built around a resolved
-    /// wire-chunk handle, so this is also the assertion that the child's
-    /// layout shape was point-readable — a shape that declined opens
-    /// resident instead.
-    #[cfg(all(test, feature = "file-io"))]
-    pub(crate) fn debug_dict_file_backed(&self) -> bool {
-        use crate::store::layouts::DictAccess;
-        matches!(
-            &self.layout,
-            ResolvedLayout::Dictionary(DictAccess::FileBacked(_))
-        )
+        Self::assemble_resident(base, components, layout)
     }
 
     /// Build from a builder's output: the primary quad array plus whatever the
@@ -283,7 +193,7 @@ impl VortexRdfStore {
     pub fn from_built(built: BuiltArray) -> Result<Self> {
         let layout = resolved_layout(built.dict, built.array.dtype())?;
         let (base, components) = compress_built_parts(built.array, built.components)?;
-        Self::from_parts_internal(base, components, layout)
+        Self::assemble_resident(base, components, layout)
     }
 
     /// Assemble a store from an already-split primary base plus its
@@ -294,7 +204,7 @@ impl VortexRdfStore {
     /// wire encodings selectively
     /// ([`with_searchable_int_children`](array::with_searchable_int_children));
     /// this assembler transforms nothing.
-    fn from_parts_internal(
+    fn assemble_resident(
         base: ArrayRef,
         components: Vec<crate::store::indexes::IndexComponent>,
         layout: ResolvedLayout,
@@ -305,7 +215,7 @@ impl VortexRdfStore {
         let indexes = crate::store::indexes::indexes_from_components(&components);
         // Resolve the encoded-search probes at construction, so no query pays
         // the encoding-tree walk.
-        let store_probes = probes::BaseProbes::new();
+        let store_probes = probes::StructProbes::new();
         store_probes.warm(&base);
         for component in components.iter() {
             component.warm_probes();
@@ -348,7 +258,7 @@ impl VortexRdfStore {
                 selection: ViewSelection::all(),
                 components: Arc::from(Vec::new()),
                 deleted: None,
-                probes: probes::BaseProbes::new(),
+                probes: probes::StructProbes::new(),
                 serve: None,
             },
             tail: None,
@@ -472,14 +382,12 @@ impl VortexRdfStore {
             .tail
             .as_ref()
             .is_none_or(|tail| matches!(tail.selection, RowSelection::All));
-        tail_owned
-            && match &self.quads {
-                QuadsSource::InMemory { selection, .. } => selection.is_all(),
-                #[cfg(feature = "file-io")]
-                QuadsSource::File {
-                    filter, selection, ..
-                } => filter.is_none() && selection.is_all(),
-            }
+        let unfiltered = match &self.quads {
+            QuadsSource::InMemory { .. } => true,
+            #[cfg(feature = "file-io")]
+            QuadsSource::File { filter, .. } => filter.is_none(),
+        };
+        tail_owned && unfiltered && self.quads.view_selection().is_all()
     }
 
     fn ensure_owner(&self, operation: &str) -> Result<()> {
@@ -553,54 +461,6 @@ impl VortexRdfStore {
         }
         self.dictionary_snapshot()
     }
-
-    /// Test-only: whether the named in-memory index component has
-    /// canonicalized its rows yet (`None` when this store holds no such
-    /// component) — how the deferral tests pin `from_bytes`' laziness. The
-    /// tests need `to_bytes`, hence the file-io bound.
-    #[cfg(all(test, feature = "file-io"))]
-    pub(crate) fn index_component_materialized(&self, name: &str) -> Option<bool> {
-        match &self.quads {
-            QuadsSource::InMemory { components, .. } => components
-                .iter()
-                .find(|c| c.name == name)
-                .map(|c| c.is_materialized()),
-            #[cfg(feature = "file-io")]
-            QuadsSource::File { .. } => None,
-        }
-    }
-}
-
-/// Whether every non-nullable integer child of `struct_arr` is a canonical
-/// primitive — the shared predicate behind the resident-adoption test hooks.
-#[cfg(all(test, feature = "file-io"))]
-fn debug_int_children_canonical(struct_arr: &StructArray) -> bool {
-    use vortex_array::arrays::Primitive;
-    use vortex_array::arrays::struct_::StructArrayExt;
-    struct_arr.names().iter().all(|name| {
-        let Ok(child) = struct_arr.unmasked_field_by_name(name.as_ref()) else {
-            return false;
-        };
-        let int = child.dtype().is_int() && !child.dtype().is_nullable();
-        !int || child.clone().try_downcast::<Primitive>().is_ok()
-    })
-}
-
-/// Whether every sorted-stamped child of `struct_arr` binds an encoded
-/// search probe — the property that keeps every bounds search off the
-/// generic per-scalar kernel, whether the child is canonical or
-/// wire-encoded. Unsorted children never take bounds searches, and their
-/// equality path has the mask scan behind it, so they are not constrained.
-#[cfg(all(test, feature = "file-io"))]
-fn debug_sorted_children_probe_resolvable(struct_arr: &StructArray) -> bool {
-    use vortex_array::arrays::struct_::StructArrayExt;
-    struct_arr.names().iter().all(|name| {
-        let Ok(child) = struct_arr.unmasked_field_by_name(name.as_ref()) else {
-            return false;
-        };
-        !array::column_is_sorted(child)
-            || vortex_rdf_encoded_search::SortedProbe::resolve(child).is_some()
-    })
 }
 
 #[cfg(test)]

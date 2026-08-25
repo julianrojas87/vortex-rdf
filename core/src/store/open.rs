@@ -355,6 +355,6 @@ impl VortexRdfStore {
             (None, LayoutStrategy::TypedObject) => ResolvedLayout::TypedObject,
             (None, LayoutStrategy::Default) => ResolvedLayout::Default,
         };
-        Self::from_parts_internal(quads, components, layout)
+        Self::assemble_resident(quads, components, layout)
     }
 }

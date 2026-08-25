@@ -21,14 +21,14 @@ use vortex_rdf_encoded_search::OwnedSortedProbe;
 /// a construction site that wrongly carries the cache across a base swap
 /// degrades to the uncached path instead of corrupting reads.
 #[derive(Default)]
-pub(crate) struct BaseProbes {
+pub(crate) struct StructProbes {
     cells: OnceLock<(usize, ProbeCells)>,
 }
 
 /// One resolved probe (or a decline) per base child, in child order.
 type ProbeCells = Vec<(FieldName, Option<Arc<OwnedSortedProbe>>)>;
 
-impl BaseProbes {
+impl StructProbes {
     pub(crate) fn new() -> Arc<Self> {
         Arc::new(Self::default())
     }

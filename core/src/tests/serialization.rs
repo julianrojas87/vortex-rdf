@@ -362,7 +362,7 @@ async fn test_from_bytes_defers_index_child_materialization() {
     let reread = VortexRdfStore::from_bytes(&bytes).await.unwrap();
     for name in ["index:posg", "index:ospg", "index:ref-o", "index:ref-p"] {
         assert_eq!(
-            reread.index_component_materialized(name),
+            reread.debug_index_component_materialized(name),
             Some(false),
             "{name}: from_bytes must not materialize index children"
         );
@@ -381,13 +381,13 @@ async fn test_from_bytes_defers_index_child_materialization() {
     // p1 is on rows 1, 4, 7, 10 — the probe answered through the index.
     assert_eq!(matched.size().await.unwrap(), 4);
     assert_eq!(
-        reread.index_component_materialized("index:posg"),
+        reread.debug_index_component_materialized("index:posg"),
         Some(true),
         "the probed family materializes on first use"
     );
     for name in ["index:ospg", "index:ref-o", "index:ref-p"] {
         assert_eq!(
-            reread.index_component_materialized(name),
+            reread.debug_index_component_materialized(name),
             Some(false),
             "{name}: an unprobed component stays deferred"
         );
@@ -435,7 +435,7 @@ async fn test_from_parts_adopts_searchable_children() {
     );
     for name in ["index:posg", "index:ospg"] {
         assert_eq!(
-            store.index_component_materialized(name),
+            store.debug_index_component_materialized(name),
             Some(true),
             "{name}: from_parts must adopt components in resident form"
         );

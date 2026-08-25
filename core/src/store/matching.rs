@@ -21,8 +21,6 @@ use crate::store::selection::{RowSelection, ViewSelection};
 use crate::store::{QuadsSource, Tail};
 
 use oxrdf::{GraphName, NamedNode, NamedOrBlankNode, Quad, Term};
-#[cfg(all(test, feature = "file-io"))]
-use std::ops::Range;
 use std::sync::Arc;
 use web_time::Instant;
 
@@ -140,33 +138,18 @@ impl VortexRdfStore {
     ) -> Result<Self> {
         let t = debug::timer();
 
-        // Resolve each bound term to its dictionary code at most once for this
-        // whole match: the stages below each need the same mapping, and under
-        // the Dictionary layout deriving it is a binary search per term.
-        //
-        // The prelude resolves them all up front and hands back the witness
-        // every synchronous probe below runs on — the one point where a
-        // dictionary may perform I/O (a file-backed one will scan here), so
-        // every stage below reads `codes` synchronously.
         let pattern = QuadPattern::new(subject, predicate, object, graph);
-        let mut codes = self.layout.prepare_pattern(pattern).await?;
-        log::debug!(
-            "[match_pattern] Prepared pattern codes at {:?}",
-            debug::elapsed(t)
-        );
-
-        // A pattern the layout can prove unmatchable (e.g. a term absent from
-        // the dictionary) needs no search — and no scan machinery — at all,
-        // whichever backend holds the rows. The gate reads the prelude's role
-        // cache rather than compiling constraints, which every stage below
-        // compiles for itself over whatever the fast paths leave residual.
-        if codes.provably_empty(pattern) {
+        let Some(mut codes) = self.prepared_codes(pattern).await? else {
             log::debug!(
                 "[match_pattern] Layout proved the pattern unmatchable at {:?}",
                 debug::elapsed(t)
             );
             return Ok(self.empty_view());
-        }
+        };
+        log::debug!(
+            "[match_pattern] Prepared pattern codes at {:?}",
+            debug::elapsed(t)
+        );
 
         match &self.quads {
             QuadsSource::InMemory { .. } => {
@@ -178,6 +161,21 @@ impl VortexRdfStore {
                     .await
             }
         }
+    }
+
+    /// The match prelude: every bound term of `pattern` resolved to its code
+    /// at most once, as the witness every synchronous probe of the match
+    /// runs on — the one point where a dictionary may perform I/O (a
+    /// file-backed one scans here). `None` when the layout proves the
+    /// pattern unmatchable (e.g. a term absent from the dictionary), read off
+    /// the prelude's role cache: such a pattern needs no search, and no scan
+    /// machinery, whichever backend holds the rows.
+    pub(super) async fn prepared_codes(
+        &self,
+        pattern: QuadPattern<'_>,
+    ) -> Result<Option<PatternCodes>> {
+        let codes = self.layout.prepare_pattern(pattern).await?;
+        Ok((!codes.provably_empty(pattern)).then_some(codes))
     }
 
     /// The in-memory backend of [`match_base`](Self::match_base): every
@@ -512,20 +510,12 @@ impl VortexRdfStore {
         // the file mirror of the in-memory subject fast path. Both index
         // resolvers decline bound-subject patterns, so this takes over an
         // uncontested route; the subject then leaves the pattern, and the
-        // residual terms ride the narrowed range. Any decline (unsorted
-        // file, string-subject layout, unknown term, unsupported chunk
-        // encoding) leaves the pattern intact for the scan path.
+        // residual terms ride the narrowed range. Any decline leaves the
+        // pattern intact for the scan path.
         let mut pat = QuadPattern::new(subject, predicate, object, graph);
         let mut subject_range: Option<std::ops::Range<u64>> = None;
         if let Some(subj) = pat.subject
-            && file.quads_sorted()
-            && let Ok(Some(probe)) = codes.probe_scalar(TermRef::Subject(subj))
-            && let Ok(needle) = u64::try_from(&probe)
-            && let Some(chunks) = file.sorted_subject_chunks()
-            && let Some(range) = chunks
-                .bounds(needle, &file.segment_source(), file.session())
-                .await
-                .map_err(VortexRdfError::Vortex)?
+            && let Some(range) = file_scan::locate_subject_run(file, codes, subj).await?
         {
             subject_range = Some(range);
             pat.subject = None;
@@ -787,167 +777,6 @@ impl VortexRdfStore {
             // a non-empty constraint set, so the fold always starts.
             None => ConstantArray::new(Scalar::from(true), struct_arr.len()).into_array(),
         })
-    }
-
-    /// Test-only hook: whether this view carries an index serving plan for
-    /// `quads()`, so tests can assert the plan actually attaches (and drops)
-    /// where intended instead of only observing results.
-    #[cfg(test)]
-    pub(crate) fn debug_has_serve_plan(&self) -> bool {
-        match &self.quads {
-            QuadsSource::InMemory { serve, .. } => serve.is_some(),
-            #[cfg(feature = "file-io")]
-            QuadsSource::File { serve, .. } => serve.is_some(),
-        }
-    }
-
-    /// Test-only hook: whether this view's base selection is still pending —
-    /// a served match whose exact row ids no consumer has needed yet — so
-    /// tests can assert the deferral engages (and materializes) exactly where
-    /// intended instead of only observing results.
-    #[cfg(test)]
-    pub(crate) fn debug_selection_pending(&self) -> bool {
-        match &self.quads {
-            QuadsSource::InMemory { selection, .. } => {
-                matches!(selection, ViewSelection::Pending(_))
-            }
-            #[cfg(feature = "file-io")]
-            QuadsSource::File { selection, .. } => matches!(selection, ViewSelection::Pending(_)),
-        }
-    }
-
-    /// Test-only hook: whether a pending selection's row ids have actually
-    /// been computed. `false` for a still-deferred resolution, so a test can
-    /// pin that a read was answered off the serve plan alone. `None` when the
-    /// selection is not pending at all.
-    #[cfg(test)]
-    pub(crate) fn debug_row_ids_materialized(&self) -> Option<bool> {
-        let selection = match &self.quads {
-            QuadsSource::InMemory { selection, .. } => selection,
-            #[cfg(feature = "file-io")]
-            QuadsSource::File { selection, .. } => selection,
-        };
-        match selection {
-            ViewSelection::Exact(_) => None,
-            ViewSelection::Pending(lazy) => Some(lazy.debug_materialized()),
-        }
-    }
-
-    /// Test-only hook: the exact row range this view's base selection is,
-    /// when it is one — what the prefix probe leaves behind — so tests can
-    /// pin that a pattern was answered by binary search rather than by a scan
-    /// that happens to agree on the count. `None` for every other shape.
-    #[cfg(test)]
-    pub(crate) fn debug_selection_range(&self) -> Option<std::ops::Range<u64>> {
-        let selection = match &self.quads {
-            QuadsSource::InMemory { selection, .. } => selection,
-            #[cfg(feature = "file-io")]
-            QuadsSource::File { selection, .. } => selection,
-        };
-        match selection {
-            ViewSelection::Exact(RowSelection::Range(range)) => Some(range.clone()),
-            _ => None,
-        }
-    }
-
-    /// Test-only hook: the index-child row range a file view's serve plan
-    /// located for its run, so tests can pin that a served read goes through
-    /// the range scan (or the point reads) rather than the filter scan.
-    /// `None` without a plan, or when the plan's run is unlocated.
-    #[cfg(all(test, feature = "file-io"))]
-    pub(crate) fn debug_serve_row_range(&self) -> Option<std::ops::Range<u64>> {
-        match &self.quads {
-            QuadsSource::InMemory { .. } => None,
-            QuadsSource::File { serve, .. } => serve.as_ref().and_then(|plan| plan.row_range()),
-        }
-    }
-
-    /// Test-only hook exposing the zone-map row-range envelope computed for a
-    /// bound subject, so tests can assert on it directly instead of only on
-    /// final match results.
-    #[cfg(all(test, feature = "file-io"))]
-    pub(crate) async fn debug_subject_row_range(
-        &self,
-        subject: &NamedOrBlankNode,
-    ) -> Result<Option<Range<u64>>> {
-        match &self.quads {
-            QuadsSource::File { file, .. } => {
-                // Mirror match_base's prelude so the probes below see every
-                // bound role resolved (required for a file-backed dictionary).
-                let mut codes = self
-                    .layout
-                    .prepare_pattern(QuadPattern::new(Some(subject), None, None, None))
-                    .await?;
-                // Term doesn't exist in the store — the envelope is empty
-                // without needing to touch the file at all.
-                if matches!(
-                    codes.constraints(Some(subject), None, None, None)?,
-                    Constraints::AlwaysFalse
-                ) {
-                    return Ok(Some(0..0));
-                }
-                // Otherwise compute the same envelope match_pattern would.
-                match file_scan::build_file_filter(Some(subject), None, None, None, &mut codes)? {
-                    Some(filter) => file_scan::row_range_from_pruning(file, &filter).await,
-                    None => Ok(None),
-                }
-            }
-            QuadsSource::InMemory { .. } => Ok(None),
-        }
-    }
-
-    /// Test-only hook exposing the exact row range the encoded chunk-probe
-    /// fast path computes for a bound subject — `None` when the fast path
-    /// would not engage (unsorted file, unsupported layout, unknown term) —
-    /// so tests can assert engagement instead of inferring it from results.
-    #[cfg(all(test, feature = "file-io"))]
-    pub(crate) async fn debug_subject_bounds_range(
-        &self,
-        subject: &NamedOrBlankNode,
-    ) -> Result<Option<Range<u64>>> {
-        let QuadsSource::File { file, .. } = &self.quads else {
-            return Ok(None);
-        };
-        if !file.quads_sorted() {
-            return Ok(None);
-        }
-        let mut codes = self
-            .layout
-            .prepare_pattern(QuadPattern::new(Some(subject), None, None, None))
-            .await?;
-        let Ok(Some(probe)) = codes.probe_scalar(TermRef::Subject(subject)) else {
-            return Ok(None);
-        };
-        let Ok(needle) = u64::try_from(&probe) else {
-            return Ok(None);
-        };
-        let Some(chunks) = file.sorted_subject_chunks() else {
-            return Ok(None);
-        };
-        chunks
-            .bounds(needle, &file.segment_source(), file.session())
-            .await
-            .map_err(VortexRdfError::Vortex)
-    }
-
-    /// Test-only hook exposing the index-child run the reference index's file
-    /// resolution locates for a predicate/object pattern — `None` when the
-    /// location declines and the resolution falls back to its pushed-down
-    /// scan — so tests can assert engagement instead of inferring it from
-    /// results.
-    #[cfg(all(test, feature = "file-io"))]
-    pub(crate) async fn debug_reference_index_located_run(
-        &self,
-        predicate: Option<&NamedNode>,
-        object: Option<&Term>,
-    ) -> Result<Option<Range<u64>>> {
-        let QuadsSource::File { file, .. } = &self.quads else {
-            return Ok(None);
-        };
-        let pattern = QuadPattern::new(None, predicate, object, None);
-        let mut codes = self.layout.prepare_pattern(pattern).await?;
-        crate::store::indexes::secondary_by_reference::debug_located_run(file, pattern, &mut codes)
-            .await
     }
 
     /// Whether the store holds a quad equal to `quad` (tombstoned rows count
