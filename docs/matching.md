@@ -5,7 +5,10 @@ This document traces what actually runs when a caller asks
 matching a `(subject, predicate, object, graph)` pattern — every stage, every
 decision point, and how the answer changes with the pattern shape, the storage
 backend (in memory or file), the column layout, the secondary indexes present,
-and the state of the append tail.
+and the state of the append tail (see [file-format.md](./file-format.md) for more details of the data structure). Every stage is illustrated on one small
+store ([§1.1](#11-the-running-example)); what the paths cost at scale is in
+[§14](#14-what-each-path-costs), and how to watch a match make its decisions
+in [§15](#15-watching-a-match-happen).
 
 ---
 
@@ -20,7 +23,7 @@ implies:
 | In memory | a `RowSelection` over base row ids (`All` / `Range` / `Ids`), plus an optional serve plan |
 | File | a pushed-down filter `Expression`, a `RowSelection` over file row ids, plus an optional serve plan |
 
-Everything a view names is a **base row id**, never a rebased position. That is
+Everything a view names is a **base row id** (i.e., row positions in the base quad columns). That is
 what lets secondary indexes (whose `rid` columns address base rows) survive a
 match, and what lets matches be chained.
 
@@ -37,9 +40,61 @@ Three pieces of vocabulary recur below:
   (a contiguous run) instead of gathering the primary columns at scattered row
   ids. Purely an optimization; the row ids alone are always sufficient.
 
+### 1.1 The running example
+
+The examples in this document all match against the four-quad store of
+[file-format.md §7](file-format.md#7-a-worked-example):
+
+```turtle
+@prefix ex: <http://example.org/> .
+@prefix foaf: <http://xmlns.com/foaf/0.1/> .
+@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+
+ex:alice a foaf:Person ;
+   foaf:name "Alice" .
+
+ex:bob a foaf:Person ;
+   foaf:knows ex:alice .
+```
+
+In `(s, p, o, g)` order — the order every builder writes — its base rows are:
+
+| row | s | p | o | g |
+|---|---|---|---|---|
+| 0 | `ex:alice` | `rdf:type` | `foaf:Person` | `""` |
+| 1 | `ex:alice` | `foaf:name` | `"Alice"` | `""` |
+| 2 | `ex:bob` | `rdf:type` | `foaf:Person` | `""` |
+| 3 | `ex:bob` | `foaf:knows` | `ex:alice` | `""` |
+
+Terms are written in their prefixed form throughout; the string layouts store
+and compare the full N-Triples term (`<http://example.org/alice>`), and `""` is
+the default graph.
+
+Under the `Dictionary` layout every column holds the term's
+position in the sorted dictionary instead, and the examples quote those codes
+wherever a probe value is one:
+
+| code | term |
+|---|---|
+| 0 | `""` |
+| 1 | `"Alice"` |
+| 2 | `ex:alice` |
+| 3 | `ex:bob` |
+| 4 | `rdf:type` |
+| 5 | `foaf:Person` |
+| 6 | `foaf:knows` |
+| 7 | `foaf:name` |
+
+Row 0 in the base quads is then encoded as: `2 4 5 0`.
+
+Patterns are written as four slots with `?` for unbound: `(ex:alice ? ? ?)`,
+`(? a foaf:Person ?)`, `(ex:bob foaf:knows ex:alice "")`. In the predicate slot
+`a` is Turtle's keyword for `rdf:type` (code 4). Row ids are base row ids,
+and a range `[lo, hi)` excludes `hi`.
+
 ---
 
-## 2. Top level: base and tail are matched independently
+## 2. Top level: *base* and *tail* are matched independently
 
 ```mermaid
 flowchart TD
@@ -52,15 +107,18 @@ flowchart TD
 ```
 
 The tail branch runs **even when the base short-circuited to an empty view**.
-That is deliberate: under the Dictionary layout the base's dictionary is frozen
-at construction, so a term it has never seen proves nothing about rows appended
-since — the tail stores terms as strings precisely so such a term can still
-match. `match_base`'s `empty_view()` blanks the carried tail, and the tail match
-then overwrites it with the real result.
+Under the Dictionary layout the base's _dictionary_ is frozen
+at construction, so a term it has never seen cannot gurantee they have been appended
+since.
+
+**Example.** After `add_quad(ex:carol a foaf:Person "")` on the Dictionary
+store, `(ex:carol ? ? ?)` won't find `ex:carol` — the base returns an empty view (see [stage B](#4-stage-b--the-provable-emptiness-gate))
+— and the tail, which holds the new quad, still matches its one
+row: the result is that row. [§9](#9-the-tail) walks the tail side.
 
 ---
 
-## 3. Stage A — the prelude: `prepare_pattern`
+## 3. Stage A — `prepare_pattern`
 
 Every match begins with
 [`ResolvedLayout::prepare_pattern`](../core/src/store/layouts/mod.rs), which
@@ -73,7 +131,7 @@ perform I/O, and the only reason the prelude is async at all.
 |---|---|---|---|
 | `Default` | — | nothing but tag the resolver (never suspends) | the N-Triples string |
 | `TypedObject` | — | nothing but tag the resolver (never suspends) | the N-Triples string; the object decomposes into `o_kind`/`o_value`/`o_datatype`/`o_lang` |
-| `Dictionary` | resident | seeds the role cache by in-memory binary search | `u32` code |
+| `Dictionary` | in-memory | seeds the role cache by in-memory binary search | `u32` code |
 | `Dictionary` | file-backed | four **concurrent** point-read binary searches of the dictionary child (`futures::join!`), seeding every bound role | `u32` code |
 
 What the witness saves is likewise layout-dependent. Its **role cache holds
@@ -82,34 +140,29 @@ per term however many stages and indexes ask for the same probe. The string
 layouts have no code to cache: each probe re-renders the term's N-Triples form,
 into a scratch buffer the witness owns so the render does not allocate.
 
-The residency split is a contract, not just a cost difference. A file-backed
-witness has *no* synchronous resolver, so probing a role the prelude never bound
-is an error rather than a silent `None` — `None` is reserved for "resolved, and
-absent from the dictionary", and fabricating it would turn an unresolvable probe
-into an empty match result.
-
 `PatternCodes::constraints(...)` lowers the pattern into per-column equalities —
-the one source of truth shared by the in-memory mask scan and the pushed-down
-file filter. **Only bound roles emit an equality**; an unbound role emits
-nothing, which is precisely what makes it a wildcard. The right-hand side of
+shared by both the in-memory mask scan and the pushed-down
+file filter. **Only bound roles emit an equality**. The right-hand side of
 each equality is the layout's probe value: the rendered N-Triples string for the
 string layouts, the dictionary code for `Dictionary`.
 
-For the pattern `(<http://ex/a>, ?, "hi"@en, ?)` — subject and object bound,
-predicate and graph free:
+**Example.** For `(ex:alice ? "Alice" ?)` — subject and object bound, predicate
+and graph free — the prelude resolves what is bound and exists, and the equalities come out
+as:
 
-| Layout | Emitted equalities |
-|---|---|
-| `Default` | `s = "<http://ex/a>"`, `o = "\"hi\"@en"` |
-| `TypedObject` | `s = "<http://ex/a>"`, `o_kind = 3u8`, `o_value = "hi"`, `o_lang = "en"` |
-| `Dictionary` | `s = 42u32`, `o = 25u32` |
+| Layout | What the prelude resolves | Emitted equalities |
+|---|---|---|
+| `Default` | nothing | `s = "<http://example.org/alice>"`, `o = "\"Alice\""` |
+| `TypedObject` | nothing | `s = "<http://example.org/alice>"`, `o_kind = 2u8`, `o_value = "Alice"` |
+| `Dictionary` | `s → 2`, `o → 1` — two binary searches of the dictionary | `s = 2u32`, `o = 1u32` |
 
 The string layouts compare one column per bound role; `TypedObject` is the
 exception, expanding a bound object into the 2–4 sub-column equalities its
-decomposition implies (`o_datatype` and `o_lang` appear only when the literal
-has them). `Dictionary` compares `u32` codes, and short-circuits the whole
-pattern to **`Constraints::AlwaysFalse`** the moment any bound term is absent
-from the dictionary.
+decomposition implies — `"Alice"@en` would add `o_lang = "en"`, a typed
+literal `o_datatype`. `Dictionary` compares `u32` codes, and short-circuits the
+whole pattern to **`Constraints::AlwaysFalse`** the moment any bound term is
+absent from the dictionary: for `(ex:carol ? ? ?)` the subject resolves to no
+code, and nothing below ever runs.
 
 ---
 
@@ -122,9 +175,7 @@ if codes.provably_empty(pattern) {
 ```
 
 Only the Dictionary layout can reach this: a term missing from the dictionary
-cannot match any base row. No search machinery, no scan, no backend dispatch —
-`empty_view()` returns a view selecting nothing, with its indexes and components
-dropped (so a chained match on it runs no pointless lookups).
+cannot match any base row. `empty_view()` returns a view selecting nothing, with its indexes and components dropped (so a chained match on it runs no pointless lookups).
 
 `provably_empty` reads the prelude-seeded role cache (`roles[r] == Some(None)`)
 rather than compiling `Constraints` just to test for `AlwaysFalse`: the string
@@ -134,9 +185,24 @@ own constraints over whatever the fast paths leave residual.
 The string layouts (`Default`, `TypedObject`) never prove emptiness here; an
 unknown term simply matches zero rows later on.
 
+**Example.** `(ex:carol ? ? ?)` on the Dictionary store ends here on either
+backend: `ex:carol` has no code, and the empty view comes back
+without a search, an index lookup or a scan. On a
+`Default` store the same pattern is not provably empty: the subject search of
+stage 1 finds the empty run `[4, 4)` (`ex:carol` sorts after `ex:bob`), and the
+later stages see an empty selection and skip.
+
 ---
 
 ## 5. Stage C — backend dispatch
+
+Here it is decided **where the base rows live**. `match_base` reads
+the store's [`QuadsSource`](../core/src/store/source.rs#L28) and hands the prelude's witness to the matching backend. `InMemory` holds the
+base array (and any index components) resident (i.e., loaded into RAM), so its stages narrow a
+`RowSelection` directly and run synchronously. `File` leaves the rows on disk,
+so its stages can only *define* a filter and a selection for the next scan
+([§7](#7-the-file-path)), and the arm is async because its chunk probes and
+index locates may fetch segments.
 
 ```mermaid
 flowchart LR
@@ -155,13 +221,20 @@ part of this pattern cheaply?* and *which rows survive?* — narrowing the share
 `RowSelection` and clearing whatever pattern components it answered, so the next
 stage only sees what is left.
 
+Only the *struct* is canonical. Its columns stay in the compressed encodings
+every in-memory construction gives them
+([`compress_built_parts`](../core/src/store/mod.rs)), and the stages below
+search them in place through the cached encoded-search probes. No stage
+decompresses a column; a match decodes nothing but the rows a mask scan has to
+compare ([§6.3](#63-residual-column-filtering)).
+
 ```mermaid
 flowchart TD
-    S0["<b>Prelude</b> — canonicalize the base struct, materialize a chained<br/>view's deferred ids, and remember whether this view started unrestricted"] --> S1
+    S0["<b>Prelude</b> — take the base as a struct, materialize a chained view's deferred ids, and remember<br/>whether this view started unrestricted"] --> S1
 
-    S1{"<b>Stage 1</b><br/>Is the subject bound, on a base stamped sorted?"}
-    S1 -- "yes — binary-search its row run, then each further bound role in<br/>(p, o, g) order inside it, and keep only those rows" --> S2
-    S1 -- "no — check if indexes can help" --> S2
+    S1{"<b>Stage 1</b><br/>Is the subject bound?"}
+    S1 -- "yes — binary-search its rows, then each further bound role in<br/>(p, o, g) order inside it, and keep only those rows" --> S2
+    S1 -- "no — proceed to Stage 2" --> S2
 
     S2{"<b>Stage 2</b><br/>Are there indexes for this pattern?<br/>"}
     S2 -- "no — nothing left bound, an empty selection, or under 4,096 rows" --> S3
@@ -230,6 +303,27 @@ Unlike its file counterpart, the in-memory subject fast path works under
 **every** layout; the deeper prefix needs the Dictionary layout's code
 columns.
 
+**Examples** (Dictionary layout; the subject searches the `s` column, every
+further role only the run the previous one left):
+
+| Pattern | Subject search | Roles behind it | Leaves |
+|---|---|---|---|
+| `(ex:alice ? ? ?)` | `s = 2` → `[0, 2)` | `p` unbound — the prefix ends | `Range [0, 2)`, nothing residual |
+| `(ex:alice a ? ?)` | `[0, 2)` | `p = 4` within `[0, 2)` → `[0, 1)` | `Range [0, 1)` |
+| `(ex:bob foaf:knows ex:alice "")` | `s = 3` → `[2, 4)` | `p = 6` → `[3, 4)`; `o = 2` → `[3, 4)`; `g = 0` → `[3, 4)` | `Range [3, 4)` — what `contains` runs |
+| `(ex:alice foaf:knows ? ?)` | `[0, 2)` | `p = 6` within `[0, 2)` → empty: `foaf:knows` exists, but not under `ex:alice` | an empty range; stages 2 and 3 skip |
+| `(ex:alice ? "Alice" ?)` | `[0, 2)` | `p` unbound — `o` is not consulted, the probe cannot skip a role | `Range [0, 2)` with `o` still bound, for [stage 3](#63-residual-column-filtering) |
+
+Under `Default` or `TypedObject`, `(ex:alice a ? ?)` still finds `[0, 2)` —
+through `search_sorted_bounds` on the string column — but `p` stays bound and
+stage 3 compares it over those two rows.
+
+**Cost.** A prefix-answered match is a fixed handful of binary searches, so it
+does not grow with the run it finds: on the 1M store `S` (10 rows) costs
+≈ 1.8 µs and `SPOG` ≈ 2.8 µs under `Dictionary`. The string layouts pay the
+per-call search instead of a cached probe — `S` ≈ 18–26 µs — and roughly
+4–8 µs more per residual role compared over the run.
+
 ### 6.2 Secondary-index routing
 
 Both index resolvers **decline any pattern with a bound subject** — the sorted
@@ -279,9 +373,29 @@ it. Reads then go through the plan, so decoding and sorting the run's row ids
 can wait for a consumer that actually needs them. In every other case the lazy
 ids are materialized and intersected immediately.
 
+**Examples** (what each index holds for the running example is laid out
+where the index is described: [§8.2](#82-secondarybycopy--two-sorted-quad-copies)
+for the sorted copies, [§8.3](#83-secondarybyreference--sorted-val-rid-pairs)
+for the `{val, rid}` pairs).
+
+| Pattern | With `SecondaryByCopy` | With `SecondaryByReference` |
+|---|---|---|
+| `(? a ? ?)` | `choose` picks the POSG family; `p = 4` bounds `index:posg` to `[0, 2)` (rids `0, 2`) → `Resolved`, `Lazy` rids, plan over that run. The view started `All`, stage 1 never ran, nothing is left bound → the ids stay **pending** and the plan is kept | `ref-p`, `val = 4` → `[0, 2)` → rids `[0, 2]`, sorted → `Eager` → selection `Ids [0, 2]`, no plan |
+| `(? a foaf:Person ?)` | the `(p, o)` prefix: `p = 4` → `[0, 2)`, then `o = 5` within it → `[0, 2)`; both components resolved, nothing residual | the object is preferred: `ref-o`, `val = 5` → `[2, 4)` → rids `[0, 2]`; `p` stays bound, and stage 3 tests it on those two rows |
+| `(? ? ? "")` | no family sorts by `g` → `Declined`; stage 3 scans `g` | same |
+| `(? a ? "")` | `p` resolves as above, but `g` is still bound — the lazy ids materialize now (`[0, 2]`), stage 3 tests `g` on them, and stage 4 drops the plan | `ref-p` → `[0, 2]`, stage 3 tests `g` |
+| `(ex:alice ? "Alice" ?)` | stage 1 cut the view to 2 rows, under `INDEX_ROUTING_MIN_ROWS` → routing skipped (`worth_indexing` is false); on the 1M store a subject run is 10 rows, so the same | same |
+| `(? ? "Carol" ?)`, `Default` layout | the dictionary cannot prove absence, the index can: the `index:ospg` run for `"Carol"` is empty → `Empty` → empty view | `ref-o` run empty → `Empty` |
+
+**Cost.** In memory on the 1M store, a by-copy resolution is ≈ 2–3 µs
+whatever the run's width — the rids are sliced, not decoded (`P`, 31,776
+rows: 2.0 µs). A by-reference resolution decodes and sorts its rids on the
+spot: `O` (2 rows) 6.3 µs, `P` (31,776 rows) 29 µs. Without an index the same
+shapes fall to stage 3 at ≈ 0.85–1.2 ms.
+
 ### 6.3 Residual column filtering
 
-Whatever no fast path answered is compiled to constraints ([§3](#3-stage-a--the-prelude-prepare_pattern))
+Whatever no fast path answered is compiled to constraints ([§3](#3-stage-a--prepare_pattern))
 and compared column-wise, over **only the rows the view still selects**. The
 compile can in principle answer `AlwaysFalse` — an empty view — but not here:
 the residual binds a subset of roles the [stage B gate](#4-stage-b--the-provable-emptiness-gate)
@@ -301,10 +415,12 @@ order:
    constraint faces a wide selection (`> 4096` rows — SIMD wins there), or when
    a probe-bound (wire-encoded) column faces a wide selection.
 
-2. **Mask scan** (`mask_for`) — the general vectorized fallback: canonicalize
-   the gathered rows, broadcast each probe to a `ConstantArray`, `Eq`-compare
-   per column, `And` them together, then `RowSelection::refine` translates the
-   positional mask back into base row ids.
+2. **Mask scan** (`mask_for`) — the general vectorized fallback: take the
+   gathered rows as a struct (again only the struct, not its columns),
+   broadcast each probe to a `ConstantArray`, `Eq`-compare per column, `And`
+   them together, then `RowSelection::refine` translates the positional mask
+   back into base row ids. Each `Eq` kernel decides for itself how much of its
+   column it has to decode, and it sees only the gathered rows.
 
 The whole stage is skipped unless **both** halves of its gate hold: some term
 is still bound (stages 1 and 2 clear the components they answer, so a pattern
@@ -319,6 +435,26 @@ struct canonicalization — are exactly the per-call cost the gate avoids.
 > them. Keeping them out also keeps the mask scan's positions aligned with
 > `selection.apply`, which is what `refine` maps back through.
 
+**Examples** (no index unless stated):
+
+| Pattern | Residual | Selection on entry | Which implementation | Result |
+|---|---|---|---|---|
+| `(ex:alice ? "Alice" ?)` | `o = 1` | `Range [0, 2)` from stage 1 | typed: one equality over 2 rows (≤ 4,096) | row 0 has `o = 5`, row 1 has `o = 1` → `Ids [1]` |
+| `(? ? ? "")` | `g = 0` | `All` (4 rows) | typed: 4 rows are under the gate | `Ids [0, 1, 2, 3]` |
+| `(? a foaf:Person ?)`, `SecondaryByReference` | `p = 4` — the index answered `o` | `Ids [0, 2]` | typed | both hold → `Ids [0, 2]` |
+| `(ex:alice a ? ?)`, `Default` layout | `p = "<…#type>"` | `Range [0, 2)` | typed: a `VarBinView` compare, length first | `Ids [0]` |
+| `(? p0 ? ?)` on the 1M store | `p = code` | `All` (1,048,576 rows) | **mask scan** — a lone equality over a wide selection declines the typed loop | 31,776 ids |
+| `(? p0 o0 ?)` on the 1M store | `p = code`, `o = code` | `All` | typed: two code columns, the branch-free loop | 1 id |
+| `(? ? o0 ?)` on the 1M store, `TypedObject` | `o_kind = 2u8`, `o_value = "…"` | `All` | mask scan — the `u8` column binds only through a probe, which declines over a wide selection | 2 ids |
+
+**Cost.** Both implementations read every selected row, so a wide residual is
+the one stage whose cost tracks the store, not the result. On the 1M store in
+memory: the mask scan of one code column ≈ 0.85–0.97 ms (`P`, `O`, `G`); the
+typed loop over two code columns (`PO`) ≈ 1.2 ms; the same scans over the
+string layouts' N-Triples columns ≈ 7–9 ms for one column and ≈ 14–16 ms for
+two. A narrow residual behind a subject run is a few microseconds — the
+`Default` layout's `SP` costs ≈ 8 µs more than its `S`.
+
 ### 6.4 Keeping (or dropping) the serve plan
 
 A serving plan describes a contiguous run of the index's own columns. It is only
@@ -331,6 +467,15 @@ unrefined (the view started as All)  AND  nothing else narrowed the view
 A deferred (`Pending`) selection is kept under the strictly stronger condition
 that additionally requires nothing to be left bound — which is why a pending
 selection always rides with a plan.
+
+**Examples** (`SecondaryByCopy`): `(? a ? ?)` keeps its plan — the view
+started `All` and only the index narrowed it — and its ids stay pending, so
+`size()` answers from the run's width and `quads()` reads `index:posg[0, 2)`
+without ever computing `[0, 2]`. `(? a ? "")` loses it: stage 3 ran
+for `g`, so `narrowed_elsewhere` is set. `(ex:alice a ? ?)` never had one —
+the prefix probe answered, and the indexes were not consulted. A second match
+on the `(? a ? ?)` view loses it too, however it resolves: the view no
+longer starts `All` ([§11](#11-chained-matches)).
 
 ---
 
@@ -404,6 +549,18 @@ decline bound-subject patterns, so this fast path takes an uncontested route.
 Unlike its in-memory counterpart it stops at the subject: the residual terms
 ride the narrowed range as filter conjuncts rather than being bounded within it.
 
+**Examples** (Dictionary file): `(ex:alice ? ? ?)` bisects the subject column's
+chunks for `s = 2` and finds `[0, 2)`; the view carries that range and no
+filter. `(ex:alice a ? ?)` finds the same `[0, 2)`, and `p = 4` becomes a
+pushed-down filter evaluated over those two rows when they are read — the
+in-memory path would have narrowed the range to `[0, 1)` instead.
+`(ex:alice foaf:knows ? ?)` likewise carries `[0, 2)` plus `p = 6`, and only
+the read discovers that nothing matches.
+
+**Cost.** With the chunk cache warm the probe costs ≈ 5 µs on the 1M file
+(`S` 4.8 µs, `SPOG` 8.0 µs against ≈ 2–3 µs in memory); the first probe on a
+freshly opened file, which fetches the chunks it bisects, ≈ 0.75 ms.
+
 ### 7.2 Zone-map pruning
 
 When no index resolved anything and no subject range was found,
@@ -416,6 +573,21 @@ memoized on the shared file handle, keyed by the filter expression.
 
 Results: `Some(0..0)` when nothing can match, `None` when statistics exclude
 nothing.
+
+**Example.** `(? a ? ?)` on the Dictionary file without indexes pushes
+`p = 4` down. The four-row file is one zone whose `p` statistics span `4..7`,
+so nothing is excluded: the result is `None`, the selection stays `All`, and
+the filter waits for the read. On the 1M file (128 zones of 8,192 rows) the
+predicate `p0` occurs every 33 rows, so every zone keeps it (the log says
+`range: false`) and the read evaluates the filter over the whole file — match
+≈ 2.6 µs, match plus read ≈ 8 ms, most of it decoding the 31,776 matched rows.
+`(? ? o0 ?)` matches two rows whose object the statistics of most zones rule
+out, so pruning collapses the scan to the zones that can hold it
+(`range: true`) and the read costs ≈ 1.6 ms. Pruning matters most where the
+subject cannot be bisected: a `Default` file's `(s0 ? ? ?)` has no chunk
+probe (string subject), but subjects are sorted, so every zone's statistics
+but one exclude `s0` and the read costs ≈ 0.9 ms rather than a scan of the
+file.
 
 ### 7.3 What ends up on the view
 
@@ -440,6 +612,18 @@ An `Exact` selection that is provably empty normalizes to `empty_view()` before
 the view is built. A `Pending` one is left alone: its coverage is unknown by
 design, and it may still materialize to nothing later, which every consumer
 handles like any other narrow selection.
+
+**Examples** — what the view holds after a match on the Dictionary file with
+`SecondaryByCopy`:
+
+| Pattern | Filter | Selection | Serve plan |
+|---|---|---|---|
+| `(ex:alice ? ? ?)` | none | `Range [0, 2)` from the chunk probe | none (a subject range) |
+| `(ex:alice a ? ?)` | `p = 4` | `Range [0, 2)` | none |
+| `(? a ? ?)` | none — the index answered `p` | `Ids [0, 2]`, **eager**: the located run is 2 rows, under `POINT_GATHER_MAX_ROWS`. On the 1M file `P`'s run is 31,776 rows and the ids stay `Pending` | over the `index:posg` run |
+| `(? a ? "")` | `g = 0` | `Ids [0, 2]` | **kept** — on file the plan carries the `g` equality itself; the in-memory twin drops it |
+| `(? ? ? "")` | `g = 0` | `All` — pruning excluded nothing | none |
+| `(? ? foaf:Person ?)` then `(? a ? ?)` on that view | `p = 4` ANDed onto nothing | the second match's `Ids [0, 2]` intersected into the first's | dropped: `existing_selection` was no longer `All` |
 
 ---
 
@@ -495,6 +679,33 @@ Its `row_range` is kept only when the graph is unbound, since the location
 searched sort keys only. If a bound residual term has no dictionary code the
 plan cannot be built, and the resolution falls back to an eager filtered scan.
 
+**Example.** `(? a ? ?)`: the lead probe `p = 4` on `index:posg` — rows
+`(2 4 5 0 · 0)`, `(3 4 5 0 · 2)`, `(3 6 2 0 · 3)`, `(2 7 1 0 · 1)` in that
+order — bounds `[0, 2)`, whose `rid` column reads `0, 2`. In memory that slice
+is handed back lazily with a plan over `index:posg[0, 2)`; on file the run is
+located through the child's chunk probes and, being 2 rows, its rids are
+point-read now (`Eager`) while the plan still serves the quads.
+`(? a foaf:Person ?)` adds the windowed second search, `o = 5` inside
+`[0, 2)`, and resolves both roles in one probe. `(? ? foaf:Person ?)` goes to
+`index:ospg` — rids
+`1, 3, 0, 2` — where `o = 5` bounds `[2, 4)`, rids `0, 2`. On the 1M file
+`P`'s located run is 31,776 rows: over the point-read cap, so the ids become a
+deferred rid-only scan of that run and reads stream the run through the plan
+— a scan of exactly that row range, no filter, split by row count so that its
+decode runs on many of the runtime's workers rather than inside the single
+leaf-chunk split the child's own layout would make of the run.
+
+**Cost.** Locating a run is a few microseconds on either backend (in memory
+`P` 2.0 µs, `O` 2.5 µs, `PO` 2.8 µs; on file 3.3–9.5 µs). Reading through the
+plan is what differs: in memory the 31,776-row `P` is served in ≈ 8.8 ms
+against ≈ 13 ms gathered from a by-reference resolution and ≈ 15 ms after a
+scan; on file the served range scan of that run, split across the workers,
+reads it in ≈ 2.4 ms against ≈ 4.2–4.6 ms for the filtered scan of the
+primaries a by-reference or filter-only match reads through (the three
+re-measured together on 2026-08-25, after the split landed; served through
+the child's single leaf-chunk split it had cost ≈ 2.3× the primary scan),
+while narrow runs (`O`, `PO`) are point-read in ≈ 40 µs.
+
 ### 8.3 `SecondaryByReference` — sorted `{val, rid}` pairs
 
 Children: `index:ref-o` and `index:ref-p`. Stores no whole quads, so it **never
@@ -511,11 +722,27 @@ neither pays filter evaluation. Anything the probes decline falls back to
 `scan_index_row_ids`, a pushed-down `val == probe` scan that answers whatever the
 order.
 
+**Example.** For the running example `index:ref-o` holds
+`(1→1) (2→3) (5→0) (5→2)` and `index:ref-p` `(4→0) (4→2) (6→3) (7→1)` —
+`{val, rid}` pairs sorted by value. `(? ? foaf:Person ?)`: `val = 5` bounds `[2, 4)`
+in `ref-o`, the paired rids are `0, 2`, already in base order. `(? a ? ?)`
+bounds `val = 4` in `ref-p` to `[0, 2)`, rids `0, 2`. `(? a foaf:Person ?)` takes
+the object's route — the preferred side — and leaves `p` for the residual
+stage, which tests it on rows 0 and 2. On the
+1M file a `P` run of 31,776 pairs is over the point-read cap: a rid-only scan
+of exactly that range answers it (≈ 0.76 ms), where `O`'s two pairs are
+point-read (≈ 3 µs).
+
+**Cost.** In memory the rids are decoded and sorted at match time — `O`
+6.3 µs, `P` 29 µs — and every read is a gather of the primaries at those ids:
+`P` ≈ 13 ms on the 1M store, against ≈ 8.8 ms served from a copy. The trade is
+size: `{val, rid}` pairs are a fraction of a second sorted copy of every quad.
+
 ### 8.4 Serve plans, side by side
 
 | | `InMemoryServePlan` | `FileServePlan` |
 |---|---|---|
-| Acquisition | slice the component's `[start, end)` run, or point-read it through cached probes when ≤ 256 rows | pushed-down projected+filtered scan of the index child, or `component_point_chunk` point reads over a located run ≤ 256 rows |
+| Acquisition | slice the component's `[start, end)` run, or point-read it through cached probes when ≤ 256 rows | a located run: `component_point_chunk` point reads when ≤ 256 rows, else a projected scan of exactly its row range, split by row count across the workers (`located_run_scan`); unlocated: the pushed-down projected+filtered scan of the index child |
 | Constraints | implicit in the run's bounds (lead ± second key) | explicit `p`/`o`/`g` term equalities, bound lazily on first read |
 | Dropped when | anything else narrowed the view (including a bound graph, which forces a residual scan) | an earlier filter/selection exists, or a subject range applies |
 | Tombstones | applied through the plan's `rid` column | applied through the plan's `rid` column |
@@ -559,6 +786,21 @@ Notes:
   per-call compare/canonicalize pipeline.
 - `typed_positions` accepts a flat canonical struct **or** a chunked accretion
   of them, which is the shape `add_quads` builds.
+
+**Example.** `add_quad(ex:carol a foaf:Person "")` on the Dictionary store
+with `SecondaryByCopy` first runs the presence check — a fully bound match,
+which the base proves unmatchable at stage B (`ex:carol` has no code) and the
+absent tail cannot answer — then appends the quad to a one-row tail of
+N-Triples strings. On the resulting store:
+
+| Pattern | Base | Tail | Rows |
+|---|---|---|---|
+| `(? a foaf:Person ?)` | `index:posg` prefix probe → pending ids + plan over rows `0, 2` | `p = "<…#type>"`, `o = "<…Person>"` by typed positions over 1 row → position 0 | 3 |
+| `(ex:carol ? ? ?)` | provably empty | `s = "<http://example.org/carol>"` → position 0 | 1 |
+| `(ex:alice ? ? ?)` | prefix probe → `Range [0, 2)` | typed positions → none | 2 |
+
+The tail's cost is its size: a few rows compared as raw bytes, which is why a
+presence check on a small tail is not visible next to the base match.
 
 ---
 
@@ -621,6 +863,18 @@ scan that still supplies a serve plan.
   set over the new order.
 - The tail's own selection is tail-local and narrows independently on each call.
 
+**Example.** `(? a ? ?)` on the in-memory `SecondaryByCopy` store gives a
+view whose ids are pending with a plan over `index:posg[0, 2)`. Calling
+`match_pattern(? ? foaf:Person ?)` on that view: the pending ids materialize first
+(`[0, 2]`), so `unrefined` is false; nothing narrowed the view *in this call*,
+so the indexes are consulted and `index:ospg` resolves `o = 5` to rids `0, 2`
+— lazily, but the deferral condition fails (`unrefined`), so they are
+materialized and intersected: `Ids [0, 2]`. Stage 4 drops the plan the second
+index offered. Doing the same on the file view ANDs nothing onto the filter
+(both matches were answered by an index) and intersects the two id sets. On
+the 1M store the pair `(? p0 ? ?)` then `(? ? o0 ?)` costs ≈ 0.65 ms in memory
+and ≈ 5.8 ms on file, reading included (`match_chained`, `Default` layout).
+
 ---
 
 ## 12. What the derived view costs at read time
@@ -639,6 +893,16 @@ The match's decisions show up here
 
 `LazyRowIds` caches into a shared `OnceLock`, so the first consumer that needs
 the ids pays for them once and every clone of the view reads them back for free.
+
+**What a read costs**, on the 1M store in memory (Dictionary layout): a point
+result — `S`, 10 rows — decodes in ≈ 12 µs on top of its 2 µs match, and a
+single row in ≈ 5 µs; `P`'s 31,776 rows take ≈ 8.8 ms served from `index:posg`
+(≈ 0.28 µs per row), ≈ 13 ms gathered at by-reference ids and ≈ 15 ms after a
+mask scan; `G`'s 61,681 rows ≈ 27 ms (≈ 0.44 µs per row). Decoding rows is
+what a wide read pays for; the match in front of it is microseconds with an
+index and about a millisecond without. `size()` on a pending in-memory view
+costs nothing (the run's width); on a file view it costs nothing for a
+located by-copy run and a rid scan of the run otherwise.
 
 ---
 
@@ -674,7 +938,148 @@ the ids pays for them once and every clone of the view reads them back for free.
 
 ---
 
-## 14. Source map
+## 14. What each path costs
+
+One run of the internals benchmarks —
+[`core/benches/match_lazy.rs`](../core/benches/match_lazy.rs) for
+`match_pattern` alone ("match"), [`core/benches/benchmark.rs`](../core/benches/benchmark.rs)
+for the match plus `quads_vec()` over every matched row ("+ read") — on the
+benchmark dataset at 1,048,576 quads: 104,858 subjects, 33 predicates, 524,291
+objects, 17 named graphs, 629,199 dictionary terms. Its terms are generated
+IRIs, not the running example's — where an example above says `s0`, `p0` or
+`o0` it means that dataset's first subject, predicate or object
+(`<http://data.example.org/ontology/2026/property/0000>` and the like), which
+no prefixed name abbreviates. Warm regime (one store,
+caches primed by an untimed first query), fastest of ten samples, one machine,
+2026-08-24. Read the figures as orders of magnitude and ratios: the dashboard
+`scripts/refresh.sh` renders carries the current ones, and
+`BENCH_SIZE=1048576 cargo bench --bench match_lazy` reproduces the match
+column.
+
+| Probe shape | `S` | `SP` | `SPO` | `SPOG` | `P` | `O` | `PO` | `G` |
+|---|---|---|---|---|---|---|---|---|
+| rows matched | 10 | 1 | 1 | 1 | 31,776 | 2 | 1 | 61,681 |
+
+### 14.1 In memory
+
+Dictionary layout unless stated.
+
+| Path | Shape | match | + read | What the numbers say |
+|---|---|---|---|---|
+| stage 1 · prefix probe | `S` / `SP` / `SPO` / `SPOG` | 1.8 / 1.9 / 2.4 / 2.8 µs | 14 / 6.6 / 7.5 / 7.9 µs | nested binary searches through cached probes; independent of the run's width |
+| stage 1 · string-layout subject search + residual | `S` / `SP` / `SPOG`, `Default` | 26 / 34 / 47 µs | 35 / 46 / 53 µs | `search_sorted_bounds` per call, then a typed compare over the 10-row run per residual role |
+| stage 2 · `SecondaryByCopy` | `P` / `O` / `PO` | 2.0 / 2.5 / 2.8 µs | 8.8 ms / 10 µs / 6.9 µs | rids sliced, never decoded at match time; reads served from the copy |
+| stage 2 · `SecondaryByReference` | `P` / `O` / `PO` | 29 / 6.3 / 9.8 µs | 13 ms / 13 µs / 16 µs | rids decoded and sorted now (31,776 for `P`); reads gather the primaries; `PO` adds a 2-row residual for `p` |
+| stage 3 · mask scan, one equality | `P` / `O` / `G`, no index | 0.91 / 0.85 / 0.97 ms | 16 ms / 0.92 ms / 27 ms | one vectorized compare over the 1M-row code column, then `refine` |
+| stage 3 · mask scan over strings | `P` / `O` / `G`, `Default`, no index | 6.9 / 7.3 / 9.2 ms | 17 / 6.2 / 29 ms | the same scan comparing N-Triples strings |
+| stage 3 · typed residual, two equalities | `PO`, no index | 1.2 ms (`Dictionary`) / 16 ms (`Default`) | 1.3 / 14 ms | the branch-free code loop over both columns; the string loop compares views |
+| stage 2 declined, stage 3 for `g` | `G`, any index | 1.1 ms | 27 ms | a bound graph never routes |
+| first query on a fresh store (cold) | `S` / `P`, `SecondaryByCopy` | 23 / 19 µs | 37 µs / 7.8 ms | the probe caches are built on first use |
+
+### 14.2 File-backed
+
+Dictionary layout unless stated; the file's chunk cache is warm.
+
+| Path | Shape | match | + read | What the numbers say |
+|---|---|---|---|---|
+| stage 1 · subject chunk probe | `S` / `SP` / `SPOG` | 4.8 / 5.4 / 8.0 µs | 30 / 31 / 37 µs | residual roles ride as filter conjuncts; the read point-reads the run |
+| stage 2 · `SecondaryByCopy`, located run | `P` / `O` / `PO` | 3.5 / 3.3 / 9.5 µs | 2.4 ms / 37 µs / 38 µs | `P`'s 31,776-row run defers its ids and is served by a row-count-split scan of the run (the 2.4 ms is a 2026-08-25 re-measurement after the split landed, in a run where the by-reference and no-index `P` reads below took 4.6 / 4.2 ms; the stamped run's single-split serve had cost 19 ms); `O` and `PO` (≤ 256 rows) point-read rids and quads |
+| stage 2 · `SecondaryByReference`, located run | `P` / `O` / `PO` | 0.76 ms / 3.2 µs / 4.2 µs | 8.6 ms / 13 µs / 17 µs | a wide run pays a rid-only scan of the run now; narrow runs point-read |
+| stages 3–4 · pushed-down filter + pruning | `P` / `O` / `G`, no index | 2.6 / 2.0 / 2.4 µs | 8.1 ms / 1.6 ms / 13 ms | the match only builds the filter (the envelope is memoized); the read is a filtered scan — pruning keeps only the zones that can hold `o0`, while `p0` occurs in every zone and its read decodes 31,776 rows |
+| string-layout file | `S` / `P`, `Default`, no index | 2.6 / 2.6 µs | 0.86 / 11 ms | no chunk probe for a string subject: pruning envelope, then a filtered scan |
+| first query on a freshly opened file (cold) | `S` / `P`, no index | 0.75 / 0.48 ms | 2.9 / 8.0 ms | chunk leaves and statistics fetched on first use |
+
+### 14.3 Rules of thumb
+
+- **Answering by search costs microseconds and does not grow with the
+  result.** The prefix probe and a by-copy resolution are ≈ 2–3 µs in memory
+  and ≈ 3–10 µs on file; `P` resolves 31,776 rows in 2 µs.
+- **Answering by scan costs about a millisecond per million rows of codes**,
+  7–16 ms per million rows of strings, whatever the result: an indexed and an
+  unindexed `P` differ by ≈ 450× at match time in memory.
+- **By-reference pays at match time, by-copy at read time — and by-copy reads
+  faster in memory.** `P`: 29 µs then 13 ms gathered, against 2 µs then 8.8 ms
+  served. On file too, now that a located run's scan is split by row count
+  across the workers: `P` served in ≈ 2.4 ms against ≈ 4.2–4.6 ms through the
+  filtered primary scan a by-reference or filter-only match reads through
+  (re-measured together, 2026-08-25). Served through the child's own single
+  leaf-chunk split, the same read had decoded on one worker and cost ≈ 2.3×
+  the primary scan; narrow runs are point-read either way.
+- **Wide reads are decode-bound**: ≈ 0.28 µs per row served, ≈ 0.4–0.45 µs
+  per row gathered and decoded. A ≤ 256-row point read is ≈ 10–15 µs in
+  memory and ≈ 30 µs on file.
+- **A file adds fixed costs, not proportional ones**: ≈ 3–5 µs per warm chunk
+  probe, ≈ 1–2 ms floor for any filtered scan, and 0.5–3 ms of chunk fetches
+  on the first query after opening.
+
+---
+
+## 15. Watching a match happen
+
+Every stage logs the decision it took at `debug` level under the
+`vortex_rdf_core` target, stamped with the time since the match began
+(the timers only run when debug logging is enabled). The CLI installs
+`env_logger`, so on the Dictionary + `SecondaryByCopy` file of the running
+example:
+
+```sh
+RUST_LOG=vortex_rdf_core=debug vortex-rdf-cli match --input alice.vortex \
+  --subject http://example.org/alice \
+  --predicate http://www.w3.org/1999/02/22-rdf-syntax-ns#type
+```
+
+prints
+
+```
+[match_pattern] Prepared pattern codes at 770ns
+[match_pattern] File subject bounded by chunk probe at 2.339µs
+[match_pattern] File index declined at 4.045µs
+[match_pattern] File view built (filter: true, serve: false, pending ids: false) at 8.247µs
+```
+
+— the prelude, the subject chunk probe finding `[0, 2)`, index routing not
+taken (a subject range under 4,096 rows reports as a decline on the file
+path), and a view carrying the range plus `p = 4` as a filter. Any embedder
+that installs a `log` logger sees the same lines; what each one means:
+
+| Line | Stage |
+|---|---|
+| `Prepared pattern codes` | [§3](#3-stage-a--prepare_pattern) — the witness is built, bound terms resolved |
+| `Layout proved the pattern unmatchable` | [§4](#4-stage-b--the-provable-emptiness-gate) — a term has no code; the match ends |
+| `In-memory subject bounded by binary search` / `File subject bounded by chunk probe` | [§6.1](#61-prefix-probe) / [§7.1](#71-subject-chunk-probe) |
+| `In-memory prefix of N more roles bounded by binary search` | [§6.1](#61-prefix-probe) — `p`, `o`, `g` narrowed inside the subject run |
+| `… index resolved` (`eager ids` / `served, ids pending` / `ids materialized` on file), `… index declined`, `… index proved empty` | [§6.2](#62-secondary-index-routing) / [§8](#8-the-index-resolvers) |
+| `In-memory narrowed by typed residual scan` / `… by mask scan` | [§6.3](#63-residual-column-filtering) — which implementation ran |
+| `File narrowed by zone-map pruning (range: …)` | [§7.2](#72-zone-map-pruning) — whether an envelope was found |
+| `File selection proved empty` | [§7.3](#73-what-ends-up-on-the-view) |
+| `In-memory view built (serve, pending ids)` / `File view built (filter, serve, pending ids)` | [§6.4](#64-keeping-or-dropping-the-serve-plan) / [§7.3](#73-what-ends-up-on-the-view) — what the view carries |
+| `Tail matched by typed positions` / `… by mask scan` / `Tail proved the pattern unmatchable` | [§9](#9-the-tail) |
+
+The same store in memory, timings elided:
+
+```
+(? a ? ?)                   (ex:alice ? "Alice" ?)            (? a ? "")
+Prepared pattern codes      Prepared pattern codes            Prepared pattern codes
+In-memory index resolved    In-memory subject bounded by      In-memory index resolved
+In-memory view built          binary search                   In-memory narrowed by typed
+  (serve: true,             In-memory narrowed by typed         residual scan
+   pending ids: true)         residual scan                   In-memory view built
+                            In-memory view built                (serve: false,
+                              (serve: false,                     pending ids: false)
+                               pending ids: false)
+```
+
+`(? a ? ?)` is answered by `index:posg` alone and keeps both the plan and
+its deferred ids; `(ex:alice ? "Alice" ?)` is a subject run plus a residual
+compare; `(? a ? "")` resolves `p` by index but the bound graph sends
+it through the residual stage, which costs it the plan. A second match on the
+first view — `(? ? foaf:Person ?)` — logs `index resolved` again but builds its view
+with `serve: false, pending ids: false`: the view it started from was no longer
+unrestricted ([§11](#11-chained-matches)).
+
+---
+
+## 16. Source map
 
 | Concern | File |
 |---|---|

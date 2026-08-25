@@ -203,11 +203,15 @@ What the store reads from this structure:
   against every block's statistics first, and the surviving blocks' envelope
   bounds the scan ([matching.md §7.2](matching.md#72-zone-map-pruning));
 - the **chunk leaves** of the `u32` code columns as *chunk probes*
-  ([`ColumnChunks`](../encoded-search/src/layout.rs#L44)): a leaf's segment is
+  ([`ColumnChunks`](../encoded-search/src/layout.rs)): a leaf's segment is
   fetched and its array rebuilt in the wire encoding — not decompressed — and
-  then binary-searched or point-read in place. This is how a file-backed
-  Dictionary store resolves a bound subject to its exact row range, and how
-  index children locate a run, touching only the leaves the bisection crosses.
+  then binary-searched or point-read in place. A column the writer
+  dictionary-encoded at the layout level is probed through its codes leaves,
+  each composed with the dictionary's values leaf (fetched once, shared), so
+  an index child's `p` or `o` column locates its runs whichever shape the
+  writer's sampling gave it. This is how a file-backed Dictionary store
+  resolves a bound subject to its exact row range, and how index children
+  locate a run, touching only the leaves the bisection crosses.
 
 ---
 
@@ -253,7 +257,7 @@ sum, no I/O) with a budget:
   resolves the child's leaves once; a probe binary-searches by per-row reads,
   fetching only the leaves the bisection crosses, and a fetched leaf stays in
   its wire encoding for the store's lifetime. A match's four bound terms are
-  probed concurrently ([matching.md §3](matching.md#3-stage-a--the-prelude-prepare_pattern)).
+  probed concurrently ([matching.md §3](matching.md#3-stage-a--prepare_pattern)).
   A child whose layout shape the handle cannot address is lifted resident
   regardless.
 
@@ -304,8 +308,15 @@ row ids.
 The four quads
 
 ```turtle
-ex:alice a foaf:Person ; foaf:name "Alice" .
-ex:bob   a foaf:Person ; foaf:knows ex:alice .
+@prefix ex: <http://example.org/> .
+@prefix foaf: <http://xmlns.com/foaf/0.1/> .
+@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+
+ex:alice a foaf:Person ;
+   foaf:name "Alice" .
+
+ex:bob a foaf:Person ;
+   foaf:knows ex:alice .
 ```
 
 sorted by `(s, p, o, g)` (`<http://www.w3.org/1999/02/22-rdf-syntax-ns#type>`
@@ -313,10 +324,10 @@ sorts before `<http://xmlns.com/…>`), are the rows:
 
 | row | s | p | o | g |
 |---|---|---|---|---|
-| 0 | `<http://example.org/alice>` | `<…rdf-syntax-ns#type>` | `<…foaf/0.1/Person>` | `""` |
-| 1 | `<http://example.org/alice>` | `<…foaf/0.1/name>` | `"Alice"` | `""` |
-| 2 | `<http://example.org/bob>` | `<…rdf-syntax-ns#type>` | `<…foaf/0.1/Person>` | `""` |
-| 3 | `<http://example.org/bob>` | `<…foaf/0.1/knows>` | `<http://example.org/alice>` | `""` |
+| 0 | `ex:alice` | `rdf:type` | `foaf:Person` | `""` |
+| 1 | `ex:alice` | `foaf:name` | `"Alice"` | `""` |
+| 2 | `ex:bob` | `rdf:type` | `foaf:Person` | `""` |
+| 3 | `ex:bob` | `foaf:knows` | `ex:alice` | `""` |
 
 Under the `Default` layout that table *is* the quad-source child. Under the
 `Dictionary` layout the `dictionary` child holds the sorted terms (`"` sorts
@@ -359,7 +370,7 @@ With `secondary-by-reference`:
 | | 5 | 0 | | | 6 | 3 |
 | | 5 | 2 | | | 7 | 1 |
 
-The pattern `(?, ?, ex:alice, ?)` becomes: code of `<http://example.org/alice>`
+The pattern `(? ? ex:alice ?)` becomes: code of `<http://example.org/alice>`
 = 2 → binary search `index:ref-o`'s `val` for 2 → position 1 → `rid` 3 → row 3.
 
 ---
