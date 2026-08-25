@@ -602,7 +602,7 @@ async fn test_large_dictionary_child_lift_keeps_fsst() {
         dtype,
         Box::pin(futures::stream::once(async move { Ok(quads) })),
     );
-    let component = crate::io::ser::dict_component(&dict).unwrap();
+    let component = dict.to_write().unwrap();
     let mut bytes: Vec<u8> = Vec::new();
     container::write_store(
         &crate::session::VORTEX_SESSION,

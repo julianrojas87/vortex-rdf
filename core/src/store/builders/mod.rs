@@ -89,19 +89,21 @@ pub struct BuiltArray {
 pub struct BuiltStream {
     pub dtype: DType,
     pub chunks: ChunkStream,
-    // Read by the serializer and the materializing sorted-stream path, both
-    // absent on wasm (no file-io feature there, external sort compiled out).
-    #[cfg_attr(all(target_arch = "wasm32", target_os = "unknown"), allow(dead_code))]
+    /// The index children riding beside the rows as writable components.
     pub(crate) components: Vec<crate::io::container::NativeComponentWrite>,
-    /// Whether the chunks' `s` column is globally sorted — recorded in the
-    /// written root's metadata so a materialized read can restore the
-    /// subject binary-search stamp truthfully.
-    #[cfg_attr(not(feature = "file-io"), allow(dead_code))]
+    /// Whether the chunks are in global `(s, p, o, g)` order; written as the
+    /// root's `quads_sorted` (see `WireMetadata::quads_sorted`).
+    #[cfg_attr(
+        not(any(feature = "file-io", target_arch = "wasm32")),
+        allow(dead_code)
+    )]
     pub(crate) quads_sorted: bool,
     /// The Dictionary layout's terms, for the serializer to place as the
-    /// `dictionary` child. (Read by the serializer, so dead in builds that
-    /// compile none in.)
-    #[cfg_attr(not(feature = "file-io"), allow(dead_code))]
+    /// `dictionary` child.
+    #[cfg_attr(
+        not(any(feature = "file-io", target_arch = "wasm32")),
+        allow(dead_code)
+    )]
     pub(crate) dict: Option<Arc<TermDictionary>>,
 }
 

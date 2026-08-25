@@ -454,7 +454,13 @@ async fn test_file_subject_probe_requires_sorted() {
     let codes = dictionary::encode_quads(&raws, &dict, &id_map).unwrap();
     let primary = dictionary::build_code_chunk(&codes, 0..raws.len(), false).unwrap();
     let mut bytes: Vec<u8> = Vec::new();
-    crate::io::ser::serialize_parts(primary, &[], Some(&dict), &mut bytes)
+    let parts = crate::store::StoreParts {
+        array: primary,
+        components: Vec::new(),
+        dict: Some(std::sync::Arc::new(dict)),
+        quads_sorted: false,
+    };
+    crate::io::ser::serialize_parts(&parts, &mut bytes)
         .await
         .unwrap();
     let dir = tempfile::tempdir().unwrap();

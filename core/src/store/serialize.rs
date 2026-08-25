@@ -20,6 +20,17 @@ use vortex_array::ArrayRef;
 use super::open::scanned_index_components;
 use super::{StoreParts, VortexRdfStore};
 
+/// What [`VortexRdfStore::selected_parts`] yields: the rows, the index
+/// components addressing them, the fresh dictionary of a re-encoded
+/// Dictionary rebuild, and whether the rows are in global `(s, p, o, g)`
+/// order.
+type SelectedParts = (
+    ArrayRef,
+    Vec<IndexComponent>,
+    Option<Arc<TermDictionary>>,
+    bool,
+);
+
 /// Put a rebuild's rows into the (s, p, o, g) order every builder emits, so
 /// the array they build carries the subject sorted stamp.
 ///
@@ -61,9 +72,7 @@ impl VortexRdfStore {
     /// Serialization only — the row read paths use the rows-only
     /// [`selected_rows`](Self::selected_rows), which never materializes
     /// components.
-    async fn selected_parts(
-        &self,
-    ) -> Result<(ArrayRef, Vec<IndexComponent>, Option<Arc<TermDictionary>>)> {
+    async fn selected_parts(&self) -> Result<SelectedParts> {
         let base = self.base_selected_rows().await?;
         let (owner_shaped, tombstoned) = match &self.quads {
             QuadsSource::InMemory {
@@ -92,7 +101,8 @@ impl VortexRdfStore {
             } else {
                 Vec::new()
             };
-            return Ok((base, components, None));
+            let quads_sorted = subject_sorted(&base);
+            return Ok((base, components, None, quads_sorted));
         }
         // A rebuild re-emits every surviving row in (s, p, o, g) order (see
         // `order_for_rebuild`), so the written artifact carries the subject
@@ -101,7 +111,9 @@ impl VortexRdfStore {
         let base_sorted = subject_sorted(&base);
         let (mut raws, base_rows) = self.merged_raw_quads(&base).await?;
         order_for_rebuild(&mut raws, base_rows, base_sorted);
-        build_parts_from_raws(&raws, self.layout.strategy(), &self.indexes, true)
+        let (array, components, dict) =
+            build_parts_from_raws(&raws, self.layout.strategy(), &self.indexes, true)?;
+        Ok((array, components, dict, true))
     }
 
     /// This store's rows and, under the Dictionary layout, the term
@@ -117,7 +129,7 @@ impl VortexRdfStore {
     /// A view that rebuilds (tailed, or tombstoned with indexes) emits its
     /// rows in `(s, p, o, g)` order rather than in the order it holds them.
     pub async fn to_serializable_parts(&self) -> Result<StoreParts> {
-        let (array, components, fresh) = self.selected_parts().await?;
+        let (array, components, fresh, quads_sorted) = self.selected_parts().await?;
         let dict = match (&self.layout, fresh) {
             (ResolvedLayout::Dictionary(_), Some(fresh)) => Some(fresh),
             (ResolvedLayout::Dictionary(access), None) => Some(access.ensure_resident().await?),
@@ -127,6 +139,7 @@ impl VortexRdfStore {
             array,
             components,
             dict,
+            quads_sorted,
         })
     }
 
@@ -139,13 +152,7 @@ impl VortexRdfStore {
     pub async fn to_bytes(&self) -> Result<Vec<u8>> {
         let parts = self.to_serializable_parts().await?;
         let mut bytes = Vec::new();
-        crate::io::ser::serialize_parts(
-            parts.array,
-            &parts.components,
-            parts.dict.as_deref(),
-            &mut bytes,
-        )
-        .await?;
+        crate::io::ser::serialize_parts(&parts, &mut bytes).await?;
         Ok(bytes)
     }
 }

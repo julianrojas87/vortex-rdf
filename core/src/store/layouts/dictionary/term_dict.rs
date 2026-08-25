@@ -773,6 +773,36 @@ pub(crate) async fn dict_from_reader(
     )
 }
 
+#[cfg(any(feature = "file-io", target_arch = "wasm32"))]
+impl TermDictionary {
+    /// This dictionary as a native store component: the sorted term column,
+    /// one chunk per held FSST window ([`dict_child_chunks`]), written
+    /// verbatim through the pass-through strategy as the root's required
+    /// `dictionary` child (see `container::dict_child_strategy`).
+    pub(crate) fn to_write(&self) -> Result<crate::io::container::NativeComponentWrite> {
+        use crate::io::container::{
+            self, BufferedComponentSource, DICT_COMPONENT_NAME, NativeComponentWrite,
+            StoreComponentDescriptor, StoreComponentRole,
+        };
+        let chunks = dict_child_chunks(self)?;
+        let dtype = chunks[0].dtype().clone();
+        NativeComponentWrite::new(
+            StoreComponentDescriptor {
+                name: DICT_COMPONENT_NAME.into(),
+                role: StoreComponentRole::Dictionary,
+                implementation: container::DICT_IMPLEMENTATION.into(),
+                version: 1,
+                required: true,
+                sorted: true,
+                dtype,
+            },
+            Arc::new(BufferedComponentSource::try_new(chunks).map_err(VortexRdfError::Vortex)?),
+            container::dict_child_strategy(),
+        )
+        .map_err(VortexRdfError::Vortex)
+    }
+}
+
 /// The dictionary component's body, one `{_dict_term: utf8}` struct per held
 /// term chunk — row i of the concatenation = the term with code i, in the
 /// encoding the dictionary is held in (FSST when compressed at the source).

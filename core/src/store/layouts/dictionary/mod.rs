@@ -56,7 +56,7 @@ pub(crate) use self::ingest::{TermIdMap, ingest_interning};
 pub(crate) use self::ingest::TermDictionaryBuilder;
 use self::term_dict::DictReader;
 pub use self::term_dict::DictSnapshot;
-#[cfg(any(feature = "file-io", target_arch = "wasm32"))]
+#[cfg(all(test, any(feature = "file-io", target_arch = "wasm32")))]
 pub(crate) use self::term_dict::dict_child_chunks;
 pub(crate) use self::term_dict::{TermDictionary, dict_from_reader};
 

@@ -143,12 +143,11 @@ impl StoreComponentDescriptor {
     }
 }
 
-/// Validate a component inventory as a whole: every descriptor individually
+/// Validate a component inventory: every descriptor individually
 /// ([`StoreComponentDescriptor::validate`]) plus name uniqueness across the
-/// set. The single owner of inventory validation, called once per entry path
-/// into the container — [`decode_store_metadata`] on read, the write
-/// strategy's `with_components` on write — instead of being re-run by every
-/// constructor in between.
+/// set. The single owner of inventory validation, run once per container
+/// entry path — [`decode_store_metadata`] on read,
+/// `RdfStoreWriteStrategy::with_components` on write.
 pub(super) fn validate_components<'a>(
     components: impl IntoIterator<Item = &'a StoreComponentDescriptor>,
 ) -> VortexResult<()> {

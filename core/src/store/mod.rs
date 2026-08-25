@@ -106,6 +106,13 @@ pub struct StoreParts {
     pub(crate) array: ArrayRef,
     pub(crate) components: Vec<crate::store::indexes::IndexComponent>,
     pub(crate) dict: Option<Arc<TermDictionary>>,
+    /// Whether `array`'s rows are in global `(s, p, o, g)` order; written as
+    /// the root's `quads_sorted` (see `WireMetadata::quads_sorted`).
+    #[cfg_attr(
+        not(any(feature = "file-io", target_arch = "wasm32")),
+        allow(dead_code)
+    )]
+    pub(crate) quads_sorted: bool,
 }
 
 /// The layout an in-memory construction (`from_parts`, `from_built`,
@@ -489,6 +496,7 @@ mod tests {
             array,
             components: Vec::new(),
             dict: None,
+            quads_sorted: false,
         })
         .err()
         .expect("from_parts should fail");

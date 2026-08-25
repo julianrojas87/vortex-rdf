@@ -330,7 +330,7 @@ async fn test_locally_sorted_children_from_bytes_match_correctly() {
                         false,
                     ),
                 },
-                std::sync::Arc::new(container::ReplayableArraySource::try_new(chunks).unwrap()),
+                std::sync::Arc::new(container::BufferedComponentSource::try_new(chunks).unwrap()),
                 container::default_child_strategy(),
             )
             .unwrap()

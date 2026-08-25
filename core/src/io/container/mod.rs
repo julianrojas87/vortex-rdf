@@ -14,8 +14,7 @@
 //! (component descriptors and their JSON stamp), [`layout`] the root layout
 //! vtable and its read-side inspection, [`sources`] the always-compiled
 //! component producers builders construct on every target, and [`write`] the
-//! write strategy — gated as a whole, since only targets with a serializer
-//! consume it. `ser` assembles a store's parts and drives
+//! write strategy, gated like `io::ser`. `ser` assembles a store's parts and drives
 //! [`write::write_store`]; `read` reads the bytes back.
 
 pub(crate) mod layout;
@@ -29,14 +28,13 @@ pub(crate) mod layout;
 )]
 pub(crate) mod sources;
 pub(crate) mod wire;
-/// Every item in `write` is write-side container machinery, compiled only
-/// where a store can be written: natively behind `file-io`, and on wasm
-/// (whose bindings exchange file bytes).
+/// Write strategy; gated like `io::ser`.
 #[cfg(any(feature = "file-io", target_arch = "wasm32"))]
 pub(crate) mod write;
 
-/// Stable identity of the store root layout. Changing the wire below means a
-/// new versioned id, not a silent reinterpretation.
+/// Stable identity of the store root layout. Changing the container grammar
+/// (`wire`, `layout`) means a new versioned id, not a silent
+/// reinterpretation.
 pub(crate) const STORE_LAYOUT_ID: &str = "vortex-rdf.store.v1";
 /// The transparent quad table is always child 0.
 const QUAD_SOURCE_CHILD: usize = 0;
@@ -58,7 +56,7 @@ pub(crate) use sources::{NativeComponentWrite, default_child_strategy};
 // Consumed only by the write side (`ser` and `IndexComponent::to_write`),
 // gated the same way.
 #[cfg(any(feature = "file-io", target_arch = "wasm32"))]
-pub(crate) use sources::ReplayableArraySource;
+pub(crate) use sources::BufferedComponentSource;
 pub(crate) use wire::{StoreComponentDescriptor, StoreComponentRole};
 #[cfg(any(feature = "file-io", target_arch = "wasm32"))]
 pub(crate) use write::{dict_child_strategy, write_store};
@@ -222,7 +220,7 @@ mod tests {
 
             let component = NativeComponentWrite::new(
                 dict_descriptor(dict_dtype.clone()),
-                Arc::new(ReplayableArraySource::try_new(dict_chunks).unwrap()),
+                Arc::new(BufferedComponentSource::try_new(dict_chunks).unwrap()),
                 default_child_strategy(),
             )
             .unwrap();

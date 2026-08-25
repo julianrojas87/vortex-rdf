@@ -155,7 +155,7 @@ pub(crate) struct IndexComponent {
     pub(crate) implementation: &'static str,
     /// The component's rows: canonical from construction, or a deferred
     /// adoption canonicalized on first genuine use — reached through
-    /// [`rows`](Self::rows)/[`as_array`](Self::as_array).
+    /// [`rows`](Self::rows).
     rows: ComponentRows,
     /// Whether the sort-key columns are GLOBALLY sorted — the writer's
     /// provenance, not an inspection: binary-search resolution is gated on
@@ -266,29 +266,21 @@ impl IndexComponent {
         }
     }
 
-    /// The component's rows as an `ArrayRef` (an `Arc` bump past the first
-    /// materialization). Consumed only by `ser`'s component write, gated the
-    /// same way.
-    #[cfg(any(feature = "file-io", target_arch = "wasm32"))]
-    pub(crate) fn as_array(&self) -> Result<ArrayRef> {
-        Ok(self.rows()?.clone().into_array())
-    }
-
     /// This component as a replayable native child write, its descriptor
     /// carrying the component's own sortedness provenance — the one way a
     /// component reaches the container writer, from a store's serialization
     /// and from a builder's chunk stream alike. Compiled only where a store
-    /// can be written, the gate [`as_array`](Self::as_array) carries.
+    /// can be written (file-io or wasm32).
     ///
     /// Writing is a genuine use: a deferred adoption materializes here, so
     /// the written child is byte-identical to an eagerly-adopted one's.
     #[cfg(any(feature = "file-io", target_arch = "wasm32"))]
     pub(crate) fn to_write(&self) -> Result<crate::io::container::NativeComponentWrite> {
         use crate::io::container::{
-            NativeComponentWrite, ReplayableArraySource, StoreComponentDescriptor,
+            BufferedComponentSource, NativeComponentWrite, StoreComponentDescriptor,
             StoreComponentRole, default_child_strategy,
         };
-        let array = self.as_array()?;
+        let array = self.rows()?.clone().into_array();
         NativeComponentWrite::new(
             StoreComponentDescriptor {
                 name: self.name.into(),
@@ -299,7 +291,9 @@ impl IndexComponent {
                 sorted: self.sorted,
                 dtype: array.dtype().clone(),
             },
-            Arc::new(ReplayableArraySource::try_new(vec![array]).map_err(VortexRdfError::Vortex)?),
+            Arc::new(
+                BufferedComponentSource::try_new(vec![array]).map_err(VortexRdfError::Vortex)?,
+            ),
             default_child_strategy(),
         )
         .map_err(VortexRdfError::Vortex)

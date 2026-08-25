@@ -13,7 +13,7 @@ use vortex_error::{VortexResult, vortex_bail, vortex_ensure_eq};
 use super::wire::StoreComponentDescriptor;
 
 /// Replayable producer for one independently typed component. Sources are
-/// buffered arrays ([`ReplayableArraySource`]) or spill-run mergers pulled
+/// buffered arrays ([`BufferedComponentSource`]) or spill-run mergers pulled
 /// chunk by chunk ([`PullComponentSource`]); both are lazy — nothing is
 /// produced until the write strategy polls, which is what lets it bound how
 /// many components compress concurrently.
@@ -25,19 +25,19 @@ pub(crate) trait NativeComponentSource: Send + Sync + 'static {
     }
 }
 
-/// A component source over already-materialized chunks. Replay is Arc-cheap;
-/// large components should prefer run-backed sources.
+/// A component source over already-materialized chunks; replay is
+/// `Arc`-cheap.
 #[derive(Clone)]
-pub(crate) struct ReplayableArraySource {
+pub(crate) struct BufferedComponentSource {
     dtype: DType,
     chunks: Arc<[vortex_array::ArrayRef]>,
     retained_bytes: u64,
 }
 
-impl ReplayableArraySource {
+impl BufferedComponentSource {
     pub(crate) fn try_new(chunks: Vec<vortex_array::ArrayRef>) -> VortexResult<Self> {
         let Some(first) = chunks.first() else {
-            vortex_bail!("a replayable component source requires at least one chunk");
+            vortex_bail!("a buffered component source requires at least one chunk");
         };
         let dtype = first.dtype().clone();
         for chunk in &chunks {
@@ -56,7 +56,7 @@ impl ReplayableArraySource {
     }
 }
 
-impl NativeComponentSource for ReplayableArraySource {
+impl NativeComponentSource for BufferedComponentSource {
     fn dtype(&self) -> &DType {
         &self.dtype
     }
@@ -145,11 +145,8 @@ pub(crate) struct NativeComponentWrite {
 }
 
 impl NativeComponentWrite {
-    /// Pair a descriptor with its source and per-child write strategy. Only
-    /// the source's dtype is checked here (a construction invariant);
-    /// inventory-wide validation — descriptor well-formedness and name
-    /// uniqueness — runs once at the container's write entry path, see
-    /// [`validate_components`](super::wire::validate_components).
+    /// Pair a descriptor with its source and per-child write strategy; the
+    /// source's dtype must match the descriptor's.
     pub(crate) fn new(
         descriptor: StoreComponentDescriptor,
         source: Arc<dyn NativeComponentSource>,
@@ -169,11 +166,8 @@ impl NativeComponentWrite {
 }
 
 /// The stock write strategy `write_options()` installs — used for the quad
-/// child and the index components so their encoding pipeline is exactly what
-/// a plain table write produces (the dictionary child instead passes its
-/// pre-compressed chunks through `write::dict_child_strategy`). Ungated like
-/// the component data types: builders construct [`NativeComponentWrite`]s on
-/// every target, even when no serializer is compiled in.
+/// child and the index components (the dictionary child instead passes its
+/// pre-compressed chunks through `write::dict_child_strategy`).
 pub(crate) fn default_child_strategy() -> Arc<dyn vortex_layout::LayoutStrategy> {
     Arc::new(vortex_file::WriteStrategyBuilder::default().build())
 }

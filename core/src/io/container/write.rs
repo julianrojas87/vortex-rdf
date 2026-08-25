@@ -16,6 +16,11 @@ use super::layout::{RdfStoreLayout, RdfStoreLayoutData, RdfStoreLayoutVTable};
 use super::sources::NativeComponentWrite;
 use super::wire::{StoreComponentDescriptor, validate_components};
 
+/// How many component children compress concurrently alongside the quad
+/// source. Sources are lazy (replayable or merger-backed) and cost nothing
+/// until polled, so the window only bounds writer-buffered memory.
+const COMPONENT_WRITE_CONCURRENCY: usize = 2;
+
 /// One descriptor paired with its written child layout.
 #[derive(Clone)]
 struct StoreComponent {
@@ -24,9 +29,7 @@ struct StoreComponent {
 }
 
 /// Assemble a native root from the written quad-source child and its
-/// components. The component inventory must already be validated — the write
-/// strategy's [`with_components`](RdfStoreWriteStrategy::with_components) is
-/// the sole entry feeding this.
+/// components.
 fn new_store_layout_with_components(
     quad_source: LayoutRef,
     quads_sorted: bool,
@@ -61,8 +64,8 @@ fn new_store_layout_with_components(
 #[derive(Clone)]
 struct RdfStoreWriteStrategy {
     quad_source: Arc<dyn LayoutStrategy>,
-    /// Provenance recorded in the root metadata: whether the quad stream's
-    /// `s` column is globally sorted (see `WireMetadata::quads_sorted`).
+    /// Provenance recorded in the root metadata; see
+    /// `WireMetadata::quads_sorted`.
     quads_sorted: bool,
     components: Arc<[NativeComponentWrite]>,
 }
@@ -76,9 +79,8 @@ impl RdfStoreWriteStrategy {
         }
     }
 
-    /// Adopt the component inventory, validating it once here — the write
-    /// path's entry point for validation (each write's descriptor was
-    /// dtype-checked against its source at construction).
+    /// Adopt the component inventory; runs [`validate_components`] once for
+    /// the write path.
     fn with_components(mut self, components: Vec<NativeComponentWrite>) -> VortexResult<Self> {
         validate_components(components.iter().map(|c| &c.descriptor))?;
         self.components = components.into();
@@ -88,6 +90,11 @@ impl RdfStoreWriteStrategy {
 
 #[async_trait::async_trait]
 impl LayoutStrategy for RdfStoreWriteStrategy {
+    /// All children compress concurrently through one segment sink. The
+    /// sequenced sink assigns the quad subtree's segment ids ahead of every
+    /// auxiliary child's, so a component's compressed segments accumulate in
+    /// the sink until the quad table finishes writing: peak memory includes
+    /// the in-flight components' compressed size.
     async fn write_stream(
         &self,
         ctx: LayoutWriterContext,
@@ -140,10 +147,7 @@ impl LayoutStrategy for RdfStoreWriteStrategy {
             quad_eof,
             session,
         );
-        // Every component source is lazy (replayable or merger-backed) and
-        // costs nothing until polled, so a small window is enough: it bounds
-        // how many children compress at once without starving any of them.
-        let concurrency = jobs.len().clamp(1, 2);
+        let concurrency = jobs.len().clamp(1, COMPONENT_WRITE_CONCURRENCY);
         let components_future = futures::stream::iter(jobs)
             .buffered(concurrency)
             .try_collect::<Vec<_>>();
@@ -182,11 +186,9 @@ where
 
 /// The dictionary child's pass-through strategy: every chunk the source
 /// emits is written verbatim as one flat leaf under a chunked node — no
-/// sampling, no re-encoding. The dictionary is FSST-compressed at the source
-/// in self-contained windows (`TermDictionary::compress`), so the default
-/// strategy's compressor would only re-do work it cannot improve on, and the
-/// window boundaries become the child's chunk leaves — the granularity at
-/// which `FileBackedDict` point-reads and lifts it.
+/// sampling, no re-encoding. The chunks are the source's self-contained FSST
+/// windows (`TermDictionary::compress`), so the child's leaves are the
+/// granularity at which `FileBackedDict` point-reads.
 pub(crate) fn dict_child_strategy() -> Arc<dyn LayoutStrategy> {
     use vortex_layout::layouts::chunked::writer::ChunkedLayoutStrategy;
     use vortex_layout::layouts::flat::writer::FlatLayoutStrategy;

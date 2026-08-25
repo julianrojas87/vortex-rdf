@@ -119,9 +119,9 @@ impl VTable for RdfStoreLayoutVTable {
     }
 }
 
-/// Whether the file's quad rows are recorded as globally `s`-sorted — the
-/// writer's provenance for restoring the subject binary-search stamp on a
-/// materialized read (see `WireMetadata::quads_sorted`).
+/// Whether the quad rows are recorded in global `(s, p, o, g)` order (the
+/// meaning is defined on `WireMetadata::quads_sorted`); a materialized read
+/// restores the subject sorted stamp from it.
 pub(crate) fn quads_sorted(layout: &RdfStoreLayout) -> bool {
     layout.data().quads_sorted
 }
@@ -162,11 +162,8 @@ pub(crate) fn store_component(
     Ok(Some((descriptor, child)))
 }
 
-/// Test-only: the parsed root metadata of serialized store bytes — the
-/// `quads_sorted` provenance bit and the component inventory. Wire-contract
-/// tests assert on the decoded fields through this instead of
-/// substring-searching the file for JSON fragments, which breaks on any
-/// metadata re-serialization and can false-positive inside compressed data.
+/// Test-only: the decoded root metadata of serialized store bytes — the
+/// `quads_sorted` bit and the component inventory.
 #[cfg(all(test, feature = "file-io"))]
 pub(crate) fn store_metadata_of_bytes(bytes: &[u8]) -> (bool, Vec<StoreComponentDescriptor>) {
     use vortex_file::OpenOptionsSessionExt as _;

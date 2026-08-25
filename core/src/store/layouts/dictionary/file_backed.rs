@@ -415,7 +415,7 @@ mod tests {
             stream,
             container::default_child_strategy(),
             false,
-            vec![crate::io::ser::dict_component(&d).unwrap()],
+            vec![d.to_write().unwrap()],
         )
         .await
         .unwrap();
