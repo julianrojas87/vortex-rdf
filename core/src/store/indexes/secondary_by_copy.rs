@@ -505,10 +505,10 @@ fn build_serve_plan(
     )))
 }
 
-/// The external-sort builder's emission surface: the persisted child dtype,
-/// the child chunks built from windows of merged `(sort key, row id)`
-/// entries, and the sort key those entries carry. Compiled out on wasm
-/// with the builder itself (see the module gate in `store::builders`).
+/// The emission surface of the out-of-core builder (compiled out on
+/// wasm32-unknown-unknown with it): the persisted child dtype, the child
+/// chunks built from windows of merged `(sort key, row id)` entries, and the
+/// sort key those entries carry.
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub(crate) mod out_of_core {
     use vortex_array::arrays::PrimitiveArray;

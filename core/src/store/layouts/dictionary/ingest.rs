@@ -5,8 +5,8 @@
 
 use std::collections::HashMap;
 // Only [`TermDictionaryBuilder`] collects terms as a set, and it is compiled
-// out with the external-sort builder that drives it.
-use crate::debug;
+// out with the out-of-core builder that drives it (see the module gate in
+// `store::builders`).
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -14,6 +14,7 @@ use std::sync::Arc;
 use futures::{Stream, StreamExt};
 use vortex_array::arrays::VarBinViewArray;
 
+use crate::debug;
 use crate::error::Result;
 use crate::store::RawQuad;
 use crate::store::builders::{BuiltArray, build_components_from_codes};
@@ -98,19 +99,21 @@ impl TermDictionaryBuilder {
     }
 }
 
-/// Drain a quad stream into an [`InterningQuadBuilder`]: each quad's Strings
-/// die here, leaving one copy of every distinct term plus 16 bytes per quad.
-///
-/// The Dictionary-layout in-memory ingest; `finish` then yields the
-/// dictionary and the coded quads in global (s, p, o, g) order.
-pub(crate) async fn ingest_interning(
-    mut quads_in: Box<dyn Stream<Item = Result<RawQuad>> + Unpin + Send + 'static>,
-) -> Result<InterningQuadBuilder> {
-    let mut interner = InterningQuadBuilder::new();
-    while let Some(res) = quads_in.next().await {
-        interner.push(res?);
-    }
-    Ok(interner)
+/// Freeze `interner`'s dictionary and build the single-chunk
+/// Dictionary-layout array with the requested indexes' components beside it
+/// — the in-memory Dictionary build every interning ingest ends with.
+pub(crate) fn finish_interned(
+    interner: InterningQuadBuilder,
+    indexes: &Indexes,
+) -> Result<BuiltArray> {
+    let (dict, codes) = interner.finish()?;
+    let array = build_array(&codes)?;
+    let components = build_components_from_codes(indexes, &codes)?;
+    Ok(BuiltArray {
+        array,
+        components,
+        dict: Some(Arc::new(dict)),
+    })
 }
 
 /// Push-based Dictionary-layout ingest for callers that produce quads one at
@@ -146,14 +149,7 @@ impl DictionaryQuadSink {
     /// Freeze the dictionary and build the single-chunk Dictionary-layout
     /// array, exactly as the corresponding stream builder would.
     pub fn finish(self) -> Result<BuiltArray> {
-        let (dict, codes) = self.interner.finish()?;
-        let array = build_array(&codes)?;
-        let components = build_components_from_codes(&self.indexes, &codes)?;
-        Ok(BuiltArray {
-            array,
-            components,
-            dict: Some(Arc::new(dict)),
-        })
+        finish_interned(self.interner, &self.indexes)
     }
 }
 
@@ -186,6 +182,20 @@ impl InterningQuadBuilder {
             ids: HashMap::new(),
             quads: Vec::new(),
         }
+    }
+
+    /// Drain a quad stream into a fresh interner: each quad's Strings die
+    /// here, leaving one copy of every distinct term plus 16 bytes per quad.
+    /// [`finish`](Self::finish) then yields the dictionary and the coded
+    /// quads in global (s, p, o, g) order.
+    pub(crate) async fn from_stream(
+        mut quads_in: Box<dyn Stream<Item = Result<RawQuad>> + Unpin + Send + 'static>,
+    ) -> Result<Self> {
+        let mut interner = Self::new();
+        while let Some(res) = quads_in.next().await {
+            interner.push(res?);
+        }
+        Ok(interner)
     }
 
     fn intern(&mut self, term: String) -> u32 {

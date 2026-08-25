@@ -79,8 +79,8 @@ impl NativeComponentSource for BufferedComponentSource {
 }
 
 /// A pull closure yielding one component chunk per call (`Ok(None)` = end).
-// Constructed only by the external-sort builder's mergers, which are compiled
-// out on wasm (see the module gate in `store::builders`).
+// Constructed only by the out-of-core builder, which is compiled out on
+// wasm32-unknown-unknown.
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub(crate) type PullFn =
     Box<dyn FnMut(usize) -> VortexResult<Option<vortex_array::ArrayRef>> + Send>;

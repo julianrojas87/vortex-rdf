@@ -108,10 +108,10 @@ pub struct BuiltStream {
 }
 
 pub(crate) mod sorted_in_memory;
-// The external-sort pipeline spills to a real filesystem, which
-// `wasm32-unknown-unknown` does not have: compiling it out (rather than
-// erroring at spill time) keeps it, the rkyv serializer paths, and uuid out
-// of the wasm artifact, whose size is a recorded constraint.
+// The out-of-core builder spills to a real filesystem, which
+// `wasm32-unknown-unknown` does not have: compiling it out keeps it, the
+// rkyv serializer paths, and uuid out of the wasm artifact, whose size is a
+// recorded constraint.
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub(crate) mod sorted_stream;
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
@@ -305,7 +305,8 @@ pub(crate) fn build_parts_from_raws(
 
 /// Assemble a list of per-chunk StructArrays into a single ArrayRef.
 /// Returns an empty StructArray with the correct schema when `chunks` is empty.
-// Only the (wasm-gated) external-sort builder materializes chunk streams.
+// Read only by the out-of-core builder, which is compiled out on
+// wasm32-unknown-unknown.
 #[cfg_attr(all(target_arch = "wasm32", target_os = "unknown"), allow(dead_code))]
 pub(crate) fn assemble_chunks(chunks: Vec<ArrayRef>, layout: LayoutStrategy) -> Result<ArrayRef> {
     if chunks.is_empty() {

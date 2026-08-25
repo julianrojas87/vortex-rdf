@@ -20,7 +20,6 @@
 //!
 //! [`LayoutStrategy::Dictionary`]: super::LayoutStrategy::Dictionary
 
-use crate::debug;
 use std::borrow::Borrow;
 use std::collections::HashMap;
 use std::hash::Hash;
@@ -33,7 +32,8 @@ use vortex_array::arrays::struct_::StructArray;
 use vortex_array::validity::Validity;
 use vortex_array::{ArrayRef, IntoArray, VortexSessionExecute};
 
-use crate::common::terms::{get_as_term, parse_graph_name, parse_named_node, parse_subject};
+use crate::common::terms::{parse_graph_name, parse_named_node, parse_object, parse_subject};
+use crate::debug;
 use crate::error::{Result, VortexRdfError};
 use crate::session::VORTEX_SESSION;
 use crate::store::RawQuad;
@@ -49,9 +49,9 @@ pub(crate) mod term_dict;
 #[cfg(feature = "file-io")]
 pub(crate) use self::file_backed::FileBackedDict;
 pub use self::ingest::DictionaryQuadSink;
-pub(crate) use self::ingest::{TermIdMap, ingest_interning};
-// Only the (wasm-gated) external-sort builder collects terms ahead of the
-// encoding pass.
+pub(crate) use self::ingest::TermIdMap;
+// Read only by the out-of-core builder, which is compiled out on
+// wasm32-unknown-unknown.
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub(crate) use self::ingest::TermDictionaryBuilder;
 use self::term_dict::DictReader;
@@ -60,10 +60,8 @@ pub use self::term_dict::DictSnapshot;
 pub(crate) use self::term_dict::dict_child_chunks;
 pub(crate) use self::term_dict::{TermDictionary, dict_from_reader};
 
-/// Field names of the primary columns: `s`, `p`, `o`, `g` (all u32 codes).
-pub(crate) fn field_names() -> Vec<Arc<str>> {
-    PRIMARY_COLUMNS.iter().map(|&n| n.into()).collect()
-}
+/// The primary columns: `s`, `p`, `o`, `g` (all u32 codes).
+pub(crate) const COLUMNS: &[&str] = &PRIMARY_COLUMNS;
 
 /// Dictionary-encoded quad columns: [`RawQuad`] terms replaced by their u32
 /// codes in the global sorted term dictionary. Produced by the Dictionary
@@ -149,7 +147,7 @@ fn chunk_parts(
     range: Range<usize>,
     s_sorted: bool,
 ) -> (Vec<Arc<str>>, Vec<ArrayRef>) {
-    let names = field_names();
+    let names = super::LayoutStrategy::Dictionary.field_names();
     let arrays: Vec<ArrayRef> = vec![
         PrimitiveArray::from_iter(codes.s[range.clone()].iter().copied()).into_array(),
         PrimitiveArray::from_iter(codes.p[range.clone()].iter().copied()).into_array(),
@@ -384,12 +382,7 @@ fn decode_codes(
             let subject = sm.get_or_insert(s_ids[i], || parse_subject(src.str_at(0, s_ids[i])?))?;
             let predicate =
                 pm.get_or_insert(p_ids[i], || parse_named_node(src.str_at(1, p_ids[i])?))?;
-            let object = om.get_or_insert(o_ids[i], || {
-                let term = src.str_at(2, o_ids[i])?;
-                get_as_term(term).ok_or_else(|| {
-                    VortexRdfError::Deserialization(format!("Invalid object: {term}"))
-                })
-            })?;
+            let object = om.get_or_insert(o_ids[i], || parse_object(src.str_at(2, o_ids[i])?))?;
             let graph =
                 gm.get_or_insert(g_ids[i], || parse_graph_name(src.str_at(3, g_ids[i])?))?;
             Ok(Quad::new(subject, predicate, object, graph))
@@ -470,9 +463,7 @@ fn shared_rows(
         .collect())
 }
 
-/// [`decode_chunk`] with shared-string terms (see [`shared_rows`]); a
-/// chunk-level failure arrives as a one-element error chunk, the same
-/// convention as the quad decode.
+/// [`decode_chunk`] with shared-string terms (see [`shared_rows`]).
 pub(crate) fn decode_chunk_shared(
     chunk: &ArrayRef,
     dict: &TermDictionary,

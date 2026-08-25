@@ -87,10 +87,9 @@ impl VortexRdfStore {
         // The tail's layouts store plain strings (see `tail_layout`), so this
         // prelude resolves nothing and never suspends — but the witness is
         // still minted by it, like every probe surface.
-        let mut codes = layout
-            .prepare_pattern(QuadPattern::new(subject, predicate, object, graph))
-            .await?;
-        let eqs = match codes.constraints(subject, predicate, object, graph)? {
+        let pattern = QuadPattern::new(subject, predicate, object, graph);
+        let mut codes = layout.prepare_pattern(pattern).await?;
+        let eqs = match codes.constraints(pattern)? {
             // A term the tail's layout can prove absent matches nothing.
             Constraints::AlwaysFalse => {
                 log::debug!(
@@ -418,7 +417,7 @@ impl VortexRdfStore {
             // The residual binds a subset of the roles the caller's gate
             // already resolved to codes, so the unmatchable arm cannot fire
             // here — it stays for totality.
-            let eqs = match codes.constraints(pat.subject, pat.predicate, pat.object, pat.graph)? {
+            let eqs = match codes.constraints(pat)? {
                 Constraints::AlwaysFalse => return Ok(self.empty_view()),
                 Constraints::Eq(eqs) => eqs,
             };
@@ -572,7 +571,6 @@ impl VortexRdfStore {
                 serve,
             } => {
                 let pat = resolves.clear(pat);
-                let (s, p, o, g) = (pat.subject, pat.predicate, pat.object, pat.graph);
                 let serve = keep_serve.then_some(serve).flatten();
                 let selection = match row_ids {
                     // With the plan kept, the resolution is the view's sole
@@ -620,7 +618,7 @@ impl VortexRdfStore {
                     }
                 };
                 (
-                    file_scan::build_file_filter(s, p, o, g, codes)?,
+                    file_scan::build_file_filter(pat, codes)?,
                     Some(selection),
                     serve,
                 )
@@ -633,17 +631,7 @@ impl VortexRdfStore {
                     "[match_pattern] File index declined at {:?}",
                     debug::elapsed(t)
                 );
-                (
-                    file_scan::build_file_filter(
-                        pat.subject,
-                        pat.predicate,
-                        pat.object,
-                        pat.graph,
-                        codes,
-                    )?,
-                    None,
-                    None,
-                )
+                (file_scan::build_file_filter(pat, codes)?, None, None)
             }
         };
         // Combine with whatever filter this view already carried

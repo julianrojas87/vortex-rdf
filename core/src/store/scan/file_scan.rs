@@ -9,7 +9,7 @@ use std::ops::{BitAnd, Range};
 use std::sync::Arc;
 
 use futures::{StreamExt, stream};
-use oxrdf::{GraphName, NamedNode, NamedOrBlankNode, Term};
+use oxrdf::NamedOrBlankNode;
 use vortex_array::expr::forms::conjuncts;
 use vortex_array::expr::{BoundExpression, Expression, and, eq, get_item, lit, root};
 use vortex_array::stream::ArrayStreamExt as _;
@@ -24,7 +24,7 @@ use vortex_scan::strict_sorted_buffer::StrictSortedBuffer;
 
 use crate::error::{Result, VortexRdfError};
 use crate::io::read::available_parallelism;
-use crate::store::layouts::{Constraints, PatternCodes, TermRef};
+use crate::store::layouts::{Constraints, PatternCodes, QuadPattern, TermRef};
 use crate::store::native_file::NativeStoreFile;
 use crate::store::scan::gather::primitive_from_u64_reads;
 use crate::store::schema;
@@ -321,42 +321,37 @@ pub(crate) async fn matching_file_rows(
     Ok(Mask::from_indices(row_count as usize, matched))
 }
 
-/// Convert an RDF pattern (subject, predicate, object, graph) into a Vortex
-/// filter expression that can be applied to a file-backed array during
-/// scanning. This allows the file reader to push filters down and avoid
-/// reading unnecessary data. `codes` is the match's prepared witness, which
-/// carries the layout's term → constraint mapping.
+/// Convert a quad pattern into a Vortex filter expression that can be
+/// applied to a file-backed array during scanning. This allows the file
+/// reader to push filters down and avoid reading unnecessary data. `codes`
+/// is the match's prepared witness, which carries the layout's term →
+/// constraint mapping.
 pub(crate) fn build_file_filter(
-    subject: Option<&NamedOrBlankNode>,
-    predicate: Option<&NamedNode>,
-    object: Option<&Term>,
-    graph: Option<&GraphName>,
+    pattern: QuadPattern<'_>,
     codes: &mut PatternCodes,
 ) -> Result<Option<Expression>> {
-    Ok(
-        match codes.constraints(subject, predicate, object, graph)? {
-            // If the layout determines that no rows can possibly match (e.g.,
-            // asking for a term that doesn't exist in a dictionary layout),
-            // return a filter that matches nothing (always evaluates to false).
-            Constraints::AlwaysFalse => Some(lit(false)),
+    Ok(match codes.constraints(pattern)? {
+        // If the layout determines that no rows can possibly match (e.g.,
+        // asking for a term that doesn't exist in a dictionary layout),
+        // return a filter that matches nothing (always evaluates to false).
+        Constraints::AlwaysFalse => Some(lit(false)),
 
-            // If the layout provides equality constraints (field_name, value
-            // pairs), build a filter expression by combining them with AND
-            // operations. Each constraint requires a specific column to equal a
-            // specific value.
-            Constraints::Eq(eqs) => {
-                let mut filter: Option<Expression> = None;
-                for (field, value) in eqs {
-                    let expr = eq(get_item(field, root()), lit(value));
-                    filter = Some(match filter.take() {
-                        Some(f) => and(f, expr),
-                        None => expr,
-                    });
-                }
-                filter
+        // If the layout provides equality constraints (field_name, value
+        // pairs), build a filter expression by combining them with AND
+        // operations. Each constraint requires a specific column to equal a
+        // specific value.
+        Constraints::Eq(eqs) => {
+            let mut filter: Option<Expression> = None;
+            for (field, value) in eqs {
+                let expr = eq(get_item(field, root()), lit(value));
+                filter = Some(match filter.take() {
+                    Some(f) => and(f, expr),
+                    None => expr,
+                });
             }
-        },
-    )
+            filter
+        }
+    })
 }
 
 /// The exact row range of `subject`'s run in a sorted file, by binary search

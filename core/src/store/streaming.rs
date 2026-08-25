@@ -4,10 +4,7 @@
 use crate::error::Result;
 #[cfg(feature = "file-io")]
 use crate::error::VortexRdfError;
-#[cfg(feature = "file-io")]
-use crate::store::indexes::FileServePlan;
-use crate::store::indexes::InMemoryServePlan;
-use crate::store::layouts::ResolvedLayout;
+use crate::store::layouts::{ChunkDecode, ResolvedLayout};
 use crate::store::scan::gather::gather_live;
 #[cfg(feature = "file-io")]
 use crate::store::selection::point_sized;
@@ -23,100 +20,8 @@ use oxrdf::Quad;
 use vortex_array::ArrayRef;
 #[cfg(feature = "file-io")]
 use vortex_layout::scan::scan_builder::ScanBuilder;
-use vortex_mask::Mask;
 
 use super::VortexRdfStore;
-
-/// The two row representations the chunk pipeline can decode into: owned
-/// oxrdf [`Quad`]s, or [`SharedQuad`]s whose terms are shared strings. One
-/// hook per decode site of [`VortexRdfStore::decoded_chunks`], so the
-/// pipeline's arms — the serve plans, the point-read fast paths, the sync and
-/// async scan streams — are written once for both.
-trait ChunkDecode: Sized + Send + 'static {
-    fn decode_chunk(layout: &ResolvedLayout, chunk: &ArrayRef) -> Vec<Result<Self>>;
-    fn serve_in_memory(plan: &InMemoryServePlan, deleted: Option<&Mask>) -> Vec<Result<Self>>;
-    #[cfg(feature = "file-io")]
-    fn decode_chunk_async<'a>(
-        layout: &'a ResolvedLayout,
-        chunk: &'a ArrayRef,
-    ) -> BoxFuture<'a, Vec<Result<Self>>>;
-    #[cfg(feature = "file-io")]
-    fn serve_columns(
-        plan: &FileServePlan,
-        chunk: &ArrayRef,
-        deleted: Option<&Mask>,
-    ) -> Vec<Result<Self>>;
-    #[cfg(feature = "file-io")]
-    fn serve_columns_async<'a>(
-        plan: &'a FileServePlan,
-        chunk: &'a ArrayRef,
-        deleted: Option<&'a Mask>,
-    ) -> BoxFuture<'a, Vec<Result<Self>>>;
-}
-
-impl ChunkDecode for Quad {
-    fn decode_chunk(layout: &ResolvedLayout, chunk: &ArrayRef) -> Vec<Result<Self>> {
-        layout.decode_chunk(chunk)
-    }
-    fn serve_in_memory(plan: &InMemoryServePlan, deleted: Option<&Mask>) -> Vec<Result<Self>> {
-        plan.decode(deleted)
-    }
-    #[cfg(feature = "file-io")]
-    fn decode_chunk_async<'a>(
-        layout: &'a ResolvedLayout,
-        chunk: &'a ArrayRef,
-    ) -> BoxFuture<'a, Vec<Result<Self>>> {
-        layout.decode_chunk_async(chunk).boxed()
-    }
-    #[cfg(feature = "file-io")]
-    fn serve_columns(
-        plan: &FileServePlan,
-        chunk: &ArrayRef,
-        deleted: Option<&Mask>,
-    ) -> Vec<Result<Self>> {
-        plan.decode_columns(chunk, deleted)
-    }
-    #[cfg(feature = "file-io")]
-    fn serve_columns_async<'a>(
-        plan: &'a FileServePlan,
-        chunk: &'a ArrayRef,
-        deleted: Option<&'a Mask>,
-    ) -> BoxFuture<'a, Vec<Result<Self>>> {
-        plan.decode_columns_async(chunk, deleted).boxed()
-    }
-}
-
-impl ChunkDecode for SharedQuad {
-    fn decode_chunk(layout: &ResolvedLayout, chunk: &ArrayRef) -> Vec<Result<Self>> {
-        layout.decode_chunk_shared(chunk)
-    }
-    fn serve_in_memory(plan: &InMemoryServePlan, deleted: Option<&Mask>) -> Vec<Result<Self>> {
-        plan.decode_shared(deleted)
-    }
-    #[cfg(feature = "file-io")]
-    fn decode_chunk_async<'a>(
-        layout: &'a ResolvedLayout,
-        chunk: &'a ArrayRef,
-    ) -> BoxFuture<'a, Vec<Result<Self>>> {
-        layout.decode_chunk_shared_async(chunk).boxed()
-    }
-    #[cfg(feature = "file-io")]
-    fn serve_columns(
-        plan: &FileServePlan,
-        chunk: &ArrayRef,
-        deleted: Option<&Mask>,
-    ) -> Vec<Result<Self>> {
-        plan.decode_columns_shared(chunk, deleted)
-    }
-    #[cfg(feature = "file-io")]
-    fn serve_columns_async<'a>(
-        plan: &'a FileServePlan,
-        chunk: &'a ArrayRef,
-        deleted: Option<&'a Mask>,
-    ) -> BoxFuture<'a, Vec<Result<Self>>> {
-        plan.decode_columns_shared_async(chunk, deleted).boxed()
-    }
-}
 
 impl VortexRdfStore {
     // ── quads streaming ───────────────────────────────────────────────────────
@@ -188,7 +93,7 @@ impl VortexRdfStore {
         // after whatever the base yields.
         let tail_quads: Vec<Result<T>> = match &self.tail {
             None => vec![],
-            Some(tail) => T::decode_chunk(&self.tail_layout(), &tail.live_rows()?),
+            Some(tail) => T::decode(&self.tail_layout(), &tail.live_rows()?),
         };
         match &self.quads {
             QuadsSource::InMemory {
@@ -207,10 +112,10 @@ impl VortexRdfStore {
                     // instead of gathering the primary columns at scattered row
                     // ids; tombstones are applied through the rid column. The
                     // selection may still be pending — the plan never needs it.
-                    Some(serve) => T::serve_in_memory(serve, deleted.as_ref()),
+                    Some(serve) => serve.decode::<T>(deleted.as_ref()),
                     // Without a plan the selection is exact (pending ids only
                     // ever ride alongside one).
-                    None => T::decode_chunk(
+                    None => T::decode(
                         &layout,
                         &gather_live(
                             base,
@@ -264,7 +169,9 @@ impl VortexRdfStore {
                                 .await
                             {
                                 Ok(rows) => {
-                                    T::serve_columns_async(&serve, &rows, deleted.as_ref()).await
+                                    serve
+                                        .decode_columns_async::<T>(&rows, deleted.as_ref())
+                                        .await
                                 }
                                 Err(e) => vec![Err(e)],
                             }
@@ -289,12 +196,14 @@ impl VortexRdfStore {
                     let (sync_serve, sync_deleted) = (serve.clone(), deleted.clone());
                     return self.scan_chunks(
                         scan,
-                        move |chunk| T::serve_columns(&sync_serve, &chunk, sync_deleted.as_ref()),
+                        move |chunk| sync_serve.decode_columns::<T>(&chunk, sync_deleted.as_ref()),
                         move |chunk| {
                             let serve = serve.clone();
                             let deleted = deleted.clone();
                             async move {
-                                T::serve_columns_async(&serve, &chunk, deleted.as_ref()).await
+                                serve
+                                    .decode_columns_async::<T>(&chunk, deleted.as_ref())
+                                    .await
                             }
                             .boxed()
                         },
@@ -316,20 +225,20 @@ impl VortexRdfStore {
                     let scan =
                         self.restricted_file_scan(file, filter.as_ref(), exact, deleted.as_ref())?;
                     let file = std::sync::Arc::clone(file);
-                    let columns = self.layout.primary_column_names();
+                    let columns = self.layout.strategy().primary_column_names();
                     let filter = filter.clone();
                     let selection = exact.clone();
                     let deleted = deleted.clone();
                     let chunk = async move {
                         let point = crate::store::scan::file_scan::file_point_rows(
                             &file,
-                            &columns,
+                            columns,
                             filter.as_ref(),
                             &selection,
                             deleted.as_ref(),
                         );
                         match crate::store::scan::file_scan::point_rows_or_scan(point, scan).await {
-                            Ok(rows) => T::decode_chunk_async(&layout, &rows).await,
+                            Ok(rows) => T::decode_async(&layout, &rows).await,
                             Err(e) => vec![Err(e)],
                         }
                     };
@@ -353,10 +262,10 @@ impl VortexRdfStore {
                 let sync_layout = layout.clone();
                 self.scan_chunks(
                     scan,
-                    move |chunk| T::decode_chunk(&sync_layout, &chunk),
+                    move |chunk| T::decode(&sync_layout, &chunk),
                     move |chunk| {
                         let layout = layout.clone();
-                        async move { T::decode_chunk_async(&layout, &chunk).await }.boxed()
+                        async move { T::decode_async(&layout, &chunk).await }.boxed()
                     },
                     tail_quads,
                 )

@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use oxrdf::Quad;
 
-use crate::common::terms::{get_as_term, parse_graph_name, parse_named_node, parse_subject};
-use crate::error::{Result, VortexRdfError};
+use crate::common::terms::quad_from_terms;
+use crate::error::Result;
 
 /// A quad whose terms are shared N-Triples strings: a decoder produces one
 /// `Arc<str>` per distinct term of a chunk and hands it to every row that
@@ -25,15 +25,7 @@ pub struct SharedQuad {
 impl SharedQuad {
     /// Parse the four terms into an owned oxrdf [`Quad`].
     pub fn to_quad(&self) -> Result<Quad> {
-        let object = get_as_term(&self.o).ok_or_else(|| {
-            VortexRdfError::Deserialization(format!("Invalid object: {}", self.o))
-        })?;
-        Ok(Quad::new(
-            parse_subject(&self.s)?,
-            parse_named_node(&self.p)?,
-            object,
-            parse_graph_name(&self.g)?,
-        ))
+        quad_from_terms(&self.s, &self.p, &self.o, &self.g)
     }
 }
 

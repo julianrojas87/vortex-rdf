@@ -334,10 +334,9 @@ pub(crate) async fn debug_located_run(
     locate_run(file, probe.role, &native, descriptor.sorted).await
 }
 
-/// The external-sort builder's emission surface: the persisted child dtype
-/// and the child chunks built from windows of merged `(value, row id)`
-/// pairs. Compiled out on wasm with the builder itself (see the module gate
-/// in `store::builders`).
+/// The emission surface of the out-of-core builder (compiled out on
+/// wasm32-unknown-unknown with it): the persisted child dtype and the child
+/// chunks built from windows of merged `(value, row id)` pairs.
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub(crate) mod out_of_core {
     use vortex_array::arrays::PrimitiveArray;

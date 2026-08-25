@@ -16,7 +16,8 @@ use super::{
 use crate::error::Result;
 use crate::store::RawQuad;
 use crate::store::indexes::Indexes;
-use crate::store::layouts::dictionary::{QuadCodes, TermDictionary, ingest_interning};
+use crate::store::layouts::dictionary::ingest::{InterningQuadBuilder, finish_interned};
+use crate::store::layouts::dictionary::{QuadCodes, TermDictionary};
 use crate::store::layouts::{LayoutStrategy, dictionary};
 
 use crate::debug;
@@ -49,14 +50,10 @@ impl VortexArrayBuilder for SortedInMemoryBuilder {
         // Strings per quad) ever accumulates.
         let (n, build_start, built);
         if layout == LayoutStrategy::Dictionary {
-            let (dict, codes) = ingest_interning(quad_stream).await?.finish()?;
-            n = codes.s.len();
+            let interner = InterningQuadBuilder::from_stream(quad_stream).await?;
             build_start = debug::timer();
-            built = BuiltArray {
-                array: dictionary::build_array(&codes)?,
-                components: build_components_from_codes(&indexes, &codes)?,
-                dict: Some(Arc::new(dict)),
-            };
+            built = finish_interned(interner, &indexes)?;
+            n = built.array.len();
         } else {
             let quads = ingest_and_sort(quad_stream).await?;
             n = quads.len();
@@ -127,7 +124,9 @@ pub(crate) async fn build_sorted_chunk_stream(
     chunk_size: usize,
 ) -> Result<BuiltStream> {
     if layout == LayoutStrategy::Dictionary {
-        let (dict, codes) = ingest_interning(quad_stream).await?.finish()?;
+        let (dict, codes) = InterningQuadBuilder::from_stream(quad_stream)
+            .await?
+            .finish()?;
         return emit_dict_chunks(codes, Arc::new(dict), indexes, chunk_size);
     }
 

@@ -185,13 +185,11 @@ impl VortexRdfStore {
         let QuadsSource::File { file, .. } = &self.quads else {
             return Ok(None);
         };
-        let Some(mut codes) = self
-            .prepared_codes(QuadPattern::new(Some(subject), None, None, None))
-            .await?
-        else {
+        let pattern = QuadPattern::new(Some(subject), None, None, None);
+        let Some(mut codes) = self.prepared_codes(pattern).await? else {
             return Ok(Some(0..0));
         };
-        match file_scan::build_file_filter(Some(subject), None, None, None, &mut codes)? {
+        match file_scan::build_file_filter(pattern, &mut codes)? {
             Some(filter) => file_scan::row_range_from_pruning(file, &filter).await,
             None => Ok(None),
         }

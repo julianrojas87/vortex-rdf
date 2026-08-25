@@ -9,7 +9,7 @@
 use std::sync::Arc;
 
 use crate::error::Result;
-use crate::store::layouts::{PatternCodes, QuadPattern, TermRef};
+use crate::store::layouts::{PatternCodes, QuadPattern};
 
 #[cfg(feature = "file-io")]
 use super::file_backed::FileBackedDict;
@@ -61,17 +61,8 @@ impl DictAccess {
         match self {
             DictAccess::Resident(dict) => {
                 let mut codes = PatternCodes::resident(Arc::clone(dict));
-                if let Some(s) = pattern.subject {
-                    codes.resolve(TermRef::Subject(s), |t| dict.get_id(t));
-                }
-                if let Some(p) = pattern.predicate {
-                    codes.resolve(TermRef::Predicate(p), |t| dict.get_id(t));
-                }
-                if let Some(o) = pattern.object {
-                    codes.resolve(TermRef::Object(o), |t| dict.get_id(t));
-                }
-                if let Some(g) = pattern.graph {
-                    codes.resolve(TermRef::Graph(g), |t| dict.get_id(t));
+                for term in pattern.bound_roles() {
+                    codes.resolve(term, |t| dict.get_id(t));
                 }
                 Ok(codes)
             }
@@ -80,43 +71,20 @@ impl DictAccess {
             // seeded into the witness so the sync match core never reaches
             // back here.
             //
-            // The four searches are independent, so they run overlapped
-            // rather than one await after another: whatever chunk fetches
-            // they miss on overlap instead of serializing. Concurrency is why
-            // each term is rendered into its own String here instead of the
-            // pattern's shared scratch buffer, and a race to fetch the same
-            // chunk is already handled by its drop-the-loser `OnceLock`.
+            // The searches are independent, so they run overlapped rather
+            // than one await after another: whatever chunk fetches they miss
+            // on overlap instead of serializing. Concurrency is why each term
+            // is rendered into its own String here instead of the pattern's
+            // shared scratch buffer, and a race to fetch the same chunk is
+            // already handled by its drop-the-loser `OnceLock`.
             #[cfg(feature = "file-io")]
             DictAccess::FileBacked(fb) => {
-                let render = |term: Option<TermRef<'_>>| term.map(|t| t.to_string());
-                let probe = |term: Option<String>| async move {
-                    match term {
-                        Some(t) => fb.get_id(&t).await.map(Some),
-                        None => Ok(None),
-                    }
-                };
-                let (s_id, p_id, o_id, g_id) = futures::join!(
-                    probe(render(pattern.subject.map(TermRef::Subject))),
-                    probe(render(pattern.predicate.map(TermRef::Predicate))),
-                    probe(render(pattern.object.map(TermRef::Object))),
-                    probe(render(pattern.graph.map(TermRef::Graph))),
-                );
+                let rendered: Vec<String> = pattern.bound_roles().map(|t| t.to_string()).collect();
+                let ids = futures::future::join_all(rendered.iter().map(|t| fb.get_id(t))).await;
                 let mut codes = PatternCodes::preresolved();
-                if let Some(s) = pattern.subject {
-                    let id = s_id?.expect("the subject role is bound, so it was probed");
-                    codes.resolve(TermRef::Subject(s), |_| id);
-                }
-                if let Some(p) = pattern.predicate {
-                    let id = p_id?.expect("the predicate role is bound, so it was probed");
-                    codes.resolve(TermRef::Predicate(p), |_| id);
-                }
-                if let Some(o) = pattern.object {
-                    let id = o_id?.expect("the object role is bound, so it was probed");
-                    codes.resolve(TermRef::Object(o), |_| id);
-                }
-                if let Some(g) = pattern.graph {
-                    let id = g_id?.expect("the graph role is bound, so it was probed");
-                    codes.resolve(TermRef::Graph(g), |_| id);
+                for (term, id) in pattern.bound_roles().zip(ids) {
+                    let id = id?;
+                    codes.resolve(term, |_| id);
                 }
                 Ok(codes)
             }

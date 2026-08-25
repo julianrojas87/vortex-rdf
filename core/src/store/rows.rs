@@ -367,7 +367,7 @@ impl VortexRdfStore {
                 let arr = file_scan::point_rows_or_scan(
                     file_scan::file_point_rows(
                         file,
-                        &self.layout.primary_column_names(),
+                        self.layout.strategy().primary_column_names(),
                         filter.as_ref(),
                         &selection,
                         deleted.as_ref(),
@@ -400,7 +400,7 @@ impl VortexRdfStore {
         selection: &RowSelection,
         deleted: Option<&Mask>,
     ) -> Result<ScanBuilder<ArrayRef>> {
-        let proj = self.layout.primary_column_names();
+        let proj = self.layout.strategy().primary_column_names();
         let mut scan = file.scan().map_err(VortexRdfError::Vortex)?;
         // The scan's scope (the quad-source root dtype) is what filters and
         // projections bind against — read it before the projection replaces

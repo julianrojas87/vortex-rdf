@@ -21,6 +21,10 @@
 
 use std::sync::Arc;
 
+#[cfg(feature = "file-io")]
+use futures::FutureExt as _;
+#[cfg(feature = "file-io")]
+use futures::future::BoxFuture;
 use oxrdf::{GraphName, NamedNode, NamedOrBlankNode, Quad, Term};
 use vortex_array::arrays::struct_::StructArray;
 use vortex_array::arrays::{PrimitiveArray, VarBinViewArray};
@@ -28,6 +32,7 @@ use vortex_array::dtype::{DType, PType};
 use vortex_array::scalar::Scalar;
 use vortex_array::{ArrayRef, VortexSessionExecute};
 
+use crate::common::quad::SharedQuad;
 use crate::error::{Result, VortexRdfError};
 use crate::session::VORTEX_SESSION;
 use crate::store::RawQuad;
@@ -40,8 +45,6 @@ pub(crate) mod typed_object;
 use self::dictionary::TermDictionary;
 pub(crate) use self::dictionary::access::DictAccess;
 use self::typed_object::{COL_O_DATATYPE, COL_O_KIND, COL_O_LANG, COL_O_VALUE};
-#[cfg(feature = "file-io")]
-use crate::store::schema::PRIMARY_COLUMNS;
 use crate::store::schema::{COL_G, COL_O, COL_P, COL_S};
 
 /// Determines the columnar schema used to store RDF quads in the Vortex StructArray.
@@ -167,13 +170,23 @@ impl LayoutStrategy {
         LayoutStrategy::Default
     }
 
-    /// Field names of the primary (non-index) columns for this layout.
-    pub(crate) fn field_names(self) -> Vec<Arc<str>> {
+    /// Names of the primary (non-index) columns for this layout, in schema
+    /// order.
+    pub(crate) fn primary_column_names(self) -> &'static [&'static str] {
         match self {
-            LayoutStrategy::Default => default::field_names(),
-            LayoutStrategy::TypedObject => typed_object::field_names(),
-            LayoutStrategy::Dictionary => dictionary::field_names(),
+            LayoutStrategy::Default => default::COLUMNS,
+            LayoutStrategy::TypedObject => typed_object::COLUMNS,
+            LayoutStrategy::Dictionary => dictionary::COLUMNS,
         }
+    }
+
+    /// [`primary_column_names`](Self::primary_column_names) as owned field
+    /// names, for building the struct dtype.
+    pub(crate) fn field_names(self) -> Vec<Arc<str>> {
+        self.primary_column_names()
+            .iter()
+            .map(|&n| n.into())
+            .collect()
     }
 
     /// Build the primary column arrays for this layout from raw quads.
@@ -254,6 +267,19 @@ impl<'a> QuadPattern<'a> {
             || self.predicate.is_some()
             || self.object.is_some()
             || self.graph.is_some()
+    }
+
+    /// The bound terms, each tagged with its role, in `s`, `p`, `o`, `g`
+    /// order.
+    pub(crate) fn bound_roles(&self) -> impl Iterator<Item = TermRef<'a>> {
+        [
+            self.subject.map(TermRef::Subject),
+            self.predicate.map(TermRef::Predicate),
+            self.object.map(TermRef::Object),
+            self.graph.map(TermRef::Graph),
+        ]
+        .into_iter()
+        .flatten()
     }
 }
 
@@ -451,9 +477,7 @@ impl PatternCodes {
     ///
     /// Memoized per role, so one match performs a single dictionary search
     /// and a single render per bound term however many stages and indexes ask
-    /// for the same probe. There is deliberately no uncached variant: every
-    /// probe in a match is for one of the pattern's four terms, so an
-    /// uncached one could only ever repeat work already done.
+    /// for the same probe.
     pub(crate) fn probe_scalar(&mut self, term: TermRef<'_>) -> Result<Option<Scalar>> {
         if matches!(
             self.resolver,
@@ -496,13 +520,13 @@ impl PatternCodes {
     /// layout-specific term → (column, scalar) mapping, the single source of
     /// truth consumed by both the in-memory mask scan and the pushed-down
     /// file filter.
-    pub(crate) fn constraints(
-        &mut self,
-        subject: Option<&NamedOrBlankNode>,
-        predicate: Option<&NamedNode>,
-        object: Option<&Term>,
-        graph: Option<&GraphName>,
-    ) -> Result<Constraints> {
+    pub(crate) fn constraints(&mut self, pattern: QuadPattern<'_>) -> Result<Constraints> {
+        let QuadPattern {
+            subject,
+            predicate,
+            object,
+            graph,
+        } = pattern;
         let mut eqs: Vec<(&'static str, Scalar)> = Vec::new();
         match self.resolver {
             CodeResolver::Default => {
@@ -585,27 +609,15 @@ impl ResolvedLayout {
         }
     }
 
-    /// Field names of the primary (non-index) columns.
-    #[cfg(feature = "file-io")]
-    pub(crate) fn primary_column_names(&self) -> Vec<&'static str> {
-        match self {
-            ResolvedLayout::Default | ResolvedLayout::Dictionary(_) => PRIMARY_COLUMNS.to_vec(),
-            ResolvedLayout::TypedObject => {
-                vec![
-                    COL_S,
-                    COL_P,
-                    COL_O_KIND,
-                    COL_O_VALUE,
-                    COL_O_DATATYPE,
-                    COL_O_LANG,
-                    COL_G,
-                ]
-            }
-        }
-    }
-
     /// Decode a StructArray chunk into quads. Dictionary chunks are decoded
     /// through the layout's own dictionary.
+    ///
+    /// Executes the chunk to a `StructArray` and reads its columns. A
+    /// chunk-level failure (execution, a required column missing or of the
+    /// wrong type) is returned as a single `Err` element; a row whose terms
+    /// fail to parse is an `Err` at that row's position, the other rows
+    /// decoding normally. The shared-string and async variants below follow
+    /// the same contract.
     pub(crate) fn decode_chunk(&self, chunk: &ArrayRef) -> Vec<Result<Quad>> {
         match self {
             ResolvedLayout::Default => default::decode_chunk(chunk),
@@ -630,9 +642,6 @@ impl ResolvedLayout {
     #[cfg(feature = "file-io")]
     pub(crate) async fn decode_chunk_async(&self, chunk: &ArrayRef) -> Vec<Result<Quad>> {
         if let ResolvedLayout::Dictionary(DictAccess::FileBacked(fb)) = self {
-            // Interpreting the chunk's code columns is layout logic; the
-            // dictionary contributes only the code→string translation
-            // (`resolve_terms`), so the composition lives here.
             let codes = match dictionary::unique_codes(chunk) {
                 Ok(codes) => codes,
                 Err(e) => return vec![Err(e)],
@@ -652,16 +661,12 @@ impl ResolvedLayout {
     /// Dictionary layout; the string layouts read their columns as
     /// [`raw_quads`](Self::raw_quads) does, one string per row.
     ///
-    /// [`SharedQuad`]: crate::common::quad::SharedQuad
-    pub(crate) fn decode_chunk_shared(
-        &self,
-        chunk: &ArrayRef,
-    ) -> Vec<Result<crate::common::quad::SharedQuad>> {
+    pub(crate) fn decode_chunk_shared(&self, chunk: &ArrayRef) -> Vec<Result<SharedQuad>> {
         match self {
             ResolvedLayout::Default | ResolvedLayout::TypedObject => match self.raw_quads(chunk) {
                 Ok(raws) => raws
                     .into_iter()
-                    .map(|raw| Ok(crate::common::quad::SharedQuad::from(raw)))
+                    .map(|raw| Ok(SharedQuad::from(raw)))
                     .collect(),
                 Err(e) => vec![Err(e)],
             },
@@ -684,17 +689,17 @@ impl ResolvedLayout {
     pub(crate) async fn decode_chunk_shared_async(
         &self,
         chunk: &ArrayRef,
-    ) -> Vec<Result<crate::common::quad::SharedQuad>> {
+    ) -> Vec<Result<SharedQuad>> {
         if let ResolvedLayout::Dictionary(DictAccess::FileBacked(fb)) = self {
             let codes = match dictionary::unique_codes(chunk) {
                 Ok(codes) => codes,
                 Err(e) => return vec![Err(e)],
             };
-            let terms: std::collections::HashMap<u32, std::sync::Arc<str>> =
+            let terms: std::collections::HashMap<u32, Arc<str>> =
                 match fb.resolve_terms(&codes).await {
                     Ok(terms) => codes
                         .into_iter()
-                        .zip(terms.into_iter().map(std::sync::Arc::from))
+                        .zip(terms.into_iter().map(Arc::from))
                         .collect(),
                     Err(e) => return vec![Err(e)],
                 };
@@ -783,6 +788,47 @@ impl ResolvedLayout {
             return resident.raw_quads(rows);
         }
         self.raw_quads(rows)
+    }
+}
+
+/// The two row representations a chunk decodes into: owned oxrdf [`Quad`]s,
+/// or [`SharedQuad`]s whose terms are shared strings. Each pipeline over
+/// chunks — the serve plans, the point-read fast paths, the sync and async
+/// scan streams — is written once against this trait for both.
+pub(crate) trait ChunkDecode: Sized + Send + 'static {
+    /// [`ResolvedLayout::decode_chunk`] into this representation.
+    fn decode(layout: &ResolvedLayout, chunk: &ArrayRef) -> Vec<Result<Self>>;
+    /// [`ResolvedLayout::decode_chunk_async`] into this representation.
+    #[cfg(feature = "file-io")]
+    fn decode_async<'a>(
+        layout: &'a ResolvedLayout,
+        chunk: &'a ArrayRef,
+    ) -> BoxFuture<'a, Vec<Result<Self>>>;
+}
+
+impl ChunkDecode for Quad {
+    fn decode(layout: &ResolvedLayout, chunk: &ArrayRef) -> Vec<Result<Self>> {
+        layout.decode_chunk(chunk)
+    }
+    #[cfg(feature = "file-io")]
+    fn decode_async<'a>(
+        layout: &'a ResolvedLayout,
+        chunk: &'a ArrayRef,
+    ) -> BoxFuture<'a, Vec<Result<Self>>> {
+        layout.decode_chunk_async(chunk).boxed()
+    }
+}
+
+impl ChunkDecode for SharedQuad {
+    fn decode(layout: &ResolvedLayout, chunk: &ArrayRef) -> Vec<Result<Self>> {
+        layout.decode_chunk_shared(chunk)
+    }
+    #[cfg(feature = "file-io")]
+    fn decode_async<'a>(
+        layout: &'a ResolvedLayout,
+        chunk: &'a ArrayRef,
+    ) -> BoxFuture<'a, Vec<Result<Self>>> {
+        layout.decode_chunk_shared_async(chunk).boxed()
     }
 }
 

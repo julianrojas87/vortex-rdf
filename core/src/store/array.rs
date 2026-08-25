@@ -54,6 +54,9 @@ impl<'a> StrColReader<'a> {
         }
     }
 
+    /// Row `i` as a `&str` view borrowed straight from the column buffers
+    /// (zero-copy); a decoder's oxrdf constructors make the single owned
+    /// copy.
     #[inline]
     pub(crate) fn str_at(&self, i: usize) -> Result<&'a str> {
         buf_as_str(self.bytes_at(i))

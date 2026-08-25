@@ -31,7 +31,6 @@
 use std::ops::Range;
 use std::sync::Arc;
 
-use oxrdf::Quad;
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::struct_::{StructArray, StructArrayExt};
 use vortex_array::dtype::FieldNames;
@@ -46,10 +45,9 @@ use vortex_buffer::Buffer;
 use vortex_layout::scan::split_by::SplitBy;
 use vortex_mask::Mask;
 
-use crate::common::quad::SharedQuad;
 use crate::error::{Result, VortexRdfError};
 use crate::session::VORTEX_SESSION;
-use crate::store::layouts::ResolvedLayout;
+use crate::store::layouts::{ChunkDecode, ResolvedLayout};
 use crate::store::scan::gather::primitive_from_u64_reads;
 use crate::store::selection::point_sized;
 
@@ -72,12 +70,16 @@ struct ServeDecode {
 }
 
 impl ServeDecode {
-    /// Decode the `(s, p, o, g)` quads out of a chunk of the plan's projected
+    /// Decode the `(s, p, o, g)` rows out of a chunk of the plan's projected
     /// index columns, dropping rows tombstoned in `deleted` via the row-id
     /// column.
-    fn decode_columns(&self, chunk: &ArrayRef, deleted: Option<&Mask>) -> Vec<Result<Quad>> {
+    fn decode_columns<T: ChunkDecode>(
+        &self,
+        chunk: &ArrayRef,
+        deleted: Option<&Mask>,
+    ) -> Vec<Result<T>> {
         match self.chunk_rows(chunk, deleted) {
-            Ok(rows) => self.decode_layout.decode_chunk(&rows),
+            Ok(rows) => T::decode(&self.decode_layout, &rows),
             Err(e) => vec![Err(e)],
         }
     }
@@ -86,39 +88,13 @@ impl ServeDecode {
     /// decode — for serving a store whose term dictionary is file-backed,
     /// where each chunk's codes are resolved with a dictionary scan.
     #[cfg(feature = "file-io")]
-    async fn decode_columns_async(
+    async fn decode_columns_async<T: ChunkDecode>(
         &self,
         chunk: &ArrayRef,
         deleted: Option<&Mask>,
-    ) -> Vec<Result<Quad>> {
+    ) -> Vec<Result<T>> {
         match self.chunk_rows(chunk, deleted) {
-            Ok(rows) => self.decode_layout.decode_chunk_async(&rows).await,
-            Err(e) => vec![Err(e)],
-        }
-    }
-
-    /// [`decode_columns`](Self::decode_columns) into shared-string quads.
-    fn decode_columns_shared(
-        &self,
-        chunk: &ArrayRef,
-        deleted: Option<&Mask>,
-    ) -> Vec<Result<SharedQuad>> {
-        match self.chunk_rows(chunk, deleted) {
-            Ok(rows) => self.decode_layout.decode_chunk_shared(&rows),
-            Err(e) => vec![Err(e)],
-        }
-    }
-
-    /// [`decode_columns_async`](Self::decode_columns_async) into shared-string
-    /// quads.
-    #[cfg(feature = "file-io")]
-    async fn decode_columns_shared_async(
-        &self,
-        chunk: &ArrayRef,
-        deleted: Option<&Mask>,
-    ) -> Vec<Result<SharedQuad>> {
-        match self.chunk_rows(chunk, deleted) {
-            Ok(rows) => self.decode_layout.decode_chunk_shared_async(&rows).await,
+            Ok(rows) => T::decode_async(&self.decode_layout, &rows).await,
             Err(e) => vec![Err(e)],
         }
     }
@@ -340,40 +316,22 @@ impl InMemoryServePlan {
         ])
     }
 
-    /// Decode the matched quads straight from the index component's rows:
+    /// Decode the matched rows straight from the index component's rows:
     /// point reads at the run's global positions through the component's
     /// cached probes when the run is small, else slice the component to this
     /// plan's row run — either way decoding those columns as the primary
     /// `(s, p, o, g)`, replacing the row-id gather over the primaries.
-    pub(crate) fn decode(&self, deleted: Option<&Mask>) -> Vec<Result<Quad>> {
+    pub(crate) fn decode<T: ChunkDecode>(&self, deleted: Option<&Mask>) -> Vec<Result<T>> {
         match self
             .decode
             .rows_via_probes(&self.array, self.range.clone(), &self.probes, deleted)
         {
-            Ok(Some(rows)) => return self.decode.decode_layout.decode_chunk(&rows),
+            Ok(Some(rows)) => return T::decode(&self.decode.decode_layout, &rows),
             Ok(None) => {}
             Err(e) => return vec![Err(e)],
         }
         match self.array.slice(self.range.clone()) {
             Ok(rows) => self.decode.decode_columns(&rows, deleted),
-            Err(e) => vec![Err(VortexRdfError::Vortex(e))],
-        }
-    }
-
-    /// [`decode`](Self::decode) into shared-string quads — the same
-    /// acquisition (point reads for a small run, else the slice), decoding
-    /// each distinct term once.
-    pub(crate) fn decode_shared(&self, deleted: Option<&Mask>) -> Vec<Result<SharedQuad>> {
-        match self
-            .decode
-            .rows_via_probes(&self.array, self.range.clone(), &self.probes, deleted)
-        {
-            Ok(Some(rows)) => return self.decode.decode_layout.decode_chunk_shared(&rows),
-            Ok(None) => {}
-            Err(e) => return vec![Err(e)],
-        }
-        match self.array.slice(self.range.clone()) {
-            Ok(rows) => self.decode.decode_columns_shared(&rows, deleted),
             Err(e) => vec![Err(VortexRdfError::Vortex(e))],
         }
     }
@@ -589,46 +547,25 @@ impl FileServePlan {
         ))
     }
 
-    /// Decode the `(s, p, o, g)` quads out of a chunk of this plan's projected
+    /// Decode the `(s, p, o, g)` rows out of a chunk of this plan's projected
     /// index columns, dropping rows tombstoned in `deleted` via the row-id
     /// column.
-    pub(crate) fn decode_columns(
+    pub(crate) fn decode_columns<T: ChunkDecode>(
         &self,
         chunk: &ArrayRef,
         deleted: Option<&Mask>,
-    ) -> Vec<Result<Quad>> {
+    ) -> Vec<Result<T>> {
         self.decode.decode_columns(chunk, deleted)
     }
 
     /// [`decode_columns`](Self::decode_columns) through the layout's async
     /// decode — for serving a store whose term dictionary is file-backed,
     /// where each chunk's codes are resolved with a dictionary scan.
-    pub(crate) async fn decode_columns_async(
+    pub(crate) async fn decode_columns_async<T: ChunkDecode>(
         &self,
         chunk: &ArrayRef,
         deleted: Option<&Mask>,
-    ) -> Vec<Result<Quad>> {
+    ) -> Vec<Result<T>> {
         self.decode.decode_columns_async(chunk, deleted).await
-    }
-
-    /// [`decode_columns`](Self::decode_columns) into shared-string quads.
-    pub(crate) fn decode_columns_shared(
-        &self,
-        chunk: &ArrayRef,
-        deleted: Option<&Mask>,
-    ) -> Vec<Result<SharedQuad>> {
-        self.decode.decode_columns_shared(chunk, deleted)
-    }
-
-    /// [`decode_columns_async`](Self::decode_columns_async) into
-    /// shared-string quads.
-    pub(crate) async fn decode_columns_shared_async(
-        &self,
-        chunk: &ArrayRef,
-        deleted: Option<&Mask>,
-    ) -> Vec<Result<SharedQuad>> {
-        self.decode
-            .decode_columns_shared_async(chunk, deleted)
-            .await
     }
 }

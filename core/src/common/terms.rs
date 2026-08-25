@@ -8,7 +8,7 @@ use crate::error::{Result, VortexRdfError};
 use std::borrow::Cow;
 
 use futures::{Stream, stream};
-use oxrdf::{BlankNode, GraphName, Literal, NamedNode, NamedOrBlankNode, Term};
+use oxrdf::{BlankNode, GraphName, Literal, NamedNode, NamedOrBlankNode, Quad, Term};
 use oxrdfio::{RdfFormat, RdfParser};
 
 /// Parses a string representation of an RDF named node (URI), stripping optional `<` and `>` boundaries.
@@ -329,6 +329,24 @@ pub fn parse_pattern_checked(
         p.map(parse_named_node_checked).transpose()?,
         o.map(parse_term_checked).transpose()?,
         g.map(parse_graph_name_checked).transpose()?,
+    ))
+}
+
+/// [`get_as_term`] as a decode step: an object string the columns store,
+/// parsed on the trusted path, with an unrecognized form reported as a
+/// deserialization error.
+pub(crate) fn parse_object(o: &str) -> Result<Term> {
+    get_as_term(o).ok_or_else(|| VortexRdfError::Deserialization(format!("Invalid object: {o}")))
+}
+
+/// A quad from its four stored N-Triples term strings (`g` empty for the
+/// default graph), parsed on the trusted decode path.
+pub(crate) fn quad_from_terms(s: &str, p: &str, o: &str, g: &str) -> Result<Quad> {
+    Ok(Quad::new(
+        parse_subject(s)?,
+        parse_named_node(p)?,
+        parse_object(o)?,
+        parse_graph_name(g)?,
     ))
 }
 
