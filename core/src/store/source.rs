@@ -157,7 +157,7 @@ pub(crate) enum QuadsSource {
 ///
 /// Selection and tombstones mirror the base's, in tail-local row ids
 /// (`0..rows.len()`): views narrow `selection`, deletes set bits in `deleted`,
-/// and every read path applies both (`gather_live`).
+/// and every read path applies both (`scan::gather::gather_live`).
 #[derive(Clone)]
 pub(crate) struct Tail {
     /// The appended rows. Appends accrete as chunks of a ChunkedArray and are

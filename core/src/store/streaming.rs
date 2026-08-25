@@ -8,7 +8,7 @@ use crate::error::VortexRdfError;
 use crate::store::indexes::FileServePlan;
 use crate::store::indexes::InMemoryServePlan;
 use crate::store::layouts::ResolvedLayout;
-use crate::store::selection::gather_live;
+use crate::store::scan::gather::gather_live;
 #[cfg(feature = "file-io")]
 use crate::store::selection::{POINT_GATHER_MAX_ROWS, RowSelection};
 use crate::store::{QuadsSource, RawQuad, SharedQuad};

@@ -7,7 +7,8 @@ use crate::store::RawQuad;
 use crate::store::builders::build_struct_array;
 #[cfg(feature = "file-io")]
 use crate::store::scan::file_scan;
-use crate::store::selection::{RowSelection, gather_live, union_deleted};
+use crate::store::scan::gather::gather_live;
+use crate::store::selection::RowSelection;
 use crate::store::{QuadsSource, Tail};
 
 use oxrdf::{GraphName, NamedNode, NamedOrBlankNode, Quad, Term};
@@ -17,7 +18,6 @@ use std::sync::Arc;
 use vortex_array::arrays::chunked::ChunkedArrayExt;
 use vortex_array::arrays::{Chunked, ChunkedArray};
 use vortex_array::{IntoArray, RecursiveCanonical, VortexSessionExecute};
-#[cfg(feature = "file-io")]
 use vortex_mask::Mask;
 
 use super::VortexRdfStore;
@@ -313,3 +313,12 @@ const TAIL_FLATTEN_FLOOR: usize = 1_024;
 /// … and regardless of row counts once this many chunks accrete, so tail scans
 /// (which visit every chunk) stay dense.
 const TAIL_MAX_CHUNKS: usize = 64;
+
+/// Fold a freshly-doomed set of base rows into a store's existing tombstones,
+/// shared by both backends' delete paths.
+fn union_deleted(existing: Option<&Mask>, doomed: Mask) -> Mask {
+    match existing {
+        Some(existing) => existing | &doomed,
+        None => doomed,
+    }
+}

@@ -7,9 +7,8 @@ use std::fs::File;
 use std::io::{Read, Write, stdin, stdout};
 use std::time::Instant;
 
-use vortex_rdf_core::VortexRdfStore;
-use vortex_rdf_core::common::export::export_rdf;
 use vortex_rdf_core::common::formats::detect_format;
+use vortex_rdf_core::{VortexRdfStore, export_rdf};
 
 use crate::DeserializeArgs;
 

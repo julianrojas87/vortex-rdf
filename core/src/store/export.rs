@@ -1,8 +1,8 @@
 //! Exporting a store back to textual RDF: the write direction of the textual
 //! boundary whose read direction is
-//! [`parse_quads_from_reader`](super::terms::parse_quads_from_reader) — the
+//! [`parse_quads_from_reader`](crate::common::terms::parse_quads_from_reader) — the
 //! counterpart of parsing, not of the Vortex byte format (writing that is
-//! `io::ser`'s job, reading it `io::native_file`'s).
+//! `io::ser`'s job, reading it `io::read`'s).
 
 use crate::error::{self, VortexRdfError};
 use crate::store::VortexRdfStore;

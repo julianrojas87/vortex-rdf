@@ -126,7 +126,7 @@ async fn test_export_nquads_fast_path_matches_oxrdf() {
 
     let stored: Vec<Quad> = store.quads().unwrap().try_collect().await.unwrap();
     let mut exported = Vec::new();
-    crate::common::export::export_rdf(store, &mut exported, oxrdfio::RdfFormat::NQuads)
+    crate::export_rdf(store, &mut exported, oxrdfio::RdfFormat::NQuads)
         .await
         .unwrap();
     // The reference follows the store's own row order, so what this pins is
@@ -157,7 +157,7 @@ async fn test_export_ntriples_fast_path_and_named_graph_refusal() {
     let store = VortexRdfStore::from_built(arr).unwrap();
     let stored: Vec<Quad> = store.quads().unwrap().try_collect().await.unwrap();
     let mut exported = Vec::new();
-    crate::common::export::export_rdf(store, &mut exported, oxrdfio::RdfFormat::NTriples)
+    crate::export_rdf(store, &mut exported, oxrdfio::RdfFormat::NTriples)
         .await
         .unwrap();
     assert_eq!(
@@ -174,7 +174,7 @@ async fn test_export_ntriples_fast_path_and_named_graph_refusal() {
     let store = VortexRdfStore::from_built(arr).unwrap();
     let mut exported = Vec::new();
     assert!(
-        crate::common::export::export_rdf(store, &mut exported, oxrdfio::RdfFormat::NTriples)
+        crate::export_rdf(store, &mut exported, oxrdfio::RdfFormat::NTriples)
             .await
             .is_err()
     );
@@ -191,7 +191,7 @@ async fn test_export_nquads_fast_path_file_backed() {
     let store = VortexRdfStore::from_file(&path).await.unwrap();
     let stored: Vec<Quad> = store.quads().unwrap().try_collect().await.unwrap();
     let mut exported = Vec::new();
-    crate::common::export::export_rdf(store, &mut exported, oxrdfio::RdfFormat::NQuads)
+    crate::export_rdf(store, &mut exported, oxrdfio::RdfFormat::NQuads)
         .await
         .unwrap();
     assert_eq!(
@@ -243,7 +243,7 @@ async fn test_export_reparses_to_the_same_quads() {
         .unwrap();
         let store = VortexRdfStore::from_built(arr).unwrap();
         let mut exported = Vec::new();
-        crate::common::export::export_rdf(store, &mut exported, format)
+        crate::export_rdf(store, &mut exported, format)
             .await
             .unwrap();
 

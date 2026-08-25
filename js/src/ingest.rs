@@ -6,9 +6,9 @@ use futures::channel::mpsc;
 use futures::{Stream, stream};
 use js_sys::Reflect;
 use oxrdf::{GraphName, NamedNode, NamedOrBlankNode, Quad, Term};
-use vortex_rdf_core::error::{Result as CoreResult, VortexRdfError};
-use vortex_rdf_core::store::{BuiltArray, RawQuad};
-use vortex_rdf_core::{DictionaryQuadSink, Indexes};
+use vortex_rdf_core::{
+    BuiltArray, DictionaryQuadSink, Indexes, RawQuad, Result as CoreResult, VortexRdfError,
+};
 use wasm_bindgen::prelude::*;
 
 use crate::error::js_err;

@@ -4,9 +4,9 @@
 
 use crate::error::{Result, VortexRdfError};
 use crate::io::container;
-use crate::io::native_file;
+use crate::io::read;
 use crate::session::VORTEX_SESSION;
-use crate::store::indexes::KnownComponent;
+use crate::store::indexes::{IndexComponent, KnownComponent};
 use crate::store::layouts::DictAccess;
 use crate::store::layouts::dictionary::dict_from_reader;
 use crate::store::layouts::{LayoutStrategy, ResolvedLayout};
@@ -42,7 +42,7 @@ pub(super) enum ComponentKind {
 }
 
 /// Interpret one component descriptor for every open path (`from_file`,
-/// `from_bytes`, `file_components`), owning the rejection of an
+/// `from_bytes`, `scanned_index_components`), owning the rejection of an
 /// *uninterpretable required* component: skipping one — a future change set,
 /// say — would silently change query results.
 pub(super) fn classify_component(
@@ -62,6 +62,37 @@ pub(super) fn classify_component(
         )));
     }
     Ok(ComponentKind::Skip)
+}
+
+/// Lift an unrefined file view's index children into in-memory
+/// components: the same rows under the same child schema, with each
+/// descriptor's `sorted` provenance carried across. Adoption shares
+/// `from_bytes`' deferral — the sole caller serializes the components
+/// immediately, so they canonicalize at the write either way.
+#[cfg(feature = "file-io")]
+pub(super) async fn scanned_index_components(
+    file: &NativeStoreFile,
+) -> Result<Vec<IndexComponent>> {
+    let mut components = Vec::new();
+    for descriptor in file.components() {
+        let ComponentKind::Index(known) = classify_component(descriptor)? else {
+            continue;
+        };
+        let Some((_, reader)) = file
+            .component_reader(&descriptor.name)
+            .map_err(VortexRdfError::Vortex)?
+        else {
+            continue;
+        };
+        let scanned = read::scan_all_reader(reader).await?;
+        components.push(crate::store::indexes::adopt_scanned_component(
+            &known,
+            scanned,
+            descriptor.sorted,
+            file.row_count(),
+        )?);
+    }
+    Ok(components)
 }
 
 /// Default residency ceiling for a Dictionary-layout file's term dictionary:
@@ -118,9 +149,9 @@ impl VortexRdfStore {
         // is read yet. The returned handle caches its layout reader tree so
         // later scans/prunes across this store (and stores derived from it)
         // share decoded zone-map stats instead of re-reading them each time.
-        let raw = native_file::open_vortex_file(path).await?;
+        let raw = read::open_vortex_file(path).await?;
         if !container::is_native_file(&raw) {
-            return Err(native_file::unsupported_file_error(&raw));
+            return Err(read::unsupported_file_error(&raw));
         }
         let file = Arc::new(NativeStoreFile::try_new(raw).map_err(VortexRdfError::Vortex)?);
         // Interpret the component roster: the dictionary child feeds the
@@ -138,7 +169,7 @@ impl VortexRdfStore {
                 if let Some((_, child)) = container::store_component(typed, &descriptor.name)
                     .map_err(VortexRdfError::Vortex)?
                 {
-                    crate::store::indexes::components::check_component_rows(
+                    crate::store::indexes::check_component_rows(
                         &descriptor.name,
                         child.row_count(),
                         file.row_count(),
@@ -252,10 +283,10 @@ impl VortexRdfStore {
             .open_buffer(bytes.into())
             .map_err(VortexRdfError::Vortex)?;
         if !container::is_native_file(&file) {
-            return Err(native_file::unsupported_file_error(&file));
+            return Err(read::unsupported_file_error(&file));
         }
         // The root scan is the transparent quad child.
-        let quads = native_file::scan_all(&file).await?;
+        let quads = read::scan_all(&file).await?;
         let root = file.footer().layout();
         let typed = root.as_::<container::RdfStoreLayoutVTable>();
         let mut ctx = VORTEX_SESSION.create_execution_ctx();
@@ -267,7 +298,7 @@ impl VortexRdfStore {
         // through the same helper every materializing read path uses.
         let quads = Self::with_subject_stamp(quads, container::quads_sorted(typed))?;
 
-        let mut components: Vec<crate::store::indexes::IndexComponent> = Vec::new();
+        let mut components: Vec<IndexComponent> = Vec::new();
         let mut dict = None;
         for descriptor in container::store_components(typed) {
             let Some((_, child)) = container::store_component(typed, &descriptor.name)

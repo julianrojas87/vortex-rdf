@@ -7,9 +7,8 @@ use std::io::Cursor;
 use futures::StreamExt;
 use js_sys::{Object, Reflect};
 use oxrdf::{GraphName, NamedNode, NamedOrBlankNode, Term};
-use vortex_rdf_core::common::export::export_rdf;
 use vortex_rdf_core::common::terms::parse_quads_from_reader;
-use vortex_rdf_core::{DictSnapshot, LayoutStrategy, VortexRdfStore as CoreStore};
+use vortex_rdf_core::{DictSnapshot, LayoutStrategy, VortexRdfStore as CoreStore, export_rdf};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::future_to_promise;
 

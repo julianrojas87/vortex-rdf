@@ -13,10 +13,9 @@ use futures::{Stream, StreamExt, stream};
 use oxrdf::{GraphName, Literal, NamedNode, NamedOrBlankNode, Quad, Term};
 use tokio::runtime::Runtime;
 
-use vortex_rdf_core::error::Result;
-use vortex_rdf_core::store::RawQuad;
 use vortex_rdf_core::{
-    BuiltArray, IndexType, LayoutStrategy, SortedStreamBuilder, VortexArrayBuilder, VortexRdfStore,
+    BuiltArray, IndexType, LayoutStrategy, RawQuad, Result, SortedStreamBuilder,
+    VortexArrayBuilder, VortexRdfStore,
 };
 
 // The dataset shape — moduli, term spellings, probe patterns — lives on its own

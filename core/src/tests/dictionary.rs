@@ -482,9 +482,7 @@ async fn test_dictionary_native_file_roundtrip() {
     // One self-contained file: the native root with the quad-source child
     // and the dictionary as an auxiliary child.
     assert!(!path.with_extension("dict.vortex").exists());
-    let file = crate::io::native_file::open_vortex_file(&path)
-        .await
-        .unwrap();
+    let file = crate::io::read::open_vortex_file(&path).await.unwrap();
     assert!(container::is_native_file(&file));
     let names: Vec<_> = file.footer().layout().child_names().collect();
     assert_eq!(names.first().map(|n| n.as_ref()), Some("quad-source"));

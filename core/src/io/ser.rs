@@ -8,7 +8,7 @@
 //! reader will trust. Also owns the `quads_stream_to_*` entry points, which
 //! run a builder's chunk stream straight into that writer.
 //!
-//! Reading these bytes back is [`native_file`](crate::io::native_file)'s job,
+//! Reading these bytes back is [`read`](crate::io::read)'s job,
 //! and the container's own on-disk grammar is
 //! [`container`](crate::io::container)'s.
 

@@ -245,7 +245,7 @@ impl IndexComponent {
                         // synchronously (the `from_bytes` invariant every
                         // handle-free open already relies on), so the future
                         // completes on its first poll.
-                        crate::io::native_file::scan_all_reader(reader.clone())
+                        crate::io::read::scan_all_reader(reader.clone())
                             .now_or_never()
                             .unwrap_or_else(|| {
                                 unreachable!(

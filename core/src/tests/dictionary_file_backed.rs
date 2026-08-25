@@ -178,12 +178,8 @@ async fn test_file_backed_dictionary_threshold_boundary() {
     let quads = dictionary_test_quads();
     let (_dir, path) = write_store_file(quads, LayoutStrategy::Dictionary, vec![]).await;
 
-    let file = NativeStoreFile::try_new(
-        crate::io::native_file::open_vortex_file(&path)
-            .await
-            .unwrap(),
-    )
-    .unwrap();
+    let file =
+        NativeStoreFile::try_new(crate::io::read::open_vortex_file(&path).await.unwrap()).unwrap();
     let dict_bytes = file
         .component_bytes(DICT_COMPONENT_NAME)
         .unwrap()
@@ -341,12 +337,8 @@ async fn test_file_backed_dictionary_probe_parity() {
     // The probe target, built exactly as `from_file` does file-backed: the
     // dictionary child's cached layout reader plus the wire-chunk handle
     // resolved off the same child.
-    let outer = NativeStoreFile::try_new(
-        crate::io::native_file::open_vortex_file(&path)
-            .await
-            .unwrap(),
-    )
-    .unwrap();
+    let outer =
+        NativeStoreFile::try_new(crate::io::read::open_vortex_file(&path).await.unwrap()).unwrap();
     let (_, reader) = outer
         .component_reader(DICT_COMPONENT_NAME)
         .unwrap()
@@ -422,12 +414,8 @@ async fn test_file_backed_dictionary_rejects_below_first_term() {
         "fixture must have no term sorting at or below `!`, got {first_term:?}"
     );
 
-    let outer = NativeStoreFile::try_new(
-        crate::io::native_file::open_vortex_file(&path)
-            .await
-            .unwrap(),
-    )
-    .unwrap();
+    let outer =
+        NativeStoreFile::try_new(crate::io::read::open_vortex_file(&path).await.unwrap()).unwrap();
     let (_, reader) = outer
         .component_reader(DICT_COMPONENT_NAME)
         .unwrap()

@@ -3,7 +3,7 @@
 //! memoized splits, per-filter pruning envelopes (whose envelope semantics
 //! [`file_scan`](super::scan::file_scan) defines and consumes), and cached
 //! component readers. The pure open/materialize primitives are in
-//! [`io::native_file`](crate::io::native_file).
+//! [`io::read`](crate::io::read).
 
 use std::collections::HashMap;
 use std::ops::Range;

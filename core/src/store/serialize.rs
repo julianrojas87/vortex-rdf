@@ -3,16 +3,12 @@
 //! in-memory round-trips).
 
 use crate::error::Result;
-#[cfg(feature = "file-io")]
-use crate::error::VortexRdfError;
-#[cfg(feature = "file-io")]
-use crate::io::native_file;
 use crate::store::QuadsSource;
 use crate::store::builders::{build_components, build_components_from_codes, build_struct_array};
 use crate::store::indexes::IndexComponent;
 use crate::store::layouts::dictionary::TermDictionary;
 use crate::store::layouts::{ResolvedLayout, dictionary};
-use crate::store::selection::gather_live;
+use crate::store::scan::gather::gather_live;
 
 use crate::store::RawQuad;
 
@@ -21,7 +17,7 @@ use std::sync::Arc;
 use vortex_array::ArrayRef;
 
 #[cfg(feature = "file-io")]
-use super::open::{ComponentKind, classify_component};
+use super::open::scanned_index_components;
 use super::{StoreParts, VortexRdfStore};
 
 /// Put a rebuild's rows into the (s, p, o, g) order every builder emits, so
@@ -98,7 +94,7 @@ impl VortexRdfStore {
                     // wholesale, so a file-backed store's serialization (and
                     // the bindings' in-memory round-trip) keeps its indexes.
                     #[cfg(feature = "file-io")]
-                    QuadsSource::File { file, .. } => Self::file_components(file).await?,
+                    QuadsSource::File { file, .. } => scanned_index_components(file).await?,
                 }
             } else {
                 Vec::new()
@@ -172,37 +168,6 @@ impl VortexRdfStore {
                 Ok((primary, Vec::new(), None))
             }
         }
-    }
-
-    /// Lift an unrefined file view's index children into in-memory
-    /// components: the same rows under the same child schema, with each
-    /// descriptor's `sorted` provenance carried across. Adoption shares
-    /// `from_bytes`' deferral — the sole caller serializes the components
-    /// immediately, so they canonicalize at the write either way.
-    #[cfg(feature = "file-io")]
-    async fn file_components(
-        file: &crate::store::native_file::NativeStoreFile,
-    ) -> Result<Vec<IndexComponent>> {
-        let mut components = Vec::new();
-        for descriptor in file.components() {
-            let ComponentKind::Index(known) = classify_component(descriptor)? else {
-                continue;
-            };
-            let Some((_, reader)) = file
-                .component_reader(&descriptor.name)
-                .map_err(VortexRdfError::Vortex)?
-            else {
-                continue;
-            };
-            let scanned = native_file::scan_all_reader(reader).await?;
-            components.push(crate::store::indexes::adopt_scanned_component(
-                &known,
-                scanned,
-                descriptor.sorted,
-                file.row_count(),
-            )?);
-        }
-        Ok(components)
     }
 
     /// This store's rows and, under the Dictionary layout, the term

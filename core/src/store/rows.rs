@@ -9,8 +9,9 @@ use crate::store::layouts::dictionary::TermDictionary;
 use crate::store::layouts::{LayoutStrategy, ResolvedLayout, dictionary};
 #[cfg(feature = "file-io")]
 use crate::store::scan::file_scan;
+use crate::store::scan::gather::gather_live;
 use crate::store::schema;
-use crate::store::selection::{RowSelection, ViewSelection, gather_live};
+use crate::store::selection::{RowSelection, ViewSelection};
 
 use vortex_array::arrays::struct_::StructArrayExt;
 use vortex_array::arrays::{ChunkedArray, PrimitiveArray, StructArray};

@@ -6,10 +6,9 @@ use futures::Stream;
 use js_sys::Reflect;
 use oxrdfio::RdfFormat;
 use vortex_rdf_core::common::formats::{format_from_name, supported_format_names};
-use vortex_rdf_core::error::Result as CoreResult;
-use vortex_rdf_core::store::{BuiltArray, RawQuad};
 use vortex_rdf_core::{
-    IndexType, Indexes, LayoutStrategy, SortedInMemoryBuilder, VortexArrayBuilder,
+    BuiltArray, IndexType, Indexes, LayoutStrategy, RawQuad, Result as CoreResult,
+    SortedInMemoryBuilder, VortexArrayBuilder,
 };
 use wasm_bindgen::prelude::*;
 

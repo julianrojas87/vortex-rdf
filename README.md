@@ -313,7 +313,7 @@ use oxrdfio::RdfFormat;
 use vortex_rdf_core::{
     VortexRdfStore, LayoutStrategy, IndexType,
     io::quads_stream_to_vortex_writer,
-    common::export::export_rdf,
+    export_rdf,
     common::terms::parse_quads_from_reader,
 };
 

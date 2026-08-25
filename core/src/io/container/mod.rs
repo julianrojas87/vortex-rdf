@@ -16,7 +16,7 @@
 //! component producers builders construct on every target, and [`write`] the
 //! write strategy — gated as a whole, since only targets with a serializer
 //! consume it. `ser` assembles a store's parts and drives
-//! [`write::write_store`]; `native_file` reads the bytes back.
+//! [`write::write_store`]; `read` reads the bytes back.
 
 pub(crate) mod layout;
 // The write strategy is the sole consumer of the sources' write hooks

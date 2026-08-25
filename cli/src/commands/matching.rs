@@ -8,11 +8,12 @@ use std::fs::File;
 use std::io::{Write, stdout};
 use std::time::Instant;
 
-use vortex_rdf_core::common::export::export_rdf;
 use vortex_rdf_core::common::formats::detect_format;
 use vortex_rdf_core::common::terms::{parse_pattern_checked, parse_quads_from_reader};
 use vortex_rdf_core::debug as debug_time;
-use vortex_rdf_core::{LayoutStrategy, SortedStreamBuilder, VortexArrayBuilder, VortexRdfStore};
+use vortex_rdf_core::{
+    LayoutStrategy, SortedStreamBuilder, VortexArrayBuilder, VortexRdfStore, export_rdf,
+};
 
 use crate::MatchArgs;
 

@@ -23,6 +23,7 @@ use vortex_scan::strict_sorted_buffer::StrictSortedBuffer;
 use crate::error::{Result, VortexRdfError};
 use crate::store::layouts::{Constraints, PatternCodes};
 use crate::store::native_file::NativeStoreFile;
+use crate::store::scan::gather::primitive_from_u64_reads;
 use crate::store::selection::RowSelection;
 
 /// The bind-memo scope tag for expressions over the quad table's schema
@@ -347,7 +348,7 @@ pub(crate) fn build_file_filter(
 
 /// Rows of a small exact file selection, read point-by-point through the
 /// file's cached wire-encoded chunk probes instead of a scan — the file
-/// analogue of the in-memory `gather_by_point_reads`. A pushed filter of
+/// analogue of the in-memory [`gather_by_point_reads`](super::gather::gather_by_point_reads). A pushed filter of
 /// equality conjuncts is applied per row during the read (an eq column's
 /// surviving value is its constant, so only residual columns read twice).
 /// `None` declines — a wide or non-exact selection, a filter that is not an
@@ -362,8 +363,8 @@ pub(crate) async fn file_point_rows(
     deleted: Option<&Mask>,
 ) -> Result<Option<ArrayRef>> {
     use vortex_array::IntoArray;
-    use vortex_array::arrays::{PrimitiveArray, StructArray};
-    use vortex_array::dtype::{FieldName, PType};
+    use vortex_array::arrays::StructArray;
+    use vortex_array::dtype::FieldName;
     use vortex_array::validity::Validity;
 
     use crate::store::selection::POINT_GATHER_MAX_ROWS;
@@ -440,13 +441,10 @@ pub(crate) async fn file_point_rows(
                 }
             }
         }
-        let reads = values.into_iter();
-        let child = match handles[idx].dtype().as_ptype() {
-            PType::U8 => PrimitiveArray::from_iter(reads.map(|v| v as u8)).into_array(),
-            PType::U16 => PrimitiveArray::from_iter(reads.map(|v| v as u16)).into_array(),
-            PType::U32 => PrimitiveArray::from_iter(reads.map(|v| v as u32)).into_array(),
-            PType::U64 => PrimitiveArray::from_iter(reads).into_array(),
-            _ => return Ok(None),
+        let Some(child) =
+            primitive_from_u64_reads(handles[idx].dtype().as_ptype(), values.into_iter())
+        else {
+            return Ok(None);
         };
         children.push(child);
     }
@@ -470,8 +468,8 @@ pub(crate) async fn component_point_chunk(
     range: Range<u64>,
 ) -> Result<Option<ArrayRef>> {
     use vortex_array::IntoArray;
-    use vortex_array::arrays::{PrimitiveArray, StructArray};
-    use vortex_array::dtype::{FieldName, PType};
+    use vortex_array::arrays::StructArray;
+    use vortex_array::dtype::FieldName;
     use vortex_array::validity::Validity;
 
     let Some(handles) = columns
@@ -497,13 +495,9 @@ pub(crate) async fn component_point_chunk(
                 None => return Ok(None),
             }
         }
-        let reads = values.into_iter();
-        let child = match handle.dtype().as_ptype() {
-            PType::U8 => PrimitiveArray::from_iter(reads.map(|v| v as u8)).into_array(),
-            PType::U16 => PrimitiveArray::from_iter(reads.map(|v| v as u16)).into_array(),
-            PType::U32 => PrimitiveArray::from_iter(reads.map(|v| v as u32)).into_array(),
-            PType::U64 => PrimitiveArray::from_iter(reads).into_array(),
-            _ => return Ok(None),
+        let Some(child) = primitive_from_u64_reads(handle.dtype().as_ptype(), values.into_iter())
+        else {
+            return Ok(None);
         };
         children.push(child);
     }

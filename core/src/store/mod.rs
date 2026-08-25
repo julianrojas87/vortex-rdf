@@ -14,6 +14,7 @@ pub(crate) mod source;
 
 // [`VortexRdfStore`]'s impl clusters — the struct itself is defined below.
 mod compaction;
+mod export;
 mod matching;
 mod mutation;
 mod open;
@@ -21,7 +22,10 @@ mod rows;
 mod serialize;
 mod streaming;
 
-pub use builders::{BuiltArray, BuiltStream, SortedInMemoryBuilder, VortexArrayBuilder};
+pub use builders::{
+    BuiltArray, BuiltStream, ChunkStream, SortedInMemoryBuilder, VortexArrayBuilder,
+};
+pub use export::export_rdf;
 // Compiled out on wasm along with the rest of the external-sort pipeline
 // (see the module gate in `builders`).
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]

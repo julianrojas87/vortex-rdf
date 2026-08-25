@@ -50,6 +50,7 @@ use crate::common::quad::SharedQuad;
 use crate::error::{Result, VortexRdfError};
 use crate::session::VORTEX_SESSION;
 use crate::store::layouts::ResolvedLayout;
+use crate::store::scan::gather::primitive_from_u64_reads;
 
 /// The decode tail shared by both backend-typed serve plans: which of the
 /// index's columns source each primary component, which carries the primary
@@ -133,8 +134,6 @@ impl ServeDecode {
         probes: &crate::store::probes::BaseProbes,
         deleted: Option<&Mask>,
     ) -> Result<Option<ArrayRef>> {
-        use vortex_array::dtype::PType;
-
         use crate::store::selection::POINT_GATHER_MAX_ROWS;
 
         if range.len() > POINT_GATHER_MAX_ROWS {
@@ -159,12 +158,9 @@ impl ServeDecode {
                 return Ok(None);
             };
             let reads = live.iter().map(|&pos| probe.value_at(pos));
-            let child = match probe.array().dtype().as_ptype() {
-                PType::U8 => PrimitiveArray::from_iter(reads.map(|v| v as u8)).into_array(),
-                PType::U16 => PrimitiveArray::from_iter(reads.map(|v| v as u16)).into_array(),
-                PType::U32 => PrimitiveArray::from_iter(reads.map(|v| v as u32)).into_array(),
-                PType::U64 => PrimitiveArray::from_iter(reads).into_array(),
-                _ => return Ok(None),
+            let Some(child) = primitive_from_u64_reads(probe.array().dtype().as_ptype(), reads)
+            else {
+                return Ok(None);
             };
             children.push(child);
         }
@@ -207,7 +203,7 @@ impl ServeDecode {
         // A small served run over still-encoded component columns reads
         // faster point-by-point than through the per-column decode pipeline;
         // wide runs and non-probeable columns keep the vectorized path.
-        let rows = match crate::store::selection::gather_by_point_reads(
+        let rows = match crate::store::scan::gather::gather_by_point_reads(
             &rows,
             &crate::store::selection::RowSelection::Range(0..len as u64),
             None,

@@ -59,11 +59,12 @@ pub mod io;
 mod session;
 pub mod store;
 
-pub use error::VortexRdfError;
+pub use error::{Result, VortexRdfError};
 
 pub use store::{
-    BuiltArray, DictSnapshot, DictionaryQuadSink, IndexType, Indexes, LayoutStrategy, RawQuad,
-    SharedQuad, SortedInMemoryBuilder, StoreParts, VortexArrayBuilder, VortexRdfStore,
+    BuiltArray, BuiltStream, ChunkStream, DictSnapshot, DictionaryQuadSink, IndexType, Indexes,
+    LayoutStrategy, RawQuad, SharedQuad, SortedInMemoryBuilder, StoreParts, VortexArrayBuilder,
+    VortexRdfStore, export_rdf,
 };
 // Compiled out on wasm along with the rest of the external-sort pipeline
 // (see the module gate in `store::builders`).
