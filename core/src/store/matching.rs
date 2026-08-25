@@ -4,7 +4,9 @@
 use crate::debug;
 use crate::error::{Result, VortexRdfError};
 use crate::session::VORTEX_SESSION;
-use crate::store::array::{bool_array_to_mask, column_is_sorted, search_sorted_bounds};
+use crate::store::array::{
+    bool_array_to_mask, column_is_sorted, into_struct_array, search_sorted_bounds,
+};
 #[cfg(feature = "file-io")]
 use crate::store::indexes::resolve_indexes_file;
 use crate::store::indexes::{
@@ -221,15 +223,7 @@ impl VortexRdfStore {
         // Bases adopted through the split are already canonical
         // structs, so the common case is a plain downcast — no
         // per-match canonicalization.
-        let struct_arr = match base.clone().try_downcast::<vortex_array::arrays::Struct>() {
-            Ok(s) => s,
-            Err(other) => {
-                let mut ctx = VORTEX_SESSION.create_execution_ctx();
-                other
-                    .execute::<StructArray>(&mut ctx)
-                    .map_err(VortexRdfError::Vortex)?
-            }
-        };
+        let struct_arr = into_struct_array(base.clone())?;
 
         // A chained match folds this pattern's restrictions into the
         // previous ones, so a still-pending selection materializes here —

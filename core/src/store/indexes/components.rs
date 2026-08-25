@@ -25,6 +25,7 @@ use vortex_array::{ArrayRef, IntoArray, VortexSessionExecute};
 
 use crate::error::{Result, VortexRdfError};
 use crate::session::VORTEX_SESSION;
+use crate::store::array::into_struct_array;
 
 use super::{ALL_INDEX_TYPES, IndexType, Indexes};
 
@@ -326,20 +327,11 @@ impl IndexComponent {
     ///
     /// [`array::with_searchable_int_children`]: crate::store::array::with_searchable_int_children
     pub(crate) fn into_resident(self) -> Result<Self> {
-        use vortex_array::arrays::Struct;
         let rows = self.rows()?.clone().into_array();
         let canonical = crate::store::array::with_searchable_int_children(rows)?;
         // The helper only ever hands back a struct (its input was one), so
         // the downcast is a cast, not work.
-        let array = match canonical.try_downcast::<Struct>() {
-            Ok(array) => array,
-            Err(other) => {
-                let mut ctx = VORTEX_SESSION.create_execution_ctx();
-                other
-                    .execute::<StructArray>(&mut ctx)
-                    .map_err(VortexRdfError::Vortex)?
-            }
-        };
+        let array = into_struct_array(canonical)?;
         Ok(Self {
             rows: ComponentRows::Built(array),
             // The rebuilt rows are a different array; the old cache's
@@ -359,18 +351,9 @@ impl IndexComponent {
     ///
     /// [`array::with_compressed_int_children`]: crate::store::array::with_compressed_int_children
     pub(crate) fn into_compressed(self) -> Result<Self> {
-        use vortex_array::arrays::Struct;
         let rows = self.rows()?.clone().into_array();
         let compressed = crate::store::array::with_compressed_int_children(rows, false)?;
-        let array = match compressed.try_downcast::<Struct>() {
-            Ok(array) => array,
-            Err(other) => {
-                let mut ctx = VORTEX_SESSION.create_execution_ctx();
-                other
-                    .execute::<StructArray>(&mut ctx)
-                    .map_err(VortexRdfError::Vortex)?
-            }
-        };
+        let array = into_struct_array(compressed)?;
         Ok(Self {
             rows: ComponentRows::Built(array),
             probes: crate::store::probes::BaseProbes::new(),

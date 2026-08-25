@@ -87,7 +87,7 @@ pub(crate) async fn serialize_parts<W: VortexWrite + Unpin + Send>(
         writes.push(dict_component(dict)?);
     }
 
-    let quads_sorted = crate::store::builders::subject_sorted(&primary);
+    let quads_sorted = crate::store::array::subject_sorted(&primary);
     let dtype = primary.dtype().clone();
     let stream = ArrayStreamAdapter::new(
         dtype,

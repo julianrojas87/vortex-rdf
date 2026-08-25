@@ -242,9 +242,7 @@ pub(crate) async fn resolve_file(
         }
         // The located range is exactly this index's matched rows: the value
         // column is the one and only constraint.
-        let row_ids = if (range.end - range.start) as usize
-            <= crate::store::selection::POINT_GATHER_MAX_ROWS
-        {
+        let row_ids = if crate::store::selection::point_sized(range.end - range.start) {
             super::rid_point_reads(file, name, CHILD_RID_COL, range.clone()).await?
         } else {
             Some(

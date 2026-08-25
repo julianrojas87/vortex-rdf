@@ -10,7 +10,7 @@ use vortex_mask::Mask;
 
 use crate::error::{Result, VortexRdfError};
 use crate::store::probes::BaseProbes;
-use crate::store::selection::{POINT_GATHER_MAX_ROWS, RowSelection};
+use crate::store::selection::RowSelection;
 
 /// Gather the rows of `base` that `selection` covers and `deleted` has not
 /// tombstoned.
@@ -58,20 +58,10 @@ pub(crate) fn gather_by_point_reads(
     use vortex_array::arrays::{Struct, StructArray};
     use vortex_rdf_encoded_search::SortedProbe;
 
-    let live: Vec<usize> = match selection {
-        RowSelection::All => return Ok(None),
-        RowSelection::Range(r) if (r.end - r.start) as usize <= POINT_GATHER_MAX_ROWS => (r.start
-            ..r.end)
-            .map(|i| i as usize)
-            .filter(|&i| deleted.is_none_or(|d| !d.value(i)))
-            .collect(),
-        RowSelection::Ids(ids) if ids.len() <= POINT_GATHER_MAX_ROWS => ids
-            .iter()
-            .map(|&i| i as usize)
-            .filter(|&i| deleted.is_none_or(|d| !d.value(i)))
-            .collect(),
-        _ => return Ok(None),
+    let Some(live) = selection.point_sized_live_rows(deleted) else {
+        return Ok(None);
     };
+    let live: Vec<usize> = live.into_iter().map(|i| i as usize).collect();
     let Ok(struct_arr) = base.clone().try_downcast::<Struct>() else {
         return Ok(None);
     };

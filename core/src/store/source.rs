@@ -3,8 +3,10 @@ use std::sync::Arc;
 use vortex_array::ArrayRef;
 use vortex_mask::Mask;
 
+use crate::error::Result;
 use crate::store::indexes::{InMemoryServePlan, IndexComponent};
 use crate::store::probes::BaseProbes;
+use crate::store::scan::gather::gather_live;
 use crate::store::selection::{RowSelection, ViewSelection};
 
 #[cfg(feature = "file-io")]
@@ -170,4 +172,12 @@ pub(crate) struct Tail {
     /// Tail rows deleted since they were appended, one bit per tail row
     /// (`None` until something is deleted).
     pub(crate) deleted: Option<Mask>,
+}
+
+impl Tail {
+    /// The tail rows visible through this store, tombstones dropped, in tail
+    /// order.
+    pub(crate) fn live_rows(&self) -> Result<ArrayRef> {
+        gather_live(&self.rows, &self.selection, self.deleted.as_ref(), None)
+    }
 }

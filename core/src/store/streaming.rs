@@ -10,7 +10,7 @@ use crate::store::indexes::InMemoryServePlan;
 use crate::store::layouts::ResolvedLayout;
 use crate::store::scan::gather::gather_live;
 #[cfg(feature = "file-io")]
-use crate::store::selection::{POINT_GATHER_MAX_ROWS, RowSelection};
+use crate::store::selection::point_sized;
 use crate::store::{QuadsSource, RawQuad, SharedQuad};
 
 #[cfg(feature = "file-io")]
@@ -190,10 +190,7 @@ impl VortexRdfStore {
         // after whatever the base yields.
         let tail_quads: Vec<Result<T>> = match &self.tail {
             None => vec![],
-            Some(tail) => T::decode_chunk(
-                &self.tail_layout(),
-                &gather_live(&tail.rows, &tail.selection, tail.deleted.as_ref(), None)?,
-            ),
+            Some(tail) => T::decode_chunk(&self.tail_layout(), &tail.live_rows()?),
         };
         match &self.quads {
             QuadsSource::InMemory {
@@ -251,7 +248,7 @@ impl VortexRdfStore {
                     // scan machinery; the moved-in filter scan handles the
                     // rare mid-fetch decline.
                     if let Some(range) = serve.row_range()
-                        && (range.end - range.start) as usize <= POINT_GATHER_MAX_ROWS
+                        && point_sized(range.end - range.start)
                     {
                         let scan = serve.projected_filtered_scan()?;
                         let serve = serve.clone();
@@ -333,12 +330,7 @@ impl VortexRdfStore {
                 // future for the rare mid-fetch decline (an unprobeable
                 // chunk), which reads the same few rows through the scan.
                 let exact = selection.expect_exact();
-                let small = match exact {
-                    RowSelection::Range(r) => (r.end - r.start) as usize <= POINT_GATHER_MAX_ROWS,
-                    RowSelection::Ids(ids) => ids.len() <= POINT_GATHER_MAX_ROWS,
-                    RowSelection::All => false,
-                };
-                if small
+                if exact.is_point_sized()
                     && filter
                         .as_ref()
                         .is_none_or(|f| crate::store::scan::file_scan::eq_code_pairs(f).is_some())
@@ -437,10 +429,7 @@ impl VortexRdfStore {
         // so this never needs the async dictionary path.
         let tail_raws: Vec<Result<RawQuad>> = match &self.tail {
             None => vec![],
-            Some(tail) => raw_chunk(
-                &self.tail_layout(),
-                &gather_live(&tail.rows, &tail.selection, tail.deleted.as_ref(), None)?,
-            ),
+            Some(tail) => raw_chunk(&self.tail_layout(), &tail.live_rows()?),
         };
         match &self.quads {
             QuadsSource::InMemory {

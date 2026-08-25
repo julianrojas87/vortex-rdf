@@ -31,9 +31,8 @@
 //! than assumed.
 
 use crate::error::{Result, VortexRdfError};
-use crate::session::VORTEX_SESSION;
 use crate::store::RawQuad;
-use crate::store::array::stamp_is_sorted;
+use crate::store::array::{chunked_or_single, stamp_is_sorted};
 use crate::store::indexes::{
     IndexComponent, IndexType, Indexes, secondary_by_copy, secondary_by_reference, unique_indexes,
 };
@@ -43,10 +42,9 @@ use futures::{Stream, stream};
 use std::future::Future;
 use std::sync::Arc;
 use vortex_array::arrays::StructArray;
-use vortex_array::arrays::struct_::StructArrayExt;
 use vortex_array::dtype::DType;
 use vortex_array::validity::Validity;
-use vortex_array::{ArrayRef, IntoArray, VortexSessionExecute};
+use vortex_array::{ArrayRef, IntoArray};
 
 /// Number of quads per StructArray chunk in streaming/chunked builders.
 pub(crate) const DEFAULT_CHUNK_SIZE: usize = 100_000;
@@ -265,62 +263,16 @@ pub(crate) fn build_components_from_codes(
     GlobalIndexes::from_codes(indexes, codes).into_components()
 }
 
-/// Canonicalize a sorted builder's (possibly chunked) materialized quad array
-/// and re-stamp the `s` sortedness the builder guarantees. Canonicalization
-/// loses the per-chunk stats, so without this multi-chunk in-memory stores
-/// would fall back to mask scans on subject-bound patterns.
-// Only the (wasm-gated) external-sort builder materializes chunk streams.
-#[cfg_attr(all(target_arch = "wasm32", target_os = "unknown"), allow(dead_code))]
-pub(crate) fn canonicalize_sorted(arr: ArrayRef) -> Result<ArrayRef> {
-    let mut ctx = VORTEX_SESSION.create_execution_ctx();
-    let struct_arr = arr
-        .execute::<StructArray>(&mut ctx)
-        .map_err(VortexRdfError::Vortex)?;
-
-    if let Ok(col) = struct_arr.unmasked_field_by_name(crate::store::schema::COL_S) {
-        stamp_is_sorted(col);
-    }
-    Ok(struct_arr.into_array())
-}
-
-/// Whether a quad array's `s` column carries the globally-sorted stamp — the
-/// provenance a write records in the root's metadata and a reader gates its
-/// subject binary search on. Only the global-emission paths stamp it, so a
-/// tail-appended or gathered array correctly lands on `false`.
-// Read only by the write driver, which is compiled only where a store can be
-// written (the same gate `io::ser` carries).
-#[cfg(any(feature = "file-io", target_arch = "wasm32"))]
-pub(crate) fn subject_sorted(array: &ArrayRef) -> bool {
-    let mut ctx = VORTEX_SESSION.create_execution_ctx();
-    let Ok(struct_arr) = array.clone().execute::<StructArray>(&mut ctx) else {
-        return false;
-    };
-    struct_arr
-        .unmasked_field_by_name(crate::store::schema::COL_S)
-        .map(crate::store::array::column_is_sorted)
-        .unwrap_or(false)
-}
-
 /// Assemble a list of per-chunk StructArrays into a single ArrayRef.
 /// Returns an empty StructArray with the correct schema when `chunks` is empty.
 // Only the (wasm-gated) external-sort builder materializes chunk streams.
 #[cfg_attr(all(target_arch = "wasm32", target_os = "unknown"), allow(dead_code))]
-pub(crate) fn assemble_chunks(
-    mut chunks: Vec<ArrayRef>,
-    layout: LayoutStrategy,
-) -> Result<ArrayRef> {
+pub(crate) fn assemble_chunks(chunks: Vec<ArrayRef>, layout: LayoutStrategy) -> Result<ArrayRef> {
     if chunks.is_empty() {
-        make_empty_struct(layout)
-    } else if chunks.len() == 1 {
-        Ok(chunks.remove(0))
-    } else {
-        use vortex_array::arrays::ChunkedArray;
-        let dtype = chunks[0].dtype().clone();
-        let chunked = ChunkedArray::try_new(chunks, dtype)
-            .map_err(VortexRdfError::Vortex)?
-            .into_array();
-        Ok(chunked)
+        return make_empty_struct(layout);
     }
+    let dtype = chunks[0].dtype().clone();
+    chunked_or_single(chunks, dtype)
 }
 
 /// An empty StructArray with the given layout's primary schema. Building from

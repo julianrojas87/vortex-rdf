@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use oxrdf::{BlankNode, Literal, NamedNode, Quad, Term};
-use vortex_array::arrays::struct_::{StructArray, StructArrayExt};
+use vortex_array::arrays::struct_::StructArray;
 use vortex_array::arrays::{PrimitiveArray, VarBinViewArray};
 use vortex_array::{ArrayRef, IntoArray, VortexSessionExecute};
 
@@ -15,7 +15,7 @@ use crate::common::terms::{get_as_term, parse_graph_name, parse_named_node, pars
 use crate::error::{Result, VortexRdfError};
 use crate::session::VORTEX_SESSION;
 use crate::store::RawQuad;
-use crate::store::array::{StrColReader, make_nullable_string_array, make_string_array};
+use crate::store::array::{StrColReader, field_as, make_nullable_string_array, make_string_array};
 use crate::store::schema::{COL_G, COL_P, COL_S};
 
 /// The term kind tag — its presence in a schema is what marks the layout.
@@ -138,27 +138,11 @@ fn compose_object(
 pub(crate) fn object_terms(struct_arr: &StructArray) -> Result<Vec<String>> {
     let mut ctx = VORTEX_SESSION.create_execution_ctx();
 
-    let kind_col = struct_arr
-        .unmasked_field_by_name(COL_O_KIND)
-        .map_err(VortexRdfError::Vortex)?
-        .clone()
-        .execute::<PrimitiveArray>(&mut ctx)
-        .map_err(VortexRdfError::Vortex)?;
-    let val_col = struct_arr
-        .unmasked_field_by_name(COL_O_VALUE)
-        .map_err(VortexRdfError::Vortex)?
-        .clone()
-        .execute::<VarBinViewArray>(&mut ctx)
-        .map_err(VortexRdfError::Vortex)?;
+    let kind_col = field_as::<PrimitiveArray>(struct_arr, COL_O_KIND, &mut ctx)?;
+    let val_col = field_as::<VarBinViewArray>(struct_arr, COL_O_VALUE, &mut ctx)?;
     // Nullable columns — try VarBinViewArray; fall back to all-None on error.
-    let dt_col: Option<VarBinViewArray> = struct_arr
-        .unmasked_field_by_name(COL_O_DATATYPE)
-        .ok()
-        .and_then(|c| c.clone().execute::<VarBinViewArray>(&mut ctx).ok());
-    let lang_col: Option<VarBinViewArray> = struct_arr
-        .unmasked_field_by_name(COL_O_LANG)
-        .ok()
-        .and_then(|c| c.clone().execute::<VarBinViewArray>(&mut ctx).ok());
+    let dt_col = field_as::<VarBinViewArray>(struct_arr, COL_O_DATATYPE, &mut ctx).ok();
+    let lang_col = field_as::<VarBinViewArray>(struct_arr, COL_O_LANG, &mut ctx).ok();
 
     let kinds = kind_col.as_slice::<u8>();
     let vals = StrColReader::new(&val_col);
@@ -199,47 +183,23 @@ pub(crate) fn decode_chunk(chunk: &ArrayRef) -> Vec<Result<Quad>> {
 
     let n = struct_arr.len();
 
-    macro_rules! get_str_col {
-        ($name:expr) => {
-            match struct_arr
-                .unmasked_field_by_name($name)
-                .map_err(VortexRdfError::Vortex)
-                .and_then(|c| {
-                    c.clone()
-                        .execute::<VarBinViewArray>(&mut ctx)
-                        .map_err(VortexRdfError::Vortex)
-                }) {
-                Ok(arr) => arr,
-                Err(e) => return vec![Err(e)],
-            }
-        };
-    }
-
-    let s_col = get_str_col!(COL_S);
-    let p_col = get_str_col!(COL_P);
-    let kind_col = match struct_arr
-        .unmasked_field_by_name(COL_O_KIND)
-        .map_err(VortexRdfError::Vortex)
-        .and_then(|c| {
-            c.clone()
-                .execute::<PrimitiveArray>(&mut ctx)
-                .map_err(VortexRdfError::Vortex)
-        }) {
-        Ok(a) => a,
+    let columns = (|| {
+        Ok((
+            field_as::<VarBinViewArray>(&struct_arr, COL_S, &mut ctx)?,
+            field_as::<VarBinViewArray>(&struct_arr, COL_P, &mut ctx)?,
+            field_as::<PrimitiveArray>(&struct_arr, COL_O_KIND, &mut ctx)?,
+            field_as::<VarBinViewArray>(&struct_arr, COL_O_VALUE, &mut ctx)?,
+            field_as::<VarBinViewArray>(&struct_arr, COL_G, &mut ctx)?,
+        ))
+    })();
+    let (s_col, p_col, kind_col, val_col, g_col) = match columns {
+        Ok(columns) => columns,
         Err(e) => return vec![Err(e)],
     };
-    let val_col = get_str_col!(COL_O_VALUE);
-    let g_col = get_str_col!(COL_G);
 
     // Nullable columns — try VarBinViewArray; fall back to all-None on error.
-    let dt_col: Option<VarBinViewArray> = struct_arr
-        .unmasked_field_by_name(COL_O_DATATYPE)
-        .ok()
-        .and_then(|c| c.clone().execute::<VarBinViewArray>(&mut ctx).ok());
-    let lang_col: Option<VarBinViewArray> = struct_arr
-        .unmasked_field_by_name(COL_O_LANG)
-        .ok()
-        .and_then(|c| c.clone().execute::<VarBinViewArray>(&mut ctx).ok());
+    let dt_col = field_as::<VarBinViewArray>(&struct_arr, COL_O_DATATYPE, &mut ctx).ok();
+    let lang_col = field_as::<VarBinViewArray>(&struct_arr, COL_O_LANG, &mut ctx).ok();
 
     let kinds = kind_col.as_slice::<u8>();
     let subjects = StrColReader::new(&s_col);

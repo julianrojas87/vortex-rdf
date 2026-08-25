@@ -51,6 +51,7 @@ use crate::error::{Result, VortexRdfError};
 use crate::session::VORTEX_SESSION;
 use crate::store::layouts::ResolvedLayout;
 use crate::store::scan::gather::primitive_from_u64_reads;
+use crate::store::selection::point_sized;
 
 /// The decode tail shared by both backend-typed serve plans: which of the
 /// index's columns source each primary component, which carries the primary
@@ -134,9 +135,7 @@ impl ServeDecode {
         probes: &crate::store::probes::BaseProbes,
         deleted: Option<&Mask>,
     ) -> Result<Option<ArrayRef>> {
-        use crate::store::selection::POINT_GATHER_MAX_ROWS;
-
-        if range.len() > POINT_GATHER_MAX_ROWS {
+        if !point_sized(range.len() as u64) {
             return Ok(None);
         }
         // Tombstones are defined over primary row ids; the rid column says
@@ -304,9 +303,7 @@ impl InMemoryServePlan {
     /// [`POINT_GATHER_MAX_ROWS`]: crate::store::selection::POINT_GATHER_MAX_ROWS
     /// [`rows_via_probes`]: ServeDecode::rows_via_probes
     pub(crate) fn code_columns(&self, deleted: Option<&Mask>) -> Option<[Buffer<u32>; 4]> {
-        use crate::store::selection::POINT_GATHER_MAX_ROWS;
-
-        if self.range.len() > POINT_GATHER_MAX_ROWS
+        if !point_sized(self.range.len() as u64)
             || !matches!(self.decode.decode_layout, ResolvedLayout::Dictionary(_))
         {
             return None;
@@ -437,7 +434,7 @@ const SERVE_SPLIT_MIN_ROWS: u64 = 1024;
 /// worker a couple, never fewer than [`SERVE_SPLIT_MIN_ROWS`] rows each.
 #[cfg(feature = "file-io")]
 fn run_split_rows(rows: u64) -> usize {
-    let workers = crate::store::scan::file_scan::available_parallelism() as u64;
+    let workers = crate::io::read::available_parallelism() as u64;
     rows.div_ceil(2 * workers).max(SERVE_SPLIT_MIN_ROWS) as usize
 }
 

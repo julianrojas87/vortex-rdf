@@ -13,21 +13,23 @@
 
 use crate::error::{Result, VortexRdfError};
 use crate::session::VORTEX_SESSION;
+use crate::store::schema;
 
+use vortex_array::arrays::struct_::StructArrayExt;
 use vortex_array::arrays::varbinview::BinaryView;
-use vortex_array::arrays::{BoolArray, VarBinViewArray};
+use vortex_array::arrays::{BoolArray, ChunkedArray, Struct, StructArray, VarBinViewArray};
+use vortex_array::dtype::DType;
 use vortex_array::expr::stats::{Precision, Stat, StatsProvider};
-use vortex_array::{ArrayRef, IntoArray, VortexSessionExecute};
+use vortex_array::{ArrayRef, Executable, ExecutionCtx, IntoArray, VortexSessionExecute};
 use vortex_mask::Mask;
 
 /// Zero-cost row access into a canonical `VarBinView` string column: the
 /// 16-byte views slice and the data buffers are resolved once, and each row's
 /// bytes are then an inline read or a plain slice of the referenced buffer.
 ///
-/// `bytes_at` instead materializes a refcounted `ByteBuffer` per row (two
-/// atomic refcount ops plus alignment bookkeeping); this reader is the
-/// loop-shaped counterpart, sharing the access pattern of the typed residual
-/// filter's `StrEq`.
+/// Rows are read directly from the views slice and the referenced data
+/// buffers, so a loop over the column allocates and refcounts nothing per
+/// row.
 pub(crate) struct StrColReader<'a> {
     arr: &'a VarBinViewArray,
     views: &'a [BinaryView],
@@ -97,6 +99,76 @@ pub(crate) fn column_is_sorted(arr: &ArrayRef) -> bool {
     }
 }
 
+/// Whether a quad struct's `s` column carries the globally-sorted stamp —
+/// the provenance a write records in the root's metadata and a reader gates
+/// its subject binary search on. Every producer that stamps yields a
+/// canonical `StructArray`, so anything that is not one reads as unsorted.
+pub(crate) fn subject_sorted(rows: &ArrayRef) -> bool {
+    rows.clone()
+        .try_downcast::<Struct>()
+        .ok()
+        .and_then(|s| {
+            s.unmasked_field_by_name(schema::COL_S)
+                .ok()
+                .map(column_is_sorted)
+        })
+        .unwrap_or(false)
+}
+
+/// Canonicalize `rows` to a struct and stamp its `s` column sorted when the
+/// caller's provenance says the rows are globally `(s, p, o, g)`-sorted;
+/// a pass-through when they are not.
+pub(crate) fn with_subject_stamp(rows: ArrayRef, sorted: bool) -> Result<ArrayRef> {
+    if !sorted {
+        return Ok(rows);
+    }
+    let struct_arr = into_struct_array(rows)?;
+    if let Ok(col) = struct_arr.unmasked_field_by_name(schema::COL_S) {
+        stamp_is_sorted(col);
+    }
+    Ok(struct_arr.into_array())
+}
+
+/// Assemble per-chunk arrays into one array of `dtype`: an empty
+/// `ChunkedArray` for no chunks, the chunk itself for exactly one, a
+/// `ChunkedArray` otherwise.
+pub(crate) fn chunked_or_single(mut chunks: Vec<ArrayRef>, dtype: DType) -> Result<ArrayRef> {
+    match chunks.len() {
+        1 => Ok(chunks.pop().expect("length checked above")),
+        _ => Ok(ChunkedArray::try_new(chunks, dtype)
+            .map_err(VortexRdfError::Vortex)?
+            .into_array()),
+    }
+}
+
+/// `arr` as a `StructArray`: a plain downcast when it already is one, else
+/// an execution to the canonical struct.
+pub(crate) fn into_struct_array(arr: ArrayRef) -> Result<StructArray> {
+    match arr.try_downcast::<Struct>() {
+        Ok(struct_arr) => Ok(struct_arr),
+        Err(other) => {
+            let mut ctx = VORTEX_SESSION.create_execution_ctx();
+            other
+                .execute::<StructArray>(&mut ctx)
+                .map_err(VortexRdfError::Vortex)
+        }
+    }
+}
+
+/// The named field of `struct_arr` executed to `T` (a canonical array type).
+pub(crate) fn field_as<T: Executable>(
+    struct_arr: &StructArray,
+    name: &str,
+    ctx: &mut ExecutionCtx,
+) -> Result<T> {
+    struct_arr
+        .unmasked_field_by_name(name)
+        .map_err(VortexRdfError::Vortex)?
+        .clone()
+        .execute::<T>(ctx)
+        .map_err(VortexRdfError::Vortex)
+}
+
 /// Binary-search a sorted column for the `[lo, hi)` run of rows equal to
 /// `probe` (`lo == hi` means the value is absent). Only meaningful on
 /// columns [`column_is_sorted`] reports as sorted.
@@ -104,17 +176,13 @@ pub(crate) fn search_sorted_bounds(
     arr: &ArrayRef,
     probe: &vortex_array::scalar::Scalar,
 ) -> Result<(usize, usize)> {
-    use vortex_array::arrays::Primitive;
     use vortex_array::search_sorted::{SearchResult, SearchSorted, SearchSortedSide};
 
     // Typed fast path: a canonical non-nullable u32 column (the Dictionary
     // layout's term codes). `partition_point` over the raw slice costs a few
     // dozen loads, where the generic kernel below builds a fresh
     // `ExecutionCtx` and materializes a `Scalar` per probe.
-    if arr.dtype().is_unsigned_int()
-        && !arr.dtype().is_nullable()
-        && let Ok(prim) = arr.clone().try_downcast::<Primitive>()
-        && prim.ptype() == vortex_array::dtype::PType::U32
+    if let Some(prim) = canonical_u32(arr)
         && let Ok(code) = u32::try_from(probe)
     {
         let codes = prim.as_slice::<u32>();
@@ -220,12 +288,10 @@ pub(crate) fn with_searchable_int_children(rows: ArrayRef) -> Result<ArrayRef> {
 /// the construction half of the store's compressed-resident form (the
 /// adoption half is [`with_searchable_int_children`]).
 ///
-/// The encoding is chosen from bounds the construction already knows —
-/// Constant for a single-valued column, RunEnd for a sorted column with few
-/// runs, BitPacked at the observed value width otherwise — never by a
-/// sampling compressor: an external selector is free to pick encodings
-/// outside the probe-supported set, which would put the column back on the
-/// per-call generic-kernel fallback this crate's fast paths exist to avoid.
+/// Every encoding chosen here is one an encoded search probe resolves, so
+/// the match fast paths keep binding the column; the choice is made from
+/// bounds the construction already knows (Constant for single-valued, RunEnd
+/// for sorted with few runs, BitPacked at the observed width).
 /// Sortedness stamps carry across; non-u32 and nullable children pass
 /// through untouched. A chunked column is compressed chunk by chunk (see
 /// [`compress_u32_child`]) — the builders assemble anything over

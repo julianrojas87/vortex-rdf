@@ -397,10 +397,7 @@ pub(crate) async fn resolve_file(
     // handful of cached-chunk accesses — instead of deferring a whole child
     // scan (which a count or chained match would then pay).
     let row_ids = match &located {
-        Some(range)
-            if (range.end - range.start) as usize
-                <= crate::store::selection::POINT_GATHER_MAX_ROWS =>
-        {
+        Some(range) if crate::store::selection::point_sized(range.end - range.start) => {
             match super::rid_point_reads(file, name, CHILD_RID_COL, range.clone()).await? {
                 Some(ids) => ResolvedRowIds::Eager(ids),
                 None => ResolvedRowIds::Lazy(LazyRowIds::from_index_child_scan(

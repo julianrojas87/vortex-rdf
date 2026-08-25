@@ -817,7 +817,7 @@ async fn test_in_memory_copy_index_serving() {
     assert_eq!(view_strings(&by_p).await, expected(&|i| i % 3 == 1));
     // A base-order gather cannot ride the plan: it materializes the pending
     // ids and must agree with the served read.
-    assert_eq!(by_p.get_quads_array().await.unwrap().len(), 10);
+    assert_eq!(by_p.selected_rows().await.unwrap().len(), 10);
 
     // Object-bound: served from the OSPG family.
     let o2 = Term::Literal(Literal::new_simple_literal("o2"));
@@ -1079,7 +1079,7 @@ async fn run_copy_index_file_serving_test(layout: LayoutStrategy, located: bool)
     assert_eq!(view_strings(&by_p).await, expected(&|i| i % 3 == 1));
     // A base-order gather cannot ride the plan: it materializes the pending
     // ids (the deferred index-child scan) and must agree with the served read.
-    assert_eq!(by_p.get_quads_array().await.unwrap().len(), 10);
+    assert_eq!(by_p.selected_rows().await.unwrap().len(), 10);
 
     // Object-bound: i ≡ 2 (mod 5), served from the OSPG family.
     let o2 = Term::Literal(Literal::new_simple_literal("o2"));

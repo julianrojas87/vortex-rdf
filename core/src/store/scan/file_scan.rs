@@ -21,6 +21,7 @@ use vortex_scan::selection::Selection;
 use vortex_scan::strict_sorted_buffer::StrictSortedBuffer;
 
 use crate::error::{Result, VortexRdfError};
+use crate::io::read::available_parallelism;
 use crate::store::layouts::{Constraints, PatternCodes};
 use crate::store::native_file::NativeStoreFile;
 use crate::store::scan::gather::primitive_from_u64_reads;
@@ -115,8 +116,12 @@ fn split_bounds(selection: &RowSelection, row_count: u64) -> (Selection, Range<u
 /// `range`, minus any that `deleted` has tombstoned. Returned split-relative
 /// (one bit per row of `range`), ready for the store's per-split filter
 /// evaluation (`evaluate_filter_split`).
-fn split_start_mask(selection: &Selection, deleted: Option<&Mask>, range: &Range<u64>) -> Mask {
-    let mask = selection.row_mask(range).mask().clone();
+fn split_start_mask(
+    mask_selection: &Selection,
+    deleted: Option<&Mask>,
+    range: &Range<u64>,
+) -> Mask {
+    let mask = mask_selection.row_mask(range).mask().clone();
     match deleted {
         None => mask,
         Some(deleted) => {
@@ -124,21 +129,6 @@ fn split_start_mask(selection: &Selection, deleted: Option<&Mask>, range: &Range
             mask.bitand(&live)
         }
     }
-}
-
-/// The host's available parallelism, read once — split-loop concurrency is
-/// derived from it on every counting/matching call, and the syscall is not
-/// free on hot repeated-match paths (the bindings' `triples()` pattern).
-static AVAILABLE_PARALLELISM: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
-    std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1)
-});
-
-/// The host's available parallelism (see [`AVAILABLE_PARALLELISM`]) — how
-/// many workers a scan's per-split tasks can spread over.
-pub(crate) fn available_parallelism() -> usize {
-    *AVAILABLE_PARALLELISM
 }
 
 /// Evaluate a filter over one file split, threading a narrowing mask through the
@@ -224,7 +214,7 @@ where
     // Translate the view's selection into the two knobs the split loop
     // understands: the bounds it iterates and the per-split starting mask
     // (see `split_start_mask`).
-    let (row_selection, bounds) = split_bounds(selection, file.row_count());
+    let (mask_selection, bounds) = split_bounds(selection, file.row_count());
 
     let splits = file.splits().map_err(VortexRdfError::Vortex)?;
     let ranges: Vec<Range<u64>> = splits
@@ -240,7 +230,7 @@ where
         let filter_conjuncts = filter_conjuncts.clone();
         // The starting mask for this split: the selected rows within
         // `range`, minus any the caller has tombstoned.
-        let start_mask = split_start_mask(&row_selection, deleted, &range);
+        let start_mask = split_start_mask(&mask_selection, deleted, &range);
         let map = map.clone();
         async move {
             let mask = evaluate_filter_split(reader, &filter_conjuncts, &range, start_mask).await?;
@@ -248,7 +238,7 @@ where
         }
     });
 
-    let concurrency = *AVAILABLE_PARALLELISM * 4;
+    let concurrency = available_parallelism() * 4;
     let mut results = stream::iter(tasks).buffer_unordered(concurrency);
     let mut out = Vec::new();
     while let Some(r) = results.next().await {
@@ -292,15 +282,12 @@ pub(crate) async fn matching_file_rows(
     };
     // Same per-split evaluation as the counting path, but lifting each
     // split's surviving rows back to absolute file row ids.
-    let ids = map_filter_splits(file, filter, selection, None, |mask, range| {
-        let ids: Vec<usize> = match mask.indices() {
-            vortex_mask::AllOr::All => (range.start as usize..range.end as usize).collect(),
-            vortex_mask::AllOr::None => Vec::new(),
-            vortex_mask::AllOr::Some(indices) => {
-                indices.iter().map(|&i| range.start as usize + i).collect()
-            }
-        };
-        ids
+    let ids = map_filter_splits(file, filter, selection, None, |mask, range| -> Vec<usize> {
+        match mask.indices() {
+            AllOr::All => (range.start as usize..range.end as usize).collect(),
+            AllOr::None => Vec::new(),
+            AllOr::Some(indices) => indices.iter().map(|&i| range.start as usize + i).collect(),
+        }
     })
     .await?;
     let mut matched: Vec<usize> = ids.into_iter().flatten().collect();
@@ -367,19 +354,8 @@ pub(crate) async fn file_point_rows(
     use vortex_array::dtype::FieldName;
     use vortex_array::validity::Validity;
 
-    use crate::store::selection::POINT_GATHER_MAX_ROWS;
-
-    let rows: Vec<u64> = match selection {
-        RowSelection::Range(r) if (r.end - r.start) as usize <= POINT_GATHER_MAX_ROWS => (r.start
-            ..r.end)
-            .filter(|&i| deleted.is_none_or(|d| !d.value(i as usize)))
-            .collect(),
-        RowSelection::Ids(ids) if ids.len() <= POINT_GATHER_MAX_ROWS => ids
-            .iter()
-            .copied()
-            .filter(|&i| deleted.is_none_or(|d| !d.value(i as usize)))
-            .collect(),
-        _ => return Ok(None),
+    let Some(rows) = selection.point_sized_live_rows(deleted) else {
+        return Ok(None);
     };
     let eqs = match filter {
         None => Vec::new(),

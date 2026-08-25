@@ -7,7 +7,6 @@ use crate::store::RawQuad;
 use crate::store::builders::build_struct_array;
 #[cfg(feature = "file-io")]
 use crate::store::scan::file_scan;
-use crate::store::scan::gather::gather_live;
 use crate::store::selection::RowSelection;
 use crate::store::{QuadsSource, Tail};
 
@@ -96,7 +95,7 @@ impl VortexRdfStore {
             // pre-append store keep the old tail, and an owner's selections
             // are `All`.
             Some(tail) => {
-                let old = gather_live(&tail.rows, &tail.selection, tail.deleted.as_ref(), None)?;
+                let old = tail.live_rows()?;
                 let dtype = old.dtype().clone();
                 let mut chunks = match old.clone().try_downcast::<Chunked>() {
                     Ok(ch) => ch.chunks(),

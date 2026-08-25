@@ -141,15 +141,9 @@ impl RowSelection {
     pub(crate) fn apply(&self, base: &ArrayRef) -> Result<ArrayRef> {
         match self {
             RowSelection::All => Ok(base.clone()),
-            RowSelection::Range(range) => {
-                let start = usize::try_from(range.start)
-                    .unwrap_or(usize::MAX)
-                    .min(base.len());
-                let end = usize::try_from(range.end)
-                    .unwrap_or(usize::MAX)
-                    .min(base.len());
-                base.slice(start..end).map_err(VortexRdfError::Vortex)
-            }
+            RowSelection::Range(range) => base
+                .slice(clamped(range, base.len()))
+                .map_err(VortexRdfError::Vortex),
             RowSelection::Ids(ids) => {
                 let indices = PrimitiveArray::new(ids.clone(), Validity::NonNullable).into_array();
                 base.take(indices).map_err(VortexRdfError::Vortex)
@@ -178,9 +172,34 @@ impl RowSelection {
             RowSelection::All => RowSelection::Ids(ids),
             RowSelection::Range(range) => RowSelection::Ids(restrict_ids(ids, &range)),
             RowSelection::Ids(current) => {
-                RowSelection::Ids(intersect_ids(current.as_slice(), ids.as_slice()))
+                RowSelection::Ids(intersect_sorted_ids(current.as_slice(), ids.as_slice()))
             }
         }
+    }
+
+    /// Whether this selection is small enough for the point-read paths
+    /// (at most [`POINT_GATHER_MAX_ROWS`] rows). `All` never is.
+    pub(crate) fn is_point_sized(&self) -> bool {
+        match self {
+            RowSelection::All => false,
+            RowSelection::Range(range) => point_sized(range.end - range.start),
+            RowSelection::Ids(ids) => point_sized(ids.len() as u64),
+        }
+    }
+
+    /// The live base row ids of a point-sized selection, ascending, with the
+    /// `deleted` tombstones dropped; `None` when the selection is not
+    /// point-sized.
+    pub(crate) fn point_sized_live_rows(&self, deleted: Option<&Mask>) -> Option<Vec<u64>> {
+        if !self.is_point_sized() {
+            return None;
+        }
+        let live = |id: &u64| deleted.is_none_or(|d| !d.value(*id as usize));
+        Some(match self {
+            RowSelection::All => unreachable!("`All` is never point-sized"),
+            RowSelection::Range(range) => range.clone().filter(live).collect(),
+            RowSelection::Ids(ids) => ids.iter().copied().filter(live).collect(),
+        })
     }
 
     /// This selection as a mask over the whole base — one bit per base row.
@@ -191,18 +210,13 @@ impl RowSelection {
         match self {
             RowSelection::All => Mask::new_true(base_len),
             RowSelection::Range(range) => {
-                let start = usize::try_from(range.start)
-                    .unwrap_or(usize::MAX)
-                    .min(base_len);
-                let end = usize::try_from(range.end)
-                    .unwrap_or(usize::MAX)
-                    .min(base_len);
+                let range = clamped(range, base_len);
                 // `from_slices` rejects an empty slice, and the canonical empty
                 // selection (`0..0`) is exactly that.
-                if start >= end {
+                if range.is_empty() {
                     return Mask::new_false(base_len);
                 }
-                Mask::from_slices(base_len, vec![(start, end)])
+                Mask::from_slices(base_len, vec![(range.start, range.end)])
             }
             RowSelection::Ids(ids) => {
                 Mask::from_indices(base_len, ids.iter().map(|&id| id as usize))
@@ -221,15 +235,7 @@ impl RowSelection {
     pub(crate) fn live_mask(&self, deleted: &Mask, base_len: usize) -> Mask {
         match self {
             RowSelection::All => !deleted,
-            RowSelection::Range(range) => {
-                let start = usize::try_from(range.start)
-                    .unwrap_or(usize::MAX)
-                    .min(base_len);
-                let end = usize::try_from(range.end)
-                    .unwrap_or(usize::MAX)
-                    .min(base_len);
-                !&deleted.slice(start..end)
-            }
+            RowSelection::Range(range) => !&deleted.slice(clamped(range, base_len)),
             // A sparse selection asks the mask about only the rows it names.
             RowSelection::Ids(ids) => Mask::from_indices(
                 ids.len(),
@@ -281,8 +287,20 @@ fn restrict_ids(ids: Buffer<u64>, range: &Range<u64>) -> Buffer<u64> {
     ids.slice(lo..hi)
 }
 
+/// A base row range as `usize` positions, clamped to `base_len` (an
+/// out-of-range end lands on the base's end; an inverted range is empty).
+fn clamped(range: &Range<u64>, base_len: usize) -> Range<usize> {
+    let start = usize::try_from(range.start)
+        .unwrap_or(usize::MAX)
+        .min(base_len);
+    let end = usize::try_from(range.end)
+        .unwrap_or(usize::MAX)
+        .min(base_len);
+    start..end.max(start)
+}
+
 /// Intersection of two ascending id lists.
-fn intersect_ids(left: &[u64], right: &[u64]) -> Buffer<u64> {
+fn intersect_sorted_ids(left: &[u64], right: &[u64]) -> Buffer<u64> {
     // Classic sorted-merge intersection: advance whichever side is behind,
     // emit a value only when both sides agree on it. The result can hold at
     // most the smaller list, so one up-front reservation replaces the
@@ -311,8 +329,17 @@ fn intersect_ids(left: &[u64], right: &[u64]) -> Buffer<u64> {
 /// The pipeline's cost is fixed per column
 /// (optimizer pass, execution context, canonicalization) whatever the row
 /// count, while point reads cost per row per column, so the crossover sits in
-/// the hundreds of rows and this threshold stays under it.
+/// the hundreds of rows and this threshold stays under it. The file-backed
+/// dictionary makes the same trade: `FileBackedDict::resolve_terms`
+/// point-reads batches of up to this many codes through the chunk leaves and
+/// scans wider ones.
 pub(crate) const POINT_GATHER_MAX_ROWS: usize = 256;
+
+/// Whether `rows` rows fit the point-read paths (see
+/// [`POINT_GATHER_MAX_ROWS`]).
+pub(crate) fn point_sized(rows: u64) -> bool {
+    rows <= POINT_GATHER_MAX_ROWS as u64
+}
 
 #[cfg(test)]
 mod tests {

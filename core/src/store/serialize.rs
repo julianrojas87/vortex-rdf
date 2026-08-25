@@ -4,11 +4,11 @@
 
 use crate::error::Result;
 use crate::store::QuadsSource;
+use crate::store::array::subject_sorted;
 use crate::store::builders::{build_components, build_components_from_codes, build_struct_array};
 use crate::store::indexes::IndexComponent;
 use crate::store::layouts::dictionary::TermDictionary;
 use crate::store::layouts::{ResolvedLayout, dictionary};
-use crate::store::scan::gather::gather_live;
 
 use crate::store::RawQuad;
 
@@ -102,12 +102,7 @@ impl VortexRdfStore {
             return Ok((base, components, None));
         }
         let tail_rows = match &self.tail {
-            Some(tail) => Some(gather_live(
-                &tail.rows,
-                &tail.selection,
-                tail.deleted.as_ref(),
-                None,
-            )?),
+            Some(tail) => Some(tail.live_rows()?),
             None => None,
         };
         // A rebuild re-emits every surviving row, so it also re-establishes
@@ -117,7 +112,7 @@ impl VortexRdfStore {
         // subject chunk probe — until someone compacts. The rebuild already
         // decodes, re-dictionaries and re-sorts the index children over these
         // same rows, so ordering the primary is the one step it was missing.
-        let base_sorted = Self::base_subject_sorted(&base);
+        let base_sorted = subject_sorted(&base);
         match &self.layout {
             ResolvedLayout::Dictionary(_) => {
                 let mut raws = self.base_raw_quads(&base).await?;

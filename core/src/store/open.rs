@@ -296,7 +296,7 @@ impl VortexRdfStore {
             .into_array();
         // Restore the subject stamp from the file's recorded provenance,
         // through the same helper every materializing read path uses.
-        let quads = Self::with_subject_stamp(quads, container::quads_sorted(typed))?;
+        let quads = crate::store::array::with_subject_stamp(quads, container::quads_sorted(typed))?;
 
         let mut components: Vec<IndexComponent> = Vec::new();
         let mut dict = None;

@@ -29,7 +29,7 @@ use std::sync::Arc;
 
 use oxrdf::Quad;
 use vortex_array::arrays::PrimitiveArray;
-use vortex_array::arrays::struct_::{StructArray, StructArrayExt};
+use vortex_array::arrays::struct_::StructArray;
 use vortex_array::validity::Validity;
 use vortex_array::{ArrayRef, IntoArray, VortexSessionExecute};
 
@@ -37,7 +37,7 @@ use crate::common::terms::{get_as_term, parse_graph_name, parse_named_node, pars
 use crate::error::{Result, VortexRdfError};
 use crate::session::VORTEX_SESSION;
 use crate::store::RawQuad;
-use crate::store::array::stamp_is_sorted;
+use crate::store::array::{field_as, stamp_is_sorted};
 use crate::store::schema::{COL_G, COL_O, COL_P, COL_S, PRIMARY_COLUMNS};
 
 pub(crate) mod access;
@@ -262,14 +262,7 @@ fn code_columns(
         .clone()
         .execute::<StructArray>(&mut ctx)
         .map_err(VortexRdfError::Vortex)?;
-    let mut col = |name: &str| -> Result<PrimitiveArray> {
-        struct_arr
-            .unmasked_field_by_name(name)
-            .map_err(VortexRdfError::Vortex)?
-            .clone()
-            .execute::<PrimitiveArray>(&mut ctx)
-            .map_err(VortexRdfError::Vortex)
-    };
+    let mut col = |name: &str| field_as::<PrimitiveArray>(&struct_arr, name, &mut ctx);
     Ok((col(COL_S)?, col(COL_P)?, col(COL_O)?, col(COL_G)?))
 }
 
@@ -501,12 +494,7 @@ pub(crate) fn unique_codes(chunk: &ArrayRef) -> Result<Vec<u32>> {
         .map_err(VortexRdfError::Vortex)?;
     let mut codes: Vec<u32> = Vec::with_capacity(struct_arr.len().saturating_mul(4));
     for name in PRIMARY_COLUMNS {
-        let col = struct_arr
-            .unmasked_field_by_name(name)
-            .map_err(VortexRdfError::Vortex)?
-            .clone()
-            .execute::<PrimitiveArray>(&mut ctx)
-            .map_err(VortexRdfError::Vortex)?;
+        let col = field_as::<PrimitiveArray>(&struct_arr, name, &mut ctx)?;
         codes.extend_from_slice(col.as_slice::<u32>());
     }
     codes.sort_unstable();

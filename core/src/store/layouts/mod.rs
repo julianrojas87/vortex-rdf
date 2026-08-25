@@ -22,7 +22,7 @@
 use std::sync::Arc;
 
 use oxrdf::{GraphName, NamedNode, NamedOrBlankNode, Quad, Term};
-use vortex_array::arrays::struct_::{StructArray, StructArrayExt};
+use vortex_array::arrays::struct_::StructArray;
 use vortex_array::arrays::{PrimitiveArray, VarBinViewArray};
 use vortex_array::dtype::{DType, PType};
 use vortex_array::scalar::Scalar;
@@ -31,7 +31,7 @@ use vortex_array::{ArrayRef, VortexSessionExecute};
 use crate::error::{Result, VortexRdfError};
 use crate::session::VORTEX_SESSION;
 use crate::store::RawQuad;
-use crate::store::array::StrColReader;
+use crate::store::array::{StrColReader, field_as};
 
 pub(crate) mod default;
 pub(crate) mod dictionary;
@@ -789,12 +789,7 @@ impl ResolvedLayout {
 /// Read a UTF-8 string column into owned term strings, one per row.
 fn read_string_column(struct_arr: &StructArray, name: &str) -> Result<Vec<String>> {
     let mut ctx = VORTEX_SESSION.create_execution_ctx();
-    let col = struct_arr
-        .unmasked_field_by_name(name)
-        .map_err(VortexRdfError::Vortex)?
-        .clone()
-        .execute::<VarBinViewArray>(&mut ctx)
-        .map_err(VortexRdfError::Vortex)?;
+    let col = field_as::<VarBinViewArray>(struct_arr, name, &mut ctx)?;
     let reader = StrColReader::new(&col);
     (0..col.len())
         .map(|i| reader.str_at(i).map(str::to_string))
@@ -804,11 +799,6 @@ fn read_string_column(struct_arr: &StructArray, name: &str) -> Result<Vec<String
 /// Read a u32 code column into owned codes, one per row.
 fn read_u32_column(struct_arr: &StructArray, name: &str) -> Result<Vec<u32>> {
     let mut ctx = VORTEX_SESSION.create_execution_ctx();
-    let col = struct_arr
-        .unmasked_field_by_name(name)
-        .map_err(VortexRdfError::Vortex)?
-        .clone()
-        .execute::<PrimitiveArray>(&mut ctx)
-        .map_err(VortexRdfError::Vortex)?;
+    let col = field_as::<PrimitiveArray>(struct_arr, name, &mut ctx)?;
     Ok(col.as_slice::<u32>().to_vec())
 }

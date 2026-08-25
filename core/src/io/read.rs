@@ -10,21 +10,28 @@
 use std::future::Future;
 
 use futures::StreamExt as _;
-use vortex_array::arrays::ChunkedArray;
-use vortex_array::{ArrayRef, IntoArray};
+use vortex_array::ArrayRef;
 use vortex_error::VortexResult;
 
 use crate::error::{Result, VortexRdfError};
+use crate::store::array::chunked_or_single;
 
-/// How many per-split futures [`collect_scan`] keeps in flight. The host's
-/// available parallelism, read once (the syscall is not free on repeated
-/// paths); 1 on targets that cannot answer — wasm's buffer-backed segment
-/// reads resolve synchronously, so extra width would buy nothing there.
-static SCAN_CONCURRENCY: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+/// The host's available parallelism, read once; 1 on targets that cannot
+/// answer (wasm). Read by [`collect_scan`] for its in-flight split count and
+/// exposed through [`available_parallelism`] to the store's scan and serve
+/// split loops.
+static AVAILABLE_PARALLELISM: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
     std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1)
 });
+
+/// The host's available parallelism — how many workers a scan's per-split
+/// tasks can spread over.
+#[cfg(feature = "file-io")]
+pub(crate) fn available_parallelism() -> usize {
+    *AVAILABLE_PARALLELISM
+}
 
 /// Drive a scan's per-split futures inline and assemble the chunks into one
 /// array — the shared tail of [`scan_all`] and [`scan_all_reader`].
@@ -36,25 +43,14 @@ async fn collect_scan<F>(dtype: vortex_array::dtype::DType, tasks: Vec<F>) -> Re
 where
     F: Future<Output = VortexResult<Option<ArrayRef>>>,
 {
-    let mut results = futures::stream::iter(tasks).buffered(*SCAN_CONCURRENCY);
+    let mut results = futures::stream::iter(tasks).buffered(*AVAILABLE_PARALLELISM);
     let mut chunks = Vec::new();
     while let Some(chunk) = results.next().await {
         if let Some(chunk) = chunk.map_err(VortexRdfError::Vortex)? {
             chunks.push(chunk);
         }
     }
-    match chunks.len() {
-        0 => Ok(ChunkedArray::try_new(vec![], dtype)
-            .map_err(VortexRdfError::Vortex)?
-            .into_array()),
-        1 => Ok(chunks.pop().expect("length checked above")),
-        _ => {
-            let dtype = chunks[0].dtype().clone();
-            Ok(ChunkedArray::try_new(chunks, dtype)
-                .map_err(VortexRdfError::Vortex)?
-                .into_array())
-        }
-    }
+    chunked_or_single(chunks, dtype)
 }
 
 /// Materialize a whole file by driving its scan's per-split futures inline.

@@ -49,7 +49,7 @@ use selection::{RowSelection, ViewSelection};
 use std::iter;
 use std::sync::Arc;
 
-use vortex_array::arrays::{StructArray, VarBinViewArray};
+use vortex_array::arrays::StructArray;
 use vortex_array::dtype::FieldNames;
 use vortex_array::validity::Validity;
 use vortex_array::{ArrayRef, IntoArray};
@@ -257,7 +257,7 @@ impl VortexRdfStore {
     #[cfg(all(test, feature = "file-io"))]
     pub(crate) fn debug_base_subject_sorted(&self) -> bool {
         match &self.quads {
-            QuadsSource::InMemory { base, .. } => Self::base_subject_sorted(base),
+            QuadsSource::InMemory { base, .. } => array::subject_sorted(base),
             QuadsSource::File { .. } => false,
         }
     }
@@ -329,7 +329,7 @@ impl VortexRdfStore {
     pub fn empty() -> Self {
         // Build one empty string column and reuse it for all four fields —
         // they're all zero-length anyway, so there's nothing to distinguish.
-        let e = VarBinViewArray::from_iter_str(iter::empty::<&str>()).into_array();
+        let e = array::make_string_array(iter::empty::<&str>());
 
         let quads = StructArray::try_new(
             FieldNames::from(schema::PRIMARY_COLUMNS),
@@ -355,31 +355,27 @@ impl VortexRdfStore {
         }
     }
 
-    /// Derive a view over this store's base, narrowed to `selection`.
+    /// An empty view of this store: same base (and tail), selecting no row of
+    /// either.
     ///
-    /// The base and the index set carry over untouched: `selection` names base
-    /// row ids, so nothing the indexes know has been invalidated, and the rows
-    /// outside the selection remain reachable. The tail carries over as-is
-    /// (its own selection is tail-local and untouched by a base narrowing);
-    /// `match_pattern` narrows it separately.
-    fn with_selection(&self, selection: RowSelection) -> Self {
+    /// Scans over it plan no work and `size()` answers 0 without touching the
+    /// data. Indexes and components are dropped: chained matches on an empty
+    /// view would otherwise run pointless lookups just to intersect with
+    /// nothing. No serve plan carries across — a plan is only valid while its
+    /// row run is exactly the selection.
+    fn empty_view(&self) -> Self {
         let quads = match &self.quads {
             QuadsSource::InMemory {
                 base,
-                components,
                 deleted,
                 probes,
                 ..
             } => QuadsSource::InMemory {
                 base: base.clone(),
-                selection: ViewSelection::Exact(selection),
-                // Shared, not rebuilt: the narrowed view's rows are still base
-                // row ids, exactly what the components' `rid` columns address.
-                components: Arc::clone(components),
+                selection: ViewSelection::Exact(RowSelection::empty()),
+                components: Arc::from(Vec::new()),
                 deleted: deleted.clone(),
                 probes: Arc::clone(probes),
-                // A re-selection breaks the serve plan's "row run is exactly the
-                // selection" invariant, so it never carries across (as for File).
                 serve: None,
             },
             #[cfg(feature = "file-io")]
@@ -395,40 +391,22 @@ impl VortexRdfStore {
                 dict_max_resident_bytes: *dict_max_resident_bytes,
                 file: file.clone(),
                 filter: filter.clone(),
-                selection: ViewSelection::Exact(selection),
+                selection: ViewSelection::Exact(RowSelection::empty()),
                 deleted: deleted.clone(),
-                // A different selection breaks the serve plan's "filter selects
-                // exactly the selection's rows" invariant, so it never carries
-                // across a re-selection.
                 serve: None,
             },
         };
+        let tail = self.tail.as_ref().map(|tail| Tail {
+            rows: tail.rows.clone(),
+            selection: RowSelection::empty(),
+            deleted: tail.deleted.clone(),
+        });
         Self {
             layout: self.layout.clone(),
-            indexes: self.indexes.clone(),
+            indexes: vec![],
             quads,
-            tail: self.tail.clone(),
+            tail,
         }
-    }
-
-    /// An empty view of this store: same base (and tail), selecting no row of
-    /// either.
-    ///
-    /// Scans over it plan no work and `size()` answers 0 without touching the
-    /// data. Indexes are dropped: chained matches on an empty view would
-    /// otherwise run pointless lookups just to intersect with nothing.
-    fn empty_view(&self) -> Self {
-        let mut view = self.with_selection(RowSelection::empty());
-        view.indexes = vec![];
-        // Without the file backend the in-memory arm is the only variant.
-        #[cfg_attr(not(feature = "file-io"), allow(irrefutable_let_patterns))]
-        if let QuadsSource::InMemory { components, .. } = &mut view.quads {
-            *components = Arc::from(Vec::new());
-        }
-        if let Some(tail) = &mut view.tail {
-            tail.selection = RowSelection::empty();
-        }
-        view
     }
 
     /// The layout the tail's rows are stored in: the store's own, except under
@@ -443,11 +421,6 @@ impl VortexRdfStore {
     }
 
     // ── ownership & compaction policy ────────────────────────────────────────
-
-    /// The secondary indexes this store's schema carries.
-    pub fn indexes(&self) -> &[IndexType] {
-        &self.indexes
-    }
 
     /// Number of physical rows in the append tail (including any tombstoned
     /// since they were appended); `0` when nothing has been appended or the
@@ -523,6 +496,11 @@ impl VortexRdfStore {
 
     // ── accessors ─────────────────────────────────────────────────────────────
 
+    /// The secondary indexes this store's schema carries.
+    pub fn indexes(&self) -> &[IndexType] {
+        &self.indexes
+    }
+
     pub fn layout(&self) -> LayoutStrategy {
         // Report the build-time strategy tag regardless of whether extra
         // state (like the Dictionary layout's term dictionary) is attached.
@@ -562,7 +540,7 @@ impl VortexRdfStore {
     ///   appended term has no code in the sorted dictionary), so a tailed
     ///   view's rows are not fully code-addressable and gathering them
     ///   re-encodes against a fresh dictionary this handle would not be (see
-    ///   [`get_quads_array`](Self::get_quads_array)'s contract);
+    ///   `selected_rows`'s contract);
     /// - a resident dictionary — a file-backed one has no in-memory snapshot
     ///   to hand out.
     ///

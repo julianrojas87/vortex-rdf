@@ -15,11 +15,12 @@ use super::spill::{
 };
 use super::{
     BuiltArray, BuiltStream, ChunkStream, DEFAULT_CHUNK_SIZE, VortexArrayBuilder, assemble_chunks,
-    build_struct_array, canonicalize_sorted, into_vortex_error, make_empty_struct,
+    build_struct_array, into_vortex_error, make_empty_struct,
 };
 use crate::error::{Result, VortexRdfError};
 use crate::io::container::NativeComponentWrite;
 use crate::store::RawQuad;
+use crate::store::array::{chunked_or_single, with_subject_stamp};
 use crate::store::indexes::secondary_by_copy::{self, out_of_core::CopyKey};
 use crate::store::indexes::{IndexComponent, IndexType, Indexes, known_component, unique_indexes};
 use crate::store::layouts::dictionary::{TermDictionary, TermDictionaryBuilder};
@@ -38,7 +39,7 @@ use std::sync::Arc;
 
 use vortex_array::ArrayRef;
 use vortex_array::arrays::StructArray;
-use vortex_array::{IntoArray, dtype::DType};
+use vortex_array::dtype::DType;
 
 /// Out-of-core globally sorted Vortex RDF Array Builder.
 ///
@@ -132,22 +133,14 @@ pub(crate) async fn build_sorted_stream_array(
         let Some(known) = known_component(&component.descriptor.implementation) else {
             continue;
         };
-        let mut arrays: Vec<ArrayRef> = component
+        let arrays: Vec<ArrayRef> = component
             .source
             .open()
             .map_err(VortexRdfError::Vortex)?
             .try_collect()
             .await
             .map_err(VortexRdfError::Vortex)?;
-        let part = match arrays.len() {
-            1 => arrays.pop().expect("length checked above"),
-            _ => {
-                let dtype = component.descriptor.dtype.clone();
-                vortex_array::arrays::ChunkedArray::try_new(arrays, dtype)
-                    .map_err(VortexRdfError::Vortex)?
-                    .into_array()
-            }
-        };
+        let part = chunked_or_single(arrays, component.descriptor.dtype.clone())?;
         let array = part
             .execute::<StructArray>(&mut ctx)
             .map_err(VortexRdfError::Vortex)?;
@@ -162,7 +155,7 @@ pub(crate) async fn build_sorted_stream_array(
     // Correct by construction for this builder: every emission is a window
     // of the global merge, so the s column is globally sorted — the stamp
     // the store's adoption reads back.
-    let result = canonicalize_sorted(assembled)?;
+    let result = with_subject_stamp(assembled, true)?;
     log::debug!(
         "[SortedStreamBuilder] Materialized {} quads in {:?}",
         result.len(),

@@ -5,6 +5,7 @@ use crate::error::{Result, VortexRdfError};
 use crate::session::VORTEX_SESSION;
 use crate::store::QuadsSource;
 use crate::store::RawQuad;
+use crate::store::array::{chunked_or_single, field_as, subject_sorted, with_subject_stamp};
 use crate::store::layouts::dictionary::TermDictionary;
 use crate::store::layouts::{LayoutStrategy, ResolvedLayout, dictionary};
 #[cfg(feature = "file-io")]
@@ -14,8 +15,8 @@ use crate::store::schema;
 use crate::store::selection::{RowSelection, ViewSelection};
 
 use vortex_array::arrays::struct_::StructArrayExt;
-use vortex_array::arrays::{ChunkedArray, PrimitiveArray, StructArray};
-use vortex_array::{ArrayRef, IntoArray, VortexSessionExecute};
+use vortex_array::arrays::{PrimitiveArray, StructArray};
+use vortex_array::{ArrayRef, VortexSessionExecute};
 use vortex_buffer::Buffer;
 
 #[cfg(feature = "file-io")]
@@ -127,44 +128,33 @@ impl VortexRdfStore {
         Ok(base + tail)
     }
 
-    /// Gather the rows this view selects into a single in-memory StructArray
-    /// of primary columns only — index components never ride in the returned
-    /// array (in memory they live beside the base, on disk as index children;
+    /// The rows this view selects, base and tail combined, as a single
+    /// in-memory array of primary columns only — the rows-only counterpart
+    /// of serialization's `selected_parts`: no index components are
+    /// materialized, rebuilt, or split off, because none ride in the result
+    /// (in memory they live beside the base, on disk as index children;
     /// serialize through [`to_serializable_parts`](Self::to_serializable_parts)
     /// to get them beside the rows).
-    ///
-    /// On a Dictionary view with a non-empty append tail the returned codes
-    /// address a *fresh* dictionary (the tail's terms are not in the cached
-    /// one) that this method cannot hand out — decode such views through
-    /// [`quads`](Self::quads)/[`quads_vec`](Self::quads_vec), or serialize
-    /// them via [`to_serializable_parts`](Self::to_serializable_parts), which
-    /// returns the dictionary beside the rows. Without a tail — tombstoned or
-    /// not — Dictionary codes always address the cached dictionary
-    /// ([`code_read_snapshot`](Self::code_read_snapshot) hands it out).
-    pub async fn get_quads_array(&self) -> Result<ArrayRef> {
-        self.selected_rows().await
-    }
-
-    /// The rows this view selects, base and tail combined — the rows-only
-    /// counterpart of serialization's `selected_parts`: no index components
-    /// are materialized, rebuilt, or split off, because none ride in the
-    /// result.
     ///
     /// Without a tail the base's selected live rows are the whole answer, in
     /// the store's own vocabulary: under the Dictionary layout a tombstone
     /// never re-encodes, so the codes stay addressed to the cached dictionary
-    /// the caller can actually obtain. With a tail the layouts diverge:
+    /// ([`code_read_snapshot`](Self::code_read_snapshot) hands it out). With
+    /// a tail the layouts diverge:
     /// - a Dictionary view must re-encode base and tail together against a
-    ///   fresh dictionary (the tail's terms have no codes in the cached one —
-    ///   see [`get_quads_array`](Self::get_quads_array)'s contract);
+    ///   *fresh* dictionary (the tail's terms have no codes in the cached one)
+    ///   that this method cannot hand out — decode such views through
+    ///   [`quads`](Self::quads)/[`quads_vec`](Self::quads_vec), or serialize
+    ///   them via [`to_serializable_parts`](Self::to_serializable_parts),
+    ///   which returns the dictionary beside the rows;
     /// - every other layout stores the tail in the base's own vocabulary, so
     ///   the two chunk together with no decode at all.
-    async fn selected_rows(&self) -> Result<ArrayRef> {
+    pub(crate) async fn selected_rows(&self) -> Result<ArrayRef> {
         let base = self.base_selected_rows().await?;
         let Some(tail) = &self.tail else {
             return Ok(base);
         };
-        let tail_rows = gather_live(&tail.rows, &tail.selection, tail.deleted.as_ref(), None)?;
+        let tail_rows = tail.live_rows()?;
         match &self.layout {
             ResolvedLayout::Dictionary(_) => {
                 let mut raws = self.base_raw_quads(&base).await?;
@@ -181,9 +171,7 @@ impl VortexRdfStore {
                 // The tail is a second chunk in the base's own vocabulary —
                 // no raws decode, no rebuild.
                 let dtype = base.dtype().clone();
-                Ok(ChunkedArray::try_new(vec![base, tail_rows], dtype)
-                    .map_err(VortexRdfError::Vortex)?
-                    .into_array())
+                chunked_or_single(vec![base, tail_rows], dtype)
             }
         }
     }
@@ -197,7 +185,7 @@ impl VortexRdfStore {
     /// a non-Dictionary layout, a non-empty append tail (its strings are not
     /// in the cached dictionary), a file-backed source, or base columns not
     /// reachable as canonical non-nullable u32 primitives (e.g. chunked or
-    /// wire-compressed). Callers fall back to [`Self::get_quads_array`].
+    /// wire-compressed). Callers fall back to `selected_rows`.
     ///
     /// A builder-compressed column behind a `vortex.shared` wrapper still
     /// qualifies: its canonical primitive is materialized once into the
@@ -298,7 +286,7 @@ impl VortexRdfStore {
     /// does not apply.
     ///
     /// The fallback is the full read pipeline —
-    /// [`get_quads_array`](Self::get_quads_array), canonicalize, then one
+    /// `selected_rows`, canonicalize, then one
     /// primitive column per role — so a file-backed store, a narrowed view
     /// whose base columns are chunked, or any other non-canonical shape still
     /// answers codes. Only the cases where codes are not the store's
@@ -321,14 +309,7 @@ impl VortexRdfStore {
             .execute::<StructArray>(&mut ctx)
             .map_err(VortexRdfError::Vortex)?;
         let column = |name: &str, ctx: &mut vortex_array::ExecutionCtx| -> Result<Buffer<u32>> {
-            let col = struct_arr
-                .unmasked_field_by_name(name)
-                .map_err(VortexRdfError::Vortex)?;
-            let prim = col
-                .clone()
-                .execute::<PrimitiveArray>(ctx)
-                .map_err(VortexRdfError::Vortex)?;
-            Ok(prim.into_buffer::<u32>())
+            Ok(field_as::<PrimitiveArray>(&struct_arr, name, ctx)?.into_buffer::<u32>())
         };
         Ok(Some([
             column(schema::COL_S, &mut ctx)?,
@@ -366,7 +347,7 @@ impl VortexRdfStore {
                     // the base's own provenance.
                     _ => {
                         let rows = gather_live(base, &selection, deleted.as_ref(), Some(probes))?;
-                        Self::with_subject_stamp(rows, Self::base_subject_sorted(base))
+                        with_subject_stamp(rows, subject_sorted(base))
                     }
                 }
             }
@@ -393,7 +374,7 @@ impl VortexRdfStore {
                 )
                 .await?
                 {
-                    return Self::with_subject_stamp(rows, file.quads_sorted());
+                    return with_subject_stamp(rows, file.quads_sorted());
                 }
                 let scan =
                     self.restricted_file_scan(file, filter.as_ref(), &selection, deleted.as_ref())?;
@@ -412,7 +393,7 @@ impl VortexRdfStore {
                 // it, a re-serialization would demote the file to
                 // quads_sorted:false and every later reader would lose the
                 // subject binary search.
-                Self::with_subject_stamp(arr, file.quads_sorted())
+                with_subject_stamp(arr, file.quads_sorted())
             }
         }
     }
@@ -451,36 +432,6 @@ impl VortexRdfStore {
         Ok(selection.restrict_scan(scan, deleted))
     }
 
-    /// Whether an in-memory base's `s` column carries the sorted stamp.
-    pub(super) fn base_subject_sorted(base: &ArrayRef) -> bool {
-        base.clone()
-            .try_downcast::<vortex_array::arrays::Struct>()
-            .ok()
-            .and_then(|s| {
-                s.unmasked_field_by_name(schema::COL_S)
-                    .ok()
-                    .map(crate::store::array::column_is_sorted)
-            })
-            .unwrap_or(false)
-    }
-
-    /// Canonicalize `rows` and restore the subject sorted stamp when the
-    /// caller's provenance says the rows are globally `s`-sorted. A no-op
-    /// pass-through when they are not.
-    pub(super) fn with_subject_stamp(rows: ArrayRef, sorted: bool) -> Result<ArrayRef> {
-        if !sorted {
-            return Ok(rows);
-        }
-        let mut ctx = VORTEX_SESSION.create_execution_ctx();
-        let struct_arr = rows
-            .execute::<StructArray>(&mut ctx)
-            .map_err(VortexRdfError::Vortex)?;
-        if let Ok(col) = struct_arr.unmasked_field_by_name(schema::COL_S) {
-            crate::store::array::stamp_is_sorted(col);
-        }
-        Ok(struct_arr.into_array())
-    }
-
     /// The base rows decoded to raw quads, through the async path when the
     /// dictionary is file-backed (only possible on a file-io build).
     pub(super) async fn base_raw_quads(&self, rows: &ArrayRef) -> Result<Vec<RawQuad>> {
@@ -501,8 +452,7 @@ impl VortexRdfStore {
             .base_raw_quads(&self.base_selected_rows().await?)
             .await?;
         if let Some(tail) = &self.tail {
-            let rows = gather_live(&tail.rows, &tail.selection, tail.deleted.as_ref(), None)?;
-            raws.extend(self.tail_layout().raw_quads(&rows)?);
+            raws.extend(self.tail_layout().raw_quads(&tail.live_rows()?)?);
         }
         Ok(raws)
     }
