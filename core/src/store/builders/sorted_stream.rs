@@ -20,8 +20,7 @@ use super::{
 use crate::error::{Result, VortexRdfError};
 use crate::io::container::NativeComponentWrite;
 use crate::store::RawQuad;
-use crate::store::array::stamp_is_sorted;
-use crate::store::indexes::secondary_by_copy::{self, CopyKey};
+use crate::store::indexes::secondary_by_copy::{self, out_of_core::CopyKey};
 use crate::store::indexes::{IndexComponent, IndexType, Indexes, known_component, unique_indexes};
 use crate::store::layouts::dictionary::{TermDictionary, TermDictionaryBuilder};
 use crate::store::layouts::{LayoutStrategy, dictionary};
@@ -39,7 +38,6 @@ use std::sync::Arc;
 
 use vortex_array::ArrayRef;
 use vortex_array::arrays::StructArray;
-use vortex_array::validity::Validity;
 use vortex_array::{IntoArray, dtype::DType};
 
 /// Out-of-core globally sorted Vortex RDF Array Builder.
@@ -571,16 +569,6 @@ fn read_merged_batch(merged: &mut Run<RawQuad>, n: usize) -> Result<Vec<RawQuad>
     Ok(buf)
 }
 
-/// Build one primary-columns chunk from merged quads (globally s-sorted).
-fn build_presorted_chunk(quads: &[RawQuad], layout: LayoutStrategy) -> Result<ArrayRef> {
-    let names = layout.field_names();
-    let arrays = layout.build_columns(quads)?;
-    stamp_is_sorted(&arrays[0]); // merge output is globally s-sorted
-    StructArray::try_new(names.into(), arrays, quads.len(), Validity::NonNullable)
-        .map_err(VortexRdfError::Vortex)
-        .map(|a| a.into_array())
-}
-
 /// A window of one copy family's merged entries, as one child chunk.
 type CopyChunkFn<V> = fn(secondary_by_copy::Family, &[(CopyKey<V>, u32)]) -> Result<ArrayRef>;
 /// A window of one reference component's merged pairs, as one child chunk.
@@ -718,16 +706,16 @@ fn emit_presorted_chunks(
         spilled,
         chunk_size,
         &guard,
-        secondary_by_copy::copy_child_dtype(false),
-        crate::store::indexes::secondary_by_reference::ref_child_dtype(false),
-        secondary_by_copy::copy_child_chunk_strings,
-        crate::store::indexes::secondary_by_reference::ref_child_chunk_strings,
+        secondary_by_copy::out_of_core::copy_child_dtype(false),
+        crate::store::indexes::secondary_by_reference::out_of_core::ref_child_dtype(false),
+        secondary_by_copy::out_of_core::copy_child_chunk_strings,
+        crate::store::indexes::secondary_by_reference::out_of_core::ref_child_chunk_strings,
     )?;
     let buf = read_merged_batch(&mut merged, chunk_size)?;
     let first = if buf.is_empty() {
         make_empty_struct(layout)?
     } else {
-        build_presorted_chunk(&buf, layout)?
+        build_struct_array(&buf, layout, true)?
     };
     let dtype = first.dtype().clone();
 
@@ -739,7 +727,7 @@ fn emit_presorted_chunks(
                 if buf.is_empty() {
                     return Ok(None);
                 }
-                build_presorted_chunk(&buf, layout).map(Some)
+                build_struct_array(&buf, layout, true).map(Some)
             })();
             match chunk {
                 Ok(None) => None,
@@ -767,10 +755,10 @@ fn emit_presorted_dict_chunks(
         spilled,
         chunk_size,
         &guard,
-        secondary_by_copy::copy_child_dtype(true),
-        crate::store::indexes::secondary_by_reference::ref_child_dtype(true),
-        secondary_by_copy::copy_child_chunk_codes,
-        crate::store::indexes::secondary_by_reference::ref_child_chunk_codes,
+        secondary_by_copy::out_of_core::copy_child_dtype(true),
+        crate::store::indexes::secondary_by_reference::out_of_core::ref_child_dtype(true),
+        secondary_by_copy::out_of_core::copy_child_chunk_codes,
+        crate::store::indexes::secondary_by_reference::out_of_core::ref_child_chunk_codes,
     )?;
     let buf = read_merged_batch(&mut merged, chunk_size)?;
     let first = if buf.is_empty() {

@@ -99,7 +99,7 @@ pub(crate) fn unsupported_file_error(file: &vortex_file::VortexFile) -> VortexRd
 /// evaluation over the store shares one reader tree, so zone-map stats tables
 /// are read and decoded once and per-expression pruning masks are reused across data access calls.
 #[cfg(feature = "file-io")]
-pub async fn open_vortex_file<P: AsRef<std::path::Path>>(
+pub(crate) async fn open_vortex_file<P: AsRef<std::path::Path>>(
     path: P,
 ) -> Result<vortex_file::VortexFile> {
     use vortex_file::OpenOptionsSessionExt;
@@ -108,5 +108,5 @@ pub async fn open_vortex_file<P: AsRef<std::path::Path>>(
         .with_layout_reader_cache()
         .open_path(path)
         .await
-        .map_err(VortexRdfError::from)
+        .map_err(VortexRdfError::Vortex)
 }

@@ -39,8 +39,8 @@ pub(crate) mod write;
 /// new versioned id, not a silent reinterpretation.
 pub(crate) const STORE_LAYOUT_ID: &str = "vortex-rdf.store.v1";
 /// The transparent quad table is always child 0.
-pub(crate) const QUAD_SOURCE_CHILD: usize = 0;
-pub(crate) const QUAD_SOURCE_NAME: &str = "quad-source";
+const QUAD_SOURCE_CHILD: usize = 0;
+const QUAD_SOURCE_NAME: &str = "quad-source";
 /// Component name of the term dictionary child.
 pub(crate) const DICT_COMPONENT_NAME: &str = "dictionary";
 /// Implementation slug of the dictionary child: the lexicographically sorted
@@ -65,24 +65,13 @@ pub(crate) use write::{dict_child_strategy, write_store};
 
 #[cfg(test)]
 mod tests {
-    #[cfg(any(feature = "file-io", target_arch = "wasm32"))]
-    use std::sync::Arc;
-
-    #[cfg(any(feature = "file-io", target_arch = "wasm32"))]
-    use super::layout::is_native_root;
     use super::wire::{decode_store_metadata, encode_store_metadata};
     use super::*;
     use crate::session::VORTEX_SESSION;
     use vortex_array::IntoArray;
     use vortex_array::arrays::{StructArray, VarBinViewArray};
     use vortex_array::dtype::{DType, Nullability};
-    #[cfg(any(feature = "file-io", target_arch = "wasm32"))]
-    use vortex_array::stream::{ArrayStreamAdapter, ArrayStreamExt as _};
     use vortex_buffer::Buffer;
-    #[cfg(any(feature = "file-io", target_arch = "wasm32"))]
-    use vortex_buffer::ByteBuffer;
-    #[cfg(any(feature = "file-io", target_arch = "wasm32"))]
-    use vortex_file::OpenOptionsSessionExt as _;
     use vortex_layout::VTable;
 
     fn quad_chunk(base: u32, rows: u32) -> vortex_array::ArrayRef {
@@ -166,129 +155,140 @@ mod tests {
         assert!(d.validate().is_err(), "non-struct dtype must be rejected");
     }
 
+    /// The write-side round trips, compiled only where a store can be
+    /// written (natively behind `file-io`, and on wasm).
     #[cfg(any(feature = "file-io", target_arch = "wasm32"))]
-    #[tokio::test]
-    async fn quads_only_root_round_trips_scan() {
-        let chunks = vec![quad_chunk(0, 4), quad_chunk(4, 3)];
-        let dtype = chunks[0].dtype().clone();
-        let stream = ArrayStreamAdapter::new(
-            dtype.clone(),
-            futures::stream::iter(chunks.into_iter().map(Ok)),
-        );
-        let mut bytes: Vec<u8> = Vec::new();
-        let summary = write_store(
-            &VORTEX_SESSION,
-            &mut bytes,
-            stream,
-            default_child_strategy(),
-            false,
-            Vec::new(),
-        )
-        .await
-        .unwrap();
-        assert!(is_native_root(summary.footer().layout()));
+    mod write_tests {
+        use std::sync::Arc;
 
-        let file = VORTEX_SESSION
-            .open_options()
-            .open_buffer(ByteBuffer::from(bytes))
-            .unwrap();
-        assert!(is_native_file(&file));
-        let root = file.footer().layout();
-        assert_eq!(
-            root.child_names().collect::<Vec<_>>(),
-            vec![Arc::<str>::from(QUAD_SOURCE_NAME)]
-        );
-        assert_eq!(file.row_count(), 7);
-        assert_eq!(file.dtype(), &dtype);
+        use super::super::layout::is_native_root;
+        use super::*;
+        use vortex_array::stream::{ArrayStreamAdapter, ArrayStreamExt as _};
+        use vortex_buffer::ByteBuffer;
+        use vortex_file::OpenOptionsSessionExt as _;
 
-        let rows = file
-            .scan()
-            .unwrap()
-            .into_array_stream()
-            .unwrap()
-            .read_all()
+        #[tokio::test]
+        async fn quads_only_root_round_trips_scan() {
+            let chunks = vec![quad_chunk(0, 4), quad_chunk(4, 3)];
+            let dtype = chunks[0].dtype().clone();
+            let stream = ArrayStreamAdapter::new(
+                dtype.clone(),
+                futures::stream::iter(chunks.into_iter().map(Ok)),
+            );
+            let mut bytes: Vec<u8> = Vec::new();
+            let summary = write_store(
+                &VORTEX_SESSION,
+                &mut bytes,
+                stream,
+                default_child_strategy(),
+                false,
+                Vec::new(),
+            )
             .await
             .unwrap();
-        assert_eq!(rows.len(), 7);
-        assert_eq!(rows.dtype(), &dtype);
-    }
+            assert!(is_native_root(summary.footer().layout()));
 
-    #[cfg(any(feature = "file-io", target_arch = "wasm32"))]
-    #[tokio::test]
-    async fn dictionary_component_shares_file_and_scans_independently() {
-        let quads = vec![quad_chunk(0, 5)];
-        let dict_chunks = vec![dict_chunk(&["a", "b"]), dict_chunk(&["c"])];
-        let dict_dtype = dict_chunks[0].dtype().clone();
-        let dtype = quads[0].dtype().clone();
+            let file = VORTEX_SESSION
+                .open_options()
+                .open_buffer(ByteBuffer::from(bytes))
+                .unwrap();
+            assert!(is_native_file(&file));
+            let root = file.footer().layout();
+            assert_eq!(
+                root.child_names().collect::<Vec<_>>(),
+                vec![Arc::<str>::from(QUAD_SOURCE_NAME)]
+            );
+            assert_eq!(file.row_count(), 7);
+            assert_eq!(file.dtype(), &dtype);
 
-        let component = NativeComponentWrite::new(
-            dict_descriptor(dict_dtype.clone()),
-            Arc::new(ReplayableArraySource::try_new(dict_chunks).unwrap()),
-            default_child_strategy(),
-        )
-        .unwrap();
-
-        let stream = ArrayStreamAdapter::new(
-            dtype.clone(),
-            futures::stream::iter(quads.into_iter().map(Ok)),
-        );
-        let mut bytes: Vec<u8> = Vec::new();
-        write_store(
-            &VORTEX_SESSION,
-            &mut bytes,
-            stream,
-            default_child_strategy(),
-            false,
-            vec![component],
-        )
-        .await
-        .unwrap();
-
-        let file = VORTEX_SESSION
-            .open_options()
-            .open_buffer(ByteBuffer::from(bytes))
-            .unwrap();
-        let root = file.footer().layout();
-        assert_eq!(
-            root.child_names().collect::<Vec<_>>(),
-            vec![
-                Arc::<str>::from(QUAD_SOURCE_NAME),
-                Arc::<str>::from(DICT_COMPONENT_NAME)
-            ]
-        );
-        // The root reads as the quad table…
-        assert_eq!(file.row_count(), 5);
-        assert_eq!(file.dtype(), &dtype);
-
-        // …while the dictionary child scans independently.
-        let typed = root.as_::<RdfStoreLayoutVTable>();
-        let (descriptor, child) = store_component(typed, DICT_COMPONENT_NAME)
-            .unwrap()
-            .unwrap();
-        assert_eq!(descriptor.role, StoreComponentRole::Dictionary);
-        assert_eq!(child.row_count(), 3);
-        assert_eq!(child.dtype(), &dict_dtype);
-        assert!(
-            subtree_bytes(&child, file.footer().segment_map()).unwrap() > 0,
-            "dict child must own segment bytes"
-        );
-
-        let reader = child
-            .new_reader(
-                DICT_COMPONENT_NAME.into(),
-                file.segment_source(),
-                file.session(),
-                &Default::default(),
-            )
-            .unwrap();
-        let terms =
-            vortex_layout::scan::scan_builder::ScanBuilder::new(file.session().clone(), reader)
+            let rows = file
+                .scan()
+                .unwrap()
                 .into_array_stream()
                 .unwrap()
                 .read_all()
                 .await
                 .unwrap();
-        assert_eq!(terms.len(), 3);
-        assert_eq!(terms.dtype(), &dict_dtype);
+            assert_eq!(rows.len(), 7);
+            assert_eq!(rows.dtype(), &dtype);
+        }
+
+        #[tokio::test]
+        async fn dictionary_component_shares_file_and_scans_independently() {
+            let quads = vec![quad_chunk(0, 5)];
+            let dict_chunks = vec![dict_chunk(&["a", "b"]), dict_chunk(&["c"])];
+            let dict_dtype = dict_chunks[0].dtype().clone();
+            let dtype = quads[0].dtype().clone();
+
+            let component = NativeComponentWrite::new(
+                dict_descriptor(dict_dtype.clone()),
+                Arc::new(ReplayableArraySource::try_new(dict_chunks).unwrap()),
+                default_child_strategy(),
+            )
+            .unwrap();
+
+            let stream = ArrayStreamAdapter::new(
+                dtype.clone(),
+                futures::stream::iter(quads.into_iter().map(Ok)),
+            );
+            let mut bytes: Vec<u8> = Vec::new();
+            write_store(
+                &VORTEX_SESSION,
+                &mut bytes,
+                stream,
+                default_child_strategy(),
+                false,
+                vec![component],
+            )
+            .await
+            .unwrap();
+
+            let file = VORTEX_SESSION
+                .open_options()
+                .open_buffer(ByteBuffer::from(bytes))
+                .unwrap();
+            let root = file.footer().layout();
+            assert_eq!(
+                root.child_names().collect::<Vec<_>>(),
+                vec![
+                    Arc::<str>::from(QUAD_SOURCE_NAME),
+                    Arc::<str>::from(DICT_COMPONENT_NAME)
+                ]
+            );
+            // The root reads as the quad table…
+            assert_eq!(file.row_count(), 5);
+            assert_eq!(file.dtype(), &dtype);
+
+            // …while the dictionary child scans independently.
+            let typed = root.as_::<RdfStoreLayoutVTable>();
+            let (descriptor, child) = store_component(typed, DICT_COMPONENT_NAME)
+                .unwrap()
+                .unwrap();
+            assert_eq!(descriptor.role, StoreComponentRole::Dictionary);
+            assert_eq!(child.row_count(), 3);
+            assert_eq!(child.dtype(), &dict_dtype);
+            assert!(
+                subtree_bytes(&child, file.footer().segment_map()).unwrap() > 0,
+                "dict child must own segment bytes"
+            );
+
+            let reader = child
+                .new_reader(
+                    DICT_COMPONENT_NAME.into(),
+                    file.segment_source(),
+                    file.session(),
+                    &Default::default(),
+                )
+                .unwrap();
+            let terms =
+                vortex_layout::scan::scan_builder::ScanBuilder::new(file.session().clone(), reader)
+                    .into_array_stream()
+                    .unwrap()
+                    .read_all()
+                    .await
+                    .unwrap();
+            assert_eq!(terms.len(), 3);
+            assert_eq!(terms.dtype(), &dict_dtype);
+        }
     }
 }

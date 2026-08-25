@@ -57,7 +57,7 @@ pub(crate) const DEFAULT_CHUNK_SIZE: usize = 100_000;
 pub type ChunkStream = stream::BoxStream<'static, vortex_error::VortexResult<ArrayRef>>;
 
 /// Convert a builder error into a `VortexError` for use inside a [`ChunkStream`].
-pub(crate) fn into_vortex_error(e: VortexRdfError) -> vortex_error::VortexError {
+fn into_vortex_error(e: VortexRdfError) -> vortex_error::VortexError {
     match e {
         VortexRdfError::Vortex(v) => v,
         other => vortex_error::vortex_err!("{}", other),
@@ -80,7 +80,7 @@ pub struct BuiltArray {
     /// store's adoption currency
     /// ([`IndexComponent`](crate::store::indexes::IndexComponent)). Empty
     /// exactly when no indexes were requested.
-    pub(crate) components: Vec<crate::store::indexes::IndexComponent>,
+    pub(crate) components: Vec<IndexComponent>,
     pub(crate) dict: Option<Arc<TermDictionary>>,
 }
 
@@ -326,7 +326,7 @@ pub(crate) fn assemble_chunks(
 /// An empty StructArray with the given layout's primary schema. Building from
 /// an empty quad slice yields every column empty but with the correct dtype,
 /// so this is just the regular build path with no rows.
-pub(crate) fn make_empty_struct(layout: LayoutStrategy) -> Result<ArrayRef> {
+fn make_empty_struct(layout: LayoutStrategy) -> Result<ArrayRef> {
     if layout == LayoutStrategy::Dictionary {
         return crate::store::layouts::dictionary::empty_struct();
     }

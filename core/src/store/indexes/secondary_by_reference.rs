@@ -29,12 +29,11 @@ use std::ops::Range;
 
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::struct_::StructArrayExt;
-use vortex_array::dtype::DType;
 use vortex_array::{ArrayRef, IntoArray};
 
 #[cfg(feature = "file-io")]
 use super::FileServePlan;
-use super::components::{child_struct, child_struct_dtype};
+use super::components::child_struct;
 use super::{InMemoryServePlan, IndexResolution, IndexedComponent, ResolvedRowIds, sorted_row_ids};
 use crate::error::{Result, VortexRdfError};
 use crate::store::RawQuad;
@@ -45,48 +44,10 @@ use crate::store::layouts::{PatternCodes, QuadPattern, TermRef};
 pub(crate) const REF_O_COMPONENT: &str = "index:ref-o";
 pub(crate) const REF_P_COMPONENT: &str = "index:ref-p";
 
-/// The persisted child's struct dtype: sorted values (strings, or u32 codes
-/// under the Dictionary layout) plus the u32 primary row id.
-// This and the child-chunk builders below are consumed only by the
-// external-sort builder, compiled out on wasm (see the module gate in
-// `store::builders`).
-#[cfg_attr(all(target_arch = "wasm32", target_os = "unknown"), allow(dead_code))]
-pub(crate) fn ref_child_dtype(encoded: bool) -> DType {
-    use vortex_array::dtype::{Nullability, PType};
-    let val = if encoded {
-        DType::Primitive(PType::U32, Nullability::NonNullable)
-    } else {
-        DType::Utf8(Nullability::NonNullable)
-    };
-    child_struct_dtype(
-        &CHILD_COLUMNS,
-        vec![val, DType::Primitive(PType::U32, Nullability::NonNullable)],
-    )
-}
-
-/// One chunk of a reference component's persisted child from a window of its
-/// merged `(value, row id)` pairs.
-#[cfg_attr(all(target_arch = "wasm32", target_os = "unknown"), allow(dead_code))]
-pub(crate) fn ref_child_chunk_strings(pairs: &[(String, u32)]) -> Result<ArrayRef> {
-    let val = make_string_array(pairs.iter().map(|(v, _)| v.as_str()));
-    stamp_is_sorted(&val);
-    let rid = PrimitiveArray::from_iter(pairs.iter().map(|(_, rid)| *rid)).into_array();
-    child_struct(&CHILD_COLUMNS, vec![val, rid], pairs.len()).map(|a| a.into_array())
-}
-
-/// Code-column variant of [`ref_child_chunk_strings`].
-#[cfg_attr(all(target_arch = "wasm32", target_os = "unknown"), allow(dead_code))]
-pub(crate) fn ref_child_chunk_codes(pairs: &[(u32, u32)]) -> Result<ArrayRef> {
-    let val = PrimitiveArray::from_iter(pairs.iter().map(|(code, _)| *code)).into_array();
-    stamp_is_sorted(&val);
-    let rid = PrimitiveArray::from_iter(pairs.iter().map(|(_, rid)| *rid)).into_array();
-    child_struct(&CHILD_COLUMNS, vec![val, rid], pairs.len()).map(|a| a.into_array())
-}
-
 /// Column names inside a reference component's persisted child.
-pub(crate) const CHILD_COLUMNS: [&str; 2] = ["val", "rid"];
-pub(crate) const CHILD_VAL_COL: &str = "val";
-pub(crate) const CHILD_RID_COL: &str = "rid";
+const CHILD_COLUMNS: [&str; 2] = ["val", "rid"];
+const CHILD_VAL_COL: &str = "val";
+const CHILD_RID_COL: &str = "rid";
 pub(crate) const O_IMPLEMENTATION: &str = "secondary-by-reference/o";
 pub(crate) const P_IMPLEMENTATION: &str = "secondary-by-reference/p";
 
@@ -373,6 +334,54 @@ pub(crate) async fn debug_located_run(
         return Ok(None);
     };
     locate_run(file, probe.role, &native, descriptor.sorted).await
+}
+
+/// The external-sort builder's emission surface: the persisted child dtype
+/// and the child chunks built from windows of merged `(value, row id)`
+/// pairs. Compiled out on wasm with the builder itself (see the module gate
+/// in `store::builders`).
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+pub(crate) mod out_of_core {
+    use vortex_array::arrays::PrimitiveArray;
+    use vortex_array::dtype::DType;
+    use vortex_array::{ArrayRef, IntoArray};
+
+    use super::super::components::{child_struct, child_struct_dtype};
+    use super::CHILD_COLUMNS;
+    use crate::error::Result;
+    use crate::store::array::{make_string_array, stamp_is_sorted};
+
+    /// The persisted child's struct dtype: sorted values (strings, or u32 codes
+    /// under the Dictionary layout) plus the u32 primary row id.
+    pub(crate) fn ref_child_dtype(encoded: bool) -> DType {
+        use vortex_array::dtype::{Nullability, PType};
+        let val = if encoded {
+            DType::Primitive(PType::U32, Nullability::NonNullable)
+        } else {
+            DType::Utf8(Nullability::NonNullable)
+        };
+        child_struct_dtype(
+            &CHILD_COLUMNS,
+            vec![val, DType::Primitive(PType::U32, Nullability::NonNullable)],
+        )
+    }
+
+    /// One chunk of a reference component's persisted child from a window of its
+    /// merged `(value, row id)` pairs.
+    pub(crate) fn ref_child_chunk_strings(pairs: &[(String, u32)]) -> Result<ArrayRef> {
+        let val = make_string_array(pairs.iter().map(|(v, _)| v.as_str()));
+        stamp_is_sorted(&val);
+        let rid = PrimitiveArray::from_iter(pairs.iter().map(|(_, rid)| *rid)).into_array();
+        child_struct(&CHILD_COLUMNS, vec![val, rid], pairs.len()).map(|a| a.into_array())
+    }
+
+    /// Code-column variant of [`ref_child_chunk_strings`].
+    pub(crate) fn ref_child_chunk_codes(pairs: &[(u32, u32)]) -> Result<ArrayRef> {
+        let val = PrimitiveArray::from_iter(pairs.iter().map(|(code, _)| *code)).into_array();
+        stamp_is_sorted(&val);
+        let rid = PrimitiveArray::from_iter(pairs.iter().map(|(_, rid)| *rid)).into_array();
+        child_struct(&CHILD_COLUMNS, vec![val, rid], pairs.len()).map(|a| a.into_array())
+    }
 }
 
 /// The complete dataset's secondary-index columns in global sorted order —

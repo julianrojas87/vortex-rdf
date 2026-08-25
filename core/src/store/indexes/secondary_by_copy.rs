@@ -42,10 +42,9 @@ use std::cmp::Ordering;
 
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::struct_::StructArrayExt;
-use vortex_array::dtype::DType;
 use vortex_array::{ArrayRef, IntoArray};
 
-use super::components::{child_struct, child_struct_dtype};
+use super::components::child_struct;
 use super::{IndexResolution, IndexedComponent, LazyRowIds, ResolvedRowIds};
 use crate::error::{Result, VortexRdfError};
 use crate::store::RawQuad;
@@ -73,10 +72,10 @@ pub(crate) enum Family {
 /// Column names inside a copy family's persisted child: the plain primaries
 /// plus the primary row id. Both families use the same names — the child's
 /// identity is what says which sort order the rows are in.
-pub(crate) const CHILD_COLUMNS: [&str; 5] = ["s", "p", "o", "g", "rid"];
-pub(crate) const CHILD_RID_COL: &str = "rid";
-pub(crate) const POSG_IMPLEMENTATION: &str = "secondary-by-copy/posg";
-pub(crate) const OSPG_IMPLEMENTATION: &str = "secondary-by-copy/ospg";
+const CHILD_COLUMNS: [&str; 5] = ["s", "p", "o", "g", "rid"];
+const CHILD_RID_COL: &str = "rid";
+const POSG_IMPLEMENTATION: &str = "secondary-by-copy/posg";
+const OSPG_IMPLEMENTATION: &str = "secondary-by-copy/ospg";
 
 /// This index's persisted-child role table — one differently-sorted quad
 /// table per family — feeding every generic loop in the hub (the slug
@@ -93,72 +92,6 @@ pub(crate) const ROLES: [super::ComponentRole; 2] = [
         slug: Family::Ospg.component_slug(),
     },
 ];
-
-/// The persisted child's struct dtype: quad components as strings (or u32
-/// codes under the Dictionary layout) plus the u32 primary row id.
-// This and the child-chunk builders below are consumed only by the
-// external-sort builder, compiled out on wasm (see the module gate in
-// `store::builders`).
-#[cfg_attr(all(target_arch = "wasm32", target_os = "unknown"), allow(dead_code))]
-pub(crate) fn copy_child_dtype(encoded: bool) -> DType {
-    use vortex_array::dtype::{Nullability, PType};
-    let term = if encoded {
-        DType::Primitive(PType::U32, Nullability::NonNullable)
-    } else {
-        DType::Utf8(Nullability::NonNullable)
-    };
-    child_struct_dtype(
-        &CHILD_COLUMNS,
-        vec![
-            term.clone(),
-            term.clone(),
-            term.clone(),
-            term,
-            DType::Primitive(PType::U32, Nullability::NonNullable),
-        ],
-    )
-}
-
-/// One chunk of a copy family's persisted child from a window of its merged
-/// `(sort key, row id)` entries — plain child column names, lead stamped.
-#[cfg_attr(all(target_arch = "wasm32", target_os = "unknown"), allow(dead_code))]
-pub(crate) fn copy_child_chunk_strings(
-    family: Family,
-    keys: &[(CopyKey<String>, u32)],
-) -> Result<ArrayRef> {
-    let [s_ix, p_ix, o_ix, g_ix] = family.key_positions();
-    let col = |ix: usize| make_string_array(keys.iter().map(|(key, _)| key.0[ix].as_str()));
-    let columns = vec![
-        col(s_ix),
-        col(p_ix),
-        col(o_ix),
-        col(g_ix),
-        PrimitiveArray::from_iter(keys.iter().map(|(_, rid)| *rid)).into_array(),
-    ];
-    stamp_is_sorted(&columns[family.lead_ix()]);
-    child_struct(&CHILD_COLUMNS, columns, keys.len()).map(|a| a.into_array())
-}
-
-/// Code-column variant of [`copy_child_chunk_strings`].
-#[cfg_attr(all(target_arch = "wasm32", target_os = "unknown"), allow(dead_code))]
-pub(crate) fn copy_child_chunk_codes(
-    family: Family,
-    keys: &[(CopyKey<u32>, u32)],
-) -> Result<ArrayRef> {
-    let [s_ix, p_ix, o_ix, g_ix] = family.key_positions();
-    let col = |ix: usize| -> ArrayRef {
-        PrimitiveArray::from_iter(keys.iter().map(|(key, _)| key.0[ix])).into_array()
-    };
-    let columns = vec![
-        col(s_ix),
-        col(p_ix),
-        col(o_ix),
-        col(g_ix),
-        PrimitiveArray::from_iter(keys.iter().map(|(_, rid)| *rid)).into_array(),
-    ];
-    stamp_is_sorted(&columns[family.lead_ix()]);
-    child_struct(&CHILD_COLUMNS, columns, keys.len()).map(|a| a.into_array())
-}
 
 impl Family {
     /// The persisted child's component name.
@@ -178,7 +111,7 @@ impl Family {
     }
 
     /// The leading sort-key column inside the persisted child (plain names).
-    pub(crate) fn child_lead_col(self) -> &'static str {
+    fn child_lead_col(self) -> &'static str {
         match self {
             Family::Posg => "p",
             Family::Ospg => "o",
@@ -186,7 +119,7 @@ impl Family {
     }
 
     /// The second sort-key column inside the persisted child.
-    pub(crate) fn child_second_col(self) -> &'static str {
+    fn child_second_col(self) -> &'static str {
         match self {
             Family::Posg => "o",
             Family::Ospg => "s",
@@ -226,17 +159,6 @@ impl Family {
         match self {
             Family::Posg => [codes.p[i], codes.o[i], codes.s[i], codes.g[i]],
             Family::Ospg => [codes.o[i], codes.s[i], codes.p[i], codes.g[i]],
-        }
-    }
-
-    /// Where each quad component (s, p, o, g) sits inside this family's
-    /// [`CopyKey`] tuple, which stores the components in sort-key order.
-    // Read only by the external-sort emission (wasm-gated) and its tests.
-    #[cfg_attr(all(target_arch = "wasm32", target_os = "unknown"), allow(dead_code))]
-    fn key_positions(self) -> [usize; 4] {
-        match self {
-            Family::Posg => [2, 0, 1, 3],
-            Family::Ospg => [1, 2, 0, 3],
         }
     }
 }
@@ -586,6 +508,134 @@ fn build_serve_plan(
     )))
 }
 
+/// The external-sort builder's emission surface: the persisted child dtype,
+/// the child chunks built from windows of merged `(sort key, row id)`
+/// entries, and the sort key those entries carry. Compiled out on wasm
+/// with the builder itself (see the module gate in `store::builders`).
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+pub(crate) mod out_of_core {
+    use vortex_array::arrays::PrimitiveArray;
+    use vortex_array::dtype::DType;
+    use vortex_array::{ArrayRef, IntoArray};
+
+    use super::super::components::{child_struct, child_struct_dtype};
+    use super::{CHILD_COLUMNS, Family};
+    use crate::error::Result;
+    use crate::store::array::{make_string_array, stamp_is_sorted};
+
+    /// The persisted child's struct dtype: quad components as strings (or u32
+    /// codes under the Dictionary layout) plus the u32 primary row id.
+    pub(crate) fn copy_child_dtype(encoded: bool) -> DType {
+        use vortex_array::dtype::{Nullability, PType};
+        let term = if encoded {
+            DType::Primitive(PType::U32, Nullability::NonNullable)
+        } else {
+            DType::Utf8(Nullability::NonNullable)
+        };
+        child_struct_dtype(
+            &CHILD_COLUMNS,
+            vec![
+                term.clone(),
+                term.clone(),
+                term.clone(),
+                term,
+                DType::Primitive(PType::U32, Nullability::NonNullable),
+            ],
+        )
+    }
+
+    /// One chunk of a copy family's persisted child from a window of its merged
+    /// `(sort key, row id)` entries — plain child column names, lead stamped.
+    pub(crate) fn copy_child_chunk_strings(
+        family: Family,
+        keys: &[(CopyKey<String>, u32)],
+    ) -> Result<ArrayRef> {
+        let [s_ix, p_ix, o_ix, g_ix] = family.key_positions();
+        let col = |ix: usize| make_string_array(keys.iter().map(|(key, _)| key.0[ix].as_str()));
+        let columns = vec![
+            col(s_ix),
+            col(p_ix),
+            col(o_ix),
+            col(g_ix),
+            PrimitiveArray::from_iter(keys.iter().map(|(_, rid)| *rid)).into_array(),
+        ];
+        stamp_is_sorted(&columns[family.lead_ix()]);
+        child_struct(&CHILD_COLUMNS, columns, keys.len()).map(|a| a.into_array())
+    }
+
+    /// Code-column variant of [`copy_child_chunk_strings`].
+    pub(crate) fn copy_child_chunk_codes(
+        family: Family,
+        keys: &[(CopyKey<u32>, u32)],
+    ) -> Result<ArrayRef> {
+        let [s_ix, p_ix, o_ix, g_ix] = family.key_positions();
+        let col = |ix: usize| -> ArrayRef {
+            PrimitiveArray::from_iter(keys.iter().map(|(key, _)| key.0[ix])).into_array()
+        };
+        let columns = vec![
+            col(s_ix),
+            col(p_ix),
+            col(o_ix),
+            col(g_ix),
+            PrimitiveArray::from_iter(keys.iter().map(|(_, rid)| *rid)).into_array(),
+        ];
+        stamp_is_sorted(&columns[family.lead_ix()]);
+        child_struct(&CHILD_COLUMNS, columns, keys.len()).map(|a| a.into_array())
+    }
+
+    impl Family {
+        /// Where each quad component (s, p, o, g) sits inside this family's
+        /// [`CopyKey`] tuple, which stores the components in sort-key order.
+        pub(super) fn key_positions(self) -> [usize; 4] {
+            match self {
+                Family::Posg => [2, 0, 1, 3],
+                Family::Ospg => [1, 2, 0, 3],
+            }
+        }
+    }
+
+    /// A quad's terms rearranged into one family's sort-key order, so deriving
+    /// `Ord` (and the spill machinery's pair sort) compares by exactly that
+    /// family's comparator. `V` is the term encoding: `String`, or `u32` codes
+    /// under the Dictionary layout.
+    ///
+    /// Built via [`Self::posg`] / [`Self::ospg`] from an `[s, p, o, g]` tuple;
+    /// [`Family::key_positions`](super::Family::key_positions) maps the components back out when the sorted
+    /// keys are turned into columns.
+    #[derive(
+        Clone,
+        Debug,
+        PartialEq,
+        Eq,
+        PartialOrd,
+        Ord,
+        rkyv::Archive,
+        rkyv::Serialize,
+        rkyv::Deserialize,
+    )]
+    pub(crate) struct CopyKey<V>(pub(crate) [V; 4]);
+
+    impl<V: Clone> CopyKey<V> {
+        /// The POSG key of a quad given as `[s, p, o, g]`.
+        pub(crate) fn posg(spog: &[V; 4]) -> Self {
+            Self([
+                spog[1].clone(),
+                spog[2].clone(),
+                spog[0].clone(),
+                spog[3].clone(),
+            ])
+        }
+
+        /// The OSPG key of a quad given as `[s, p, o, g]`, consuming the tuple —
+        /// the merge path constructs it last, so the rearrangement needs no
+        /// clones (which are String allocations on the non-Dictionary layouts).
+        pub(crate) fn ospg(spog: [V; 4]) -> Self {
+            let [s, p, o, g] = spog;
+            Self([o, s, p, g])
+        }
+    }
+}
+
 // ── build side ───────────────────────────────────────────────────────────────
 
 /// The permutation putting `quads` in `family` order.
@@ -630,41 +680,6 @@ fn family_code_columns(codes: &QuadCodes, perm: &[u32]) -> [ArrayRef; 5] {
         col(&codes.g),
         PrimitiveArray::from_iter(perm.iter().copied()).into_array(),
     ]
-}
-
-/// A quad's terms rearranged into one family's sort-key order, so deriving
-/// `Ord` (and the spill machinery's pair sort) compares by exactly that
-/// family's comparator. `V` is the term encoding: `String`, or `u32` codes
-/// under the Dictionary layout.
-///
-/// Built via [`Self::posg`] / [`Self::ospg`] from an `[s, p, o, g]` tuple;
-/// [`Family::key_positions`] maps the components back out when the sorted
-/// keys are turned into columns.
-#[derive(
-    Clone, Debug, PartialEq, Eq, PartialOrd, Ord, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
-)]
-#[cfg_attr(all(target_arch = "wasm32", target_os = "unknown"), allow(dead_code))]
-pub(crate) struct CopyKey<V>(pub(crate) [V; 4]);
-
-#[cfg_attr(all(target_arch = "wasm32", target_os = "unknown"), allow(dead_code))]
-impl<V: Clone> CopyKey<V> {
-    /// The POSG key of a quad given as `[s, p, o, g]`.
-    pub(crate) fn posg(spog: &[V; 4]) -> Self {
-        Self([
-            spog[1].clone(),
-            spog[2].clone(),
-            spog[0].clone(),
-            spog[3].clone(),
-        ])
-    }
-
-    /// The OSPG key of a quad given as `[s, p, o, g]`, consuming the tuple —
-    /// the merge path constructs it last, so the rearrangement needs no
-    /// clones (which are String allocations on the non-Dictionary layouts).
-    pub(crate) fn ospg(spog: [V; 4]) -> Self {
-        let [s, p, o, g] = spog;
-        Self([o, s, p, g])
-    }
 }
 
 /// The complete dataset's copy columns in global family order — the
@@ -801,7 +816,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     fn copy_key_positions_roundtrip() {
+        use super::out_of_core::CopyKey;
+
         // Rearranging [s, p, o, g] into a key and reading it back through
         // key_positions must return the original components.
         let spog = [

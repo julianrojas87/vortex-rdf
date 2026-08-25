@@ -14,7 +14,7 @@ use oxrdfio::{RdfFormat, RdfParser};
 /// Parses a string representation of an RDF named node (URI), stripping optional `<` and `>` boundaries.
 ///
 /// **Trusted-input decode path.** Every caller reconstructs a term from the
-/// store's *own* serialized columns (see [`super::super::store::layouts`]), whose
+/// store's *own* serialized columns (see `store::layouts`), whose
 /// IRIs were validated by oxrdf's constructors at ingestion — so this uses
 /// [`NamedNode::new_unchecked`] rather than re-running `oxiri::Iri::parse` on
 /// every decoded row. `.vortex` files are likewise trusted to have been checked
@@ -256,9 +256,9 @@ pub fn parse_graph_name_checked(s: &str) -> Result<GraphName> {
     }
 }
 
-/// The untrusted-boundary counterpart of [`get_as_term`]/[`parse_term`]: the
+/// The untrusted-boundary counterpart of [`get_as_term`]/`parse_term`: the
 /// same N-Triples forms — `<iri>`, `_:id`, `"v"`, `"v"@lang`, `"v"^^<dt>`,
-/// plus a bare IRI as [`parse_term`] accepts — with every component built
+/// plus a bare IRI as `parse_term` accepts — with every component built
 /// through a validating constructor (including the language tag and the
 /// literal's datatype IRI).
 ///

@@ -56,7 +56,6 @@ const DICT_CHUNK_ROWS: usize = 64 * 1024;
 /// a dictionary read back from a file or IPC stream may arrive in any
 /// encoding, and the read path has to be total over that. Anything that is not
 /// FSST is canonicalized to plaintext on open.
-#[derive(Clone)]
 enum TermStore {
     /// Plaintext terms. `bytes_at` is a zero-copy read.
     Canonical(VarBinViewArray),
@@ -71,7 +70,6 @@ enum TermStore {
 
 /// The chunks of a multi-chunk term column, with a cumulative-start table
 /// mapping a global term index to (chunk, local index).
-#[derive(Clone)]
 pub(crate) struct ChunkedTerms {
     chunks: Vec<TermChunk>,
     /// `starts[i]` = global index of chunk i's first term; ascending.
@@ -79,7 +77,6 @@ pub(crate) struct ChunkedTerms {
     len: usize,
 }
 
-#[derive(Clone)]
 pub(crate) enum TermChunk {
     Canonical(VarBinViewArray),
     Fsst(FsstTerms),
@@ -131,16 +128,6 @@ pub(crate) struct TermDictionary {
     terms: TermStore,
     /// Memo for [`get_id`](Self::get_id); see [`ProbeCache`].
     probes: ProbeCache,
-}
-
-/// Cloning shares nothing: the memo starts empty rather than being copied.
-impl Clone for TermDictionary {
-    fn clone(&self) -> Self {
-        Self {
-            terms: self.terms.clone(),
-            probes: ProbeCache::new(),
-        }
-    }
 }
 
 impl TermDictionary {
@@ -561,7 +548,6 @@ const FSST_DECODE_HEADROOM: usize = 8 * FSST_SYMBOL_LEN;
 
 /// FSST-compressed sorted terms, with the pieces a hot lookup needs hoisted
 /// out of the Vortex array.
-#[derive(Clone)]
 pub(crate) struct FsstTerms {
     /// Kept whole so the dictionary can be serialized without recompressing.
     array: FSSTArray,
@@ -878,16 +864,6 @@ mod tests {
         // `b` evicted `a`; asking again must re-search, not return `b`'s code.
         assert_eq!(d.get_id(a), d.search(a));
         assert_ne!(d.get_id(a), d.get_id(b));
-    }
-
-    /// A cloned dictionary answers the same, starting from an empty memo.
-    #[test]
-    fn clone_keeps_lookups_correct() {
-        let d = dict(&["<http://a>", "<http://b>", "<http://c>"]);
-        assert_eq!(d.get_id("<http://b>"), Some(1));
-        let copy = d.clone();
-        assert_eq!(copy.get_id("<http://b>"), Some(1));
-        assert_eq!(copy.get_id("<http://zz>"), None);
     }
 
     /// Multi-window compression is invisible to lookups: a dictionary

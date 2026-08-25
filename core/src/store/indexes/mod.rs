@@ -434,7 +434,7 @@ impl LazyRowIds {
 /// `None` when the column is missing or the probe can't cast to its dtype
 /// (the resolver declines and the store falls back to a mask scan); an empty
 /// range when the probed term is absent from the data.
-pub(crate) fn sorted_probe_run(
+fn sorted_probe_run(
     rows: &StructArray,
     column: &'static str,
     native: &Scalar,

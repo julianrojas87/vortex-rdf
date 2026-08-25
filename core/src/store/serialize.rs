@@ -9,6 +9,7 @@ use crate::error::VortexRdfError;
 use crate::io::native_file;
 use crate::store::QuadsSource;
 use crate::store::builders::{build_components, build_components_from_codes, build_struct_array};
+use crate::store::indexes::IndexComponent;
 use crate::store::layouts::dictionary::TermDictionary;
 use crate::store::layouts::{ResolvedLayout, dictionary};
 use crate::store::selection::gather_live;
@@ -66,11 +67,7 @@ impl VortexRdfStore {
     /// [`to_serializable_parts`]: Self::to_serializable_parts
     async fn selected_parts(
         &self,
-    ) -> Result<(
-        ArrayRef,
-        Vec<crate::store::indexes::IndexComponent>,
-        Option<Arc<TermDictionary>>,
-    )> {
+    ) -> Result<(ArrayRef, Vec<IndexComponent>, Option<Arc<TermDictionary>>)> {
         let base = self.base_selected_rows().await?;
         // Which serialization shape this view gets:
         // - a pristine owner passes its components through (in memory) or
@@ -185,7 +182,7 @@ impl VortexRdfStore {
     #[cfg(feature = "file-io")]
     async fn file_components(
         file: &crate::store::native_file::NativeStoreFile,
-    ) -> Result<Vec<crate::store::indexes::IndexComponent>> {
+    ) -> Result<Vec<IndexComponent>> {
         let mut components = Vec::new();
         for descriptor in file.components() {
             let ComponentKind::Index(known) = classify_component(descriptor)? else {

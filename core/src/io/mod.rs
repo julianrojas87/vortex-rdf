@@ -1,6 +1,6 @@
 //! The native container codec: the `vortex-rdf.store.v1` grammar
-//! ([`container`]), the write driver over it ([`ser`]), and read-side file
-//! access ([`native_file`]). Textual RDF conversion lives in
+//! (`container`), the write driver over it (`ser`), and read-side file
+//! access (`native_file`). Textual RDF conversion lives in
 //! [`common`](crate::common) (parsing in `terms`, export in `export`); the
 //! opened-store runtime handle lives store-side in `store::native_file`.
 

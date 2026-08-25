@@ -28,6 +28,7 @@
 use std::fmt::Write as _;
 use std::io::{BufWriter, Write as _};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::Instant;
 
 use sophia::api::MownStr;
@@ -180,8 +181,7 @@ struct Pat {
     g: Option<String>,
 }
 
-fn probes(n: usize) -> Vec<Pat> {
-    let _ = moduli(n);
+fn probes() -> Vec<Pat> {
     let s0 = format!("<{}>", subject_term(0));
     let p0 = format!("<{}>", predicate_term(0));
     let o0 = object_term(0);
@@ -370,7 +370,6 @@ fn split_id(id: &str) -> (String, Option<String>) {
 /// reported honestly through the row's `samples` field, which the dashboard
 /// displays. Same knob and default as the JS and Python workers.
 fn slow_phase_cutoff_ns() -> f64 {
-    use std::sync::OnceLock;
     static V: OnceLock<f64> = OnceLock::new();
     *V.get_or_init(|| {
         std::env::var("BENCH_SLOW_PHASE_MS")
@@ -518,30 +517,9 @@ trait Queryable {
 }
 
 /// The lexical bytes of one oxrdf term — the read that forces a matched row's
-/// terms to exist. Written over `oxrdf` for the Vortex adapter; oxigraph's
-/// model is its own re-export of the same shapes, so it has its own twin.
+/// terms to exist.
 fn oxrdf_quad_bytes(q: &oxrdf::Quad) -> usize {
     use oxrdf::{GraphName, NamedOrBlankNode, Term};
-    let subject = match &q.subject {
-        NamedOrBlankNode::NamedNode(n) => n.as_str().len(),
-        NamedOrBlankNode::BlankNode(b) => b.as_str().len(),
-    };
-    let object = match &q.object {
-        Term::NamedNode(n) => n.as_str().len(),
-        Term::BlankNode(b) => b.as_str().len(),
-        Term::Literal(l) => l.value().len(),
-    };
-    let graph = match &q.graph_name {
-        GraphName::NamedNode(n) => n.as_str().len(),
-        GraphName::BlankNode(b) => b.as_str().len(),
-        GraphName::DefaultGraph => 0,
-    };
-    subject + q.predicate.as_str().len() + object + graph
-}
-
-/// [`oxrdf_quad_bytes`] over oxigraph's model.
-fn oxigraph_quad_bytes(q: &oxigraph::model::Quad) -> usize {
-    use oxigraph::model::{GraphName, NamedOrBlankNode, Term};
     let subject = match &q.subject {
         NamedOrBlankNode::NamedNode(n) => n.as_str().len(),
         NamedOrBlankNode::BlankNode(b) => b.as_str().len(),
@@ -588,7 +566,6 @@ struct VortexAdapter {
 }
 
 fn rt() -> &'static tokio::runtime::Runtime {
-    use std::sync::OnceLock;
     static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
     RT.get_or_init(|| tokio::runtime::Runtime::new().unwrap())
 }
@@ -806,7 +783,7 @@ fn drain_oxigraph<E: std::fmt::Debug>(
     let mut bytes = 0usize;
     for q in quads {
         if consume {
-            bytes += oxigraph_quad_bytes(&q.expect("oxigraph quad"));
+            bytes += oxrdf_quad_bytes(&q.expect("oxigraph quad"));
         }
         rows += 1;
     }
@@ -1339,7 +1316,7 @@ fn run_adapter(a: &dyn Adapter, n: usize) -> WorkerOut {
     }
 
     let handle = a.open(&artifact, &src);
-    let mut pats = probes(n);
+    let mut pats = probes();
     if a.handles_graphs() {
         pats.extend(graph_probes());
     } else {

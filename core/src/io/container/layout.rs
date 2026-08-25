@@ -22,7 +22,7 @@ use super::{QUAD_SOURCE_CHILD, QUAD_SOURCE_NAME, STORE_LAYOUT_ID};
 #[derive(Clone, Debug)]
 pub(crate) struct RdfStoreLayoutVTable;
 
-pub(crate) type RdfStoreLayout = Layout<RdfStoreLayoutVTable>;
+pub(super) type RdfStoreLayout = Layout<RdfStoreLayoutVTable>;
 
 #[derive(Clone, Debug)]
 pub(crate) struct RdfStoreLayoutData {
@@ -134,7 +134,7 @@ pub(crate) fn register(session: &VortexSession) {
     session.layouts().register(&LAYOUT as &dyn LayoutEncoding);
 }
 
-pub(crate) fn is_native_root(layout: &LayoutRef) -> bool {
+pub(super) fn is_native_root(layout: &LayoutRef) -> bool {
     layout.encoding_id().as_ref() == STORE_LAYOUT_ID
 }
 

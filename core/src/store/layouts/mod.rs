@@ -93,7 +93,7 @@ pub enum LayoutStrategy {
     /// ### `LayoutStrategy::Dictionary` column schema
     /// All four quad fields stored as u32 codes into a single global term
     /// dictionary. In memory the dictionary lives beside the columns (see
-    /// [`dictionary::term_dict`]); a serialized
+    /// `dictionary::term_dict`); a serialized
     /// file carries it as the native
     /// container's `dictionary` child (see `crate::io::container`), so
     /// the quad columns stay bare.
@@ -212,7 +212,7 @@ pub(crate) enum ResolvedLayout {
 
 /// One of the four term positions of a quad pattern.
 #[derive(Clone, Copy)]
-pub(crate) enum Role {
+enum Role {
     S,
     P,
     O,

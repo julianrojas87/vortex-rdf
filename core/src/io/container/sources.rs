@@ -81,21 +81,21 @@ impl NativeComponentSource for ReplayableArraySource {
 /// A pull closure yielding one component chunk per call (`Ok(None)` = end).
 // Constructed only by the external-sort builder's mergers, which are compiled
 // out on wasm (see the module gate in `store::builders`).
-#[cfg_attr(all(target_arch = "wasm32", target_os = "unknown"), allow(dead_code))]
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub(crate) type PullFn =
     Box<dyn FnMut(usize) -> VortexResult<Option<vortex_array::ArrayRef>> + Send>;
 
 /// A single-shot component source over a pull closure — how spill-run mergers
 /// stream a component's chunks without materializing them (each call reads
 /// the next window off the merger's run files).
-#[cfg_attr(all(target_arch = "wasm32", target_os = "unknown"), allow(dead_code))]
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub(crate) struct PullComponentSource {
     dtype: DType,
     batch_rows: usize,
     pull: std::sync::Mutex<Option<PullFn>>,
 }
 
-#[cfg_attr(all(target_arch = "wasm32", target_os = "unknown"), allow(dead_code))]
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 impl PullComponentSource {
     pub(crate) fn new(dtype: DType, batch_rows: usize, pull: PullFn) -> Self {
         Self {
@@ -106,6 +106,7 @@ impl PullComponentSource {
     }
 }
 
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 impl NativeComponentSource for PullComponentSource {
     fn dtype(&self) -> &DType {
         &self.dtype

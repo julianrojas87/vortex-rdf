@@ -6,20 +6,18 @@ use crate::error::{Result, VortexRdfError};
 use crate::io::container;
 use crate::io::native_file;
 use crate::session::VORTEX_SESSION;
-#[cfg(feature = "file-io")]
-use crate::store::QuadsSource;
-#[cfg(feature = "file-io")]
-use crate::store::indexes::Indexes;
 use crate::store::indexes::KnownComponent;
 use crate::store::layouts::DictAccess;
 use crate::store::layouts::dictionary::dict_from_reader;
-#[cfg(feature = "file-io")]
-use crate::store::layouts::dictionary::{FileBackedDict, TermChunks};
 use crate::store::layouts::{LayoutStrategy, ResolvedLayout};
 #[cfg(feature = "file-io")]
-use crate::store::native_file::NativeStoreFile;
-#[cfg(feature = "file-io")]
-use crate::store::selection::ViewSelection;
+use crate::store::{
+    QuadsSource,
+    indexes::Indexes,
+    layouts::dictionary::{FileBackedDict, TermChunks},
+    native_file::NativeStoreFile,
+    selection::ViewSelection,
+};
 
 use vortex_file::OpenOptionsSessionExt as _;
 

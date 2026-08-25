@@ -22,7 +22,7 @@ use crate::error::{Result, VortexRdfError};
 /// escape hatch for putting out-of-core runs on a specific volume. The OS
 /// temp dir is commonly a size-capped, RAM-backed tmpfs, exactly the wrong
 /// home for runs that exist because the data outgrew memory.
-pub(crate) const SPILL_DIR_ENV: &str = "VORTEX_RDF_SPILL_DIR";
+const SPILL_DIR_ENV: &str = "VORTEX_RDF_SPILL_DIR";
 
 /// Create a unique temp directory for spill files.
 ///

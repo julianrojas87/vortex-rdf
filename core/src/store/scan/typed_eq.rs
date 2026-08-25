@@ -274,9 +274,6 @@ pub(crate) fn typed_positions(
 ) -> Option<Vec<usize>> {
     use vortex_array::arrays::chunked::ChunkedArrayExt;
     use vortex_array::arrays::{Chunked, Struct};
-    if eqs.is_empty() {
-        return None;
-    }
     let needles = Needle::extract(eqs)?;
     fn positions_of(
         sa: &StructArray,

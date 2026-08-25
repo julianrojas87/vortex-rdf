@@ -83,12 +83,7 @@ impl VortexRdfStore {
                 // not hold, and a pending filter's selectivity is unknown, so
                 // either sends the count through the selection.
                 let located = match (selection, serve, filter, deleted) {
-                    (
-                        crate::store::selection::ViewSelection::Pending(_),
-                        Some(plan),
-                        None,
-                        None,
-                    ) => plan.row_range(),
+                    (ViewSelection::Pending(_), Some(plan), None, None) => plan.row_range(),
                     _ => None,
                 };
                 if let Some(range) = located {

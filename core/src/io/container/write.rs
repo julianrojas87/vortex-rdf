@@ -7,7 +7,9 @@
 use std::sync::Arc;
 
 use vortex_error::{VortexResult, vortex_ensure_eq};
-use vortex_layout::{LayoutParts, LayoutRef, layout_children};
+use vortex_layout::segments::SegmentSinkRef;
+use vortex_layout::sequence::{SendableSequentialStream, SequencePointer};
+use vortex_layout::{LayoutParts, LayoutRef, LayoutStrategy, LayoutWriterContext, layout_children};
 use vortex_session::VortexSession;
 
 use super::layout::{RdfStoreLayout, RdfStoreLayoutData, RdfStoreLayoutVTable};
@@ -16,34 +18,16 @@ use super::wire::{StoreComponentDescriptor, validate_components};
 
 /// One descriptor paired with its written child layout.
 #[derive(Clone)]
-pub(crate) struct StoreComponent {
-    pub(crate) descriptor: StoreComponentDescriptor,
-    pub(crate) layout: LayoutRef,
-}
-
-impl StoreComponent {
-    /// Pair a descriptor with the layout its write produced, checking only
-    /// that the written child matches the descriptor's dtype — descriptor
-    /// validity was established when the inventory entered the write path
-    /// ([`validate_components`]).
-    pub(crate) fn new(
-        descriptor: StoreComponentDescriptor,
-        layout: LayoutRef,
-    ) -> VortexResult<Self> {
-        vortex_ensure_eq!(
-            &descriptor.dtype,
-            layout.dtype(),
-            "store component descriptor dtype does not match its child layout"
-        );
-        Ok(Self { descriptor, layout })
-    }
+struct StoreComponent {
+    descriptor: StoreComponentDescriptor,
+    layout: LayoutRef,
 }
 
 /// Assemble a native root from the written quad-source child and its
 /// components. The component inventory must already be validated — the write
 /// strategy's [`with_components`](RdfStoreWriteStrategy::with_components) is
 /// the sole entry feeding this.
-pub(crate) fn new_store_layout_with_components(
+fn new_store_layout_with_components(
     quad_source: LayoutRef,
     quads_sorted: bool,
     components: Vec<StoreComponent>,
@@ -75,8 +59,8 @@ pub(crate) fn new_store_layout_with_components(
 /// quad-source child, each component becomes an auxiliary child, and all of
 /// them share the file's segment sink.
 #[derive(Clone)]
-pub(crate) struct RdfStoreWriteStrategy {
-    quad_source: Arc<dyn vortex_layout::LayoutStrategy>,
+struct RdfStoreWriteStrategy {
+    quad_source: Arc<dyn LayoutStrategy>,
     /// Provenance recorded in the root metadata: whether the quad stream's
     /// `s` column is globally sorted (see `WireMetadata::quads_sorted`).
     quads_sorted: bool,
@@ -84,10 +68,7 @@ pub(crate) struct RdfStoreWriteStrategy {
 }
 
 impl RdfStoreWriteStrategy {
-    pub(crate) fn new(
-        quad_source: Arc<dyn vortex_layout::LayoutStrategy>,
-        quads_sorted: bool,
-    ) -> Self {
+    fn new(quad_source: Arc<dyn LayoutStrategy>, quads_sorted: bool) -> Self {
         Self {
             quad_source,
             quads_sorted,
@@ -98,10 +79,7 @@ impl RdfStoreWriteStrategy {
     /// Adopt the component inventory, validating it once here — the write
     /// path's entry point for validation (each write's descriptor was
     /// dtype-checked against its source at construction).
-    pub(crate) fn with_components(
-        mut self,
-        components: Vec<NativeComponentWrite>,
-    ) -> VortexResult<Self> {
+    fn with_components(mut self, components: Vec<NativeComponentWrite>) -> VortexResult<Self> {
         validate_components(components.iter().map(|c| &c.descriptor))?;
         self.components = components.into();
         Ok(self)
@@ -109,13 +87,13 @@ impl RdfStoreWriteStrategy {
 }
 
 #[async_trait::async_trait]
-impl vortex_layout::LayoutStrategy for RdfStoreWriteStrategy {
+impl LayoutStrategy for RdfStoreWriteStrategy {
     async fn write_stream(
         &self,
-        ctx: vortex_layout::LayoutWriterContext,
-        segment_sink: vortex_layout::segments::SegmentSinkRef,
-        stream: vortex_layout::sequence::SendableSequentialStream,
-        mut eof: vortex_layout::sequence::SequencePointer,
+        ctx: LayoutWriterContext,
+        segment_sink: SegmentSinkRef,
+        stream: SendableSequentialStream,
+        mut eof: SequencePointer,
         session: &VortexSession,
     ) -> VortexResult<LayoutRef> {
         use futures::{StreamExt as _, TryStreamExt as _};
@@ -148,7 +126,10 @@ impl vortex_layout::LayoutStrategy for RdfStoreWriteStrategy {
                         &child_session,
                     )
                     .await?;
-                StoreComponent::new(component.descriptor, layout)
+                Ok(StoreComponent {
+                    descriptor: component.descriptor,
+                    layout,
+                })
             });
         }
 
@@ -181,7 +162,7 @@ pub(crate) async fn write_store<W, S>(
     session: &VortexSession,
     writer: W,
     stream: S,
-    quad_source_strategy: Arc<dyn vortex_layout::LayoutStrategy>,
+    quad_source_strategy: Arc<dyn LayoutStrategy>,
     quads_sorted: bool,
     components: Vec<NativeComponentWrite>,
 ) -> VortexResult<vortex_file::WriteSummary>
@@ -206,7 +187,7 @@ where
 /// strategy's compressor would only re-do work it cannot improve on, and the
 /// window boundaries become the child's chunk leaves — the granularity at
 /// which `FileBackedDict` point-reads and lifts it.
-pub(crate) fn dict_child_strategy() -> Arc<dyn vortex_layout::LayoutStrategy> {
+pub(crate) fn dict_child_strategy() -> Arc<dyn LayoutStrategy> {
     use vortex_layout::layouts::chunked::writer::ChunkedLayoutStrategy;
     use vortex_layout::layouts::flat::writer::FlatLayoutStrategy;
     use vortex_layout::layouts::struct_::StructStrategy;

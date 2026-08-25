@@ -9,6 +9,8 @@ use crate::store::indexes::FileServePlan;
 use crate::store::indexes::InMemoryServePlan;
 use crate::store::layouts::ResolvedLayout;
 use crate::store::selection::gather_live;
+#[cfg(feature = "file-io")]
+use crate::store::selection::{POINT_GATHER_MAX_ROWS, RowSelection};
 use crate::store::{QuadsSource, RawQuad, SharedQuad};
 
 #[cfg(feature = "file-io")]
@@ -249,8 +251,7 @@ impl VortexRdfStore {
                     // scan machinery; the moved-in filter scan handles the
                     // rare mid-fetch decline.
                     if let Some(range) = serve.row_range()
-                        && (range.end - range.start) as usize
-                            <= crate::store::selection::POINT_GATHER_MAX_ROWS
+                        && (range.end - range.start) as usize <= POINT_GATHER_MAX_ROWS
                     {
                         let scan = serve.projected_filtered_scan()?;
                         let serve = serve.clone();
@@ -333,13 +334,9 @@ impl VortexRdfStore {
                 // chunk), which reads the same few rows through the scan.
                 let exact = selection.expect_exact();
                 let small = match exact {
-                    crate::store::selection::RowSelection::Range(r) => {
-                        (r.end - r.start) as usize <= crate::store::selection::POINT_GATHER_MAX_ROWS
-                    }
-                    crate::store::selection::RowSelection::Ids(ids) => {
-                        ids.len() <= crate::store::selection::POINT_GATHER_MAX_ROWS
-                    }
-                    crate::store::selection::RowSelection::All => false,
+                    RowSelection::Range(r) => (r.end - r.start) as usize <= POINT_GATHER_MAX_ROWS,
+                    RowSelection::Ids(ids) => ids.len() <= POINT_GATHER_MAX_ROWS,
+                    RowSelection::All => false,
                 };
                 if small
                     && filter

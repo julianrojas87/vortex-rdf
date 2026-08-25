@@ -1,6 +1,6 @@
 //! Textual RDF vocabulary, shared by the store's decode paths and every
 //! binding: term parsing/reconstruction ([`terms`]), the N-Triples-form quad
-//! ([`quad`]), textual export ([`export`]), and format-name resolution
+//! (`quad`), textual export ([`export`]), and format-name resolution
 //! ([`formats`]).
 //!
 //! The boundary is the reason this module can be named `common` without

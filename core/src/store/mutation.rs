@@ -14,7 +14,8 @@ use oxrdf::{GraphName, NamedNode, NamedOrBlankNode, Quad, Term};
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use vortex_array::arrays::ChunkedArray;
+use vortex_array::arrays::chunked::ChunkedArrayExt;
+use vortex_array::arrays::{Chunked, ChunkedArray};
 use vortex_array::{IntoArray, RecursiveCanonical, VortexSessionExecute};
 #[cfg(feature = "file-io")]
 use vortex_mask::Mask;
@@ -95,8 +96,6 @@ impl VortexRdfStore {
             // pre-append store keep the old tail, and an owner's selections
             // are `All`.
             Some(tail) => {
-                use vortex_array::arrays::Chunked;
-                use vortex_array::arrays::chunked::ChunkedArrayExt;
                 let old = gather_live(&tail.rows, &tail.selection, tail.deleted.as_ref(), None)?;
                 let dtype = old.dtype().clone();
                 let mut chunks = match old.clone().try_downcast::<Chunked>() {

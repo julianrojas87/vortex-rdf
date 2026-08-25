@@ -52,17 +52,7 @@ impl From<RawQuad> for SharedQuad {
 /// This is the shared in-memory (and on-disk, for external sorting)
 /// representation consumed by layouts, indexes and builders before
 /// writing to Vortex arrays.
-#[derive(
-    Clone,
-    Hash,
-    PartialEq,
-    Eq,
-    serde::Serialize,
-    serde::Deserialize,
-    rkyv::Archive,
-    rkyv::Serialize,
-    rkyv::Deserialize,
-)]
+#[derive(Clone, Hash, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct RawQuad {
     pub s: String,
     pub p: String,

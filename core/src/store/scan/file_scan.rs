@@ -145,7 +145,7 @@ pub(crate) fn available_parallelism() -> usize {
 /// then real per-conjunct filter evaluation for whatever survives. Returns the
 /// split-relative surviving mask; callers either count its set bits or lift them
 /// to absolute row ids. Mirrors the filter phase of vortex's own `split_exec`.
-pub(crate) async fn evaluate_filter_split(
+async fn evaluate_filter_split(
     reader: Arc<dyn LayoutReader>,
     filter_conjuncts: &[BoundExpression],
     range: &Range<u64>,

@@ -21,13 +21,12 @@ use crate::io::container::{
     StoreComponentDescriptor, StoreComponentRole, default_child_strategy,
 };
 use crate::store::LayoutStrategy;
+use crate::store::indexes::IndexComponent;
 use crate::store::layouts::dictionary::{TermDictionary, dict_child_chunks};
 use std::sync::Arc;
 use vortex_array::stream::ArrayStreamAdapter;
 use vortex_io::VortexWrite;
 
-#[cfg(feature = "file-io")]
-use crate::error;
 #[cfg(feature = "file-io")]
 use crate::store::builders::{BuiltStream, SortedStreamBuilder, VortexArrayBuilder};
 #[cfg(feature = "file-io")]
@@ -65,7 +64,7 @@ pub(crate) fn dict_component(dict: &TermDictionary) -> Result<NativeComponentWri
 /// stamp), and each index child records its component's `sorted` flag.
 pub(crate) async fn serialize_parts<W: VortexWrite + Unpin + Send>(
     primary: ArrayRef,
-    components: &[crate::store::indexes::IndexComponent],
+    components: &[IndexComponent],
     dict: Option<&TermDictionary>,
     mut writer: W,
 ) -> Result<()> {
@@ -145,7 +144,7 @@ pub async fn quads_stream_to_vortex_writer<S, W>(
     indexes: Indexes,
 ) -> Result<()>
 where
-    S: Stream<Item = error::Result<RawQuad>> + Unpin + Send + 'static,
+    S: Stream<Item = Result<RawQuad>> + Unpin + Send + 'static,
     W: VortexWrite + Unpin + Send,
 {
     let start = debug::timer();
@@ -203,7 +202,7 @@ pub async fn quads_stream_to_vortex_file<S>(
     indexes: Indexes,
 ) -> Result<()>
 where
-    S: Stream<Item = error::Result<RawQuad>> + Unpin + Send + 'static,
+    S: Stream<Item = Result<RawQuad>> + Unpin + Send + 'static,
 {
     let writer = tokio::fs::File::create(path)
         .await

@@ -160,7 +160,7 @@ impl VortexRdfStore {
     /// children stay in their compressed form wherever the match fast paths
     /// can bind them through encoded search probes, and only children outside
     /// the probe's supported set are decoded to canonical primitives (see
-    /// [`with_searchable_int_children`](array::with_searchable_int_children));
+    /// `with_searchable_int_children`);
     /// every index component is materialized into the same resident form, so
     /// its sorted probes bind directly too.
     ///

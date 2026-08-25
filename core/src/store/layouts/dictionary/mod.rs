@@ -70,10 +70,10 @@ pub(crate) fn field_names() -> Vec<Arc<str>> {
 /// layout's encoding pass and consumed by index builders, which can work on
 /// codes directly (sorted-dictionary codes preserve lexicographic order).
 pub(crate) struct QuadCodes {
-    pub s: Vec<u32>,
-    pub p: Vec<u32>,
-    pub o: Vec<u32>,
-    pub g: Vec<u32>,
+    pub(crate) s: Vec<u32>,
+    pub(crate) p: Vec<u32>,
+    pub(crate) o: Vec<u32>,
+    pub(crate) g: Vec<u32>,
 }
 
 impl QuadCodes {

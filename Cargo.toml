@@ -44,7 +44,6 @@ async-trait = "0.1"
 
 oxrdf = "0.3.3"
 oxrdfio = "0.2.5"
-itertools = "0.15"
 thiserror = "2.0"
 anyhow = "1.0.104"
 

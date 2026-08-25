@@ -149,7 +149,7 @@ impl StoreComponentDescriptor {
 /// into the container — [`decode_store_metadata`] on read, the write
 /// strategy's `with_components` on write — instead of being re-run by every
 /// constructor in between.
-pub(crate) fn validate_components<'a>(
+pub(super) fn validate_components<'a>(
     components: impl IntoIterator<Item = &'a StoreComponentDescriptor>,
 ) -> VortexResult<()> {
     let mut names = std::collections::BTreeSet::new();
@@ -188,7 +188,7 @@ struct WireMetadata {
     components: Vec<WireComponent>,
 }
 
-pub(crate) fn encode_store_metadata(
+pub(super) fn encode_store_metadata(
     quads_sorted: bool,
     components: &[StoreComponentDescriptor],
 ) -> VortexResult<Vec<u8>> {
@@ -213,7 +213,7 @@ pub(crate) fn encode_store_metadata(
     serde_json::to_vec(&wire).map_err(|e| vortex_error::vortex_err!("{e}"))
 }
 
-pub(crate) fn decode_store_metadata(
+pub(super) fn decode_store_metadata(
     bytes: &[u8],
 ) -> VortexResult<(bool, Vec<StoreComponentDescriptor>)> {
     if bytes.is_empty() {

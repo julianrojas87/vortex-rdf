@@ -34,7 +34,6 @@ oxrdf.workspace = true
 oxrdfio.workspace = true
 
 # Utilities
-itertools.workspace = true
 thiserror.workspace = true
 uuid = { version = "1", features = ["v4"] }
 rkyv = { version = "0.8.17", features = ["std", "bytecheck"] }
@@ -77,8 +76,6 @@ divan = { version = "5.0.1", package = "codspeed-divan-compat" }
 oxigraph = { version = "0.5.9", default-features = false, features = ["rocksdb"] }
 sophia = "0.10"
 hdt = { version = "0.7", features = ["nt"] }
-serde_json = "1.0"
-futures = { workspace = true }
 tempfile = "3"
 tokio = { workspace = true, features = ["time", "rt-multi-thread"] }
 

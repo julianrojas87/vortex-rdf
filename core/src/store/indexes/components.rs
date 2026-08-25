@@ -17,7 +17,9 @@
 use std::sync::{Arc, OnceLock};
 
 use vortex_array::arrays::StructArray;
-use vortex_array::dtype::{DType, FieldName};
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+use vortex_array::dtype::DType;
+use vortex_array::dtype::FieldName;
 use vortex_array::validity::Validity;
 use vortex_array::{ArrayRef, IntoArray, VortexSessionExecute};
 
@@ -463,7 +465,8 @@ pub(crate) fn child_struct(
 /// The child struct dtype under `child_columns` names — the dtype counterpart
 /// of [`child_struct`], shared with the builders' direct child dtypes
 /// (`copy_child_dtype`/`ref_child_dtype`) so a component's declared and built
-/// shapes cannot drift.
+/// shapes cannot drift. Compiled out on wasm with those builders.
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub(crate) fn child_struct_dtype(
     child_columns: &[&'static str],
     field_dtypes: Vec<DType>,

@@ -5,6 +5,10 @@
 //! component readers. The pure open/materialize primitives are in
 //! [`io::native_file`](crate::io::native_file).
 
+use std::collections::HashMap;
+use std::ops::Range;
+use std::sync::{Arc, Mutex, OnceLock};
+
 use vortex_array::expr::{BoundExpression, Expression};
 use vortex_error::{VortexResult, vortex_bail};
 use vortex_layout::LayoutReaderRef;
@@ -29,11 +33,11 @@ pub(crate) struct NativeStoreFile {
     /// captured at open so read paths can restore the subject stamp on
     /// materialized rows without re-walking the layout.
     quads_sorted: bool,
-    child_readers: Vec<std::sync::OnceLock<LayoutReaderRef>>,
+    child_readers: Vec<OnceLock<LayoutReaderRef>>,
     /// The quad table's natural split ranges, computed once — every
     /// counting/matching call iterates them, and deriving them walks the
     /// layout tree.
-    splits: std::sync::OnceLock<std::sync::Arc<[std::ops::Range<u64>]>>,
+    splits: OnceLock<Arc<[Range<u64>]>>,
     /// Statistics-only pruning envelopes keyed by filter shape — the
     /// expression itself, whose `Eq`/`Hash` are structural (fn id + options
     /// per node), so a hit costs a tree walk but no allocation: the
@@ -41,16 +45,15 @@ pub(crate) struct NativeStoreFile {
     /// re-ask the same handful of filters, and each envelope costs a pruning
     /// evaluation over every zone. Bounded: cleared wholesale past
     /// [`PRUNING_MEMO_MAX`].
-    pruning_envelopes:
-        std::sync::Mutex<std::collections::HashMap<Expression, Option<std::ops::Range<u64>>>>,
+    pruning_envelopes: Mutex<HashMap<Expression, Option<Range<u64>>>>,
     /// Per-column chunk-probe handles keyed by column name (`None` memoizes
     /// a column whose layout shape or dtype declines), resolved once per open
     /// file. Each handle caches fetched chunk probes internally, so repeated
     /// bound-subject queries and point reads touch segments once.
-    column_chunks: std::sync::Mutex<ColumnChunksMemo>,
+    column_chunks: Mutex<ColumnChunksMemo>,
     /// One bound tree per (scope, filter shape), held for the handle's
     /// lifetime — see [`BoundExprMemo`].
-    bound_exprs: std::sync::Arc<BoundExprMemo>,
+    bound_exprs: Arc<BoundExprMemo>,
 }
 
 /// Structural (scope, expression) → the one [`BoundExpression`] this file
@@ -66,9 +69,7 @@ pub(crate) struct NativeStoreFile {
 /// The scope tag separates trees bound against different schemas (the quad
 /// root vs. an index child). Bounded like [`NativeStoreFile::pruning_envelopes`]:
 /// cleared wholesale past [`BIND_MEMO_MAX`].
-pub(crate) struct BoundExprMemo(
-    std::sync::Mutex<std::collections::HashMap<(&'static str, Expression), BoundExpression>>,
-);
+pub(crate) struct BoundExprMemo(Mutex<HashMap<(&'static str, Expression), BoundExpression>>);
 
 /// Entry cap on [`BoundExprMemo`] — sized for a query workload's distinct
 /// filter shapes, not for arbitrary term churn.
@@ -76,7 +77,7 @@ const BIND_MEMO_MAX: usize = 4096;
 
 impl BoundExprMemo {
     fn new() -> Self {
-        Self(std::sync::Mutex::new(std::collections::HashMap::new()))
+        Self(Mutex::new(HashMap::new()))
     }
 
     /// The memoized bound form of `expr` against `dtype`, binding on first
@@ -103,10 +104,7 @@ impl BoundExprMemo {
 
 /// Memoized per-column chunk-probe handles; see
 /// [`NativeStoreFile::column_chunks`].
-type ColumnChunksMemo = std::collections::HashMap<
-    String,
-    Option<std::sync::Arc<vortex_rdf_encoded_search::ColumnChunks>>,
->;
+type ColumnChunksMemo = HashMap<String, Option<Arc<vortex_rdf_encoded_search::ColumnChunks>>>;
 
 /// Entry cap on [`NativeStoreFile::pruning_envelopes`] — sized for a query
 /// workload's distinct filter shapes, not for arbitrary term churn.
@@ -132,26 +130,23 @@ impl NativeStoreFile {
         let typed = file.footer().layout().as_::<RdfStoreLayoutVTable>();
         let components = store_components(typed).to_vec();
         let quads_sorted = quads_sorted(typed);
-        let child_readers = components
-            .iter()
-            .map(|_| std::sync::OnceLock::new())
-            .collect();
+        let child_readers = components.iter().map(|_| OnceLock::new()).collect();
         Ok(Self {
             file,
             components,
             quads_sorted,
             child_readers,
-            splits: std::sync::OnceLock::new(),
-            pruning_envelopes: std::sync::Mutex::new(std::collections::HashMap::new()),
-            column_chunks: std::sync::Mutex::new(std::collections::HashMap::new()),
-            bound_exprs: std::sync::Arc::new(BoundExprMemo::new()),
+            splits: OnceLock::new(),
+            pruning_envelopes: Mutex::new(HashMap::new()),
+            column_chunks: Mutex::new(HashMap::new()),
+            bound_exprs: Arc::new(BoundExprMemo::new()),
         })
     }
 
     /// The handle's bound-expression memo — shared (`Arc`) so serve plans
     /// and deferred row-id sources outliving a borrow can keep binding
     /// through it.
-    pub(crate) fn bound_exprs(&self) -> &std::sync::Arc<BoundExprMemo> {
+    pub(crate) fn bound_exprs(&self) -> &Arc<BoundExprMemo> {
         &self.bound_exprs
     }
 
@@ -160,7 +155,7 @@ impl NativeStoreFile {
     /// child's layout shape declines — callers then keep the scan path.
     pub(crate) fn sorted_subject_chunks(
         &self,
-    ) -> Option<std::sync::Arc<vortex_rdf_encoded_search::ColumnChunks>> {
+    ) -> Option<Arc<vortex_rdf_encoded_search::ColumnChunks>> {
         self.column_chunks(crate::store::schema::COL_S)
     }
 
@@ -170,14 +165,14 @@ impl NativeStoreFile {
     pub(crate) fn column_chunks(
         &self,
         column: &str,
-    ) -> Option<std::sync::Arc<vortex_rdf_encoded_search::ColumnChunks>> {
+    ) -> Option<Arc<vortex_rdf_encoded_search::ColumnChunks>> {
         let mut memo = self.column_chunks.lock().expect("column chunks lock");
         memo.entry(column.to_owned())
             .or_insert_with(|| {
                 let typed = self.file.footer().layout().as_::<RdfStoreLayoutVTable>();
                 let quads = typed.slot(0).ok().flatten()?;
                 vortex_rdf_encoded_search::ColumnChunks::from_struct_layout(&quads, column)
-                    .map(std::sync::Arc::new)
+                    .map(Arc::new)
             })
             .clone()
     }
@@ -190,7 +185,7 @@ impl NativeStoreFile {
         &self,
         component: &str,
         column: &str,
-    ) -> Option<std::sync::Arc<vortex_rdf_encoded_search::ColumnChunks>> {
+    ) -> Option<Arc<vortex_rdf_encoded_search::ColumnChunks>> {
         // The `/` separator cannot appear in a bare quad column name, so the
         // composite keys share the quad columns' memo without collisions.
         let key = format!("{component}/{column}");
@@ -201,19 +196,19 @@ impl NativeStoreFile {
                 let typed = self.file.footer().layout().as_::<RdfStoreLayoutVTable>();
                 let child = typed.slot(index + 1).ok().flatten()?;
                 vortex_rdf_encoded_search::ColumnChunks::from_struct_layout(&child, column)
-                    .map(std::sync::Arc::new)
+                    .map(Arc::new)
             })
             .clone()
     }
 
     /// The quad table's natural splits, memoized. Shadows the inner file's
     /// `splits()` (which recomputes from the layout tree per call).
-    pub(crate) fn splits(&self) -> VortexResult<std::sync::Arc<[std::ops::Range<u64>]>> {
+    pub(crate) fn splits(&self) -> VortexResult<Arc<[Range<u64>]>> {
         if let Some(splits) = self.splits.get() {
-            return Ok(std::sync::Arc::clone(splits));
+            return Ok(Arc::clone(splits));
         }
-        let computed: std::sync::Arc<[std::ops::Range<u64>]> = self.file.splits()?.into();
-        let _ = self.splits.set(std::sync::Arc::clone(&computed));
+        let computed: Arc<[Range<u64>]> = self.file.splits()?.into();
+        let _ = self.splits.set(Arc::clone(&computed));
         Ok(computed)
     }
 
@@ -221,10 +216,7 @@ impl NativeStoreFile {
     /// `Option` is a memo miss; the inner is the envelope itself, whose
     /// `None` means "nothing prunable".
     #[allow(clippy::option_option)]
-    pub(crate) fn pruning_envelope(
-        &self,
-        filter: &Expression,
-    ) -> Option<Option<std::ops::Range<u64>>> {
+    pub(crate) fn pruning_envelope(&self, filter: &Expression) -> Option<Option<Range<u64>>> {
         self.pruning_envelopes
             .lock()
             .expect("pruning memo lock")
@@ -238,7 +230,7 @@ impl NativeStoreFile {
     pub(crate) fn memoize_pruning_envelope(
         &self,
         filter: Expression,
-        envelope: Option<std::ops::Range<u64>>,
+        envelope: Option<Range<u64>>,
     ) {
         let mut memo = self.pruning_envelopes.lock().expect("pruning memo lock");
         if memo.len() >= PRUNING_MEMO_MAX {

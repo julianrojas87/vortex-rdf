@@ -1189,8 +1189,6 @@ async fn run_copy_index_file_serving_test(layout: LayoutStrategy, located: bool)
 #[cfg(feature = "file-io")]
 #[tokio::test]
 async fn test_copy_index_file_serving_wide_located_run_stays_pending() {
-    use futures::StreamExt as _;
-
     // 10,000 rows per predicate: several served splits on any host (the
     // split policy floors at 1,024 rows), with the child's lead run longer
     // than the writer's first 8,192-row block, so its `p` column stays a
@@ -1281,8 +1279,6 @@ async fn test_copy_index_file_serving_wide_located_run_stays_pending() {
 #[cfg(feature = "file-io")]
 #[tokio::test]
 async fn test_copy_index_file_locates_dictionary_coded_columns() {
-    use futures::StreamExt as _;
-
     // Three predicates of 3,000 rows: the POSG child's first block holds all
     // three, so its `p` column is dictionary-coded; `o` (seven objects) is
     // dictionary-coded in both families.
