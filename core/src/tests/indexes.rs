@@ -1192,10 +1192,9 @@ async fn test_copy_index_file_serving_wide_located_run_stays_pending() {
     use futures::StreamExt as _;
 
     // 10,000 rows per predicate: several served splits on any host (the
-    // split policy floors at 1,024 rows), and a lead run longer than the
-    // writer's first 8,192-row block — which is what keeps the child's `p`
-    // column out of the dict layout the chunk probes decline, so the run
-    // locates at all.
+    // split policy floors at 1,024 rows), with the child's lead run longer
+    // than the writer's first 8,192-row block, so its `p` column stays a
+    // plain flat leaf (the dictionary-coded shape has its own test below).
     let quads: Vec<Quad> = (0..30_000)
         .map(|i| {
             make_quad(
@@ -1267,6 +1266,123 @@ async fn test_copy_index_file_serving_wide_located_run_stays_pending() {
         .unwrap();
     assert!(by_p_after.debug_has_serve_plan());
     assert_eq!(by_p_after.size().await.unwrap(), 9_999);
+    assert_eq!(
+        view_strings(&by_p_after).await,
+        expected(&|i| i % 3 == 1 && i != 1_501)
+    );
+}
+
+/// Index-child columns the writer dictionary-encodes at the layout level —
+/// a lead column whose first block holds a few predicates, a second key with
+/// a handful of objects — still locate their runs: the lead search, the
+/// windowed second-key search and the point reads all probe through the
+/// codes leaves, so every served shape reads by range and agrees with the
+/// primary read.
+#[cfg(feature = "file-io")]
+#[tokio::test]
+async fn test_copy_index_file_locates_dictionary_coded_columns() {
+    use futures::StreamExt as _;
+
+    // Three predicates of 3,000 rows: the POSG child's first block holds all
+    // three, so its `p` column is dictionary-coded; `o` (seven objects) is
+    // dictionary-coded in both families.
+    let quads: Vec<Quad> = (0..9_000)
+        .map(|i| {
+            make_quad(
+                &format!("http://example.org/s{:04}", i),
+                &format!("http://example.org/p{}", i % 3),
+                &format!("o{}", i % 7),
+                GraphName::DefaultGraph,
+            )
+        })
+        .collect();
+    let expected = |keep: &dyn Fn(usize) -> bool| -> Vec<String> {
+        let mut strings: Vec<String> = quads
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| keep(*i))
+            .map(|(_, q)| q.to_string())
+            .collect();
+        strings.sort();
+        strings
+    };
+    let (_dir, path) = write_store_file(
+        quads.clone(),
+        LayoutStrategy::Dictionary,
+        vec![IndexType::SecondaryByCopy],
+    )
+    .await;
+    let store = VortexRdfStore::from_file(&path).await.unwrap();
+
+    // Predicate-bound: the POSG lead run, located through the dictionary-coded
+    // `p` column and served by range in several splits.
+    let p1 = NamedNode::new("http://example.org/p1").unwrap();
+    let by_p = store
+        .match_pattern(None, Some(&p1), None, None)
+        .await
+        .unwrap();
+    assert!(by_p.debug_has_serve_plan());
+    assert_eq!(by_p.debug_serve_row_range(), Some(3_000..6_000));
+    assert!(by_p.debug_selection_pending());
+    assert_eq!(by_p.size().await.unwrap(), 3_000);
+    assert_eq!(view_strings(&by_p).await, expected(&|i| i % 3 == 1));
+    let chunks: Vec<usize> = by_p
+        .shared_quad_chunks()
+        .unwrap()
+        .map(|chunk| chunk.len())
+        .filter(|len| futures::future::ready(*len > 0))
+        .collect()
+        .await;
+    assert!(
+        chunks.len() >= 2,
+        "served in several splits, got {chunks:?}"
+    );
+
+    // Predicate and object bound: the windowed second-key search inside the
+    // lead run, through the dictionary-coded `o` column — `i ≡ 1 (mod 3)`
+    // and `i ≡ 1 (mod 7)` is the second of p1's seven object sub-runs.
+    let o1 = Term::Literal(Literal::new_simple_literal("o1"));
+    let by_po = store
+        .match_pattern(None, Some(&p1), Some(&o1), None)
+        .await
+        .unwrap();
+    assert!(by_po.debug_has_serve_plan());
+    assert_eq!(by_po.debug_serve_row_range(), Some(3_429..3_858));
+    assert_eq!(by_po.size().await.unwrap(), 429);
+    assert_eq!(
+        view_strings(&by_po).await,
+        expected(&|i| i % 3 == 1 && i % 7 == 1)
+    );
+
+    // Object-bound: the OSPG lead run through its dictionary-coded `o`.
+    let o2 = Term::Literal(Literal::new_simple_literal("o2"));
+    let by_o = store
+        .match_pattern(None, None, Some(&o2), None)
+        .await
+        .unwrap();
+    assert!(by_o.debug_has_serve_plan());
+    assert_eq!(by_o.debug_serve_row_range(), Some(2_572..3_858));
+    assert_eq!(by_o.size().await.unwrap(), 1_286);
+    assert_eq!(view_strings(&by_o).await, expected(&|i| i % 7 == 2));
+
+    // A term the store knows but never as a predicate: the located run is
+    // empty, proving the pattern matches nothing at match time.
+    let subject_as_p = NamedNode::new("http://example.org/s0000").unwrap();
+    let zero = store
+        .match_pattern(None, Some(&subject_as_p), None, None)
+        .await
+        .unwrap();
+    assert!(!zero.debug_selection_pending());
+    assert_eq!(zero.size().await.unwrap(), 0);
+
+    // A tombstone inside a served run leaves every split through the rid
+    // column.
+    let deleted = store.delete_quad(&quads[1_501]).await.unwrap();
+    let by_p_after = deleted
+        .match_pattern(None, Some(&p1), None, None)
+        .await
+        .unwrap();
+    assert_eq!(by_p_after.size().await.unwrap(), 2_999);
     assert_eq!(
         view_strings(&by_p_after).await,
         expected(&|i| i % 3 == 1 && i != 1_501)

@@ -188,3 +188,228 @@ async fn layout_chunks_probe_matches_canonical() {
         }
     }
 }
+
+/// A struct chunk over two `u32` columns `p` and `o`.
+fn struct_chunk(p: &[u32], o: &[u32]) -> ArrayRef {
+    assert_eq!(p.len(), o.len());
+    let len = p.len();
+    let p = PrimitiveArray::from_iter(p.iter().copied()).into_array();
+    let o = PrimitiveArray::from_iter(o.iter().copied()).into_array();
+    StructArray::try_new(["p", "o"].into(), vec![p, o], len, Validity::NonNullable)
+        .unwrap()
+        .into_array()
+}
+
+/// A field's data node beneath its zoned wrappers, for shape assertions.
+fn data_node(root: &vortex_layout::LayoutRef, field: &str) -> vortex_layout::LayoutRef {
+    use vortex_layout::LayoutChildType;
+    use vortex_layout::layouts::zoned::Zoned;
+    let mut node = (0..root.nslots())
+        .find_map(|i| {
+            matches!(root.slot_type(i), Some(LayoutChildType::Field(ref name)) if name.as_ref() == field)
+                .then(|| root.slot(i).ok().flatten())
+                .flatten()
+        })
+        .expect("field present");
+    while node.is::<Zoned>() {
+        node = node.slot(0).unwrap().unwrap();
+    }
+    node
+}
+
+fn canonical_bounds(data: &[u32], needle: u64) -> std::ops::Range<u64> {
+    let lo = data.partition_point(|&v| u64::from(v) < needle) as u64;
+    let hi = data.partition_point(|&v| u64::from(v) <= needle) as u64;
+    lo..hi.max(lo)
+}
+
+/// A column the default write strategy dictionary-encodes at the layout
+/// level — its first block holds only a few distinct values — probes through
+/// the codes leaves and the shared values leaf: global bounds over the sorted
+/// lead column, point reads anywhere, and windowed bounds over a second
+/// column sorted only within each lead run.
+#[tokio::test(flavor = "multi_thread")]
+async fn layout_chunks_probe_dictionary_coded_columns() {
+    use vortex_layout::layouts::dict::Dict as DictLayout;
+
+    let session = session();
+    // Three lead runs of 3,000 rows; the second column restarts inside each.
+    let p: Vec<u32> = (0..9_000).map(|i| (i / 3_000) as u32).collect();
+    let o: Vec<u32> = (0..9_000).map(|i| ((i % 3_000) / 300) as u32).collect();
+    let chunk = struct_chunk(&p, &o);
+    let dtype = chunk.dtype().clone();
+
+    let mut bytes = Vec::new();
+    session
+        .write_options()
+        .write(
+            &mut bytes,
+            ArrayStreamAdapter::new(dtype, futures::stream::iter([Ok(chunk)])),
+        )
+        .await
+        .unwrap();
+    let file = session.open_options().open_buffer(bytes).unwrap();
+    let root = file.footer().layout().clone();
+    for field in ["p", "o"] {
+        assert!(
+            data_node(&root, field).is::<DictLayout>(),
+            "the writer no longer dictionary-encodes `{field}`; the fixture must change to keep covering the dict layout"
+        );
+    }
+
+    let source = file.segment_source();
+    let pc = ColumnChunks::from_struct_layout(&root, "p").expect("a dict layout resolves");
+    let oc = ColumnChunks::from_struct_layout(&root, "o").expect("a dict layout resolves");
+    assert_eq!(pc.row_count(), 9_000);
+    assert_eq!(oc.row_count(), 9_000);
+
+    for needle in [0u64, 1, 2, 3, 17, u64::MAX] {
+        let got = pc
+            .bounds(needle, &source, &session)
+            .await
+            .unwrap()
+            .expect("dictionary-coded leaves are probeable");
+        assert_eq!(got, canonical_bounds(&p, needle), "needle {needle}");
+    }
+
+    let mut rows: Vec<u64> = (0..9_000u64).step_by(97).collect();
+    rows.extend([0, 2_999, 3_000, 5_999, 6_000, 8_999]);
+    for row in rows {
+        for (column, data) in [(&pc, &p), (&oc, &o)] {
+            let got = column
+                .value_at(row, &source, &session)
+                .await
+                .unwrap()
+                .expect("dictionary-coded leaves are probeable");
+            assert_eq!(got, u64::from(data[row as usize]), "row {row}");
+        }
+    }
+
+    for run in 0..3u64 {
+        let window = run * 3_000..(run + 1) * 3_000;
+        let wdata = &o[window.start as usize..window.end as usize];
+        for needle in (0..=10u64).chain([u64::MAX]) {
+            let got = oc
+                .bounds_in(window.clone(), needle, &source, &session)
+                .await
+                .unwrap()
+                .expect("dictionary-coded leaves are probeable");
+            let want = canonical_bounds(wdata, needle);
+            assert_eq!(
+                got,
+                window.start + want.start..window.start + want.end,
+                "window {window:?} needle {needle}"
+            );
+        }
+    }
+}
+
+/// A column whose dictionary outgrows its constraints becomes a chunked run
+/// of dictionary layouts, each with its own values leaf and chunked codes;
+/// probes address rows across dictionary boundaries exactly.
+#[tokio::test(flavor = "multi_thread")]
+async fn layout_chunks_probe_run_of_dictionaries() {
+    use std::sync::Arc;
+
+    use vortex_btrblocks::BtrBlocksCompressorBuilder;
+    use vortex_layout::layouts::chunked::Chunked as ChunkedLayout;
+    use vortex_layout::layouts::chunked::writer::ChunkedLayoutStrategy;
+    use vortex_layout::layouts::compressed::CompressorPlugin;
+    use vortex_layout::layouts::dict::Dict as DictLayout;
+    use vortex_layout::layouts::dict::writer::{
+        DictLayoutConstraints, DictLayoutOptions, DictStrategy,
+    };
+    use vortex_layout::layouts::flat::writer::FlatLayoutStrategy;
+    use vortex_layout::layouts::struct_::StructStrategy;
+
+    let session = session();
+    // Forty distinct values of 500 rows each, fed as four input chunks; a
+    // dictionary holds at most sixteen values, so the column becomes three
+    // dictionaries whose codes leaves follow the input chunking.
+    let data: Vec<u32> = (0..20_000).map(|i| (i / 500) as u32).collect();
+    let chunks: Vec<ArrayRef> = data.chunks(5_000).map(chunk).collect();
+    let dtype = chunks[0].dtype().clone();
+    let compressor: Arc<dyn CompressorPlugin> =
+        Arc::new(BtrBlocksCompressorBuilder::default().build());
+    let dict = DictStrategy::new(
+        ChunkedLayoutStrategy::new(FlatLayoutStrategy::default()),
+        FlatLayoutStrategy::default(),
+        FlatLayoutStrategy::default(),
+        DictLayoutOptions {
+            constraints: DictLayoutConstraints {
+                max_len: 16,
+                ..Default::default()
+            },
+        },
+        compressor,
+    );
+    let strategy = StructStrategy::new(Arc::new(FlatLayoutStrategy::default()), Arc::new(dict));
+
+    let mut bytes = Vec::new();
+    session
+        .write_options()
+        .with_strategy(Arc::new(strategy))
+        .write(
+            &mut bytes,
+            ArrayStreamAdapter::new(dtype, futures::stream::iter(chunks.into_iter().map(Ok))),
+        )
+        .await
+        .unwrap();
+    let file = session.open_options().open_buffer(bytes).unwrap();
+    let root = file.footer().layout().clone();
+    let node = data_node(&root, "s");
+    assert!(
+        node.is::<ChunkedLayout>() && node.nslots() == 3,
+        "expected a chunked run of three dictionaries, got {}",
+        node.display_tree()
+    );
+    for i in 0..node.nslots() {
+        assert!(node.slot(i).unwrap().unwrap().is::<DictLayout>());
+    }
+
+    let source = file.segment_source();
+    let column =
+        ColumnChunks::from_struct_layout(&root, "s").expect("a run of dictionaries resolves");
+    assert_eq!(column.row_count(), 20_000);
+
+    for needle in (0..=40u64).chain([100, u64::MAX]) {
+        let got = column
+            .bounds(needle, &source, &session)
+            .await
+            .unwrap()
+            .expect("dictionary-coded leaves are probeable");
+        assert_eq!(got, canonical_bounds(&data, needle), "needle {needle}");
+    }
+
+    // Rows around every dictionary boundary (values 15→16 and 31→32) and the
+    // input chunk boundaries, plus a stride over the interior.
+    let mut rows: Vec<u64> = (0..20_000u64).step_by(251).collect();
+    rows.extend([
+        0, 4_999, 5_000, 7_999, 8_000, 9_999, 10_000, 15_999, 16_000, 19_999,
+    ]);
+    for row in rows {
+        let got = column
+            .value_at(row, &source, &session)
+            .await
+            .unwrap()
+            .expect("dictionary-coded leaves are probeable");
+        assert_eq!(got, u64::from(data[row as usize]), "row {row}");
+    }
+
+    for window in [7_000u64..9_000, 15_500..16_500, 0..20_000, 4_900..5_100] {
+        let wdata = &data[window.start as usize..window.end as usize];
+        for needle in [0u64, 14, 15, 16, 17, 31, 32, 39, 40, u64::MAX] {
+            let got = column
+                .bounds_in(window.clone(), needle, &source, &session)
+                .await
+                .unwrap()
+                .expect("dictionary-coded leaves are probeable");
+            let want = canonical_bounds(wdata, needle);
+            assert_eq!(
+                got,
+                window.start + want.start..window.start + want.end,
+                "window {window:?} needle {needle}"
+            );
+        }
+    }
+}

@@ -91,6 +91,13 @@ rebuilds metadata over the segment buffers — it does not decompress), resolved
 into a probe once, and cached, so repeated queries against a hot file do no
 further I/O.
 
+A column the writer dictionary-encoded at the layout level (a `vortex.dict`
+node — a values leaf beside a codes subtree, possibly one of a chunked run of
+such dictionaries) is probed through its codes leaves: each is composed with
+the dictionary's values, fetched once and shared, into a dictionary array the
+probe resolves like any other. Because the probe's dictionary node bisects the
+decoded values, the order the writer assigned codes in never matters.
+
 ```toml
 [dependencies]
 vortex-rdf-encoded-search = { version = "0.5", features = ["layout"] }
