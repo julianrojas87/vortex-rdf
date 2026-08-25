@@ -51,7 +51,7 @@ impl VortexRdfStore {
                 ViewSelection::Exact(selection) => selection.len(base.len()),
                 ViewSelection::Pending(lazy) => match lazy.len_if_known() {
                     Some(len) => len,
-                    None => lazy.materialized_sync()?.len(),
+                    None => lazy.materialized()?.len(),
                 },
             },
             // Tombstones ask liveness per selected row, so a pending
@@ -63,7 +63,7 @@ impl VortexRdfStore {
                 deleted: Some(deleted),
                 ..
             } => selection
-                .materialized_sync()?
+                .materialized()?
                 .live_mask(deleted, base.len())
                 .true_count(),
             #[cfg(feature = "file-io")]
@@ -92,7 +92,7 @@ impl VortexRdfStore {
                     // A count needs the selection itself, so a served match's
                     // deferred index-child scan runs here, once, and is
                     // cached on the view.
-                    let selection = selection.materialized().await?;
+                    let selection = selection.materialized_async().await?;
                     match filter {
                         // No filter pending: the selection is exact, minus
                         // whatever the tombstones have removed from it.
@@ -230,7 +230,7 @@ impl VortexRdfStore {
         // No plan (or a plan that declined): codes are gathered by row id, so
         // a served match's pending selection materializes here (the in-memory
         // decode+sort it deferred at match time).
-        let selection = selection.materialized_sync().ok()?;
+        let selection = selection.materialized().ok()?;
         // Contiguous, tombstone-free selections share the base's buffers
         // zero-copy (a `Buffer` slice is a refcount bump); a tombstone-free id
         // list is a branch-free gather; only tombstoned views pay a
@@ -330,7 +330,7 @@ impl VortexRdfStore {
                 // A base-order gather needs exact row ids (a serve plan
                 // reorders rows), so a served match's pending selection
                 // materializes here.
-                let selection = selection.materialized_sync()?;
+                let selection = selection.materialized()?;
                 match (&selection, deleted) {
                     // The whole base, nothing deleted: hand back the array as
                     // it stands (pure primary columns — index copies live in
@@ -358,7 +358,7 @@ impl VortexRdfStore {
             } => {
                 // Same materialization as above — the scan reads in file row
                 // order, which only the exact ids can restrict.
-                let selection = selection.materialized().await?;
+                let selection = selection.materialized_async().await?;
                 // A tiny exact selection reads point-by-point through the
                 // file's cached chunk probes, skipping the scan machinery and
                 // its whole-leaf decodes; anything it declines runs the scan.

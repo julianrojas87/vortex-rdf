@@ -285,9 +285,7 @@ async fn test_locally_sorted_children_from_bytes_match_correctly() {
     // descriptor must say so — the shape a chunked foreign writer could
     // produce and a reader must not binary-search.
     use crate::store::indexes::secondary_by_copy::Family;
-    use crate::store::indexes::secondary_by_copy::out_of_core::{
-        CopyKey, copy_child_chunk_strings,
-    };
+    use crate::store::indexes::secondary_by_copy::out_of_core::{CopyKey, copy_child_chunk};
     let mut quad_chunks = Vec::new();
     let mut child_chunks: Vec<Vec<vortex_array::ArrayRef>> = vec![Vec::new(), Vec::new()];
     for (n, rows) in raws.chunks(4).enumerate() {
@@ -309,7 +307,7 @@ async fn test_locally_sorted_children_from_bytes_match_correctly() {
                 })
                 .collect();
             keys.sort_unstable();
-            child_chunks[family_ix].push(copy_child_chunk_strings(family, &keys).unwrap());
+            child_chunks[family_ix].push(copy_child_chunk(family, &keys).unwrap());
         }
     }
     let dtype = quad_chunks[0].dtype().clone();

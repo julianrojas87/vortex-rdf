@@ -64,21 +64,24 @@ impl ViewSelection {
 
     /// The concrete selection, running a pending resolution's deferred id
     /// computation if one is still outstanding (cached for every later
-    /// consumer and every clone of the view — see [`LazyRowIds`]).
+    /// consumer and every clone of the view — see [`LazyRowIds`]) — the
+    /// awaiting form, which also runs a file child's deferred scan.
     #[cfg(feature = "file-io")]
-    pub(crate) async fn materialized(&self) -> Result<RowSelection> {
+    pub(crate) async fn materialized_async(&self) -> Result<RowSelection> {
         match self {
             ViewSelection::Exact(selection) => Ok(selection.clone()),
-            ViewSelection::Pending(lazy) => Ok(RowSelection::Ids(lazy.materialized().await?)),
+            ViewSelection::Pending(lazy) => Ok(RowSelection::Ids(lazy.materialized_async().await?)),
         }
     }
 
-    /// The synchronous counterpart of [`materialized`](Self::materialized),
-    /// for in-memory views (whose pending ids never take I/O).
-    pub(crate) fn materialized_sync(&self) -> Result<RowSelection> {
+    /// The concrete selection, running a pending resolution's deferred id
+    /// computation if one is still outstanding — the synchronous form for
+    /// in-memory views, whose pending ids never take I/O (see
+    /// [`materialized_async`](Self::materialized_async)).
+    pub(crate) fn materialized(&self) -> Result<RowSelection> {
         match self {
             ViewSelection::Exact(selection) => Ok(selection.clone()),
-            ViewSelection::Pending(lazy) => Ok(RowSelection::Ids(lazy.materialized_sync()?)),
+            ViewSelection::Pending(lazy) => Ok(RowSelection::Ids(lazy.materialized()?)),
         }
     }
 

@@ -16,7 +16,7 @@
 //! and the only one compiled in.
 //!
 //! Index data has exactly one form: a builder emits primary-only quad rows
-//! plus one *component* per requested index's persisted-child role (see
+//! plus one *component* per requested index's persisted-child identity (see
 //! `indexes::components`), which is what a store adopts and what a file
 //! writes — nothing intermediate, nothing to split. The two pipelines differ
 //! only in where the components come from: the in-memory sort builds all of
@@ -183,7 +183,7 @@ pub(crate) fn build_struct_array(
 /// touches it.
 pub(crate) struct GlobalIndexes {
     by_copy: Option<secondary_by_copy::GlobalCopyArrays>,
-    by_reference: Option<secondary_by_reference::GlobalIndexArrays>,
+    by_reference: Option<secondary_by_reference::GlobalReferenceArrays>,
 }
 
 impl GlobalIndexes {
@@ -197,8 +197,9 @@ impl GlobalIndexes {
                     by_copy = Some(secondary_by_copy::GlobalCopyArrays::from_quads(quads));
                 }
                 IndexType::SecondaryByReference => {
-                    by_reference =
-                        Some(secondary_by_reference::GlobalIndexArrays::from_quads(quads));
+                    by_reference = Some(secondary_by_reference::GlobalReferenceArrays::from_quads(
+                        quads,
+                    ));
                 }
             }
         }
@@ -218,8 +219,9 @@ impl GlobalIndexes {
                     by_copy = Some(secondary_by_copy::GlobalCopyArrays::from_codes(codes));
                 }
                 IndexType::SecondaryByReference => {
-                    by_reference =
-                        Some(secondary_by_reference::GlobalIndexArrays::from_codes(codes));
+                    by_reference = Some(secondary_by_reference::GlobalReferenceArrays::from_codes(
+                        codes,
+                    ));
                 }
             }
         }

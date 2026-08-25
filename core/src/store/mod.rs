@@ -187,7 +187,7 @@ impl VortexRdfStore {
         let components = parts
             .components
             .into_iter()
-            .map(crate::store::indexes::IndexComponent::into_resident)
+            .map(crate::store::indexes::IndexComponent::into_searchable)
             .collect::<Result<Vec<_>>>()?;
         Self::assemble_resident(base, components, layout)
     }

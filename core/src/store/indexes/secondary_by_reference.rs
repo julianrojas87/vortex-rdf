@@ -7,10 +7,10 @@
 //!
 //! The value columns come in two encodings — term strings, or u32 dictionary
 //! codes under the Dictionary layout — and are always built over the complete
-//! dataset in one global sort: [`GlobalIndexArrays`] for the in-memory
+//! dataset in one global sort: [`GlobalReferenceArrays`] for the in-memory
 //! builders, merged `(value, row id)` spill runs for the out-of-core one.
 //! Both hand the columns over as this index's two persisted children
-//! (`{val, rid}` per covered role), value column stamped `IsSorted`.
+//! (`{val, rid}` per covered family), value column stamped `IsSorted`.
 //!
 //! Both backends need global sortedness to binary-search, and neither depends
 //! on it to be correct — they differ only in what they do without it, which
@@ -22,7 +22,6 @@
 //! (and, failing that, how much of the scan prunes).
 //!
 //! [`IndexType::SecondaryByReference`]: super::IndexType::SecondaryByReference
-// Inspired by https://clickhouse.com/blog/projections-secondary-indices
 
 #[cfg(feature = "file-io")]
 use std::ops::Range;
@@ -34,75 +33,71 @@ use vortex_array::{ArrayRef, IntoArray};
 #[cfg(feature = "file-io")]
 use super::FileServePlan;
 use super::components::child_struct;
-use super::{InMemoryServePlan, IndexResolution, IndexedComponent, ResolvedRowIds, sorted_row_ids};
+use super::{InMemoryServePlan, IndexResolution, ResolvedRoles, ResolvedRowIds, sorted_row_ids};
 use crate::error::{Result, VortexRdfError};
 use crate::store::RawQuad;
 use crate::store::array::{make_string_array, stamp_is_sorted};
 use crate::store::layouts::dictionary::QuadCodes;
 use crate::store::layouts::{PatternCodes, QuadPattern, TermRef};
 
-pub(crate) const REF_O_COMPONENT: &str = "index:ref-o";
-pub(crate) const REF_P_COMPONENT: &str = "index:ref-p";
-
 /// Column names inside a reference component's persisted child.
 const CHILD_COLUMNS: [&str; 2] = ["val", "rid"];
 const COL_VAL: &str = "val";
 const COL_RID: &str = "rid";
-pub(crate) const O_IMPLEMENTATION: &str = "secondary-by-reference/o";
-pub(crate) const P_IMPLEMENTATION: &str = "secondary-by-reference/p";
 
-/// This index's persisted-child role table — one `{val, rid}` table per
-/// covered role — feeding every generic loop in the hub (the slug registry
+/// This index's persisted-child identity table — one `{val, rid}` table per
+/// covered family — feeding every generic loop in the hub (the slug registry
 /// and the roster it builds); see
-/// [`IndexType::component_roles`](super::IndexType::component_roles). Built
-/// from the [`RefRole`] accessors so each name keeps exactly one spelling.
-pub(crate) const ROLES: [super::ComponentRole; 2] = [
-    super::ComponentRole {
-        name: RefRole::O.component_name(),
-        slug: RefRole::O.component_slug(),
+/// [`IndexType::component_identities`](super::IndexType::component_identities).
+/// Built from the [`RefFamily`] accessors so each name keeps exactly one
+/// spelling.
+pub(crate) const IDENTITIES: [super::ComponentIdentity; 2] = [
+    super::ComponentIdentity {
+        name: RefFamily::Object.component_name(),
+        slug: RefFamily::Object.component_slug(),
     },
-    super::ComponentRole {
-        name: RefRole::P.component_name(),
-        slug: RefRole::P.component_slug(),
+    super::ComponentIdentity {
+        name: RefFamily::Predicate.component_name(),
+        slug: RefFamily::Predicate.component_slug(),
     },
 ];
 
 /// One of the two quad components this index covers, named after it. Each
-/// role owns one `{val, rid}` component — its name and implementation slug —
-/// so the association is stated once here (and in the [`ROLES`] rows built
-/// from these accessors) instead of at every roster site.
+/// family owns one `{val, rid}` component — its name and implementation slug
+/// — so the association is stated once here (and in the [`IDENTITIES`] rows
+/// built from these accessors) instead of at every roster site.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub(crate) enum RefRole {
+pub(crate) enum RefFamily {
     /// Object values.
-    O,
+    Object,
     /// Predicate values.
-    P,
+    Predicate,
 }
 
-impl RefRole {
+impl RefFamily {
     /// The persisted child's component name.
     pub(crate) const fn component_name(self) -> &'static str {
         match self {
-            RefRole::O => REF_O_COMPONENT,
-            RefRole::P => REF_P_COMPONENT,
+            RefFamily::Object => "index:ref-o",
+            RefFamily::Predicate => "index:ref-p",
         }
     }
 
     /// The persisted child's implementation slug.
     pub(crate) const fn component_slug(self) -> &'static str {
         match self {
-            RefRole::O => O_IMPLEMENTATION,
-            RefRole::P => P_IMPLEMENTATION,
+            RefFamily::Object => "secondary-by-reference/o",
+            RefFamily::Predicate => "secondary-by-reference/p",
         }
     }
 }
 
-/// The covered role to probe (which names its component and columns), the
+/// The covered family to probe (which names its component and columns), the
 /// term to probe for, and which pattern component a hit resolves.
-struct ColumnProbe<'a> {
-    role: RefRole,
-    probe_term: TermRef<'a>,
-    resolves: IndexedComponent,
+struct RefProbe<'a> {
+    family: RefFamily,
+    lead: TermRef<'a>,
+    resolves: ResolvedRoles,
 }
 
 /// The column pair and component this index would use for a pattern shape,
@@ -113,22 +108,22 @@ struct ColumnProbe<'a> {
 /// predicate are bound, the object side is chosen — object equality is usually
 /// the more selective constraint. `None` when nothing this index covers is
 /// bound.
-fn choose<'a>(pattern: QuadPattern<'a>) -> Option<ColumnProbe<'a>> {
+fn choose<'a>(pattern: QuadPattern<'a>) -> Option<RefProbe<'a>> {
     if pattern.subject.is_some() {
         return None;
     }
     if let Some(object) = pattern.object {
-        return Some(ColumnProbe {
-            role: RefRole::O,
-            probe_term: TermRef::Object(object),
-            resolves: IndexedComponent::Object,
+        return Some(RefProbe {
+            family: RefFamily::Object,
+            lead: TermRef::Object(object),
+            resolves: ResolvedRoles::Object,
         });
     }
     if let Some(predicate) = pattern.predicate {
-        return Some(ColumnProbe {
-            role: RefRole::P,
-            probe_term: TermRef::Predicate(predicate),
-            resolves: IndexedComponent::Predicate,
+        return Some(RefProbe {
+            family: RefFamily::Predicate,
+            lead: TermRef::Predicate(predicate),
+            resolves: ResolvedRoles::Predicate,
         });
     }
     None
@@ -139,7 +134,7 @@ fn choose<'a>(pattern: QuadPattern<'a>) -> Option<ColumnProbe<'a>> {
 /// Binary-searches the sorted value column for the probe term and slices out
 /// the paired row ids — the base rows whose indexed component equals the
 /// term. Declines (so the store falls back to a mask scan) when the covered
-/// role's component is absent, probe-incompatible, or not globally sorted
+/// family's component is absent, probe-incompatible, or not globally sorted
 /// (`IndexComponent::sorted` — per-chunk sorted data is not
 /// binary-searchable).
 pub(crate) fn resolve_in_memory(
@@ -151,10 +146,10 @@ pub(crate) fn resolve_in_memory(
     let Some(probe) = choose(pattern) else {
         return Ok(IndexResolution::Declined);
     };
-    // Route through the index only when the role's component exists and is
+    // Route through the index only when the family's component exists and is
     // globally sorted — the writer's provenance, not a stamp inspection.
     let Some(component) =
-        super::IndexComponent::find_sorted(components, probe.role.component_name())
+        super::IndexComponent::find_sorted(components, probe.family.component_name())
     else {
         return Ok(IndexResolution::Declined);
     };
@@ -162,7 +157,7 @@ pub(crate) fn resolve_in_memory(
     // a dictionary code). Absent from the dictionary ⇒ nothing can match. The
     // probe term is the pattern's own predicate or object, so this shares the
     // match's resolution cache rather than searching the dictionary again.
-    let Some(native) = codes.probe_scalar(probe.probe_term)? else {
+    let Some(native) = codes.probe_scalar(probe.lead)? else {
         return Ok(IndexResolution::Empty);
     };
     // First genuine use of a `from_bytes`-adopted component: this is where a
@@ -217,24 +212,18 @@ pub(crate) async fn resolve_file(
     pattern: QuadPattern<'_>,
     codes: &mut PatternCodes,
 ) -> Result<IndexResolution<FileServePlan>> {
-    let Some(probe) = choose(pattern) else {
-        return Ok(IndexResolution::Declined);
+    let (probe, reader, name, native, located) = match locate(file, pattern, codes).await? {
+        Located::Declined => return Ok(IndexResolution::Declined),
+        Located::Absent => return Ok(IndexResolution::Empty),
+        Located::Run {
+            probe,
+            reader,
+            name,
+            native,
+            range,
+        } => (probe, reader, name, native, range),
     };
-    // Map the probed role onto its persisted child; be graceful when the
-    // child is absent (a foreign writer could omit one role).
-    let Some((descriptor, reader)) = file
-        .component_reader(probe.role.component_name())
-        .map_err(VortexRdfError::Vortex)?
-    else {
-        return Ok(IndexResolution::Declined);
-    };
-    // Term absent from the dictionary ⇒ the pattern provably matches nothing.
-    let Some(native) = codes.probe_scalar(probe.probe_term)? else {
-        return Ok(IndexResolution::Empty);
-    };
-
-    let name = probe.role.component_name();
-    if let Some(range) = locate_run(file, probe.role, &native, descriptor.sorted).await? {
+    if let Some(range) = located {
         // A located empty run proves the term absent from the data — the
         // short-circuit an empty scan reaches only after reading it.
         if range.is_empty() {
@@ -278,35 +267,60 @@ pub(crate) async fn resolve_file(
     .await
 }
 
-/// The child rows whose indexed value equals `native`, bounded by binary-
-/// searching the value column's cached chunk probes — the file mirror of
-/// [`resolve_in_memory`]'s search, reading only the chunks the bisection
-/// touches.
-///
-/// `None` declines the location (the caller falls back to its pushed-down
-/// scan): a child that is not globally sorted, a probe value that is not an
-/// integer (the string value columns), or a chunk whose encoding resolves no
-/// probe.
+/// The file resolver's prelude: the probe a pattern shape chooses, its
+/// persisted child, its native probe value, and the run of matching child
+/// rows when the value column's cached chunk probes locate it.
 #[cfg(feature = "file-io")]
-async fn locate_run(
+enum Located<'a> {
+    /// The index does not cover the pattern, or the probed family's child is
+    /// absent (a foreign writer could omit one).
+    Declined,
+    /// The probed term is absent from the dictionary: nothing can match.
+    Absent,
+    /// The probe applies; `range` is the matched run when located, `None`
+    /// when the location declined (an unsorted child, a string value column,
+    /// a chunk resolving no probe) and the pushed-down scan answers instead.
+    Run {
+        probe: RefProbe<'a>,
+        reader: vortex_layout::LayoutReaderRef,
+        name: &'static str,
+        native: vortex_array::scalar::Scalar,
+        range: Option<Range<u64>>,
+    },
+}
+
+/// Choose the probe for `pattern`, open its child, translate the term and
+/// locate the matched run through the value column's chunk probes — the
+/// shared front half of [`resolve_file`] and the test hook `debug_located_run`.
+#[cfg(feature = "file-io")]
+async fn locate<'a>(
     file: &crate::store::native_file::NativeStoreFile,
-    role: RefRole,
-    native: &vortex_array::scalar::Scalar,
-    sorted: bool,
-) -> Result<Option<Range<u64>>> {
-    if !sorted {
-        return Ok(None);
-    }
-    let Ok(needle) = u64::try_from(native) else {
-        return Ok(None);
+    pattern: QuadPattern<'a>,
+    codes: &mut PatternCodes,
+) -> Result<Located<'a>> {
+    let Some(probe) = choose(pattern) else {
+        return Ok(Located::Declined);
     };
-    let Some(chunks) = file.component_column_chunks(role.component_name(), COL_VAL) else {
-        return Ok(None);
+    let name = probe.family.component_name();
+    let Some((descriptor, reader)) = file
+        .component_reader(name)
+        .map_err(VortexRdfError::Vortex)?
+    else {
+        return Ok(Located::Declined);
     };
-    chunks
-        .bounds(needle, &file.segment_source(), file.session())
-        .await
-        .map_err(VortexRdfError::Vortex)
+    let Some(native) = codes.probe_scalar(probe.lead)? else {
+        return Ok(Located::Absent);
+    };
+    let range =
+        super::row_ids::locate_component_run(file, name, COL_VAL, &native, None, descriptor.sorted)
+            .await?;
+    Ok(Located::Run {
+        probe,
+        reader,
+        name,
+        native,
+        range,
+    })
 }
 
 /// Test-only hook exposing the run [`resolve_file`] locates for a pattern —
@@ -319,19 +333,10 @@ pub(crate) async fn debug_located_run(
     pattern: QuadPattern<'_>,
     codes: &mut PatternCodes,
 ) -> Result<Option<Range<u64>>> {
-    let Some(probe) = choose(pattern) else {
-        return Ok(None);
-    };
-    let Some((descriptor, _)) = file
-        .component_reader(probe.role.component_name())
-        .map_err(VortexRdfError::Vortex)?
-    else {
-        return Ok(None);
-    };
-    let Some(native) = codes.probe_scalar(probe.probe_term)? else {
-        return Ok(None);
-    };
-    locate_run(file, probe.role, &native, descriptor.sorted).await
+    Ok(match locate(file, pattern, codes).await? {
+        Located::Run { range, .. } => range,
+        Located::Declined | Located::Absent => None,
+    })
 }
 
 /// The emission surface of the out-of-core builder (compiled out on
@@ -384,14 +389,14 @@ pub(crate) mod out_of_core {
 /// The complete dataset's secondary-index columns in global sorted order —
 /// the in-memory builders' emission, handed on as this index's two persisted
 /// children by [`into_components`](Self::into_components).
-pub(crate) struct GlobalIndexArrays {
+pub(crate) struct GlobalReferenceArrays {
     o_val: ArrayRef,
     o_rid: ArrayRef,
     p_val: ArrayRef,
     p_rid: ArrayRef,
 }
 
-impl GlobalIndexArrays {
+impl GlobalReferenceArrays {
     /// Sort by term strings. Row IDs are the quads' positions in `quads`
     /// (the builder must pass the dataset in final row order), so the sort is
     /// just a u32 permutation — no per-term string copies.
@@ -453,19 +458,22 @@ impl GlobalIndexArrays {
             p_val,
             p_rid,
         } = self;
-        [(RefRole::O, o_val, o_rid), (RefRole::P, p_val, p_rid)]
-            .into_iter()
-            .map(|(role, val, rid)| {
-                let len = val.len();
-                let rows = child_struct(&CHILD_COLUMNS, vec![val, rid], len)?;
-                Ok(super::IndexComponent::built(
-                    role.component_name(),
-                    role.component_slug(),
-                    rows,
-                    true,
-                ))
-            })
-            .collect()
+        [
+            (RefFamily::Object, o_val, o_rid),
+            (RefFamily::Predicate, p_val, p_rid),
+        ]
+        .into_iter()
+        .map(|(family, val, rid)| {
+            let len = val.len();
+            let rows = child_struct(&CHILD_COLUMNS, vec![val, rid], len)?;
+            Ok(super::IndexComponent::built(
+                family.component_name(),
+                family.component_slug(),
+                rows,
+                true,
+            ))
+        })
+        .collect()
     }
 }
 
@@ -486,15 +494,15 @@ mod tests {
 
         // Object preferred over predicate when both are bound.
         let probe = choose(QuadPattern::new(None, Some(&p), Some(&o), None)).unwrap();
-        assert_eq!(probe.resolves, IndexedComponent::Object);
-        assert_eq!(probe.role.component_name(), REF_O_COMPONENT);
-        assert_eq!(probe.probe_term.to_string(), o.to_string());
+        assert_eq!(probe.resolves, ResolvedRoles::Object);
+        assert_eq!(probe.family.component_name(), "index:ref-o");
+        assert_eq!(probe.lead.to_string(), o.to_string());
 
         // Predicate-only patterns use the predicate side.
         let probe = choose(QuadPattern::new(None, Some(&p), None, None)).unwrap();
-        assert_eq!(probe.resolves, IndexedComponent::Predicate);
-        assert_eq!(probe.role.component_name(), REF_P_COMPONENT);
-        assert_eq!(probe.probe_term.to_string(), p.to_string());
+        assert_eq!(probe.resolves, ResolvedRoles::Predicate);
+        assert_eq!(probe.family.component_name(), "index:ref-p");
+        assert_eq!(probe.lead.to_string(), p.to_string());
 
         // Nothing this index covers is bound: declines.
         assert!(choose(QuadPattern::new(None, None, None, None)).is_none());

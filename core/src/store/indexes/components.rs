@@ -10,8 +10,8 @@
 //! implementation slug onto a component identity.
 //!
 //! The column *names* belong to the index modules, not here: each leaf
-//! declares them once in its const [`ComponentRole`] table (reached through
-//! [`IndexType::component_roles`]), and the loops below are parameterized by
+//! declares them once in its const [`ComponentIdentity`] table (reached through
+//! [`IndexType::component_identities`]), and the loops below are parameterized by
 //! those rows.
 
 use std::sync::{Arc, OnceLock};
@@ -29,13 +29,13 @@ use crate::store::array::into_struct_array;
 
 use super::{ALL_INDEX_TYPES, IndexType, Indexes};
 
-/// One persisted-child role of an index: the identity a component carries on
-/// the wire. Each leaf module declares its roles as a const table
-/// ([`IndexType::component_roles`]); the generic loops here — the slug
-/// registry and the roster it builds — are parameterized by these rows
-/// instead of re-spelling the scheme per leaf. The columns behind a role are
-/// the leaf's business ([`child_struct`] assembles them).
-pub(crate) struct ComponentRole {
+/// The identity a persisted index child carries on the wire: its component
+/// name and implementation slug. Each leaf module declares its identities as
+/// a const table ([`IndexType::component_identities`]); the generic loops
+/// here — the slug registry and the roster it builds — are parameterized by
+/// these rows. The columns behind an identity are the leaf's business
+/// ([`child_struct`] assembles them).
+pub(crate) struct ComponentIdentity {
     /// The component name (`index:posg`, `index:ref-o`, …) — the same
     /// identity the persisted child carries.
     pub(crate) name: &'static str,
@@ -43,28 +43,29 @@ pub(crate) struct ComponentRole {
     pub(crate) slug: &'static str,
 }
 
-/// Everything the read side knows about a persisted component slug: the role
-/// row an in-memory [`IndexComponent`] adopts and the index type the
+/// Everything the read side knows about a persisted component slug: the
+/// identity row an in-memory [`IndexComponent`] adopts and the index type the
 /// component makes queryable — see [`known_component`].
 pub(crate) struct KnownComponent {
-    /// The registry row carrying the component's identity and column scheme.
-    pub(crate) role: &'static ComponentRole,
+    /// The registry row carrying the component's name and implementation
+    /// slug.
+    pub(crate) identity: &'static ComponentIdentity,
     /// The index type owning the component.
     pub(crate) index: IndexType,
 }
 
 /// The single slug registry: what a persisted component's implementation slug
 /// means to this version, or `None` for foreign slugs (skippable when
-/// optional). A lookup over the per-leaf role tables, so a new index (or a
+/// optional). A lookup over the per-leaf identity tables, so a new index (or a
 /// renamed slug) is threaded through exactly one place — its
-/// [`IndexType::component_roles`] row.
+/// [`IndexType::component_identities`] row.
 pub(crate) fn known_component(implementation: &str) -> Option<KnownComponent> {
     ALL_INDEX_TYPES.into_iter().find_map(|index| {
         index
-            .component_roles()
+            .component_identities()
             .iter()
-            .find(|role| role.slug == implementation)
-            .map(|role| KnownComponent { role, index })
+            .find(|identity| identity.slug == implementation)
+            .map(|identity| KnownComponent { identity, index })
     })
 }
 
@@ -86,10 +87,8 @@ pub(crate) fn check_component_rows(name: &str, component_rows: u64, quad_rows: u
 /// descriptor's provenance. Canonicalization is *deferred* to the
 /// component's first genuine use; the scan itself has already run, so this
 /// form is safe over any segment source — it is how a file view lifts its
-/// children for serialization. The row-count check lives inside so every
-/// adoption site applies it uniformly rather than each remembering it — and
-/// it stays eager: a corrupt roster still fails at adoption, not at first
-/// probe.
+/// children for serialization. The row-count check runs here, eagerly: a
+/// corrupt roster fails at adoption, not at first probe.
 #[cfg(feature = "file-io")]
 pub(crate) fn adopt_scanned_component(
     known: &KnownComponent,
@@ -97,17 +96,14 @@ pub(crate) fn adopt_scanned_component(
     sorted: bool,
     quad_rows: u64,
 ) -> Result<IndexComponent> {
-    check_component_rows(known.role.name, scanned.len() as u64, quad_rows)?;
-    Ok(IndexComponent {
-        name: known.role.name,
-        implementation: known.role.slug,
-        rows: ComponentRows::Deferred(Arc::new(DeferredRows {
-            source: DeferredSource::Scanned(scanned),
-            cell: OnceLock::new(),
-        })),
+    let rows = scanned.len() as u64;
+    adopt_deferred(
+        known,
+        DeferredSource::Scanned(scanned),
+        rows,
         sorted,
-        probes: crate::store::probes::StructProbes::new(),
-    })
+        quad_rows,
+    )
 }
 
 /// Adopt a persisted child by its un-scanned reader — the fully deferred
@@ -124,12 +120,32 @@ pub(crate) fn adopt_component_reader(
     sorted: bool,
     quad_rows: u64,
 ) -> Result<IndexComponent> {
-    check_component_rows(known.role.name, reader.row_count(), quad_rows)?;
+    let rows = reader.row_count();
+    adopt_deferred(
+        known,
+        DeferredSource::Reader(reader),
+        rows,
+        sorted,
+        quad_rows,
+    )
+}
+
+/// A deferred component over `source` — the shared tail of both adopters:
+/// the row-count check against the quad rows, then the component under the
+/// registry row's identity with a fresh probe cache.
+fn adopt_deferred(
+    known: &KnownComponent,
+    source: DeferredSource,
+    rows: u64,
+    sorted: bool,
+    quad_rows: u64,
+) -> Result<IndexComponent> {
+    check_component_rows(known.identity.name, rows, quad_rows)?;
     Ok(IndexComponent {
-        name: known.role.name,
-        implementation: known.role.slug,
+        name: known.identity.name,
+        slug: known.identity.slug,
         rows: ComponentRows::Deferred(Arc::new(DeferredRows {
-            source: DeferredSource::Reader(reader),
+            source,
             cell: OnceLock::new(),
         })),
         sorted,
@@ -140,7 +156,7 @@ pub(crate) fn adopt_component_reader(
 /// One secondary-index component held in memory beside the store's primary
 /// base: the in-memory twin of a native store file's index child, carrying
 /// the same rows under the same child schema (plain column names — `s`, `p`,
-/// `o`, `g`, `rid` for a copy family; `val`, `rid` for a reference role).
+/// `o`, `g`, `rid` for a copy family; `val`, `rid` for a reference family).
 ///
 /// `rid` values address rows of the base the component was built against;
 /// that is what keeps components valid across derived views (a
@@ -152,7 +168,7 @@ pub(crate) struct IndexComponent {
     /// identity the persisted child carries.
     pub(crate) name: &'static str,
     /// The implementation slug (`secondary-by-copy/posg`, …).
-    pub(crate) implementation: &'static str,
+    pub(crate) slug: &'static str,
     /// The component's rows: canonical from construction, or a deferred
     /// adoption canonicalized on first genuine use — reached through
     /// [`rows`](Self::rows).
@@ -168,8 +184,7 @@ pub(crate) struct IndexComponent {
     /// call otherwise — the fixed cost of the resolvers' searches and the
     /// serve path's point reads). The rows are immutable once materialized,
     /// so the cache's array-identity guard holds for the component's
-    /// lifetime; `into_resident` rebuilds the component and takes a fresh
-    /// cache.
+    /// lifetime; [`rebuilt`](Self::rebuilt) takes a fresh cache.
     probes: Arc<crate::store::probes::StructProbes>,
 }
 
@@ -211,13 +226,13 @@ impl IndexComponent {
     /// construction every builder's emission uses.
     pub(crate) fn built(
         name: &'static str,
-        implementation: &'static str,
+        slug: &'static str,
         array: StructArray,
         sorted: bool,
     ) -> Self {
         Self {
             name,
-            implementation,
+            slug,
             rows: ComponentRows::Built(array),
             sorted,
             probes: crate::store::probes::StructProbes::new(),
@@ -285,7 +300,7 @@ impl IndexComponent {
             StoreComponentDescriptor {
                 name: self.name.into(),
                 role: StoreComponentRole::Index,
-                implementation: self.implementation.into(),
+                implementation: self.slug.into(),
                 version: 1,
                 required: false,
                 sorted: self.sorted,
@@ -309,34 +324,39 @@ impl IndexComponent {
         }
     }
 
-    /// This component in resident form: rows materialized, integer children
-    /// kept compressed wherever the encoded search probes bind them and
-    /// decoded to canonical primitives otherwise (see
-    /// [`array::with_searchable_int_children`]), so the sorted probes bind
-    /// the value and `rid` columns directly instead of running the generic
-    /// search kernel per call. The adoption step of a store loaded wholesale
-    /// into memory; sortedness provenance is the component's own `sorted`
-    /// field and carries across unchanged.
-    ///
-    /// [`array::with_searchable_int_children`]: crate::store::array::with_searchable_int_children
-    pub(crate) fn into_resident(self) -> Result<Self> {
+    /// This component with its rows materialized and passed through
+    /// `transform`, held as canonical built rows under a fresh probe cache
+    /// (the rebuilt rows are a different array, so the old cache's identity
+    /// guard would only ever decline against them). Name, slug and
+    /// sortedness provenance carry across unchanged.
+    fn rebuilt(self, transform: impl FnOnce(ArrayRef) -> Result<ArrayRef>) -> Result<Self> {
         let rows = self.rows()?.clone().into_array();
-        let canonical = crate::store::array::with_searchable_int_children(rows)?;
-        // The helper only ever hands back a struct (its input was one), so
-        // the downcast is a cast, not work.
-        let array = into_struct_array(canonical)?;
+        // The transforms only ever hand back a struct (their input was one),
+        // so the downcast is a cast, not work.
+        let array = into_struct_array(transform(rows)?)?;
         Ok(Self {
             rows: ComponentRows::Built(array),
-            // The rebuilt rows are a different array; the old cache's
-            // identity guard would only ever decline against them.
             probes: crate::store::probes::StructProbes::new(),
             ..self
         })
     }
 
+    /// This component in searchable form: rows materialized, integer
+    /// children kept compressed wherever the encoded search probes bind them
+    /// and decoded to canonical primitives otherwise (see
+    /// [`array::with_searchable_int_children`]), so the sorted probes bind
+    /// the value and `rid` columns directly instead of running the generic
+    /// search kernel per call. The adoption step of a store loaded wholesale
+    /// into memory.
+    ///
+    /// [`array::with_searchable_int_children`]: crate::store::array::with_searchable_int_children
+    pub(crate) fn into_searchable(self) -> Result<Self> {
+        self.rebuilt(crate::store::array::with_searchable_int_children)
+    }
+
     /// This component with its integer children compressed into
     /// probe-supported encodings — the construction-side counterpart of
-    /// [`into_resident`](Self::into_resident): a builder's canonical
+    /// [`into_searchable`](Self::into_searchable): a builder's canonical
     /// emission compresses here (see
     /// [`array::with_compressed_int_children`]), without the base's payload
     /// wrapper (components never serve code columns). The sorted probes bind
@@ -344,14 +364,7 @@ impl IndexComponent {
     ///
     /// [`array::with_compressed_int_children`]: crate::store::array::with_compressed_int_children
     pub(crate) fn into_compressed(self) -> Result<Self> {
-        let rows = self.rows()?.clone().into_array();
-        let compressed = crate::store::array::with_compressed_int_children(rows, false)?;
-        let array = into_struct_array(compressed)?;
-        Ok(Self {
-            rows: ComponentRows::Built(array),
-            probes: crate::store::probes::StructProbes::new(),
-            ..self
-        })
+        self.rebuilt(|rows| crate::store::array::with_compressed_int_children(rows, false))
     }
 
     /// The cached encoded-search probe over the component's `column`, or
@@ -406,7 +419,7 @@ impl IndexComponent {
 pub(crate) fn indexes_from_components(components: &[IndexComponent]) -> Indexes {
     let mut indexes: Indexes = Vec::new();
     for component in components {
-        if let Some(known) = known_component(component.implementation)
+        if let Some(known) = known_component(component.slug)
             && !indexes.contains(&known.index)
         {
             indexes.push(known.index);
@@ -459,4 +472,45 @@ pub(crate) fn child_struct_dtype(
         ),
         Nullability::NonNullable,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use vortex_array::arrays::PrimitiveArray;
+
+    #[test]
+    fn check_component_rows_rejects_mismatch() {
+        assert!(matches!(
+            check_component_rows("index:ref-o", 3, 4),
+            Err(VortexRdfError::Deserialization(_))
+        ));
+        assert!(check_component_rows("index:ref-o", 4, 4).is_ok());
+    }
+
+    /// A tiny built component under `slug`, for roster-shape tests.
+    fn tiny(name: &'static str, slug: &'static str) -> IndexComponent {
+        let column = PrimitiveArray::from_iter([0u32]).into_array();
+        let rows = child_struct(&["val", "rid"], vec![column.clone(), column], 1).unwrap();
+        IndexComponent::built(name, slug, rows, true)
+    }
+
+    #[test]
+    fn indexes_from_components_orders_by_preference() {
+        // Roster order is the wire order; the index set comes back in
+        // preference order regardless, one entry per index.
+        let roster = [
+            tiny("index:ref-o", "secondary-by-reference/o"),
+            tiny("index:posg", "secondary-by-copy/posg"),
+            tiny("index:ref-p", "secondary-by-reference/p"),
+        ];
+        assert_eq!(
+            indexes_from_components(&roster),
+            vec![IndexType::SecondaryByCopy, IndexType::SecondaryByReference]
+        );
+
+        // A slug this version does not know implies no index.
+        let foreign = [tiny("index:spog", "secondary-by-copy/spog")];
+        assert!(indexes_from_components(&foreign).is_empty());
+    }
 }

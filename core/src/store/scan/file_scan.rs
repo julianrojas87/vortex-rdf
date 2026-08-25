@@ -11,7 +11,7 @@ use std::sync::Arc;
 use futures::{StreamExt, stream};
 use oxrdf::NamedOrBlankNode;
 use vortex_array::expr::forms::conjuncts;
-use vortex_array::expr::{BoundExpression, Expression, and, eq, get_item, lit, root};
+use vortex_array::expr::{BoundExpression, Expression, lit};
 use vortex_array::stream::ArrayStreamExt as _;
 use vortex_array::{ArrayRef, MaskFuture};
 use vortex_buffer::Buffer;
@@ -336,21 +336,9 @@ pub(crate) fn build_file_filter(
         // return a filter that matches nothing (always evaluates to false).
         Constraints::AlwaysFalse => Some(lit(false)),
 
-        // If the layout provides equality constraints (field_name, value
-        // pairs), build a filter expression by combining them with AND
-        // operations. Each constraint requires a specific column to equal a
-        // specific value.
-        Constraints::Eq(eqs) => {
-            let mut filter: Option<Expression> = None;
-            for (field, value) in eqs {
-                let expr = eq(get_item(field, root()), lit(value));
-                filter = Some(match filter.take() {
-                    Some(f) => and(f, expr),
-                    None => expr,
-                });
-            }
-            filter
-        }
+        // Equality constraints (column, value) become one AND-conjunction;
+        // an empty set is no filter at all.
+        Constraints::Eq(eqs) => crate::store::indexes::row_ids::eq_conjunction(eqs),
     })
 }
 

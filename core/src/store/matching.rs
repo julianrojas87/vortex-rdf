@@ -225,7 +225,7 @@ impl VortexRdfStore {
         // A chained match folds this pattern's restrictions into the
         // previous ones, so a still-pending selection materializes here —
         // chaining is one of the consumers the deferral exists for.
-        let mut selection = selection.materialized_sync()?;
+        let mut selection = selection.materialized()?;
         // A serving index's plan reads exactly a contiguous row run, so
         // it is only valid when that run *is* the whole result: the view
         // must start unrestricted and nothing but the serving index's
@@ -379,7 +379,7 @@ impl VortexRdfStore {
                             {
                                 pending = Some(lazy);
                             } else {
-                                selection = selection.intersect_ids(lazy.materialized_sync()?);
+                                selection = selection.intersect_ids(lazy.materialized()?);
                             }
                         }
                     }
@@ -591,9 +591,9 @@ impl VortexRdfStore {
                     ResolvedRowIds::Lazy(lazy) => {
                         let selection = ViewSelection::Exact(apply_subject(
                             existing_selection
-                                .materialized()
+                                .materialized_async()
                                 .await?
-                                .intersect_ids(lazy.materialized().await?),
+                                .intersect_ids(lazy.materialized_async().await?),
                         ));
                         log::debug!(
                             "[match_pattern] File index resolved (ids materialized) at {:?}",
@@ -608,7 +608,10 @@ impl VortexRdfStore {
                     // restrictions at once.
                     ResolvedRowIds::Eager(ids) => {
                         let selection = ViewSelection::Exact(apply_subject(
-                            existing_selection.materialized().await?.intersect_ids(ids),
+                            existing_selection
+                                .materialized_async()
+                                .await?
+                                .intersect_ids(ids),
                         ));
                         log::debug!(
                             "[match_pattern] File index resolved (eager ids) at {:?}",
@@ -651,7 +654,7 @@ impl VortexRdfStore {
             // chained match materializes a still-pending selection to fold
             // into — exactly one of the consumers the deferral is for.)
             None => {
-                let existing = existing_selection.materialized().await?;
+                let existing = existing_selection.materialized_async().await?;
                 ViewSelection::Exact(match (&subject_range, &filter) {
                     (Some(_), _) => apply_subject(existing),
                     (None, Some(f)) => {

@@ -308,7 +308,7 @@ impl VortexRdfStore {
                 // materializes here.
                 let rows = gather_live(
                     base,
-                    &selection.materialized_sync()?,
+                    &selection.materialized()?,
                     deleted.as_ref(),
                     Some(probes),
                 )?;
@@ -333,7 +333,7 @@ impl VortexRdfStore {
                 // As for the in-memory arm: base row order needs the exact
                 // ids, so a pending selection materializes (running the
                 // deferred index-child scan once, cached on the view).
-                let selection = selection.materialized().await?;
+                let selection = selection.materialized_async().await?;
                 let scan =
                     self.restricted_file_scan(file, filter.as_ref(), &selection, deleted.as_ref())?;
                 let layout = self.layout.clone();

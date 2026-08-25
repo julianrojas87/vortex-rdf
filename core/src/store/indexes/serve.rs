@@ -35,7 +35,7 @@ use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::struct_::{StructArray, StructArrayExt};
 use vortex_array::dtype::FieldNames;
 #[cfg(feature = "file-io")]
-use vortex_array::expr::{Expression, and, eq, get_item, lit, root, select};
+use vortex_array::expr::{root, select};
 #[cfg(feature = "file-io")]
 use vortex_array::scalar::Scalar;
 use vortex_array::validity::Validity;
@@ -99,34 +99,55 @@ impl ServeDecode {
         }
     }
 
+    /// The positions of a small run's live rows, for point reads through the
+    /// component's cached probes. Tombstones are defined over primary row
+    /// ids; the rid column says which primary row each served row mirrors,
+    /// and only a tombstoned view pays for the liveness pass.
+    ///
+    /// The outer `None` declines: a run wider than
+    /// [`POINT_GATHER_MAX_ROWS`], or a rid column whose encoding resolves no
+    /// probe. The inner `None` means no tombstones — every position in
+    /// `range` is live, so the caller iterates the range directly.
+    ///
+    /// [`POINT_GATHER_MAX_ROWS`]: crate::store::selection::POINT_GATHER_MAX_ROWS
+    fn live_positions(
+        &self,
+        array: &ArrayRef,
+        range: &Range<usize>,
+        probes: &crate::store::probes::StructProbes,
+        deleted: Option<&Mask>,
+    ) -> Option<Option<Vec<usize>>> {
+        if !point_sized(range.len() as u64) {
+            return None;
+        }
+        let Some(deleted) = deleted else {
+            return Some(None);
+        };
+        let rid = probes.by_name(array, self.rid_column)?;
+        Some(Some(
+            range
+                .clone()
+                .filter(|&pos| !deleted.value(rid.value_at(pos) as usize))
+                .collect(),
+        ))
+    }
+
     /// A small run's live rows as a primary-named `(s, p, o, g)` canonical
     /// struct, read point-by-point at the run's global positions through the
     /// component's cached probes — no slice, no per-call probe resolution.
     /// `Ok(None)` declines (a wide run, or a column — e.g. a string copy —
     /// whose encoding resolves no probe); the caller keeps the slice path.
-    fn rows_via_probes(
+    fn point_read_run_rows(
         &self,
         array: &ArrayRef,
         range: Range<usize>,
         probes: &crate::store::probes::StructProbes,
         deleted: Option<&Mask>,
     ) -> Result<Option<ArrayRef>> {
-        if !point_sized(range.len() as u64) {
+        let Some(live) = self.live_positions(array, &range, probes, deleted) else {
             return Ok(None);
-        }
-        // Tombstones are defined over primary row ids; the rid column says
-        // which primary row each served row mirrors.
-        let live: Vec<usize> = match deleted {
-            None => range.collect(),
-            Some(deleted) => {
-                let Some(rid) = probes.by_name(array, self.rid_column) else {
-                    return Ok(None);
-                };
-                range
-                    .filter(|&pos| !deleted.value(rid.value_at(pos) as usize))
-                    .collect()
-            }
         };
+        let live: Vec<usize> = live.unwrap_or_else(|| range.collect());
         let mut children = Vec::with_capacity(4);
         for name in self.primary_columns {
             let Some(probe) = probes.by_name(array, name) else {
@@ -175,9 +196,9 @@ impl ServeDecode {
         )
         .map_err(VortexRdfError::Vortex)?
         .into_array();
-        // A small served run over still-encoded component columns reads
-        // faster point-by-point than through the per-column decode pipeline;
-        // wide runs and non-probeable columns keep the vectorized path.
+        // Point-read the run through the component probes when it is small
+        // enough (`gather_by_point_reads` gates on `POINT_GATHER_MAX_ROWS`);
+        // otherwise decode the sliced columns.
         let rows = match crate::store::scan::gather::gather_by_point_reads(
             &rows,
             &crate::store::selection::RowSelection::Range(0..len as u64),
@@ -271,34 +292,14 @@ impl InMemoryServePlan {
     /// hold terms, not codes), or any column whose encoding resolves no
     /// probe.
     ///
-    /// The width gate is the same trade [`rows_via_probes`] makes: a point
-    /// read through the probe beats materializing row ids for the run, but
-    /// per-element reads over a compressed column lose to a bulk gather over
-    /// the base's canonical buffers once the run is large.
-    ///
     /// [`POINT_GATHER_MAX_ROWS`]: crate::store::selection::POINT_GATHER_MAX_ROWS
-    /// [`rows_via_probes`]: ServeDecode::rows_via_probes
     pub(crate) fn code_columns(&self, deleted: Option<&Mask>) -> Option<[Buffer<u32>; 4]> {
-        if !point_sized(self.range.len() as u64)
-            || !matches!(self.decode.decode_layout, ResolvedLayout::Dictionary(_))
-        {
+        if !matches!(self.decode.decode_layout, ResolvedLayout::Dictionary(_)) {
             return None;
         }
-        // Tombstones are defined over primary row ids; the rid column says
-        // which primary row each served row mirrors. Only a tombstoned view
-        // pays for the liveness pass.
-        let live: Option<Vec<usize>> = match deleted {
-            None => None,
-            Some(deleted) => {
-                let rid = self.probes.by_name(&self.array, self.decode.rid_column)?;
-                Some(
-                    self.range
-                        .clone()
-                        .filter(|&pos| !deleted.value(rid.value_at(pos) as usize))
-                        .collect(),
-                )
-            }
-        };
+        let live = self
+            .decode
+            .live_positions(&self.array, &self.range, &self.probes, deleted)?;
         let mut columns = Vec::with_capacity(4);
         for name in self.decode.primary_columns {
             let probe = self.probes.by_name(&self.array, name)?;
@@ -322,10 +323,12 @@ impl InMemoryServePlan {
     /// plan's row run — either way decoding those columns as the primary
     /// `(s, p, o, g)`, replacing the row-id gather over the primaries.
     pub(crate) fn decode<T: ChunkDecode>(&self, deleted: Option<&Mask>) -> Vec<Result<T>> {
-        match self
-            .decode
-            .rows_via_probes(&self.array, self.range.clone(), &self.probes, deleted)
-        {
+        match self.decode.point_read_run_rows(
+            &self.array,
+            self.range.clone(),
+            &self.probes,
+            deleted,
+        ) {
             Ok(Some(rows)) => return T::decode(&self.decode.decode_layout, &rows),
             Ok(None) => {}
             Err(e) => return vec![Err(e)],
@@ -396,29 +399,13 @@ fn run_split_rows(rows: u64) -> usize {
     rows.div_ceil(2 * workers).max(SERVE_SPLIT_MIN_ROWS) as usize
 }
 
-/// The conjunction of a plan's term equalities — the filter selecting
-/// exactly the served rows within the index's columns.
-#[cfg(feature = "file-io")]
-fn filter_of(constraints: &[(&'static str, Scalar)]) -> Expression {
-    let mut filter: Option<Expression> = None;
-    for (column, value) in constraints {
-        let expr = eq(get_item(*column, root()), lit(value.clone()));
-        filter = Some(match filter.take() {
-            Some(f) => and(f, expr),
-            None => expr,
-        });
-    }
-    // A serve plan always carries at least one constraint (the resolved
-    // lead component), so the conjunction is never empty.
-    filter.expect("a serve plan constrains at least one column")
-}
-
 #[cfg(feature = "file-io")]
 impl FileServePlan {
     /// A plan serving a file's index columns by a pushed-down scan filtered to
     /// the rows where every `constraints` equality holds — or, over a located
-    /// `row_range`, by point reads through the component's cached chunk
-    /// probes.
+    /// `row_range`, by point reads (a small run) or a range-restricted scan
+    /// split across the workers (a wide one) — see
+    /// [`Self::located_run_scan`].
     // The parameters are the plan itself: the column roles, the reader, the
     // constraints, and the bind memo.
     #[allow(clippy::too_many_arguments)]
@@ -458,11 +445,11 @@ impl FileServePlan {
         if let Some(bound) = self.bound.get() {
             return Ok(bound.clone());
         }
-        let projection = {
-            let [s, p, o, g] = self.decode.primary_columns;
-            select([s, p, o, g, self.decode.rid_column], root())
-        };
-        let filter = filter_of(&self.constraints);
+        let projection = select(self.projection(), root());
+        // A serve plan always carries at least one constraint (the resolved
+        // lead component), so the conjunction is never empty.
+        let filter = super::row_ids::eq_conjunction(self.constraints.iter().cloned())
+            .expect("a serve plan constrains at least one column");
         let scope = self.reader.dtype();
         let bound_projection = self
             .memo
@@ -496,15 +483,15 @@ impl FileServePlan {
     }
 
     /// A scan over the serving index child — where [`Self::projection`] and
-    /// [`Self::filter`] apply.
-    pub(crate) fn file_scan(&self) -> vortex_layout::scan::scan_builder::ScanBuilder<ArrayRef> {
+    /// the plan's bound filter apply.
+    pub(crate) fn child_scan(&self) -> vortex_layout::scan::scan_builder::ScanBuilder<ArrayRef> {
         vortex_layout::scan::scan_builder::ScanBuilder::new(
             VORTEX_SESSION.clone(),
             self.reader.clone(),
         )
     }
 
-    /// [`Self::file_scan`] with the plan's projection and filter — bound on
+    /// [`Self::child_scan`] with the plan's projection and filter — bound on
     /// first use — applied. The form the streaming reads consume for an
     /// unlocated run.
     pub(crate) fn projected_filtered_scan(
@@ -512,12 +499,12 @@ impl FileServePlan {
     ) -> Result<vortex_layout::scan::scan_builder::ScanBuilder<ArrayRef>> {
         let (projection, filter) = self.bound_exprs()?;
         Ok(self
-            .file_scan()
+            .child_scan()
             .with_projection(projection)
             .with_filter(filter))
     }
 
-    /// A scan of the located run: [`Self::file_scan`] with the plan's
+    /// A scan of the located run: [`Self::child_scan`] with the plan's
     /// projection, restricted to `row_range` and split by row count. `None`
     /// when the run is unlocated — [`Self::projected_filtered_scan`] answers
     /// then. The form the streaming reads consume for a wide located run.
@@ -540,7 +527,7 @@ impl FileServePlan {
         let (projection, _) = self.bound_exprs()?;
         let split_rows = run_split_rows(range.end - range.start);
         Ok(Some(
-            self.file_scan()
+            self.child_scan()
                 .with_projection(projection)
                 .with_row_range(range)
                 .with_split_by(SplitBy::RowCount(split_rows)),
@@ -567,5 +554,28 @@ impl FileServePlan {
         deleted: Option<&Mask>,
     ) -> Vec<Result<T>> {
         self.decode.decode_columns_async(chunk, deleted).await
+    }
+}
+
+#[cfg(all(test, feature = "file-io"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn run_split_rows_floor_and_arithmetic() {
+        // Small runs never split below the per-split floor.
+        assert_eq!(run_split_rows(100), SERVE_SPLIT_MIN_ROWS as usize);
+        assert_eq!(run_split_rows(0), SERVE_SPLIT_MIN_ROWS as usize);
+
+        // A wide run hands every worker a couple of splits.
+        let rows = 1u64 << 20;
+        let workers = crate::io::read::available_parallelism() as u64;
+        let split = run_split_rows(rows);
+        assert_eq!(
+            split,
+            rows.div_ceil(2 * workers).max(SERVE_SPLIT_MIN_ROWS) as usize
+        );
+        assert!(split as u64 >= SERVE_SPLIT_MIN_ROWS);
+        assert!((rows as usize).div_ceil(split) as u64 <= 2 * workers + 1);
     }
 }

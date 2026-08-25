@@ -145,8 +145,8 @@ pub(crate) async fn build_sorted_stream_array(
             .execute::<StructArray>(&mut ctx)
             .map_err(VortexRdfError::Vortex)?;
         components.push(IndexComponent::built(
-            known.role.name,
-            known.role.slug,
+            known.identity.name,
+            known.identity.slug,
             array,
             component.descriptor.sorted,
         ));
@@ -590,7 +590,7 @@ where
         StoreComponentDescriptor, StoreComponentRole, default_child_strategy,
     };
     use crate::store::indexes::secondary_by_copy::Family;
-    use crate::store::indexes::secondary_by_reference::{REF_O_COMPONENT, REF_P_COMPONENT};
+    use crate::store::indexes::secondary_by_reference::RefFamily;
 
     let mut components = Vec::new();
     let mut push = |name: &str,
@@ -655,15 +655,14 @@ where
         }
     }
     if let Some((o_pairs, p_pairs)) = spilled.ref_pairs {
-        use crate::store::indexes::secondary_by_reference::{O_IMPLEMENTATION, P_IMPLEMENTATION};
-        for (name, slug, merger) in [
-            (REF_O_COMPONENT, O_IMPLEMENTATION, o_pairs),
-            (REF_P_COMPONENT, P_IMPLEMENTATION, p_pairs),
+        for (family, merger) in [
+            (RefFamily::Object, o_pairs),
+            (RefFamily::Predicate, p_pairs),
         ] {
             let mut merger = merger;
             push(
-                name,
-                slug,
+                family.component_name(),
+                family.component_slug(),
                 ref_dtype.clone(),
                 Box::new(move |n| {
                     let batch = merger.next_batch(n)?;
@@ -694,7 +693,7 @@ fn emit_presorted_chunks(
         &guard,
         secondary_by_copy::out_of_core::copy_child_dtype(false),
         crate::store::indexes::secondary_by_reference::out_of_core::ref_child_dtype(false),
-        secondary_by_copy::out_of_core::copy_child_chunk_strings,
+        secondary_by_copy::out_of_core::copy_child_chunk,
         crate::store::indexes::secondary_by_reference::out_of_core::ref_child_chunk_strings,
     )?;
     let buf = read_merged_batch(&mut merged, chunk_size)?;
@@ -743,7 +742,7 @@ fn emit_presorted_dict_chunks(
         &guard,
         secondary_by_copy::out_of_core::copy_child_dtype(true),
         crate::store::indexes::secondary_by_reference::out_of_core::ref_child_dtype(true),
-        secondary_by_copy::out_of_core::copy_child_chunk_codes,
+        secondary_by_copy::out_of_core::copy_child_chunk,
         crate::store::indexes::secondary_by_reference::out_of_core::ref_child_chunk_codes,
     )?;
     let buf = read_merged_batch(&mut merged, chunk_size)?;

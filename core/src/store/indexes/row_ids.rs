@@ -11,16 +11,66 @@ use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::struct_::{StructArray, StructArrayExt};
 use vortex_array::dtype::DType;
 #[cfg(feature = "file-io")]
-use vortex_array::expr::{Expression, and, eq, get_item, lit, root, select};
+use vortex_array::expr::{Expression, and_collect, eq, get_item, lit, root, select};
 #[cfg(feature = "file-io")]
 use vortex_array::scalar::Scalar;
 use vortex_array::{ArrayRef, VortexSessionExecute};
 use vortex_buffer::Buffer;
 
 #[cfg(feature = "file-io")]
-use super::{FileServePlan, IndexResolution, IndexedComponent, ResolvedRowIds};
+use super::{FileServePlan, IndexResolution, ResolvedRoles, ResolvedRowIds};
 use crate::error::{Result, VortexRdfError};
 use crate::session::VORTEX_SESSION;
+
+/// The conjunction of `column == value` equalities over root fields — the
+/// filter shape every pushed-down index probe and serve scan uses. `None`
+/// for an empty constraint set.
+#[cfg(feature = "file-io")]
+pub(crate) fn eq_conjunction(
+    constraints: impl IntoIterator<Item = (&'static str, Scalar)>,
+) -> Option<Expression> {
+    and_collect(
+        constraints
+            .into_iter()
+            .map(|(column, value)| eq(get_item(column, root()), lit(value))),
+    )
+}
+
+/// The `[lo, hi)` run of a sorted component column's rows equal to `native`,
+/// located by binary search over the column's cached chunk probes — reading
+/// only the chunk leaves the bisection crosses. Searched over the whole
+/// column, or `within` a row range whose slice of the column is itself sorted
+/// (a lead run for a prefix probe).
+///
+/// `Ok(None)` declines the location (the caller keeps its pushed-down scan):
+/// a child not globally sorted, a probe value that is not an integer (string
+/// value columns), or a column whose chunks resolve no probe.
+#[cfg(feature = "file-io")]
+pub(crate) async fn locate_component_run(
+    file: &crate::store::native_file::NativeStoreFile,
+    component: &str,
+    column: &str,
+    native: &Scalar,
+    within: Option<Range<u64>>,
+    sorted: bool,
+) -> Result<Option<Range<u64>>> {
+    if !sorted {
+        return Ok(None);
+    }
+    let Ok(needle) = u64::try_from(native) else {
+        return Ok(None);
+    };
+    let Some(chunks) = file.component_column_chunks(component, column) else {
+        return Ok(None);
+    };
+    let source = file.segment_source();
+    let session = file.session();
+    match within {
+        None => chunks.bounds(needle, &source, session).await,
+        Some(range) => chunks.bounds_in(range, needle, &source, session).await,
+    }
+    .map_err(VortexRdfError::Vortex)
+}
 
 /// The row ids of a located index-child run, read point-by-point from the
 /// child's rid column through its cached chunk probes and re-sorted into
@@ -60,8 +110,6 @@ pub(crate) async fn rid_point_reads(
 /// Decode a row-id column into the ascending, unique `Buffer<u64>` every index
 /// resolution answers in.
 ///
-/// The whole column is cast and decoded at once rather than pulled one scalar
-/// at a time.
 /// Sorting is required, not incidental: the ids come out in the index's own
 /// order, and both `Selection::IncludeByIndex` and the selection algebra need
 /// them ascending. They are unique by construction (each index row references
@@ -97,7 +145,7 @@ pub(crate) fn sorted_row_ids(row_id_column: ArrayRef) -> Result<Buffer<u64>> {
     }
 }
 
-/// Scan `row_id_column` for the rows where every `(value_column, probe)`
+/// Scan `rid_column` for the rows where every `(value_column, probe)`
 /// equality holds, returning the primary row ids as an ascending, unique
 /// buffer (the shape vortex's `Selection::IncludeByIndex` requires) — the
 /// file-backed probe shared by the secondary indexes.
@@ -112,21 +160,13 @@ pub(crate) fn sorted_row_ids(row_id_column: ArrayRef) -> Result<Buffer<u64>> {
 pub(crate) async fn scan_index_row_ids(
     reader: vortex_layout::LayoutReaderRef,
     value_constraints: &[(&'static str, Scalar)],
-    row_id_column: &'static str,
+    rid_column: &'static str,
     memo: &crate::store::native_file::BoundExprMemo,
     scope: &'static str,
 ) -> Result<Buffer<u64>> {
-    let mut filter: Option<Expression> = None;
-    for (column, probe) in value_constraints {
-        let expr = eq(get_item(*column, root()), lit(probe.clone()));
-        filter = Some(match filter.take() {
-            Some(f) => and(f, expr),
-            None => expr,
-        });
-    }
     // Every index probes at least one value column; an empty constraint set
     // would mean "all rows", which no resolver asks for.
-    let Some(filter) = filter else {
+    let Some(filter) = eq_conjunction(value_constraints.iter().cloned()) else {
         return Ok(Buffer::empty());
     };
     let filter = memo
@@ -134,8 +174,8 @@ pub(crate) async fn scan_index_row_ids(
         .map_err(VortexRdfError::Vortex)?;
 
     read_scanned_row_ids(
-        rid_scan(reader, row_id_column, memo, scope)?.with_filter(filter),
-        row_id_column,
+        rid_scan(reader, rid_column, memo, scope)?.with_filter(filter),
+        rid_column,
     )
     .await
 }
@@ -152,14 +192,14 @@ pub(crate) async fn scan_index_row_ids(
 #[cfg(feature = "file-io")]
 pub(crate) async fn scan_located_row_ids(
     reader: vortex_layout::LayoutReaderRef,
-    row_id_column: &'static str,
+    rid_column: &'static str,
     range: Range<u64>,
     memo: &crate::store::native_file::BoundExprMemo,
     scope: &'static str,
 ) -> Result<Buffer<u64>> {
     read_scanned_row_ids(
-        rid_scan(reader, row_id_column, memo, scope)?.with_row_range(range),
-        row_id_column,
+        rid_scan(reader, rid_column, memo, scope)?.with_row_range(range),
+        rid_column,
     )
     .await
 }
@@ -170,12 +210,12 @@ pub(crate) async fn scan_located_row_ids(
 #[cfg(feature = "file-io")]
 fn rid_scan(
     reader: vortex_layout::LayoutReaderRef,
-    row_id_column: &'static str,
+    rid_column: &'static str,
     memo: &crate::store::native_file::BoundExprMemo,
     scope: &'static str,
 ) -> Result<vortex_layout::scan::scan_builder::ScanBuilder<ArrayRef>> {
     let projection = memo
-        .bind(scope, &select([row_id_column], root()), reader.dtype())
+        .bind(scope, &select([rid_column], root()), reader.dtype())
         .map_err(VortexRdfError::Vortex)?;
     Ok(
         vortex_layout::scan::scan_builder::ScanBuilder::new(VORTEX_SESSION.clone(), reader)
@@ -189,7 +229,7 @@ fn rid_scan(
 #[cfg(feature = "file-io")]
 async fn read_scanned_row_ids(
     scan: vortex_layout::scan::scan_builder::ScanBuilder<ArrayRef>,
-    row_id_column: &'static str,
+    rid_column: &'static str,
 ) -> Result<Buffer<u64>> {
     let arr = crate::store::scan::file_scan::read_all_rows(scan).await?;
 
@@ -203,7 +243,7 @@ async fn read_scanned_row_ids(
         .map_err(VortexRdfError::Vortex)?;
     sorted_row_ids(
         struct_arr
-            .unmasked_field_by_name(row_id_column)
+            .unmasked_field_by_name(rid_column)
             .cloned()
             .map_err(VortexRdfError::Vortex)?,
     )
@@ -218,7 +258,7 @@ pub(crate) async fn resolve_eager_from_scan(
     reader: vortex_layout::LayoutReaderRef,
     constraints: &[(&'static str, Scalar)],
     rid_column: &'static str,
-    resolves: IndexedComponent,
+    resolves: ResolvedRoles,
     memo: &crate::store::native_file::BoundExprMemo,
     scope: &'static str,
 ) -> Result<IndexResolution<FileServePlan>> {
@@ -231,4 +271,22 @@ pub(crate) async fn resolve_eager_from_scan(
         resolves,
         serve: None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use vortex_array::IntoArray;
+
+    #[test]
+    fn sorted_row_ids_casts_and_sorts() {
+        // A u32 rid column comes back as ascending u64 ids.
+        let column = PrimitiveArray::from_iter([5u32, 1, 3]).into_array();
+        let ids = sorted_row_ids(column).unwrap();
+        assert_eq!(ids.as_slice(), &[1u64, 3, 5]);
+
+        // An empty column short-circuits to an empty buffer.
+        let empty = PrimitiveArray::from_iter(std::iter::empty::<u32>()).into_array();
+        assert!(sorted_row_ids(empty).unwrap().is_empty());
+    }
 }

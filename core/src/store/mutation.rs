@@ -197,7 +197,7 @@ impl VortexRdfStore {
                 // mask — materializing first if the match was served and its
                 // exact ids are still pending (a delete is one of the
                 // consumers that needs them).
-                let doomed = doomed.materialized_sync()?.to_mask(base.len());
+                let doomed = doomed.materialized()?.to_mask(base.len());
                 Ok(Self {
                     layout: self.layout.clone(),
                     indexes: self.indexes.clone(),
@@ -263,7 +263,7 @@ impl VortexRdfStore {
             unreachable!("matching_file_row_mask is only called on a file-backed view")
         };
         // A served match's pending selection materializes here.
-        let selection = selection.materialized().await?;
+        let selection = selection.materialized_async().await?;
         file_scan::matching_file_rows(file, filter.as_ref(), &selection).await
     }
 }

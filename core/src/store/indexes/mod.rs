@@ -1,9 +1,9 @@
 //! Secondary-index vocabulary and the store's dispatch into it.
 //!
 //! This hub owns what is common to every index: the [`IndexType`] enum and
-//! its exhaustive dispatch into the per-index modules (persisted-child roles,
+//! its exhaustive dispatch into the per-index modules (persisted-child identities,
 //! resolution), the resolution currency (`IndexResolution`,
-//! `IndexedComponent`, the eager/lazy `ResolvedRowIds` split and its
+//! `ResolvedRoles`, the eager/lazy `ResolvedRowIds` split and its
 //! `LazyRowIds` recipe) both backends answer in, and the planners that try a
 //! store's whole index set in preference order.
 //!
@@ -33,8 +33,8 @@ pub(crate) mod secondary_by_reference;
 pub(crate) mod serve;
 
 pub(crate) use components::{
-    ComponentRole, IndexComponent, KnownComponent, adopt_component_reader, indexes_from_components,
-    known_component,
+    ComponentIdentity, IndexComponent, KnownComponent, adopt_component_reader,
+    indexes_from_components, known_component,
 };
 #[cfg(feature = "file-io")]
 pub(crate) use components::{adopt_scanned_component, check_component_rows};
@@ -69,16 +69,14 @@ pub enum IndexType {
     /// - `index:posg`: the quads sorted by (p, o, s, g)
     /// - `index:ospg`: the quads sorted by (o, s, p, g)
     ///
-    /// Predicate-bound patterns binary-search `index:posg`'s `p` column; a
-    /// bound predicate **and** object prefix-search (p, o) in one probe,
-    /// resolving both components; object-bound patterns binary-search
-    /// `index:ospg`'s `o` column. The copies additionally let reads take the
-    /// matching rows from a *contiguous* run of the copy columns — sliced or
-    /// point-read in memory, scanned from the index child on a file — instead
-    /// of scattering row-id reads across the primary columns. As with
-    /// [`SecondaryByReference`](Self::SecondaryByReference), routing engages
-    /// only on children whose writer recorded them globally sorted, which
-    /// every build here does.
+    /// Predicate-bound patterns binary-search `index:posg`'s `p` column, a
+    /// bound predicate **and** object prefix-search (p, o) in one probe, and
+    /// object-bound patterns binary-search `index:ospg`'s `o` column. Reads
+    /// take the matching rows from a *contiguous* run of the copy columns
+    /// instead of scattering row-id reads across the primary columns. Routing
+    /// engages only on children whose writer recorded them globally sorted,
+    /// which every build here does. The `secondary_by_copy` module owns
+    /// resolution and serving.
     SecondaryByCopy,
 
     /// Builds sorted secondary indexes for both predicates **and** objects.
@@ -144,15 +142,15 @@ impl IndexType {
         }
     }
 
-    /// This index's persisted-child roles — the const table every generic
+    /// This index's persisted-child identities — the const table every generic
     /// loop is parameterized by: the slug registry ([`known_component`]) and
     /// the roster-to-index-set fold ([`indexes_from_components`]). The
     /// exhaustive match is the compile-fail anchor for those loops: a new
     /// variant answers here once and flows into all of them.
-    pub(crate) const fn component_roles(self) -> &'static [ComponentRole] {
+    pub(crate) const fn component_identities(self) -> &'static [ComponentIdentity] {
         match self {
-            IndexType::SecondaryByCopy => &secondary_by_copy::ROLES,
-            IndexType::SecondaryByReference => &secondary_by_reference::ROLES,
+            IndexType::SecondaryByCopy => &secondary_by_copy::IDENTITIES,
+            IndexType::SecondaryByReference => &secondary_by_reference::IDENTITIES,
         }
     }
 
@@ -163,7 +161,7 @@ impl IndexType {
     /// accelerates (e.g. `SecondaryByReference` declines when a subject is
     /// bound), chooses and probes its columns, and hands back the row ids to
     /// select — or declines, leaving the store to fall back to a scan. Like
-    /// [`component_roles`](Self::component_roles), the exhaustive match makes
+    /// [`component_identities`](Self::component_identities), the exhaustive match makes
     /// the compiler demand a query-side answer from every new index variant.
     pub(crate) fn resolve_in_memory(
         self,
@@ -210,7 +208,7 @@ impl IndexType {
 /// components can be omitted from any residual filtering over the fetched
 /// rows — the index's row ids already are exactly their matches.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub(crate) enum IndexedComponent {
+pub(crate) enum ResolvedRoles {
     Predicate,
     Object,
     /// Both predicate and object at once — a prefix search of the
@@ -218,20 +216,20 @@ pub(crate) enum IndexedComponent {
     PredicateObject,
 }
 
-impl IndexedComponent {
+impl ResolvedRoles {
     /// The pattern with this (index-resolved) component cleared: what still
     /// needs checking against the rows the index returned.
     pub(crate) fn clear<'a>(self, pattern: QuadPattern<'a>) -> QuadPattern<'a> {
         match self {
-            IndexedComponent::Predicate => QuadPattern {
+            ResolvedRoles::Predicate => QuadPattern {
                 predicate: None,
                 ..pattern
             },
-            IndexedComponent::Object => QuadPattern {
+            ResolvedRoles::Object => QuadPattern {
                 object: None,
                 ..pattern
             },
-            IndexedComponent::PredicateObject => QuadPattern {
+            ResolvedRoles::PredicateObject => QuadPattern {
                 predicate: None,
                 object: None,
                 ..pattern
@@ -277,7 +275,7 @@ pub(crate) enum IndexResolution<Plan> {
     /// optimization — `row_ids` already resolve the pattern on their own.
     Resolved {
         row_ids: ResolvedRowIds,
-        resolves: IndexedComponent,
+        resolves: ResolvedRoles,
         serve: Option<Plan>,
     },
 }
@@ -388,9 +386,10 @@ impl LazyRowIds {
         }
     }
 
-    /// The ids, computing (and caching) them on first call.
+    /// The ids, computing (and caching) them on first call — the awaiting
+    /// form, which also runs a file child's deferred scan.
     #[cfg(feature = "file-io")]
-    pub(crate) async fn materialized(&self) -> Result<Buffer<u64>> {
+    pub(crate) async fn materialized_async(&self) -> Result<Buffer<u64>> {
         if let Some(ids) = self.cell.get() {
             return Ok(ids.clone());
         }
@@ -407,10 +406,11 @@ impl LazyRowIds {
         Ok(self.cell.get_or_init(|| ids).clone())
     }
 
-    /// The synchronous counterpart of [`materialized`](Self::materialized),
-    /// for in-memory sources — a file child's ids take I/O, and every
-    /// consumer of a file view's selection is already async.
-    pub(crate) fn materialized_sync(&self) -> Result<Buffer<u64>> {
+    /// The ids, computing (and caching) them on first call — the synchronous
+    /// form for in-memory sources (a file child's ids take I/O, and every
+    /// consumer of a file view's selection is already async; see
+    /// [`materialized_async`](Self::materialized_async)).
+    pub(crate) fn materialized(&self) -> Result<Buffer<u64>> {
         if let Some(ids) = self.cell.get() {
             return Ok(ids.clone());
         }
@@ -482,10 +482,6 @@ pub(crate) fn component_probe_run(
 /// returning the first index whose outcome isn't `Declined` (indexes are tried
 /// in declaration = preference order). `Declined` when none apply, so the store
 /// can fall back to a mask scan.
-///
-/// The plural `indexes` name marks this as the planner over the store's whole
-/// index set; the singular [`IndexType::resolve_in_memory`] it calls resolves
-/// one index.
 pub(crate) fn resolve_indexes_in_memory(
     indexes: &[IndexType],
     components: &[IndexComponent],
@@ -553,14 +549,14 @@ mod tests {
     use oxrdf::{GraphName, Literal, NamedNode, NamedOrBlankNode, Term};
 
     #[test]
-    fn slug_registry_covers_every_role() {
-        // Every declared role's slug resolves back to its own index and
+    fn slug_registry_covers_every_identity() {
+        // Every declared identity's slug resolves back to its own index and
         // component name — the mapping a persisted child is read through.
         for index in ALL_INDEX_TYPES {
-            for role in index.component_roles() {
-                let known = known_component(role.slug).expect("declared slug is known");
+            for identity in index.component_identities() {
+                let known = known_component(identity.slug).expect("declared slug is known");
                 assert_eq!(known.index, index);
-                assert_eq!(known.role.name, role.name);
+                assert_eq!(known.identity.name, identity.name);
             }
         }
 
@@ -570,7 +566,7 @@ mod tests {
     }
 
     #[test]
-    fn indexed_component_clear() {
+    fn resolved_roles_clear() {
         let s = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/s").unwrap());
         let p = NamedNode::new("http://example.org/p").unwrap();
         let o = Term::Literal(Literal::new_simple_literal("o"));
@@ -578,17 +574,17 @@ mod tests {
 
         let bound = QuadPattern::new(Some(&s), Some(&p), Some(&o), Some(&g));
 
-        let r = IndexedComponent::Object.clear(bound);
+        let r = ResolvedRoles::Object.clear(bound);
         assert!(
             r.subject.is_some() && r.predicate.is_some() && r.object.is_none() && r.graph.is_some()
         );
 
-        let r = IndexedComponent::Predicate.clear(bound);
+        let r = ResolvedRoles::Predicate.clear(bound);
         assert!(
             r.subject.is_some() && r.predicate.is_none() && r.object.is_some() && r.graph.is_some()
         );
 
-        let r = IndexedComponent::PredicateObject.clear(bound);
+        let r = ResolvedRoles::PredicateObject.clear(bound);
         assert!(
             r.subject.is_some() && r.predicate.is_none() && r.object.is_none() && r.graph.is_some()
         );

@@ -12,7 +12,7 @@
 //!   predicate+object patterns by a two-key *prefix* search: within a
 //!   predicate's run the object column is itself sorted, so a second binary
 //!   search inside the run resolves both components at once
-//!   (`IndexedComponent::PredicateObject`).
+//!   (`ResolvedRoles::PredicateObject`).
 //! - **`index:ospg`** — quads sorted by (o, s, p, g). Serves object-bound
 //!   patterns by binary search on the child's `o` column.
 //!
@@ -32,8 +32,10 @@
 //! always sorted over the complete dataset: [`GlobalCopyArrays`] for the
 //! in-memory builders, merged `(sort key, row id)` spill runs for the
 //! out-of-core one, lead column stamped either way. The in-memory resolver
-//! requires that global provenance; the file resolver pushes equality
-//! predicates down and only prunes better when the columns are sorted.
+//! requires that global provenance. The file resolver uses it to locate the
+//! matched run by binary search over the child's cached chunk probes (lead
+//! key, then the windowed second key) and falls back to a pushed-down
+//! equality scan when the probes decline.
 //!
 //! [`IndexType::SecondaryByCopy`]: super::IndexType::SecondaryByCopy
 //! [`secondary_by_reference`]: super::secondary_by_reference
@@ -45,7 +47,7 @@ use vortex_array::arrays::struct_::StructArrayExt;
 use vortex_array::{ArrayRef, IntoArray};
 
 use super::components::child_struct;
-use super::{IndexResolution, IndexedComponent, LazyRowIds, ResolvedRowIds};
+use super::{IndexResolution, LazyRowIds, ResolvedRoles, ResolvedRowIds};
 use crate::error::{Result, VortexRdfError};
 use crate::store::RawQuad;
 use crate::store::array::{make_string_array, stamp_is_sorted};
@@ -73,21 +75,22 @@ pub(crate) enum Family {
 /// plus the primary row id. Both families use the same names — the child's
 /// identity is what says which sort order the rows are in.
 const CHILD_COLUMNS: [&str; 5] = ["s", "p", "o", "g", "rid"];
+/// The child columns sourcing the primary `(s, p, o, g)` components, in that
+/// order — what both serve plans project.
+pub(crate) const CHILD_PRIMARY: [&str; 4] = ["s", "p", "o", "g"];
 const COL_RID: &str = "rid";
-const POSG_IMPLEMENTATION: &str = "secondary-by-copy/posg";
-const OSPG_IMPLEMENTATION: &str = "secondary-by-copy/ospg";
 
-/// This index's persisted-child role table — one differently-sorted quad
+/// This index's persisted-child identity table — one differently-sorted quad
 /// table per family — feeding every generic loop in the hub (the slug
 /// registry and the roster it builds); see
-/// [`IndexType::component_roles`](super::IndexType::component_roles). Built
+/// [`IndexType::component_identities`](super::IndexType::component_identities). Built
 /// from the [`Family`] accessors so each name keeps exactly one spelling.
-pub(crate) const ROLES: [super::ComponentRole; 2] = [
-    super::ComponentRole {
+pub(crate) const IDENTITIES: [super::ComponentIdentity; 2] = [
+    super::ComponentIdentity {
         name: Family::Posg.component_name(),
         slug: Family::Posg.component_slug(),
     },
-    super::ComponentRole {
+    super::ComponentIdentity {
         name: Family::Ospg.component_name(),
         slug: Family::Ospg.component_slug(),
     },
@@ -105,8 +108,8 @@ impl Family {
     /// The persisted child's implementation slug.
     pub(crate) const fn component_slug(self) -> &'static str {
         match self {
-            Family::Posg => POSG_IMPLEMENTATION,
-            Family::Ospg => OSPG_IMPLEMENTATION,
+            Family::Posg => "secondary-by-copy/posg",
+            Family::Ospg => "secondary-by-copy/ospg",
         }
     }
 
@@ -175,7 +178,7 @@ struct CopyProbe<'a> {
     family: Family,
     lead: TermRef<'a>,
     second: Option<TermRef<'a>>,
-    resolves: IndexedComponent,
+    resolves: ResolvedRoles,
 }
 
 fn choose<'a>(pattern: QuadPattern<'a>) -> Option<CopyProbe<'a>> {
@@ -187,19 +190,19 @@ fn choose<'a>(pattern: QuadPattern<'a>) -> Option<CopyProbe<'a>> {
             family: Family::Posg,
             lead: TermRef::Predicate(predicate),
             second: Some(TermRef::Object(object)),
-            resolves: IndexedComponent::PredicateObject,
+            resolves: ResolvedRoles::PredicateObject,
         }),
         (Some(predicate), None) => Some(CopyProbe {
             family: Family::Posg,
             lead: TermRef::Predicate(predicate),
             second: None,
-            resolves: IndexedComponent::Predicate,
+            resolves: ResolvedRoles::Predicate,
         }),
         (None, Some(object)) => Some(CopyProbe {
             family: Family::Ospg,
             lead: TermRef::Object(object),
             second: None,
-            resolves: IndexedComponent::Object,
+            resolves: ResolvedRoles::Object,
         }),
         (None, None) => None,
     }
@@ -292,7 +295,7 @@ pub(crate) fn resolve_in_memory(
         // gathering the primary columns at the row ids (see
         // `InMemoryServePlan`).
         serve: Some(InMemoryServePlan::new(
-            ["s", "p", "o", "g"],
+            CHILD_PRIMARY,
             COL_RID,
             copy_decode_layout(layout),
             rows.clone().into_array(),
@@ -355,36 +358,31 @@ pub(crate) async fn resolve_file(
 
     // Locate the matched run through the child's cached chunk probes: the
     // lead search over the whole child, then — for a prefix probe — the
-    // windowed second-key search inside the lead run. Integer probe values
-    // only (string copies decline through `u64::try_from`); any probe
-    // decline abandons the location wholesale.
+    // windowed second-key search inside the lead run. Any probe decline
+    // abandons the location wholesale.
     let name = probe.family.component_name();
-    let mut located: Option<std::ops::Range<u64>> = None;
-    if sorted && let Ok(lead_needle) = u64::try_from(&constraints[0].1) {
-        let source = file.segment_source();
-        let session = file.session();
-        located = match file.component_column_chunks(name, probe.family.child_lead_col()) {
-            Some(chunks) => chunks
-                .bounds(lead_needle, &source, session)
-                .await
-                .map_err(VortexRdfError::Vortex)?,
-            None => None,
-        };
-        if let Some(range) = located.clone()
-            && !range.is_empty()
-            && let Some((_, second_native)) = constraints.get(1)
-        {
-            located = match (
-                file.component_column_chunks(name, probe.family.child_second_col()),
-                u64::try_from(second_native),
-            ) {
-                (Some(chunks), Ok(needle)) => chunks
-                    .bounds_in(range, needle, &source, session)
-                    .await
-                    .map_err(VortexRdfError::Vortex)?,
-                _ => None,
-            };
-        }
+    let mut located = super::row_ids::locate_component_run(
+        file,
+        name,
+        probe.family.child_lead_col(),
+        &constraints[0].1,
+        None,
+        sorted,
+    )
+    .await?;
+    if let Some(range) = located.clone()
+        && !range.is_empty()
+        && let Some((second_col, second_native)) = constraints.get(1)
+    {
+        located = super::row_ids::locate_component_run(
+            file,
+            name,
+            second_col,
+            second_native,
+            Some(range),
+            sorted,
+        )
+        .await?;
     }
     // A located empty run proves the combination absent — the short-circuit
     // the deferred path gives up.
@@ -396,26 +394,22 @@ pub(crate) async fn resolve_file(
     // A small located run resolves its row ids NOW by rid point reads — a
     // handful of cached-chunk accesses — instead of deferring a whole child
     // scan (which a count or chained match would then pay).
-    let row_ids = match &located {
-        Some(range) if crate::store::selection::point_sized(range.end - range.start) => {
-            match super::rid_point_reads(file, name, COL_RID, range.clone()).await? {
-                Some(ids) => ResolvedRowIds::Eager(ids),
-                None => ResolvedRowIds::Lazy(LazyRowIds::from_index_child_scan(
-                    reader.clone(),
-                    constraints.clone(),
-                    COL_RID,
-                    file.bound_exprs().clone(),
-                    name,
-                )),
-            }
-        }
-        _ => ResolvedRowIds::Lazy(LazyRowIds::from_index_child_scan(
+    let deferred = || {
+        ResolvedRowIds::Lazy(LazyRowIds::from_index_child_scan(
             reader.clone(),
             constraints.clone(),
             COL_RID,
             file.bound_exprs().clone(),
             name,
-        )),
+        ))
+    };
+    let row_ids = match &located {
+        Some(range) if crate::store::selection::point_sized(range.end - range.start) => {
+            super::rid_point_reads(file, name, COL_RID, range.clone())
+                .await?
+                .map_or_else(deferred, ResolvedRowIds::Eager)
+        }
+        _ => deferred(),
     };
     match build_serve_plan(
         reader.clone(),
@@ -494,7 +488,7 @@ fn build_serve_plan(
         None
     };
     Ok(Some(FileServePlan::new(
-        ["s", "p", "o", "g"],
+        CHILD_PRIMARY,
         COL_RID,
         copy_decode_layout(layout),
         reader,
@@ -516,9 +510,9 @@ pub(crate) mod out_of_core {
     use vortex_array::{ArrayRef, IntoArray};
 
     use super::super::components::{child_struct, child_struct_dtype};
-    use super::{CHILD_COLUMNS, Family};
+    use super::{CHILD_COLUMNS, Family, TermColumn};
     use crate::error::Result;
-    use crate::store::array::{make_string_array, stamp_is_sorted};
+    use crate::store::array::stamp_is_sorted;
 
     /// The persisted child's struct dtype: quad components as strings (or u32
     /// codes under the Dictionary layout) plus the u32 primary row id.
@@ -543,32 +537,14 @@ pub(crate) mod out_of_core {
 
     /// One chunk of a copy family's persisted child from a window of its merged
     /// `(sort key, row id)` entries — plain child column names, lead stamped.
-    pub(crate) fn copy_child_chunk_strings(
+    /// `V` is the term encoding: `String`, or `u32` codes under the Dictionary
+    /// layout.
+    pub(crate) fn copy_child_chunk<V: TermColumn>(
         family: Family,
-        keys: &[(CopyKey<String>, u32)],
+        keys: &[(CopyKey<V>, u32)],
     ) -> Result<ArrayRef> {
         let [s_ix, p_ix, o_ix, g_ix] = family.key_positions();
-        let col = |ix: usize| make_string_array(keys.iter().map(|(key, _)| key.0[ix].as_str()));
-        let columns = vec![
-            col(s_ix),
-            col(p_ix),
-            col(o_ix),
-            col(g_ix),
-            PrimitiveArray::from_iter(keys.iter().map(|(_, rid)| *rid)).into_array(),
-        ];
-        stamp_is_sorted(&columns[family.lead_ix()]);
-        child_struct(&CHILD_COLUMNS, columns, keys.len()).map(|a| a.into_array())
-    }
-
-    /// Code-column variant of [`copy_child_chunk_strings`].
-    pub(crate) fn copy_child_chunk_codes(
-        family: Family,
-        keys: &[(CopyKey<u32>, u32)],
-    ) -> Result<ArrayRef> {
-        let [s_ix, p_ix, o_ix, g_ix] = family.key_positions();
-        let col = |ix: usize| -> ArrayRef {
-            PrimitiveArray::from_iter(keys.iter().map(|(key, _)| key.0[ix])).into_array()
-        };
+        let col = |ix: usize| V::column(keys.iter().map(|(key, _)| &key.0[ix]));
         let columns = vec![
             col(s_ix),
             col(p_ix),
@@ -633,6 +609,26 @@ pub(crate) mod out_of_core {
     }
 }
 
+/// A copy column's term encoding — `String` terms, or `u32` codes under the
+/// Dictionary layout — and the array a column of them assembles into.
+pub(crate) trait TermColumn: Clone + Ord {
+    fn column<'a>(it: impl Iterator<Item = &'a Self>) -> ArrayRef
+    where
+        Self: 'a;
+}
+
+impl TermColumn for String {
+    fn column<'a>(it: impl Iterator<Item = &'a Self>) -> ArrayRef {
+        make_string_array(it.map(String::as_str))
+    }
+}
+
+impl TermColumn for u32 {
+    fn column<'a>(it: impl Iterator<Item = &'a Self>) -> ArrayRef {
+        PrimitiveArray::from_iter(it.copied()).into_array()
+    }
+}
+
 // ── build side ───────────────────────────────────────────────────────────────
 
 /// The permutation putting `quads` in `family` order.
@@ -649,32 +645,22 @@ fn code_perm(codes: &QuadCodes, family: Family) -> Vec<u32> {
     perm
 }
 
-/// One family's five columns (s, p, o, g, rid) over `perm` order, term-string
-/// encoding. The row ids are the quads' own positions: the emission covers
-/// the whole dataset, so `perm` already addresses the assembled array.
-fn family_string_columns(quads: &[RawQuad], perm: &[u32]) -> [ArrayRef; 5] {
-    let col = |term_of: fn(&RawQuad) -> &str| -> ArrayRef {
-        make_string_array(perm.iter().map(|&i| term_of(&quads[i as usize])))
-    };
+/// One family's five columns (s, p, o, g, rid) over `perm` order; `term_of`
+/// reads row `i`'s term for one component. The row ids are the quads' own
+/// positions: the emission covers the whole dataset, so `perm` already
+/// addresses the assembled array.
+fn family_columns<'a, V: TermColumn + 'a>(
+    perm: &[u32],
+    term_of: [&dyn Fn(usize) -> &'a V; 4],
+) -> [ArrayRef; 5] {
+    let col =
+        |term_of: &dyn Fn(usize) -> &'a V| V::column(perm.iter().map(|&i| term_of(i as usize)));
+    let [s, p, o, g] = term_of;
     [
-        col(|q| &q.s),
-        col(|q| &q.p),
-        col(|q| &q.o),
-        col(|q| &q.g),
-        PrimitiveArray::from_iter(perm.iter().copied()).into_array(),
-    ]
-}
-
-/// Code-column variant of [`family_string_columns`].
-fn family_code_columns(codes: &QuadCodes, perm: &[u32]) -> [ArrayRef; 5] {
-    let col = |column: &[u32]| -> ArrayRef {
-        PrimitiveArray::from_iter(perm.iter().map(|&i| column[i as usize])).into_array()
-    };
-    [
-        col(&codes.s),
-        col(&codes.p),
-        col(&codes.o),
-        col(&codes.g),
+        col(s),
+        col(p),
+        col(o),
+        col(g),
         PrimitiveArray::from_iter(perm.iter().copied()).into_array(),
     ]
 }
@@ -692,23 +678,34 @@ impl GlobalCopyArrays {
     /// builder must pass the dataset in final row order), so each family is
     /// just a u32 permutation — no per-term string copies beyond the columns.
     pub(crate) fn from_quads(quads: &[RawQuad]) -> Self {
-        let build = |family: Family| {
-            let perm = string_perm(quads, family);
-            let columns = family_string_columns(quads, &perm);
-            stamp_is_sorted(&columns[family.lead_ix()]);
-            columns
-        };
-        Self {
-            posg: build(Family::Posg),
-            ospg: build(Family::Ospg),
-        }
+        Self::build(
+            |family| string_perm(quads, family),
+            [&|i| &quads[i].s, &|i| &quads[i].p, &|i| &quads[i].o, &|i| {
+                &quads[i].g
+            }],
+        )
     }
 
     /// Dictionary-layout variant: sort the u32 codes.
     pub(crate) fn from_codes(codes: &QuadCodes) -> Self {
+        Self::build(
+            |family| code_perm(codes, family),
+            [&|i| &codes.s[i], &|i| &codes.p[i], &|i| &codes.o[i], &|i| {
+                &codes.g[i]
+            }],
+        )
+    }
+
+    /// Both families' columns: `perm_by` orders the dataset for a family,
+    /// `term_of` reads row `i`'s `(s, p, o, g)` terms; each family's lead
+    /// column is stamped sorted.
+    fn build<'a, V: TermColumn + 'a>(
+        perm_by: impl Fn(Family) -> Vec<u32>,
+        term_of: [&dyn Fn(usize) -> &'a V; 4],
+    ) -> Self {
         let build = |family: Family| {
-            let perm = code_perm(codes, family);
-            let columns = family_code_columns(codes, &perm);
+            let perm = perm_by(family);
+            let columns = family_columns(&perm, term_of);
             stamp_is_sorted(&columns[family.lead_ix()]);
             columns
         };
@@ -767,20 +764,20 @@ mod tests {
         // resolving both components.
         let probe = choose(QuadPattern::new(None, Some(&p), Some(&o), None)).unwrap();
         assert_eq!(probe.family, Family::Posg);
-        assert_eq!(probe.resolves, IndexedComponent::PredicateObject);
+        assert_eq!(probe.resolves, ResolvedRoles::PredicateObject);
         assert_eq!(probe.lead.to_string(), p.to_string());
         assert_eq!(probe.second.map(|t| t.to_string()), Some(o.to_string()));
 
         // Predicate-only patterns probe the POSG lead alone.
         let probe = choose(QuadPattern::new(None, Some(&p), None, None)).unwrap();
         assert_eq!(probe.family, Family::Posg);
-        assert_eq!(probe.resolves, IndexedComponent::Predicate);
+        assert_eq!(probe.resolves, ResolvedRoles::Predicate);
         assert!(probe.second.is_none());
 
         // Object-only patterns probe the OSPG lead.
         let probe = choose(QuadPattern::new(None, None, Some(&o), None)).unwrap();
         assert_eq!(probe.family, Family::Ospg);
-        assert_eq!(probe.resolves, IndexedComponent::Object);
+        assert_eq!(probe.resolves, ResolvedRoles::Object);
         assert!(probe.second.is_none());
 
         // Nothing this index covers is bound: declines.
