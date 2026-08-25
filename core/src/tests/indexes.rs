@@ -1183,21 +1183,39 @@ async fn run_copy_index_file_serving_test(layout: LayoutStrategy, located: bool)
 
 /// A located run wider than the point-read cap keeps the deferred contract:
 /// the rid scan stays pending until a consumer needs the selection, and the
-/// served stream reads through the filter scan — both agreeing with the
-/// in-memory store.
+/// served stream reads the run by range in several row-count splits — one
+/// decoded chunk each — agreeing row for row with the primary read,
+/// tombstones inside the run included.
 #[cfg(feature = "file-io")]
 #[tokio::test]
 async fn test_copy_index_file_serving_wide_located_run_stays_pending() {
-    let quads: Vec<Quad> = (0..900)
+    use futures::StreamExt as _;
+
+    // 10,000 rows per predicate: several served splits on any host (the
+    // split policy floors at 1,024 rows), and a lead run longer than the
+    // writer's first 8,192-row block — which is what keeps the child's `p`
+    // column out of the dict layout the chunk probes decline, so the run
+    // locates at all.
+    let quads: Vec<Quad> = (0..30_000)
         .map(|i| {
             make_quad(
-                &format!("http://example.org/s{:04}", i),
+                &format!("http://example.org/s{:05}", i),
                 &format!("http://example.org/p{}", i % 3),
                 &format!("o{}", i % 7),
                 GraphName::DefaultGraph,
             )
         })
         .collect();
+    let expected = |keep: &dyn Fn(usize) -> bool| -> Vec<String> {
+        let mut strings: Vec<String> = quads
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| keep(*i))
+            .map(|(_, q)| q.to_string())
+            .collect();
+        strings.sort();
+        strings
+    };
     let (_dir, path) = write_store_file(
         quads.clone(),
         LayoutStrategy::Dictionary,
@@ -1212,19 +1230,47 @@ async fn test_copy_index_file_serving_wide_located_run_stays_pending() {
         .await
         .unwrap();
     assert!(by_p.debug_has_serve_plan());
+    // POSG order puts p1's run right after p0's 10,000 rows.
+    assert_eq!(
+        by_p.debug_serve_row_range(),
+        Some(10_000..20_000),
+        "the run must be located for the range scan to serve it"
+    );
     assert!(
         by_p.debug_selection_pending(),
-        "a 300-row run exceeds the point-read cap and must stay deferred"
+        "a 10,000-row run exceeds the point-read cap and must stay deferred"
     );
-    assert_eq!(by_p.size().await.unwrap(), 300);
-    let mut want: Vec<String> = quads
-        .iter()
-        .enumerate()
-        .filter(|(i, _)| i % 3 == 1)
-        .map(|(_, q)| q.to_string())
-        .collect();
-    want.sort();
-    assert_eq!(view_strings(&by_p).await, want);
+    assert_eq!(by_p.size().await.unwrap(), 10_000);
+    assert_eq!(view_strings(&by_p).await, expected(&|i| i % 3 == 1));
+    // The served stream arrives one chunk per row-count split of the run
+    // (plus the empty tail item), never as the single chunk the child's own
+    // split would make of it.
+    let chunks: Vec<usize> = by_p
+        .shared_quad_chunks()
+        .unwrap()
+        .map(|chunk| chunk.len())
+        .filter(|len| futures::future::ready(*len > 0))
+        .collect()
+        .await;
+    assert!(
+        chunks.len() >= 2,
+        "a wide located run is served in several splits, got {chunks:?}"
+    );
+    assert_eq!(chunks.iter().sum::<usize>(), 10_000);
+
+    // A tombstone inside the run leaves every served split through the
+    // family's rid column, and the count agrees.
+    let deleted = store.delete_quad(&quads[1_501]).await.unwrap();
+    let by_p_after = deleted
+        .match_pattern(None, Some(&p1), None, None)
+        .await
+        .unwrap();
+    assert!(by_p_after.debug_has_serve_plan());
+    assert_eq!(by_p_after.size().await.unwrap(), 9_999);
+    assert_eq!(
+        view_strings(&by_p_after).await,
+        expected(&|i| i % 3 == 1 && i != 1_501)
+    );
 }
 
 #[cfg(feature = "file-io")]

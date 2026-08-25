@@ -856,6 +856,18 @@ impl VortexRdfStore {
         }
     }
 
+    /// Test-only hook: the index-child row range a file view's serve plan
+    /// located for its run, so tests can pin that a served read goes through
+    /// the range scan (or the point reads) rather than the filter scan.
+    /// `None` without a plan, or when the plan's run is unlocated.
+    #[cfg(all(test, feature = "file-io"))]
+    pub(crate) fn debug_serve_row_range(&self) -> Option<std::ops::Range<u64>> {
+        match &self.quads {
+            QuadsSource::InMemory { .. } => None,
+            QuadsSource::File { serve, .. } => serve.as_ref().and_then(|plan| plan.row_range()),
+        }
+    }
+
     /// Test-only hook exposing the zone-map row-range envelope computed for a
     /// bound subject, so tests can assert on it directly instead of only on
     /// final match results.

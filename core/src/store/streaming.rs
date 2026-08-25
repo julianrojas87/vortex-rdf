@@ -294,7 +294,15 @@ impl VortexRdfStore {
                     }
                     let serve = serve.clone();
                     let deleted = deleted.clone();
-                    let scan = serve.projected_filtered_scan()?;
+                    // A wide located run scans exactly its rows, split by
+                    // row count so the decode below spreads over the
+                    // runtime's workers; an unlocated one keeps the
+                    // pushed-down filter scan (see
+                    // `FileServePlan::located_run_scan`).
+                    let scan = match serve.located_run_scan()? {
+                        Some(scan) => scan,
+                        None => serve.projected_filtered_scan()?,
+                    };
                     // A file-backed dictionary resolves each chunk's codes
                     // with a scan of its own, so the decode must await.
                     if self.has_file_backed_dictionary() {

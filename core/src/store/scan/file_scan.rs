@@ -134,6 +134,12 @@ static AVAILABLE_PARALLELISM: std::sync::LazyLock<usize> = std::sync::LazyLock::
         .unwrap_or(1)
 });
 
+/// The host's available parallelism (see [`AVAILABLE_PARALLELISM`]) — how
+/// many workers a scan's per-split tasks can spread over.
+pub(crate) fn available_parallelism() -> usize {
+    *AVAILABLE_PARALLELISM
+}
+
 /// Evaluate a filter over one file split, threading a narrowing mask through the
 /// two phases the layout reader exposes — cheap zone-map/stats pruning first,
 /// then real per-conjunct filter evaluation for whatever survives. Returns the

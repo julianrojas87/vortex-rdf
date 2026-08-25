@@ -12,7 +12,8 @@
 //! The plans are typed by backend, because only the *acquisition* of the
 //! matched columns differs: [`InMemoryServePlan`] slices the contiguous
 //! matched run of an in-memory component, `FileServePlan` scans the index
-//! child with a pushed-down term-equality filter. Each `QuadsSource` variant
+//! child — its located run by row range, else with a pushed-down
+//! term-equality filter. Each `QuadsSource` variant
 //! carries exactly its own backend's plan type, so a view paired with the
 //! other backend's plan is unrepresentable — and both decode through the
 //! shared [`ServeDecode`] tail, so tombstone handling cannot drift between
@@ -41,6 +42,8 @@ use vortex_array::scalar::Scalar;
 use vortex_array::validity::Validity;
 use vortex_array::{ArrayRef, IntoArray, VortexSessionExecute};
 use vortex_buffer::Buffer;
+#[cfg(feature = "file-io")]
+use vortex_layout::scan::split_by::SplitBy;
 use vortex_mask::Mask;
 
 use crate::common::quad::SharedQuad;
@@ -384,10 +387,11 @@ impl InMemoryServePlan {
 }
 
 /// An index's serving plan for a file-backed view: the matched rows are those
-/// where every `(column, value)` term equality holds, read by a pushed-down
-/// scan of the index child (whose sort order clusters them into a contiguous,
-/// zone-prunable run) instead of scattering row-id reads across the primary
-/// columns.
+/// where every `(column, value)` term equality holds — a contiguous run of
+/// the index child, which its sort order clusters — read by a scan of that
+/// run when the resolution located it, else by a scan pushing the equalities
+/// down as a zone-prunable filter, instead of scattering row-id reads across
+/// the primary columns.
 ///
 /// The file-backed half of the serving path (see the module docs;
 /// [`InMemoryServePlan`] is the in-memory half). `QuadsSource::File` carries
@@ -420,10 +424,25 @@ pub(crate) struct FileServePlan {
     component: &'static str,
     /// The child rows the constraints select, when the resolution located
     /// them by chunk probes — exactly the constrained rows, letting a small
-    /// run be point-read instead of scanned. `None` when unlocated (or when
-    /// a constraint the location didn't cover would make the range
-    /// over-approximate).
+    /// run be point-read and a wide one scanned by range
+    /// ([`Self::located_run_scan`]) instead of filtered. `None` when
+    /// unlocated (or when a constraint the location didn't cover would make
+    /// the range over-approximate).
     row_range: Option<Range<u64>>,
+}
+
+/// The fewest rows a located run's scan split carries: below this the
+/// per-split overhead (a spawned task, its segment requests, one decode
+/// call) outweighs what spreading the decode buys.
+#[cfg(feature = "file-io")]
+const SERVE_SPLIT_MIN_ROWS: u64 = 1024;
+
+/// Rows per split for a located run of `rows`: enough splits to hand every
+/// worker a couple, never fewer than [`SERVE_SPLIT_MIN_ROWS`] rows each.
+#[cfg(feature = "file-io")]
+fn run_split_rows(rows: u64) -> usize {
+    let workers = crate::store::scan::file_scan::available_parallelism() as u64;
+    rows.div_ceil(2 * workers).max(SERVE_SPLIT_MIN_ROWS) as usize
 }
 
 /// The conjunction of a plan's term equalities — the filter selecting
@@ -535,7 +554,8 @@ impl FileServePlan {
     }
 
     /// [`Self::file_scan`] with the plan's projection and filter — bound on
-    /// first use — applied. The form the streaming reads consume.
+    /// first use — applied. The form the streaming reads consume for an
+    /// unlocated run.
     pub(crate) fn projected_filtered_scan(
         &self,
     ) -> Result<vortex_layout::scan::scan_builder::ScanBuilder<ArrayRef>> {
@@ -544,6 +564,36 @@ impl FileServePlan {
             .file_scan()
             .with_projection(projection)
             .with_filter(filter))
+    }
+
+    /// A scan of the located run: [`Self::file_scan`] with the plan's
+    /// projection, restricted to `row_range` and split by row count. `None`
+    /// when the run is unlocated — [`Self::projected_filtered_scan`] answers
+    /// then. The form the streaming reads consume for a wide located run.
+    ///
+    /// The scan spawns one task per split and the consumer decodes each
+    /// chunk inside its task, so the split count is the decode's
+    /// parallelism. The child's natural splits are its leaf chunks, which
+    /// cluster a run into one split however wide it is; splitting the range
+    /// by row count spreads the run's decode over the workers instead
+    /// (`run_split_rows`). No filter rides along: the located range is
+    /// exactly the constrained rows (the same fact `size` and the point
+    /// reads rely on), so the term equalities would only re-read and
+    /// re-compare the columns that bounded it.
+    pub(crate) fn located_run_scan(
+        &self,
+    ) -> Result<Option<vortex_layout::scan::scan_builder::ScanBuilder<ArrayRef>>> {
+        let Some(range) = self.row_range.clone() else {
+            return Ok(None);
+        };
+        let (projection, _) = self.bound_exprs()?;
+        let split_rows = run_split_rows(range.end - range.start);
+        Ok(Some(
+            self.file_scan()
+                .with_projection(projection)
+                .with_row_range(range)
+                .with_split_by(SplitBy::RowCount(split_rows)),
+        ))
     }
 
     /// Decode the `(s, p, o, g)` quads out of a chunk of this plan's projected
