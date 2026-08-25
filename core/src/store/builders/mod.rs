@@ -263,6 +263,44 @@ pub(crate) fn build_components_from_codes(
     GlobalIndexes::from_codes(indexes, codes).into_components()
 }
 
+/// The parts of a store rebuilt from raw quads under `strategy`: the primary
+/// rows, the requested indexes' components over them, and — under the
+/// Dictionary layout — the fresh term dictionary the rows' codes address.
+/// The rebuild every compaction and every mutated store's serialization run.
+///
+/// The Dictionary layout derives its dictionary from `raws`; an empty set
+/// still yields the components (over empty codes), so the index roster and
+/// its code dtypes survive. `sorted` must be `true` only when `raws` is
+/// SPOG-sorted: it stamps the `s` column. The components are globally
+/// sorted whatever the row order.
+pub(crate) fn build_parts_from_raws(
+    raws: &[RawQuad],
+    strategy: LayoutStrategy,
+    indexes: &[IndexType],
+    sorted: bool,
+) -> Result<(ArrayRef, Vec<IndexComponent>, Option<Arc<TermDictionary>>)> {
+    use crate::store::layouts::dictionary;
+    match strategy {
+        LayoutStrategy::Dictionary if raws.is_empty() => Ok((
+            dictionary::empty_struct()?,
+            build_components_from_codes(indexes, &QuadCodes::empty())?,
+            Some(Arc::new(TermDictionary::empty())),
+        )),
+        LayoutStrategy::Dictionary => {
+            let (dict, code_map) = TermDictionary::from_quads_with_map(raws)?;
+            let codes = dictionary::encode_quads(raws, &dict, &code_map)?;
+            let primary = dictionary::build_code_chunk(&codes, 0..raws.len(), sorted)?;
+            let components = build_components_from_codes(indexes, &codes)?;
+            Ok((primary, components, Some(Arc::new(dict))))
+        }
+        strategy => {
+            let primary = build_struct_array(raws, strategy, sorted)?;
+            let components = build_components(indexes, raws)?;
+            Ok((primary, components, None))
+        }
+    }
+}
+
 /// Assemble a list of per-chunk StructArrays into a single ArrayRef.
 /// Returns an empty StructArray with the correct schema when `chunks` is empty.
 // Only the (wasm-gated) external-sort builder materializes chunk streams.

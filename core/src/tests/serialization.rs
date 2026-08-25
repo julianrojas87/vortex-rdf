@@ -121,6 +121,60 @@ async fn test_tombstoned_store_serialization_keeps_indexes_and_sortedness() {
     );
 }
 
+/// A store whose every row is gone — deleted, or never in the base at all
+/// (tail only) — still serializes its index roster: the components are
+/// rebuilt over the empty row set, so the round-tripped store keeps the
+/// index set it was built with.
+#[tokio::test]
+async fn test_serialize_to_empty_keeps_indexes() {
+    let indexes = vec![IndexType::SecondaryByCopy, IndexType::SecondaryByReference];
+    for layout in [LayoutStrategy::Dictionary, LayoutStrategy::Default] {
+        let arr = build_array::<SortedInMemoryBuilder>(
+            quad_stream(modular_quads(6, 3, 4)),
+            layout,
+            indexes.clone(),
+        )
+        .await
+        .unwrap();
+        let store = VortexRdfStore::from_built(arr).unwrap();
+        assert_eq!(store.indexes(), indexes.as_slice());
+
+        // Every row tombstoned: the rebuild runs over no rows at all.
+        let emptied = store.delete_matching(None, None, None, None).await.unwrap();
+        assert_eq!(emptied.size().await.unwrap(), 0);
+        let reread = VortexRdfStore::from_bytes(&emptied.to_bytes().await.unwrap())
+            .await
+            .unwrap();
+        assert_eq!(reread.size().await.unwrap(), 0, "{layout:?}");
+        assert_eq!(
+            reread.indexes(),
+            indexes.as_slice(),
+            "{layout:?}: an emptied store's serialization must keep its indexes"
+        );
+
+        // Every base row tombstoned and a tail appended: the rebuild runs
+        // over the tail alone.
+        let tailed = emptied
+            .add_quad(make_quad(
+                "http://example.org/s99",
+                "http://example.org/p1",
+                "fresh object",
+                GraphName::DefaultGraph,
+            ))
+            .await
+            .unwrap();
+        let reread = VortexRdfStore::from_bytes(&tailed.to_bytes().await.unwrap())
+            .await
+            .unwrap();
+        assert_eq!(reread.size().await.unwrap(), 1, "{layout:?}");
+        assert_eq!(
+            reread.indexes(),
+            indexes.as_slice(),
+            "{layout:?}: a tail-only store's serialization must keep its indexes"
+        );
+    }
+}
+
 /// An unrefined file-backed store's `to_bytes` reads its index children
 /// wholesale, so the byte round-trip keeps the index set.
 #[tokio::test]

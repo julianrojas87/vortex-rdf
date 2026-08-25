@@ -47,7 +47,7 @@ pub(crate) mod ingest;
 pub(crate) mod term_dict;
 
 #[cfg(feature = "file-io")]
-pub(crate) use self::file_backed::{FileBackedDict, TermChunks};
+pub(crate) use self::file_backed::FileBackedDict;
 pub use self::ingest::DictionaryQuadSink;
 pub(crate) use self::ingest::{TermIdMap, ingest_interning};
 // Only the (wasm-gated) external-sort builder collects terms ahead of the

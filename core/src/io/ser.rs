@@ -204,8 +204,18 @@ pub async fn quads_stream_to_vortex_file<S>(
 where
     S: Stream<Item = Result<RawQuad>> + Unpin + Send + 'static,
 {
-    let writer = tokio::fs::File::create(path)
-        .await
-        .map_err(|e| VortexRdfError::Serialization(format!("create {:?}: {}", path, e)))?;
+    let writer = create_store_file(path).await?;
     quads_stream_to_vortex_writer(quads, writer, layout, indexes).await
+}
+
+/// Create the file a store is written to, reporting a failure as
+/// [`VortexRdfError::Io`] with `path` in the message.
+#[cfg(feature = "file-io")]
+pub(crate) async fn create_store_file(path: &std::path::Path) -> Result<tokio::fs::File> {
+    tokio::fs::File::create(path).await.map_err(|e| {
+        VortexRdfError::Io(std::io::Error::new(
+            e.kind(),
+            format!("create {path:?}: {e}"),
+        ))
+    })
 }

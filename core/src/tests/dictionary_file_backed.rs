@@ -1,6 +1,6 @@
 use super::*;
-use crate::io::container::{DICT_COMPONENT_NAME, RdfStoreLayoutVTable, store_component};
-use crate::store::layouts::dictionary::{FileBackedDict, TermChunks};
+use crate::io::container::DICT_COMPONENT_NAME;
+use crate::store::layouts::dictionary::FileBackedDict;
 use crate::store::native_file::NativeStoreFile;
 
 // ─── 7b) File-backed dictionary ─────────────────────────────────────────
@@ -339,19 +339,10 @@ async fn test_file_backed_dictionary_probe_parity() {
     // resolved off the same child.
     let outer =
         NativeStoreFile::try_new(crate::io::read::open_vortex_file(&path).await.unwrap()).unwrap();
-    let (_, reader) = outer
-        .component_reader(DICT_COMPONENT_NAME)
-        .unwrap()
-        .expect("dictionary child present");
     let len = dict.len() as u64;
-    assert_eq!(reader.row_count(), len);
-    let typed = outer.footer().layout().as_::<RdfStoreLayoutVTable>();
-    let (_, dict_child) = store_component(typed, DICT_COMPONENT_NAME)
+    let fb = FileBackedDict::open(&outer)
         .unwrap()
-        .expect("dictionary child present");
-    let chunks = TermChunks::resolve(&dict_child, outer.segment_source())
         .expect("the dictionary child's chunk shape must resolve");
-    let fb = FileBackedDict::new(reader, len, chunks);
 
     // Every ~397th term plus both extremes, probed twice (cold + memo).
     let sample: Vec<u32> = (0..len as u32)
@@ -416,18 +407,9 @@ async fn test_file_backed_dictionary_rejects_below_first_term() {
 
     let outer =
         NativeStoreFile::try_new(crate::io::read::open_vortex_file(&path).await.unwrap()).unwrap();
-    let (_, reader) = outer
-        .component_reader(DICT_COMPONENT_NAME)
+    let fb = FileBackedDict::open(&outer)
         .unwrap()
-        .expect("dictionary child present");
-    let dict_len = reader.row_count();
-    let typed = outer.footer().layout().as_::<RdfStoreLayoutVTable>();
-    let (_, dict_child) = store_component(typed, DICT_COMPONENT_NAME)
-        .unwrap()
-        .expect("dictionary child present");
-    let chunks = TermChunks::resolve(&dict_child, outer.segment_source())
         .expect("the dictionary child's chunk shape must resolve");
-    let fb = FileBackedDict::new(reader, dict_len, chunks);
 
     assert_eq!(fb.get_id("!").await.unwrap(), None);
     // And row 0 itself still resolves.

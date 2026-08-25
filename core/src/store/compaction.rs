@@ -6,15 +6,10 @@ use crate::error::Result;
 use crate::error::VortexRdfError;
 use crate::store::QuadsSource;
 use crate::store::RawQuad;
-use crate::store::builders::{
-    DEFAULT_CHUNK_SIZE, build_components, build_components_from_codes, build_struct_array,
-};
+use crate::store::builders::{DEFAULT_CHUNK_SIZE, build_parts_from_raws};
 use crate::store::indexes::{Indexes, unique_indexes};
 use crate::store::layouts::DictAccess;
-use crate::store::layouts::dictionary::{QuadCodes, TermDictionary};
-use crate::store::layouts::{LayoutStrategy, ResolvedLayout, dictionary};
-
-use std::sync::Arc;
+use crate::store::layouts::{LayoutStrategy, ResolvedLayout};
 
 use super::VortexRdfStore;
 
@@ -27,10 +22,9 @@ impl VortexRdfStore {
     ///
     /// See [`compact_with_indexes`] for the mechanics and for choosing a
     /// different index set. `add_quads` calls this automatically when the tail
-    /// outgrows the auto-compaction thresholds (in-memory bases only); calling
-    /// it explicitly is how a file-backed store's tail is folded — the compacted
-    /// rows are rewritten back over the store's own file (atomically) and it
-    /// stays file-backed.
+    /// outgrows the auto-compaction thresholds; a file-backed store rewrites
+    /// its source file (atomically) and stays file-backed, whether compacted
+    /// automatically or explicitly.
     ///
     /// [`compact_with_indexes`]: Self::compact_with_indexes
     pub async fn compact(&self) -> Result<Self> {
@@ -130,9 +124,7 @@ impl VortexRdfStore {
                 path.parent(),
             )
             .await?;
-            let writer = tokio::fs::File::create(&tmp)
-                .await
-                .map_err(|e| VortexRdfError::Serialization(format!("create {:?}: {}", tmp, e)))?;
+            let writer = crate::io::ser::create_store_file(&tmp).await?;
             crate::io::ser::built_stream_to_vortex_writer(built, writer).await
         };
         if let Err(e) = write.await {
@@ -141,55 +133,31 @@ impl VortexRdfStore {
             return Err(e);
         }
         tokio::fs::rename(&tmp, path).await.map_err(|e| {
-            VortexRdfError::Serialization(format!("failed to replace {}: {e}", path.display()))
+            VortexRdfError::Io(std::io::Error::new(
+                e.kind(),
+                format!("replace {path:?}: {e}"),
+            ))
         })?;
         // Reopen with the caller's pinned residency budget, not the default.
         Self::from_file_with_dict_residency(path, dict_max_resident_bytes).await
     }
 
     /// Build a fresh owning in-memory store from raw quads under `strategy` —
-    /// the shared back half of compaction.
-    ///
-    /// The Dictionary layout re-derives its term dictionary from the quads
-    /// (they may hold appended terms the old dictionary has no code for); the
-    /// other layouts rebuild their columns directly. `sorted` must be `true`
-    /// only when `raws` is SPOG-sorted: it stamps the `s` column. The index
-    /// children are rebuilt over the whole quad set either way, so they are
-    /// globally sorted whatever the row order.
+    /// the shared back half of compaction (see [`build_parts_from_raws`]).
+    /// `sorted` must be `true` only when `raws` is SPOG-sorted.
     fn from_raw_quads(
         raws: &[RawQuad],
         strategy: LayoutStrategy,
         indexes: Indexes,
         sorted: bool,
     ) -> Result<Self> {
-        let (layout, base, components) = match strategy {
-            // An empty result still carries its indexes: the children are
-            // built over the (empty) codes rather than skipped, so the
-            // compacted store keeps the roster — and its code dtypes — that
-            // a non-empty one would have.
-            LayoutStrategy::Dictionary if raws.is_empty() => (
-                ResolvedLayout::Dictionary(DictAccess::Resident(Arc::new(TermDictionary::empty()))),
-                dictionary::empty_struct()?,
-                build_components_from_codes(&indexes, &QuadCodes::empty())?,
-            ),
-            LayoutStrategy::Dictionary => {
-                let (dict, id_map) = TermDictionary::from_quads_with_map(raws)?;
-                let codes = dictionary::encode_quads(raws, &dict, &id_map)?;
-                let base = dictionary::build_code_chunk(&codes, 0..raws.len(), sorted)?;
-                (
-                    ResolvedLayout::Dictionary(DictAccess::Resident(Arc::new(dict))),
-                    base,
-                    build_components_from_codes(&indexes, &codes)?,
-                )
+        let (base, components, dict) = build_parts_from_raws(raws, strategy, &indexes, sorted)?;
+        let layout = match (strategy, dict) {
+            (LayoutStrategy::Dictionary, Some(dict)) => {
+                ResolvedLayout::Dictionary(DictAccess::Resident(dict))
             }
-            strategy => {
-                let base = build_struct_array(raws, strategy, sorted)?;
-                let layout = match strategy {
-                    LayoutStrategy::TypedObject => ResolvedLayout::TypedObject,
-                    _ => ResolvedLayout::Default,
-                };
-                (layout, base, build_components(&indexes, raws)?)
-            }
+            (LayoutStrategy::TypedObject, _) => ResolvedLayout::TypedObject,
+            _ => ResolvedLayout::Default,
         };
         // Compress like every other construction — a compacted store carries
         // the same resident form a freshly built one does.

@@ -14,8 +14,6 @@ use vortex_array::dtype::DType;
 use vortex_array::expr::{Expression, and, eq, get_item, lit, root, select};
 #[cfg(feature = "file-io")]
 use vortex_array::scalar::Scalar;
-#[cfg(feature = "file-io")]
-use vortex_array::stream::ArrayStreamExt;
 use vortex_array::{ArrayRef, VortexSessionExecute};
 use vortex_buffer::Buffer;
 
@@ -193,12 +191,7 @@ async fn read_scanned_row_ids(
     scan: vortex_layout::scan::scan_builder::ScanBuilder<ArrayRef>,
     row_id_column: &'static str,
 ) -> Result<Buffer<u64>> {
-    let arr = scan
-        .into_array_stream()
-        .map_err(VortexRdfError::Vortex)?
-        .read_all()
-        .await
-        .map_err(VortexRdfError::Vortex)?;
+    let arr = crate::store::scan::file_scan::read_all_rows(scan).await?;
 
     if arr.is_empty() {
         return Ok(Buffer::empty());

@@ -22,8 +22,6 @@ use oxrdf::Quad;
 
 use vortex_array::ArrayRef;
 #[cfg(feature = "file-io")]
-use vortex_array::stream::ArrayStreamExt as _;
-#[cfg(feature = "file-io")]
 use vortex_layout::scan::scan_builder::ScanBuilder;
 use vortex_mask::Mask;
 
@@ -256,33 +254,20 @@ impl VortexRdfStore {
                         let file = std::sync::Arc::clone(file);
                         let chunk = async move {
                             let projection = serve.projection();
-                            let chunk_arr =
-                                match crate::store::scan::file_scan::component_point_chunk(
-                                    &file,
-                                    serve.component(),
-                                    &projection,
-                                    range,
-                                )
+                            let point = crate::store::scan::file_scan::component_point_chunk(
+                                &file,
+                                serve.component(),
+                                &projection,
+                                range,
+                            );
+                            match crate::store::scan::file_scan::point_rows_or_scan(point, scan)
                                 .await
-                                {
-                                    Ok(Some(rows)) => rows,
-                                    Ok(None) => {
-                                        let scanned = async {
-                                            scan.into_array_stream()
-                                                .map_err(VortexRdfError::Vortex)?
-                                                .read_all()
-                                                .await
-                                                .map_err(VortexRdfError::Vortex)
-                                        }
-                                        .await;
-                                        match scanned {
-                                            Ok(rows) => rows,
-                                            Err(e) => return vec![Err(e)],
-                                        }
-                                    }
-                                    Err(e) => return vec![Err(e)],
-                                };
-                            T::serve_columns_async(&serve, &chunk_arr, deleted.as_ref()).await
+                            {
+                                Ok(rows) => {
+                                    T::serve_columns_async(&serve, &rows, deleted.as_ref()).await
+                                }
+                                Err(e) => vec![Err(e)],
+                            }
                         };
                         return Ok(Box::new(
                             stream::once(chunk)
@@ -301,25 +286,18 @@ impl VortexRdfStore {
                         Some(scan) => scan,
                         None => serve.projected_filtered_scan()?,
                     };
-                    // A file-backed dictionary resolves each chunk's codes
-                    // with a scan of its own, so the decode must await.
-                    if self.has_file_backed_dictionary() {
-                        return scan_chunk_stream_async(
-                            scan,
-                            move |chunk| {
-                                let serve = serve.clone();
-                                let deleted = deleted.clone();
-                                async move {
-                                    T::serve_columns_async(&serve, &chunk, deleted.as_ref()).await
-                                }
-                                .boxed()
-                            },
-                            tail_quads,
-                        );
-                    }
-                    return scan_chunk_stream(
+                    let (sync_serve, sync_deleted) = (serve.clone(), deleted.clone());
+                    return self.scan_chunks(
                         scan,
-                        move |chunk| T::serve_columns(&serve, &chunk, deleted.as_ref()),
+                        move |chunk| T::serve_columns(&sync_serve, &chunk, sync_deleted.as_ref()),
+                        move |chunk| {
+                            let serve = serve.clone();
+                            let deleted = deleted.clone();
+                            async move {
+                                T::serve_columns_async(&serve, &chunk, deleted.as_ref()).await
+                            }
+                            .boxed()
+                        },
                         tail_quads,
                     );
                 }
@@ -343,33 +321,17 @@ impl VortexRdfStore {
                     let selection = exact.clone();
                     let deleted = deleted.clone();
                     let chunk = async move {
-                        let rows = match crate::store::scan::file_scan::file_point_rows(
+                        let point = crate::store::scan::file_scan::file_point_rows(
                             &file,
                             &columns,
                             filter.as_ref(),
                             &selection,
                             deleted.as_ref(),
-                        )
-                        .await
-                        {
-                            Ok(Some(rows)) => rows,
-                            Ok(None) => {
-                                let scanned = async {
-                                    scan.into_array_stream()
-                                        .map_err(VortexRdfError::Vortex)?
-                                        .read_all()
-                                        .await
-                                        .map_err(VortexRdfError::Vortex)
-                                }
-                                .await;
-                                match scanned {
-                                    Ok(rows) => rows,
-                                    Err(e) => return vec![Err(e)],
-                                }
-                            }
-                            Err(e) => return vec![Err(e)],
-                        };
-                        T::decode_chunk_async(&layout, &rows).await
+                        );
+                        match crate::store::scan::file_scan::point_rows_or_scan(point, scan).await {
+                            Ok(rows) => T::decode_chunk_async(&layout, &rows).await,
+                            Err(e) => vec![Err(e)],
+                        }
                     };
                     return Ok(Box::new(
                         stream::once(chunk)
@@ -388,21 +350,14 @@ impl VortexRdfStore {
                     selection.expect_exact(),
                     deleted.as_ref(),
                 )?;
-                // A file-backed dictionary decodes each chunk against a term
-                // map resolved by its own scan — the decode must await.
-                if self.has_file_backed_dictionary() {
-                    return scan_chunk_stream_async(
-                        scan,
-                        move |chunk| {
-                            let layout = layout.clone();
-                            async move { T::decode_chunk_async(&layout, &chunk).await }.boxed()
-                        },
-                        tail_quads,
-                    );
-                }
-                scan_chunk_stream(
+                let sync_layout = layout.clone();
+                self.scan_chunks(
                     scan,
-                    move |chunk| T::decode_chunk(&layout, &chunk),
+                    move |chunk| T::decode_chunk(&sync_layout, &chunk),
+                    move |chunk| {
+                        let layout = layout.clone();
+                        async move { T::decode_chunk_async(&layout, &chunk).await }.boxed()
+                    },
                     tail_quads,
                 )
             }
@@ -473,35 +428,45 @@ impl VortexRdfStore {
                 let scan =
                     self.restricted_file_scan(file, filter.as_ref(), &selection, deleted.as_ref())?;
                 let layout = self.layout.clone();
-                // A file-backed dictionary resolves each chunk's codes with a
-                // scan of its own, so the decode must await.
-                if self.has_file_backed_dictionary() {
-                    return scan_chunk_stream_async(
-                        scan,
-                        move |chunk| {
-                            let layout = layout.clone();
-                            async move {
-                                match layout.raw_quads_async(&chunk).await {
-                                    Ok(raws) => raws.into_iter().map(Ok).collect(),
-                                    Err(e) => vec![Err(e)],
-                                }
+                let sync_layout = layout.clone();
+                self.scan_chunks(
+                    scan,
+                    move |chunk| raw_chunk(&sync_layout, &chunk),
+                    move |chunk| {
+                        let layout = layout.clone();
+                        async move {
+                            match layout.raw_quads_async(&chunk).await {
+                                Ok(raws) => raws.into_iter().map(Ok).collect(),
+                                Err(e) => vec![Err(e)],
                             }
-                            .boxed()
-                        },
-                        tail_raws,
-                    );
-                }
-                scan_chunk_stream(scan, move |chunk| raw_chunk(&layout, &chunk), tail_raws)
+                        }
+                        .boxed()
+                    },
+                    tail_raws,
+                )
             }
         }
     }
 
-    /// Whether this store's term dictionary lives in its file rather than in
-    /// memory — the reads that decode codes must then take the async chunk
-    /// path.
+    /// The decoded chunk stream of `scan`, through `sync` when every chunk
+    /// decodes in memory and through `r#async` when the dictionary is
+    /// file-backed — each chunk's codes then resolve with a scan of their
+    /// own, so the decode must await (see [`scan_chunk_stream_async`]).
     #[cfg(feature = "file-io")]
-    fn has_file_backed_dictionary(&self) -> bool {
-        matches!(&self.layout, ResolvedLayout::Dictionary(access) if access.is_file_backed())
+    fn scan_chunks<T: Send + 'static>(
+        &self,
+        scan: ScanBuilder<ArrayRef>,
+        sync: impl Fn(ArrayRef) -> Vec<Result<T>> + Send + Sync + 'static,
+        r#async: impl FnMut(ArrayRef) -> BoxFuture<'static, Vec<Result<T>>> + Send + 'static,
+        tail: Vec<Result<T>>,
+    ) -> Result<Box<dyn Stream<Item = Vec<Result<T>>> + Unpin + Send + 'static>> {
+        let file_backed_dictionary =
+            matches!(&self.layout, ResolvedLayout::Dictionary(access) if access.is_file_backed());
+        if file_backed_dictionary {
+            scan_chunk_stream_async(scan, r#async, tail)
+        } else {
+            scan_chunk_stream(scan, sync, tail)
+        }
     }
 }
 

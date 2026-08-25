@@ -22,8 +22,6 @@ use vortex_buffer::Buffer;
 #[cfg(feature = "file-io")]
 use vortex_array::expr::{Expression, root, select};
 #[cfg(feature = "file-io")]
-use vortex_array::stream::ArrayStreamExt;
-#[cfg(feature = "file-io")]
 use vortex_layout::scan::scan_builder::ScanBuilder;
 #[cfg(feature = "file-io")]
 use vortex_mask::Mask;
@@ -154,22 +152,21 @@ impl VortexRdfStore {
         let Some(tail) = &self.tail else {
             return Ok(base);
         };
-        let tail_rows = tail.live_rows()?;
         match &self.layout {
             ResolvedLayout::Dictionary(_) => {
-                let mut raws = self.base_raw_quads(&base).await?;
-                raws.extend(ResolvedLayout::Default.raw_quads(&tail_rows)?);
+                let (raws, _) = self.merged_raw_quads(&base).await?;
                 if raws.is_empty() {
                     return dictionary::empty_struct();
                 }
-                let (dict, id_map) = TermDictionary::from_quads_with_map(&raws)?;
+                let (dict, code_map) = TermDictionary::from_quads_with_map(&raws)?;
                 // Appended rows break the base's subject sort, and no index
                 // set rides along: the chunk is the primary columns alone.
-                dictionary::build_chunk(&raws, &dict, &id_map, false)
+                dictionary::build_chunk(&raws, &dict, &code_map, false)
             }
             _ => {
                 // The tail is a second chunk in the base's own vocabulary —
                 // no raws decode, no rebuild.
+                let tail_rows = tail.live_rows()?;
                 let dtype = base.dtype().clone();
                 chunked_or_single(vec![base, tail_rows], dtype)
             }
@@ -364,28 +361,20 @@ impl VortexRdfStore {
                 let selection = selection.materialized().await?;
                 // A tiny exact selection reads point-by-point through the
                 // file's cached chunk probes, skipping the scan machinery and
-                // its whole-leaf decodes; anything it declines scans below.
-                if let Some(rows) = file_scan::file_point_rows(
-                    file,
-                    &self.layout.primary_column_names(),
-                    filter.as_ref(),
-                    &selection,
-                    deleted.as_ref(),
-                )
-                .await?
-                {
-                    return with_subject_stamp(rows, file.quads_sorted());
-                }
+                // its whole-leaf decodes; anything it declines runs the scan.
                 let scan =
                     self.restricted_file_scan(file, filter.as_ref(), &selection, deleted.as_ref())?;
-                // Execute the scan and materialize every matching row into a
-                // single in-memory array.
-                let arr = scan
-                    .into_array_stream()
-                    .map_err(VortexRdfError::Vortex)?
-                    .read_all()
-                    .await
-                    .map_err(VortexRdfError::Vortex)?;
+                let arr = file_scan::point_rows_or_scan(
+                    file_scan::file_point_rows(
+                        file,
+                        &self.layout.primary_column_names(),
+                        filter.as_ref(),
+                        &selection,
+                        deleted.as_ref(),
+                    ),
+                    scan,
+                )
+                .await?;
                 // A scan preserves file row order and this view only narrows
                 // it, so the file's recorded quads_sorted provenance carries
                 // to the materialized rows; the multi-chunk read loses any
@@ -445,15 +434,21 @@ impl VortexRdfStore {
         }
     }
 
-    /// Every live quad this view covers, decoded to raw N-Triples term strings
-    /// — base rows first (in view order), then tail rows.
-    pub(super) async fn live_raw_quads(&self) -> Result<Vec<RawQuad>> {
-        let mut raws = self
-            .base_raw_quads(&self.base_selected_rows().await?)
-            .await?;
+    /// The given base rows decoded to raw quads, followed by the tail's live
+    /// rows, and how many of the result came from the base.
+    pub(super) async fn merged_raw_quads(&self, base: &ArrayRef) -> Result<(Vec<RawQuad>, usize)> {
+        let mut raws = self.base_raw_quads(base).await?;
+        let base_rows = raws.len();
         if let Some(tail) = &self.tail {
             raws.extend(self.tail_layout().raw_quads(&tail.live_rows()?)?);
         }
-        Ok(raws)
+        Ok((raws, base_rows))
+    }
+
+    /// Every live quad this view covers, decoded to raw N-Triples term strings
+    /// — base rows first (in view order), then tail rows.
+    pub(super) async fn live_raw_quads(&self) -> Result<Vec<RawQuad>> {
+        let base = self.base_selected_rows().await?;
+        Ok(self.merged_raw_quads(&base).await?.0)
     }
 }

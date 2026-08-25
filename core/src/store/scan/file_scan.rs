@@ -4,6 +4,7 @@
 //! knobs. Everything here is a pure function of a [`NativeStoreFile`] and a
 //! filter expression — no store state.
 
+use std::future::Future;
 use std::ops::{BitAnd, Range};
 use std::sync::Arc;
 
@@ -11,6 +12,7 @@ use futures::{StreamExt, stream};
 use oxrdf::{GraphName, NamedNode, NamedOrBlankNode, Term};
 use vortex_array::expr::forms::conjuncts;
 use vortex_array::expr::{BoundExpression, Expression, and, eq, get_item, lit, root};
+use vortex_array::stream::ArrayStreamExt as _;
 use vortex_array::{ArrayRef, MaskFuture};
 use vortex_buffer::Buffer;
 use vortex_error::VortexExpect as _;
@@ -31,6 +33,29 @@ use crate::store::selection::RowSelection;
 /// The bind-memo scope tag for expressions over the quad table's schema
 /// (the transparent root the file scan reads).
 pub(crate) const QUAD_SCOPE: &str = "quads";
+
+/// Run `scan` to completion and materialize every row it yields into one
+/// in-memory array.
+pub(crate) async fn read_all_rows(scan: ScanBuilder<ArrayRef>) -> Result<ArrayRef> {
+    scan.into_array_stream()
+        .map_err(VortexRdfError::Vortex)?
+        .read_all()
+        .await
+        .map_err(VortexRdfError::Vortex)
+}
+
+/// The rows of a point read when it answers, otherwise the rows of `scan` —
+/// the fallback every point-read fast path keeps for a chunk its probes
+/// decline.
+pub(crate) async fn point_rows_or_scan(
+    point: impl Future<Output = Result<Option<ArrayRef>>>,
+    scan: ScanBuilder<ArrayRef>,
+) -> Result<ArrayRef> {
+    match point.await? {
+        Some(rows) => Ok(rows),
+        None => read_all_rows(scan).await,
+    }
+}
 
 impl RowSelection {
     /// Apply this selection — and any tombstones — to a file scan.

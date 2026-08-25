@@ -24,44 +24,25 @@ use super::VortexRdfStore;
 impl VortexRdfStore {
     // ── mutations ─────────────────────────────────────────────────────────────
 
-    /// Append a single quad — [`add_quads`] with a batch of one. Prefer the
-    /// batch form when adding several: each call pays the fixed cost of a
-    /// one-row column build, a new store value, and a presence check against
-    /// everything added so far.
+    /// Append a single quad — [`add_quads`] with a batch of one; prefer the
+    /// batch form when adding several.
     ///
     /// [`add_quads`]: Self::add_quads
     pub async fn add_quad(&self, quad: Quad) -> Result<Self> {
         self.add_quads([quad]).await
     }
 
-    /// Append every quad not already present, per RDF/JS dataset (set)
-    /// semantics: a quad equal to an existing one — or to an earlier quad in
-    /// the same batch — is skipped.
+    /// Append every quad not already present (RDF/JS dataset semantics: a
+    /// quad equal to an existing one, or to an earlier quad of the batch, is
+    /// skipped). Appends land in the `Tail`, never the base; under the
+    /// Dictionary layout the tail holds terms as strings. Each presence check
+    /// is one fully-bound [`match_pattern`](Self::match_pattern).
     ///
-    /// Appends land in the in-memory `Tail`, never the base, so the base —
-    /// its row ids, secondary indexes, tombstones, or file handle — carries
-    /// over untouched; queries run the base's fast paths plus a mask scan over
-    /// the tail. This also makes Dictionary-layout appends possible: an
-    /// appended term has no code in the sorted dictionary, so the tail stores
-    /// terms as strings and patterns probe the base by code and the tail by
-    /// string.
-    ///
-    /// An append accretes: the fresh rows join the tail as one more chunk and
-    /// the flatten is deferred, so a copy costs amortized O(1) per appended
-    /// row. Batching still wins — it pays one column build and one store value
-    /// for the whole batch — and each presence check is one fully-bound
-    /// `match_pattern` — cheap where the store has a sorted subject column, an
-    /// index, or file pruning; a scan per quad where it has none, in which
-    /// case bulk-loading through the builders is the better tool.
-    ///
-    /// When the tail outgrows the auto-compaction thresholds — a tenth of the
-    /// base (with a floor so small stores don't thrash) or a builder chunk's
-    /// worth of rows, whichever comes first — the add that crossed the line
-    /// finishes by folding the tail into the base ([`compact`]): occasional
-    /// O(n log n) work, amortized constant per appended row. A file-backed
-    /// store does this too, rewriting its source file in place and staying
-    /// file-backed — so an append past the threshold performs a disk write
-    /// (watch [`tail_len`](Self::tail_len)).
+    /// Fresh rows join the tail as one more chunk; the tail is flattened only
+    /// when it crosses the policy at `TAIL_FLATTEN_FLOOR`/`TAIL_MAX_CHUNKS`.
+    /// The add that pushes the tail over the auto-compaction thresholds
+    /// finishes by folding it into the base ([`compact`]) — on a file-backed
+    /// store a rewrite of its source file (watch [`tail_len`](Self::tail_len)).
     ///
     /// [`compact`]: Self::compact
     pub async fn add_quads(&self, quads: impl IntoIterator<Item = Quad>) -> Result<Self> {
@@ -84,13 +65,9 @@ impl VortexRdfStore {
         let fresh_rows = build_struct_array(&fresh, self.tail_layout().strategy(), false)?;
         let rows = match &self.tail {
             None => fresh_rows,
-            // Append = accrete: the fresh rows join the tail as one more chunk
-            // of a ChunkedArray accumulator, deferring the flatten. Flattening
-            // on every add costs O(tail) per appended row (quadratic over an
-            // addQuad loop); instead the accreted suffix is folded into the
-            // flat prefix geometrically — when it rivals the prefix in rows —
-            // plus a chunk-count bound so tail scans stay dense. Amortized
-            // O(1) copies per appended row, the dynamic-array growth pattern.
+            // The fresh rows join the tail as one more chunk of a
+            // ChunkedArray accumulator; the accreted suffix is folded into
+            // the flat prefix per `TAIL_FLATTEN_FLOOR`/`TAIL_MAX_CHUNKS`.
             // Renumbering the old tail's ids on flatten is safe: views of the
             // pre-append store keep the old tail, and an owner's selections
             // are `All`.
@@ -132,10 +109,7 @@ impl VortexRdfStore {
                 deleted: None,
             }),
         };
-        // Append-then-check: the append itself is policy-free, and the add
-        // that pushes the tail over the thresholds pays for folding it into
-        // the base — amortized-rare under the ratio trigger, exactly the
-        // dynamic-array growth pattern.
+        // The add that pushes the tail over the thresholds folds it into the base.
         if appended.should_auto_compact() {
             return appended.compact().await;
         }
@@ -157,11 +131,9 @@ impl VortexRdfStore {
     /// [`match_pattern`], for when the rows a pattern selects should be dropped
     /// rather than read.
     ///
-    /// The matched rows are tombstoned rather than rewritten away, so this
-    /// costs a mask, not a copy of the surviving data, and the base's row ids —
-    /// and with them any secondary index — stay valid across the delete.
-    /// Tombstoned rows are only reclaimed by [`compact`], which is also how
-    /// a store that has accumulated many deletes is compacted.
+    /// The matched rows are tombstoned in place: the base's row ids — and
+    /// with them its secondary indexes — stay valid, and the tombstones are
+    /// only reclaimed by [`compact`].
     ///
     /// Only a store that owns its rows can be mutated; call it on the store a
     /// view came from, or on `view.owned()`.
@@ -254,9 +226,6 @@ impl VortexRdfStore {
                 },
                 QuadsSource::File { .. },
             ) => {
-                // A file view may still carry an unresolved filter, so the
-                // doomed rows are evaluated to concrete file ids first (reading
-                // only the filter columns, never the data ones).
                 let doomed = doomed.matching_file_row_mask().await?;
                 Ok(Self {
                     layout: self.layout.clone(),
@@ -279,14 +248,9 @@ impl VortexRdfStore {
         }
     }
 
-    /// Evaluate this file view's pending filter and selection to a base-wide
-    /// mask of the file rows it matches (see
-    /// [`file_scan::matching_file_rows`]).
-    ///
-    /// The in-memory delete path can read the doomed rows straight off the
-    /// matched view's selection, but a file view may still carry an unresolved
-    /// filter, so its matches have to be evaluated here (reading only the
-    /// filter columns, never the data ones) before they can be tombstoned.
+    /// Evaluate this file view's pending filter and (materialized) selection
+    /// to a base-wide mask of matching file rows, via
+    /// [`file_scan::matching_file_rows`].
     #[cfg(feature = "file-io")]
     async fn matching_file_row_mask(&self) -> Result<Mask> {
         let QuadsSource::File {
@@ -298,20 +262,21 @@ impl VortexRdfStore {
         else {
             unreachable!("matching_file_row_mask is only called on a file-backed view")
         };
-        // A delete needs the doomed rows as concrete ids — a served match's
-        // pending selection materializes here (its deferred index-child scan).
+        // A served match's pending selection materializes here.
         let selection = selection.materialized().await?;
         file_scan::matching_file_rows(file, filter.as_ref(), &selection).await
     }
 }
 
-/// Tail-accumulator flatten policy (see `add_quads`): fold the accreted chunks
-/// into the flat prefix once they rival it in rows — but not below this floor,
-/// so small tails don't flatten on every add …
-const TAIL_FLATTEN_FLOOR: usize = 1_024;
-/// … and regardless of row counts once this many chunks accrete, so tail scans
-/// (which visit every chunk) stay dense.
-const TAIL_MAX_CHUNKS: usize = 64;
+/// Tail flatten policy: appended chunks are folded into the flat first chunk
+/// once their row count reaches `max(flat_len, TAIL_FLATTEN_FLOOR)` — so the
+/// tail is rewritten geometrically, not on every add, and a small tail never
+/// flattens below this floor.
+pub(crate) const TAIL_FLATTEN_FLOOR: usize = 1_024;
+/// Tail flatten policy: appended chunks are folded into the flat first chunk
+/// once the tail holds more than this many chunks, whatever their row counts,
+/// so tail scans (which visit every chunk) stay dense.
+pub(crate) const TAIL_MAX_CHUNKS: usize = 64;
 
 /// Fold a freshly-doomed set of base rows into a store's existing tombstones,
 /// shared by both backends' delete paths.

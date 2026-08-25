@@ -108,12 +108,11 @@ pub struct StoreParts {
     pub(crate) dict: Option<Arc<TermDictionary>>,
 }
 
-/// The layout an in-memory construction resolves to: a dictionary held beside
-/// the rows makes it Dictionary-resident, otherwise the array's own dtype
-/// decides. A dict-less Dictionary-layout array is rejected: bare code
-/// columns carry no way back to their terms — open the serialized form
-/// (`from_file`/`from_bytes`), whose dictionary child carries the terms, or
-/// construct through a builder (`from_built`).
+/// The layout an in-memory construction (`from_parts`, `from_built`,
+/// `from_bytes`) resolves to: a dictionary held beside the rows makes it
+/// Dictionary-resident, otherwise the array's own dtype decides. A dict-less
+/// Dictionary-layout array is rejected: bare code columns carry no way back
+/// to their terms.
 fn resolved_layout(
     dict: Option<Arc<TermDictionary>>,
     dtype: &vortex_array::dtype::DType,
@@ -123,9 +122,9 @@ fn resolved_layout(
         None => match LayoutStrategy::from_dtype(dtype) {
             LayoutStrategy::TypedObject => Ok(ResolvedLayout::TypedObject),
             LayoutStrategy::Dictionary => Err(VortexRdfError::Deserialization(
-                "a bare Dictionary-layout array cannot self-describe; open its \
-                 serialized form (`from_file`/`from_bytes`) or construct the store \
-                 through a builder (`from_built`)"
+                "Dictionary-layout rows carry no dictionary; a bare code array cannot \
+                 self-describe — construct through a builder (`from_built`) or open a \
+                 serialized form that carries its dictionary component"
                     .to_string(),
             )),
             LayoutStrategy::Default => Ok(ResolvedLayout::Default),
@@ -390,11 +389,13 @@ impl VortexRdfStore {
         tail_owned && unfiltered && self.quads.view_selection().is_all()
     }
 
+    /// Err unless this store owns its rows — the gate every mutation takes;
+    /// see [`is_owner`](Self::is_owner).
     fn ensure_owner(&self, operation: &str) -> Result<()> {
         if self.is_owner() {
             return Ok(());
         }
-        Err(VortexRdfError::Serialization(format!(
+        Err(VortexRdfError::InvalidOperation(format!(
             "{operation} is not supported on a store derived from match_pattern: its rows are a \
              view onto a larger base, so mutating it would either silently drop the rows outside \
              the view or write through to data it does not own. Call owned() for an \

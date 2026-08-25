@@ -16,7 +16,6 @@ use vortex_array::arrays::VarBinViewArray;
 use vortex_array::arrays::struct_::{StructArray, StructArrayExt};
 use vortex_array::expr::{root, select};
 use vortex_array::serde::SerializedArray;
-use vortex_array::stream::ArrayStreamExt as _;
 use vortex_layout::layouts::chunked::Chunked as ChunkedLayout;
 use vortex_layout::layouts::flat::Flat;
 use vortex_layout::layouts::struct_::Struct as StructLayout;
@@ -25,8 +24,10 @@ use vortex_layout::segments::SegmentSource;
 use vortex_layout::{LayoutChildType, LayoutRef};
 
 use crate::error::{Result, VortexRdfError};
+use crate::io::container::DICT_COMPONENT_NAME;
 use crate::session::VORTEX_SESSION;
 use crate::store::array::{StrColReader, buf_as_str};
+use crate::store::native_file::NativeStoreFile;
 use crate::store::selection::POINT_GATHER_MAX_ROWS;
 
 use super::term_dict::{
@@ -244,18 +245,38 @@ pub(crate) struct FileBackedDict {
 }
 
 impl FileBackedDict {
-    pub(crate) fn new(
-        reader: vortex_layout::LayoutReaderRef,
-        len: u64,
-        chunks: TermChunks,
-    ) -> Self {
+    /// A file-backed dictionary over the child `reader` reads, point-read
+    /// through `chunks`; the term count is the reader's row count.
+    pub(crate) fn new(reader: vortex_layout::LayoutReaderRef, chunks: TermChunks) -> Self {
         Self {
+            len: reader.row_count(),
             reader,
-            len,
             probes: Arc::new(ProbeCache::new()),
             chunks: Arc::new(chunks),
             projection: Arc::new(OnceLock::new()),
         }
+    }
+
+    /// The file-backed form of `native`'s dictionary child: its cached
+    /// reader plus the wire-chunk handle resolved off the same child. `None`
+    /// when the file has no dictionary component or the child's layout
+    /// shape cannot be point-read (the caller then lifts the dictionary
+    /// resident).
+    pub(crate) fn open(native: &NativeStoreFile) -> Result<Option<Self>> {
+        let Some((_, reader)) = native
+            .component_reader(DICT_COMPONENT_NAME)
+            .map_err(VortexRdfError::Vortex)?
+        else {
+            return Ok(None);
+        };
+        let Some(child) = native
+            .component_layout(DICT_COMPONENT_NAME)
+            .map_err(VortexRdfError::Vortex)?
+        else {
+            return Ok(None);
+        };
+        Ok(TermChunks::resolve(&child, native.segment_source())
+            .map(|chunks| Self::new(reader, chunks)))
     }
 
     /// A scan over the dictionary child — the reader-level equivalent of
@@ -310,15 +331,12 @@ impl FileBackedDict {
                 self.projection.get_or_init(|| bound).clone()
             }
         };
-        let arr = self
-            .scan()
-            .with_row_indices(rows)
-            .with_projection(projection)
-            .into_array_stream()
-            .map_err(VortexRdfError::Vortex)?
-            .read_all()
-            .await
-            .map_err(VortexRdfError::Vortex)?;
+        let arr = crate::store::scan::file_scan::read_all_rows(
+            self.scan()
+                .with_row_indices(rows)
+                .with_projection(projection),
+        )
+        .await?;
         let mut ctx = VORTEX_SESSION.create_execution_ctx();
         let struct_arr = arr
             .execute::<StructArray>(&mut ctx)
@@ -373,7 +391,6 @@ mod tests {
             .collect();
         let plain = VarBinViewArray::from_iter_str(terms.iter().map(String::as_str));
         let d = TermDictionary::compress_windowed(plain, 100).unwrap();
-        let len = d.len() as u64;
 
         // A minimal native file: a one-row quad child plus the dictionary.
         let quads = StructArray::try_new(
@@ -407,24 +424,13 @@ mod tests {
             .open_options()
             .open_buffer(ByteBuffer::from(bytes))
             .unwrap();
-        let native = crate::store::native_file::NativeStoreFile::try_new(file).unwrap();
-        let (_, reader) = native
-            .component_reader(container::DICT_COMPONENT_NAME)
+        let native = NativeStoreFile::try_new(file).unwrap();
+        let fbd = FileBackedDict::open(&native)
             .unwrap()
-            .expect("the dictionary child must be present");
-        let typed = native
-            .footer()
-            .layout()
-            .as_::<container::RdfStoreLayoutVTable>();
-        let (_, dict_child) = container::store_component(typed, container::DICT_COMPONENT_NAME)
-            .unwrap()
-            .expect("the dictionary child must be present");
-        let chunks = TermChunks::resolve(&dict_child, native.segment_source())
             .expect("the written dictionary child must be point-readable");
 
         // One chunk leaf per compression window, none merged, none re-cut.
-        assert_eq!(chunks.specs.len(), 6);
-        let fbd = FileBackedDict::new(reader, len, chunks);
+        assert_eq!(fbd.chunks.specs.len(), 6);
 
         // Probes across every window: interior, first-of-window,
         // last-of-window, and absent.

@@ -5,10 +5,10 @@
 use crate::error::Result;
 use crate::store::QuadsSource;
 use crate::store::array::subject_sorted;
-use crate::store::builders::{build_components, build_components_from_codes, build_struct_array};
+use crate::store::builders::build_parts_from_raws;
 use crate::store::indexes::IndexComponent;
+use crate::store::layouts::ResolvedLayout;
 use crate::store::layouts::dictionary::TermDictionary;
-use crate::store::layouts::{ResolvedLayout, dictionary};
 
 use crate::store::RawQuad;
 
@@ -45,33 +45,26 @@ impl VortexRdfStore {
     /// those codes address.
     ///
     /// Components are included only when their `rid`s actually address the
-    /// returned rows: an unrefined owner passes its components through
-    /// untouched; a **tailed** owner REBUILDS them over the merged rows (the
-    /// old components predate the tail); a narrowed view returns none — its
-    /// gathered rows are renumbered, and rebuilding indexes for an arbitrary
-    /// view is compaction's job, not serialization's.
+    /// returned rows: an unrefined, untombstoned owner passes its components
+    /// through (in memory) or lifts its index children (file); an owner that
+    /// is tailed, or tombstoned and indexed, REBUILDS them over the surviving
+    /// rows (the held components' rids predate the mutation); a narrowed
+    /// view returns none — its gathered rows are renumbered, and rebuilding
+    /// indexes for an arbitrary view is compaction's job, not
+    /// serialization's.
     ///
     /// A rebuild also **reorders** the rows it re-emits (see
     /// [`order_for_rebuild`]), so the merged output is `(s, p, o, g)`-sorted
     /// and carries the subject stamp — serialization preserves the store's
     /// quads, not their row numbering.
     ///
-    /// Serialization policy only: [`to_serializable_parts`] is the sole
-    /// caller. The row read paths go through their own rows-only method
-    /// (`selected_rows`), which never materializes components.
-    ///
-    /// [`to_serializable_parts`]: Self::to_serializable_parts
+    /// Serialization only — the row read paths use the rows-only
+    /// [`selected_rows`](Self::selected_rows), which never materializes
+    /// components.
     async fn selected_parts(
         &self,
     ) -> Result<(ArrayRef, Vec<IndexComponent>, Option<Arc<TermDictionary>>)> {
         let base = self.base_selected_rows().await?;
-        // Which serialization shape this view gets:
-        // - a pristine owner passes its components through (in memory) or
-        //   lifts its index children (file);
-        // - a mutated owner (tombstones and/or a tail) REBUILDS them — the
-        //   held components' rids predate the mutation;
-        // - a narrowed view serializes primary rows only (rebuilding indexes
-        //   for an arbitrary view is compaction's job).
         let (owner_shaped, tombstoned) = match &self.quads {
             QuadsSource::InMemory {
                 selection, deleted, ..
@@ -101,68 +94,14 @@ impl VortexRdfStore {
             };
             return Ok((base, components, None));
         }
-        let tail_rows = match &self.tail {
-            Some(tail) => Some(tail.live_rows()?),
-            None => None,
-        };
-        // A rebuild re-emits every surviving row, so it also re-establishes
-        // the sorted order the appended tail broke (see `order_for_rebuild`):
-        // the artifact outlives the write, and rows written unsorted cost
-        // every later reader the subject binary search — and, on a file, the
-        // subject chunk probe — until someone compacts. The rebuild already
-        // decodes, re-dictionaries and re-sorts the index children over these
-        // same rows, so ordering the primary is the one step it was missing.
+        // A rebuild re-emits every surviving row in (s, p, o, g) order (see
+        // `order_for_rebuild`), so the written artifact carries the subject
+        // stamp and readers keep the subject binary search and, on a file,
+        // the subject chunk probe.
         let base_sorted = subject_sorted(&base);
-        match &self.layout {
-            ResolvedLayout::Dictionary(_) => {
-                let mut raws = self.base_raw_quads(&base).await?;
-                let base_rows = raws.len();
-                if let Some(tail_rows) = &tail_rows {
-                    raws.extend(ResolvedLayout::Default.raw_quads(tail_rows)?);
-                }
-                if raws.is_empty() {
-                    let empty = dictionary::empty_struct()?;
-                    return Ok((empty, Vec::new(), Some(Arc::new(TermDictionary::empty()))));
-                }
-                order_for_rebuild(&mut raws, base_rows, base_sorted);
-                let (dict, id_map) = TermDictionary::from_quads_with_map(&raws)?;
-                // Rebuild the index children over the surviving rows — the
-                // same emission a fresh build runs — so a mutated store's
-                // serialization keeps its indexes instead of silently
-                // dropping them.
-                let codes = dictionary::encode_quads(&raws, &dict, &id_map)?;
-                let primary = dictionary::build_code_chunk(&codes, 0..raws.len(), true)?;
-                let components = build_components_from_codes(&self.indexes, &codes)?;
-                Ok((primary, components, Some(Arc::new(dict))))
-            }
-            _ if !self.indexes.is_empty() => {
-                // Rebuild the components over the surviving rows — decoding
-                // to raws is what gives the index sorts something to permute.
-                let mut raws = self.layout.raw_quads(&base)?;
-                let base_rows = raws.len();
-                if let Some(tail_rows) = &tail_rows {
-                    raws.extend(self.tail_layout().raw_quads(tail_rows)?);
-                }
-                order_for_rebuild(&mut raws, base_rows, base_sorted);
-                let primary = build_struct_array(&raws, self.layout.strategy(), true)?;
-                let components = build_components(&self.indexes, &raws)?;
-                Ok((primary, components, None))
-            }
-            _ => {
-                // A tail with no indexes (this arm is only reachable with a
-                // tail — a tombstone-only store without indexes never
-                // rebuilds). Decoding both sides to merge them costs more
-                // than appending the tail as a second chunk would, and buys
-                // the artifact its sorted order and a single chunk.
-                let tail_rows = tail_rows.expect("rebuild without indexes implies a tail");
-                let mut raws = self.layout.raw_quads(&base)?;
-                let base_rows = raws.len();
-                raws.extend(self.tail_layout().raw_quads(&tail_rows)?);
-                order_for_rebuild(&mut raws, base_rows, base_sorted);
-                let primary = build_struct_array(&raws, self.layout.strategy(), true)?;
-                Ok((primary, Vec::new(), None))
-            }
-        }
+        let (mut raws, base_rows) = self.merged_raw_quads(&base).await?;
+        order_for_rebuild(&mut raws, base_rows, base_sorted);
+        build_parts_from_raws(&raws, self.layout.strategy(), &self.indexes, true)
     }
 
     /// This store's rows and, under the Dictionary layout, the term

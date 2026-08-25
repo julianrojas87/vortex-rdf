@@ -10,13 +10,14 @@ use std::ops::Range;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use vortex_array::expr::{BoundExpression, Expression};
-use vortex_error::{VortexResult, vortex_bail};
-use vortex_layout::LayoutReaderRef;
+use vortex_error::VortexResult;
+use vortex_layout::{LayoutReaderRef, LayoutRef};
 
 use crate::io::container::{
-    RdfStoreLayoutVTable, STORE_LAYOUT_ID, StoreComponentDescriptor, is_native_file, quads_sorted,
+    RdfStoreLayoutVTable, StoreComponentDescriptor, is_native_file, quads_sorted, store_component,
     store_components, subtree_bytes,
 };
+use crate::io::read::unsupported_file_error;
 
 /// An opened native store file: the [`vortex_file::VortexFile`] plus its
 /// component inventory and per-component reader cache.
@@ -43,9 +44,8 @@ pub(crate) struct NativeStoreFile {
     /// per node), so a hit costs a tree walk but no allocation: the
     /// repeated-pattern workloads the bindings serve (e.g. rdflib joins)
     /// re-ask the same handful of filters, and each envelope costs a pruning
-    /// evaluation over every zone. Bounded: cleared wholesale past
-    /// [`PRUNING_MEMO_MAX`].
-    pruning_envelopes: Mutex<HashMap<Expression, Option<Range<u64>>>>,
+    /// evaluation over every zone. Bounded by [`PRUNING_MEMO_MAX`].
+    pruning_envelopes: BoundedMemo<Expression, Option<Range<u64>>>,
     /// Per-column chunk-probe handles keyed by column name (`None` memoizes
     /// a column whose layout shape or dtype declines), resolved once per open
     /// file. Each handle caches fetched chunk probes internally, so repeated
@@ -67,9 +67,8 @@ pub(crate) struct NativeStoreFile {
 /// splits and across calls, land on the entries the first use created. A
 /// clone of a memoized tree shares its `Arc`s and therefore its identity.
 /// The scope tag separates trees bound against different schemas (the quad
-/// root vs. an index child). Bounded like [`NativeStoreFile::pruning_envelopes`]:
-/// cleared wholesale past [`BIND_MEMO_MAX`].
-pub(crate) struct BoundExprMemo(Mutex<HashMap<(&'static str, Expression), BoundExpression>>);
+/// root vs. an index child). Bounded by [`BIND_MEMO_MAX`].
+pub(crate) struct BoundExprMemo(BoundedMemo<(&'static str, Expression), BoundExpression>);
 
 /// Entry cap on [`BoundExprMemo`] — sized for a query workload's distinct
 /// filter shapes, not for arbitrary term churn.
@@ -77,7 +76,7 @@ const BIND_MEMO_MAX: usize = 4096;
 
 impl BoundExprMemo {
     fn new() -> Self {
-        Self(Mutex::new(HashMap::new()))
+        Self(BoundedMemo::new(BIND_MEMO_MAX))
     }
 
     /// The memoized bound form of `expr` against `dtype`, binding on first
@@ -89,16 +88,57 @@ impl BoundExprMemo {
         expr: &Expression,
         dtype: &vortex_array::dtype::DType,
     ) -> VortexResult<BoundExpression> {
-        let mut memo = self.0.lock().expect("bound-expression memo lock");
-        if let Some(bound) = memo.get(&(scope, expr.clone())) {
-            return Ok(bound.clone());
+        self.0
+            .get_or_try_insert_with((scope, expr.clone()), || expr.bind(dtype))
+    }
+}
+
+/// A lock-guarded memo with an entry cap: once `cap` entries are held, the
+/// next insert clears the map wholesale before adding its entry.
+struct BoundedMemo<K, V> {
+    map: Mutex<HashMap<K, V>>,
+    cap: usize,
+}
+
+impl<K: std::hash::Hash + Eq, V: Clone> BoundedMemo<K, V> {
+    fn new(cap: usize) -> Self {
+        Self {
+            map: Mutex::new(HashMap::new()),
+            cap,
         }
-        let bound = expr.bind(dtype)?;
-        if memo.len() >= BIND_MEMO_MAX {
-            memo.clear();
+    }
+
+    fn get(&self, key: &K) -> Option<V> {
+        self.map.lock().expect("memo lock").get(key).cloned()
+    }
+
+    fn insert(&self, key: K, value: V) {
+        let mut map = self.map.lock().expect("memo lock");
+        Self::insert_capped(&mut map, self.cap, key, value);
+    }
+
+    /// The value under `key`, computed by `build` and inserted on a miss;
+    /// the lock is held across `build`, so a shape is built once even under
+    /// concurrent misses.
+    fn get_or_try_insert_with(
+        &self,
+        key: K,
+        build: impl FnOnce() -> VortexResult<V>,
+    ) -> VortexResult<V> {
+        let mut map = self.map.lock().expect("memo lock");
+        if let Some(value) = map.get(&key) {
+            return Ok(value.clone());
         }
-        memo.insert((scope, expr.clone()), bound.clone());
-        Ok(bound)
+        let value = build()?;
+        Self::insert_capped(&mut map, self.cap, key, value.clone());
+        Ok(value)
+    }
+
+    fn insert_capped(map: &mut HashMap<K, V>, cap: usize, key: K, value: V) {
+        if map.len() >= cap {
+            map.clear();
+        }
+        map.insert(key, value);
     }
 }
 
@@ -119,13 +159,11 @@ impl std::ops::Deref for NativeStoreFile {
 }
 
 impl NativeStoreFile {
-    /// Wrap an opened file, requiring the native store root.
-    pub(crate) fn try_new(file: vortex_file::VortexFile) -> VortexResult<Self> {
+    /// Wrap an opened file, requiring the native store root — the one place
+    /// a file's root layout is checked on the open path.
+    pub(crate) fn try_new(file: vortex_file::VortexFile) -> crate::error::Result<Self> {
         if !is_native_file(&file) {
-            vortex_bail!(
-                "expected the {STORE_LAYOUT_ID} root layout, found {}",
-                file.footer().layout().encoding_id()
-            );
+            return Err(unsupported_file_error(&file));
         }
         let typed = file.footer().layout().as_::<RdfStoreLayoutVTable>();
         let components = store_components(typed).to_vec();
@@ -137,7 +175,7 @@ impl NativeStoreFile {
             quads_sorted,
             child_readers,
             splits: OnceLock::new(),
-            pruning_envelopes: Mutex::new(HashMap::new()),
+            pruning_envelopes: BoundedMemo::new(PRUNING_MEMO_MAX),
             column_chunks: Mutex::new(HashMap::new()),
             bound_exprs: Arc::new(BoundExprMemo::new()),
         })
@@ -184,9 +222,7 @@ impl NativeStoreFile {
         let mut memo = self.column_chunks.lock().expect("column chunks lock");
         memo.entry(key)
             .or_insert_with(|| {
-                let index = self.components.iter().position(|c| c.name == component)?;
-                let typed = self.file.footer().layout().as_::<RdfStoreLayoutVTable>();
-                let child = typed.slot(index + 1).ok().flatten()?;
+                let (_, child) = self.component_child(component).ok().flatten()?;
                 vortex_rdf_encoded_search::ColumnChunks::from_struct_layout(&child, column)
                     .map(Arc::new)
             })
@@ -209,26 +245,17 @@ impl NativeStoreFile {
     /// `None` means "nothing prunable".
     #[allow(clippy::option_option)]
     pub(crate) fn pruning_envelope(&self, filter: &Expression) -> Option<Option<Range<u64>>> {
-        self.pruning_envelopes
-            .lock()
-            .expect("pruning memo lock")
-            .get(filter)
-            .cloned()
+        self.pruning_envelopes.get(filter)
     }
 
-    /// Memoize a pruning envelope, clearing the memo wholesale at the cap
-    /// (crude, but a workload with more distinct filter shapes than the cap
-    /// was not going to hit anyway).
+    /// Memoize a pruning envelope; at [`PRUNING_MEMO_MAX`] entries the memo
+    /// is cleared wholesale before the insert.
     pub(crate) fn memoize_pruning_envelope(
         &self,
         filter: Expression,
         envelope: Option<Range<u64>>,
     ) {
-        let mut memo = self.pruning_envelopes.lock().expect("pruning memo lock");
-        if memo.len() >= PRUNING_MEMO_MAX {
-            memo.clear();
-        }
-        memo.insert(filter, envelope);
+        self.pruning_envelopes.insert(filter, envelope);
     }
 
     /// Whether the file records its quad rows as globally `s`-sorted.
@@ -241,19 +268,31 @@ impl NativeStoreFile {
         &self.components
     }
 
-    /// A component's descriptor, child layout, and cached reader, by name.
+    /// A component's slot in the inventory and its child layout, by name.
+    fn component_child(&self, name: &str) -> VortexResult<Option<(usize, LayoutRef)>> {
+        let Some(index) = self.components.iter().position(|c| c.name == name) else {
+            return Ok(None);
+        };
+        let typed = self.file.footer().layout().as_::<RdfStoreLayoutVTable>();
+        let (_, child) = store_component(typed, name)?
+            .ok_or_else(|| vortex_error::vortex_err!("store component {name} has no child"))?;
+        Ok(Some((index, child)))
+    }
+
+    /// A component's child layout, by name.
+    pub(crate) fn component_layout(&self, name: &str) -> VortexResult<Option<LayoutRef>> {
+        Ok(self.component_child(name)?.map(|(_, child)| child))
+    }
+
+    /// A component's descriptor and cached reader, by name.
     pub(crate) fn component_reader(
         &self,
         name: &str,
     ) -> VortexResult<Option<(&StoreComponentDescriptor, LayoutReaderRef)>> {
-        let Some(index) = self.components.iter().position(|c| c.name == name) else {
+        let Some((index, child)) = self.component_child(name)? else {
             return Ok(None);
         };
         if self.child_readers[index].get().is_none() {
-            let typed = self.file.footer().layout().as_::<RdfStoreLayoutVTable>();
-            let child = typed.slot(index + 1)?.ok_or_else(|| {
-                vortex_error::vortex_err!("store component {name} is missing its child layout")
-            })?;
             let reader = child.new_reader(
                 self.components[index].name.as_str().into(),
                 self.file.segment_source(),
@@ -274,13 +313,9 @@ impl NativeStoreFile {
     /// A component's on-disk byte size, by name — the residency-threshold
     /// input.
     pub(crate) fn component_bytes(&self, name: &str) -> VortexResult<Option<u64>> {
-        let Some(index) = self.components.iter().position(|c| c.name == name) else {
+        let Some((_, child)) = self.component_child(name)? else {
             return Ok(None);
         };
-        let typed = self.file.footer().layout().as_::<RdfStoreLayoutVTable>();
-        let child = typed.slot(index + 1)?.ok_or_else(|| {
-            vortex_error::vortex_err!("store component {name} is missing its child layout")
-        })?;
         subtree_bytes(&child, self.file.footer().segment_map()).map(Some)
     }
 }
