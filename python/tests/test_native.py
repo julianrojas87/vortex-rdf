@@ -156,7 +156,7 @@ def test_serialize_rejects_unknown_options(fixture_nt_path, tmp_path):
     # builder= is not part of the signature.
     with pytest.raises(TypeError):
         serialize_rdf(str(fixture_nt_path), out, builder="sorted-in-memory")
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match=r"unknown RDF format"):
         serialize_rdf(str(fixture_nt_path), out, format="nope")
 
 

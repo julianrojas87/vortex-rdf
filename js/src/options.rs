@@ -16,15 +16,9 @@ use crate::error::{js_err, js_err_ctx};
 
 pub(crate) fn parse_format(format_name: &str) -> Result<RdfFormat, JsValue> {
     format_from_name(format_name).ok_or_else(|| {
-        // Quote core's own name list, so this message cannot understate what
-        // `format_from_name` actually accepts.
-        let supported = supported_format_names()
-            .iter()
-            .map(|name| format!("'{name}'"))
-            .collect::<Vec<_>>()
-            .join(", ");
         js_err(format!(
-            "Unsupported format: {format_name}. Supported formats are {supported}."
+            "unknown RDF format {format_name:?}; expected one of: {}",
+            supported_format_names().join(", ")
         ))
     })
 }

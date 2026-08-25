@@ -112,3 +112,19 @@ fn blank_node_string(b: &oxrdf::BlankNode) -> String {
     s.push_str(id);
     s
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shared_quad_to_quad_rejects_an_object_in_no_term_form() {
+        let quad = SharedQuad {
+            s: "<http://example.org/s>".into(),
+            p: "<http://example.org/p>".into(),
+            o: "not a term".into(),
+            g: "".into(),
+        };
+        assert!(quad.to_quad().is_err());
+    }
+}

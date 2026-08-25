@@ -241,7 +241,7 @@ describe('RDF format support', () => {
 
     test('rejects an unsupported format', async () => {
         await expect(VortexRdfStore.fromString(TURTLE, 'nope' as any)).rejects.toThrow(
-            /Unsupported format/,
+            /unknown RDF format "nope"/,
         );
     });
 });

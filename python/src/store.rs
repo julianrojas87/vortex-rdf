@@ -86,7 +86,7 @@ impl VortexRdfStore {
 
     /// The matched rows as four columns of N-Triples strings, in
     /// subject-predicate-object-graph order. The default graph is the empty
-    /// string, matching what `parse_graph_name` accepts for it.
+    /// string, the spelling `parse_pattern_checked` accepts for it.
     ///
     /// Backs both [`Self::get_quads`] and [`Self::match_columns`], so the two
     /// resolve a pattern the same way.

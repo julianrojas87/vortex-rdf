@@ -12,13 +12,9 @@ use futures::StreamExt;
 use oxrdfio::{RdfFormat, RdfSerializer};
 use std::io::Write;
 
-/// Serialize a Vortex-RDF store to textual RDF in the specified format
-/// (Turtle, N-Triples, etc.), streaming quads sequentially into `writer`.
-///
-/// N-Triples and N-Quads are written straight from the store's raw columns:
-/// the columns hold every term in exactly the N-Triples string form those
-/// line formats need, so the per-quad oxrdf parse and re-escape the
-/// structured formats require is skipped entirely.
+/// Serialize the store as `format` into `writer`, streaming quads
+/// sequentially. N-Triples and N-Quads are written straight from the store's
+/// raw columns; every other format goes through oxrdfio's serializer.
 pub async fn export_rdf<W: Write>(
     store: VortexRdfStore,
     writer: W,

@@ -98,7 +98,7 @@ mod tests {
 
     fn dict_descriptor(dtype: DType) -> StoreComponentDescriptor {
         StoreComponentDescriptor {
-            name: DICT_COMPONENT_NAME.into(),
+            name: "dictionary".into(),
             role: StoreComponentRole::Dictionary,
             implementation: "sorted-terms-fsst-v1".into(),
             version: 1,

@@ -112,8 +112,7 @@ struct MatchArgs {
 fn parse_format(name: &str) -> Result<RdfFormat, String> {
     format_from_name(name).ok_or_else(|| {
         format!(
-            "unsupported RDF format {:?} (expected one of: {})",
-            name,
+            "unknown RDF format {name:?}; expected one of: {}",
             supported_format_names().join(", ")
         )
     })

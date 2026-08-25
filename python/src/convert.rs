@@ -48,7 +48,7 @@ pub fn serialize_rdf(
                 supported_format_names().join(", ")
             ))
         })?,
-        None => detect_format(&Some(input_path.clone())).ok_or_else(|| {
+        None => detect_format(Some(input_path.as_path())).ok_or_else(|| {
             PyValueError::new_err(
                 "could not detect RDF format from the input file extension; pass format=",
             )

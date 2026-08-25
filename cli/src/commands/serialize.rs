@@ -23,7 +23,7 @@ pub async fn run(args: SerializeArgs) -> Result<()> {
 
     let start = Instant::now();
     let format = format
-        .or_else(|| detect_format(&input))
+        .or_else(|| detect_format(input.as_deref()))
         .ok_or_else(|| anyhow!("Could not detect RDF format. Please specify it with --format"))?;
 
     let reader: Box<dyn Read + Send> = match &input {

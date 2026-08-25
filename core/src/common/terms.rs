@@ -14,13 +14,13 @@ use oxrdfio::{RdfFormat, RdfParser};
 /// Parses a string representation of an RDF named node (URI), stripping optional `<` and `>` boundaries.
 ///
 /// **Trusted-input decode path.** Every caller reconstructs a term from the
-/// store's *own* serialized columns (see `store::layouts`), whose
+/// store's *own* serialized columns (see [`crate::store::layouts`]), whose
 /// IRIs were validated by oxrdf's constructors at ingestion — so this uses
 /// [`NamedNode::new_unchecked`] rather than re-running `oxiri::Iri::parse` on
 /// every decoded row. `.vortex` files are likewise trusted to have been checked
 /// when written. The `Result` is kept so the decode call sites (which `?` on
 /// genuinely fallible neighbours like `buf_as_str`) stay uniform.
-pub fn parse_named_node(s: &str) -> Result<NamedNode> {
+pub(crate) fn parse_named_node(s: &str) -> Result<NamedNode> {
     let s = s.trim_matches(|c| c == '<' || c == '>');
     Ok(NamedNode::new_unchecked(s))
 }
@@ -33,7 +33,7 @@ fn parse_blank_node(s: &str) -> Result<BlankNode> {
 }
 
 /// Parses an RDF subject node, which can either be a NamedNode (URI) or a BlankNode.
-pub fn parse_subject(s: &str) -> Result<NamedOrBlankNode> {
+pub(crate) fn parse_subject(s: &str) -> Result<NamedOrBlankNode> {
     if s.starts_with("_:") {
         Ok(NamedOrBlankNode::BlankNode(parse_blank_node(s)?))
     } else {
@@ -181,29 +181,11 @@ fn literal_from_serialized(s: &str) -> Literal {
     }
 }
 
-/// Parses an arbitrary RDF term (blank node, literal, or named node) from its string form.
-///
-/// Crate-private on purpose: this is a trusted decode path (`new_unchecked`
-/// constructors) whose only callers are this crate's tests — production
-/// trusted decodes go through [`get_as_term`], and anything user-typed must
-/// take [`parse_term_checked`]. Exporting it would invite bindings to
-/// trust-parse input the store never validated.
-// Test-only callers, so non-test builds see it as dead; kept compiled (not
-// `#[cfg(test)]`) so the doc links above stay resolvable.
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn parse_term(s: &str) -> Result<Term> {
-    if s.starts_with('_') {
-        Ok(Term::BlankNode(parse_blank_node(s)?))
-    } else if s.starts_with('"') {
-        Ok(Term::Literal(literal_from_serialized(s)))
-    } else {
-        Ok(Term::NamedNode(parse_named_node(s)?))
-    }
-}
-
-/// Parses an RDF graph name, which can be the default graph, a named node, or a blank node.
-pub fn parse_graph_name(s: &str) -> Result<GraphName> {
-    if s.is_empty() || s.eq_ignore_ascii_case("default") || s == "[]" {
+/// Parses an RDF graph name as the columns store it: `""` for the default
+/// graph, otherwise a named node or a blank node. Trusted decode path — see
+/// [`parse_named_node`].
+pub(crate) fn parse_graph_name(s: &str) -> Result<GraphName> {
+    if s.is_empty() {
         Ok(GraphName::DefaultGraph)
     } else if s.starts_with("_:") {
         Ok(GraphName::BlankNode(parse_blank_node(s)?))
@@ -219,7 +201,7 @@ pub fn parse_graph_name(s: &str) -> Result<GraphName> {
 /// the store's own columns — CLI pattern arguments, binding call arguments,
 /// anything a user typed. The trusted family above stays the decode path for
 /// terms the store itself serialized, where re-validation is pure cost.
-pub fn parse_named_node_checked(s: &str) -> Result<NamedNode> {
+fn parse_named_node_checked(s: &str) -> Result<NamedNode> {
     let s = s.trim_matches(|c| c == '<' || c == '>');
     NamedNode::new(s)
         .map_err(|e| VortexRdfError::Deserialization(format!("invalid IRI {:?}: {}", s, e)))
@@ -235,7 +217,7 @@ fn parse_blank_node_checked(s: &str) -> Result<BlankNode> {
 
 /// The untrusted-boundary counterpart of [`parse_subject`] — see
 /// [`parse_named_node_checked`].
-pub fn parse_subject_checked(s: &str) -> Result<NamedOrBlankNode> {
+fn parse_subject_checked(s: &str) -> Result<NamedOrBlankNode> {
     if s.starts_with("_:") {
         Ok(NamedOrBlankNode::BlankNode(parse_blank_node_checked(s)?))
     } else {
@@ -244,9 +226,10 @@ pub fn parse_subject_checked(s: &str) -> Result<NamedOrBlankNode> {
 }
 
 /// The untrusted-boundary counterpart of [`parse_graph_name`] — see
-/// [`parse_named_node_checked`]. The default-graph spellings (`""`,
-/// `"default"`, `"[]"`) are those of the trusted form.
-pub fn parse_graph_name_checked(s: &str) -> Result<GraphName> {
+/// [`parse_named_node_checked`]. Accepts the user-typed default-graph
+/// spellings `""`, `"default"` (case-insensitive) and `"[]"`; the trusted
+/// form takes only the `""` the columns store.
+fn parse_graph_name_checked(s: &str) -> Result<GraphName> {
     if s.is_empty() || s.eq_ignore_ascii_case("default") || s == "[]" {
         Ok(GraphName::DefaultGraph)
     } else if s.starts_with("_:") {
@@ -256,15 +239,15 @@ pub fn parse_graph_name_checked(s: &str) -> Result<GraphName> {
     }
 }
 
-/// The untrusted-boundary counterpart of [`get_as_term`]/`parse_term`: the
-/// same N-Triples forms — `<iri>`, `_:id`, `"v"`, `"v"@lang`, `"v"^^<dt>`,
-/// plus a bare IRI as `parse_term` accepts — with every component built
-/// through a validating constructor (including the language tag and the
-/// literal's datatype IRI).
+/// The untrusted-boundary counterpart of [`parse_term`]: the same N-Triples
+/// forms — `<iri>`, `_:id`, `"v"`, `"v"@lang`, `"v"^^<dt>` — plus a bare IRI
+/// (no angle brackets), which is read as a named node; every component is
+/// built through a validating constructor (including the language tag and
+/// the literal's datatype IRI).
 ///
-/// Deliberately does not delegate to [`get_as_term`], which is a trusted
+/// Deliberately does not delegate to [`parse_term`], which is a trusted
 /// decode path built on `new_unchecked` — see [`parse_named_node_checked`].
-pub fn parse_term_checked(s: &str) -> Result<Term> {
+fn parse_term_checked(s: &str) -> Result<Term> {
     if s.starts_with("_:") {
         Ok(Term::BlankNode(parse_blank_node_checked(s)?))
     } else if s.starts_with('"') {
@@ -313,9 +296,9 @@ pub type Pattern = (
 
 /// Parses a user-typed quad pattern — the four optional term strings every
 /// frontend's match surface accepts — through the checked family above:
-/// subject via [`parse_subject_checked`], predicate via
-/// [`parse_named_node_checked`], object via [`parse_term_checked`], graph via
-/// [`parse_graph_name_checked`]. A `None` slot stays free; the first invalid
+/// subject via `parse_subject_checked`, predicate via
+/// `parse_named_node_checked`, object via `parse_term_checked`, graph via
+/// `parse_graph_name_checked`. A `None` slot stays free; the first invalid
 /// slot's error is returned as-is (callers wanting per-slot context wrap the
 /// error themselves).
 pub fn parse_pattern_checked(
@@ -332,11 +315,11 @@ pub fn parse_pattern_checked(
     ))
 }
 
-/// [`get_as_term`] as a decode step: an object string the columns store,
+/// [`parse_term`] as a decode step: an object string the columns store,
 /// parsed on the trusted path, with an unrecognized form reported as a
 /// deserialization error.
 pub(crate) fn parse_object(o: &str) -> Result<Term> {
-    get_as_term(o).ok_or_else(|| VortexRdfError::Deserialization(format!("Invalid object: {o}")))
+    parse_term(o).ok_or_else(|| VortexRdfError::Deserialization(format!("Invalid object: {o}")))
 }
 
 /// A quad from its four stored N-Triples term strings (`g` empty for the
@@ -350,9 +333,10 @@ pub(crate) fn quad_from_terms(s: &str, p: &str, o: &str, g: &str) -> Result<Quad
     ))
 }
 
-/// Reconstructs a full structural oxrdf `Term` from its raw serialized string representation.
-/// Handles URIs, Blank Nodes, simple literals, language-tagged literals, and typed literals.
-pub fn get_as_term(s: &str) -> Option<Term> {
+/// Reconstructs an oxrdf [`Term`] from its stored N-Triples form: `<iri>`,
+/// `_:id`, or a simple, language-tagged or typed literal. `None` for a string
+/// in none of those forms. Trusted decode path — see [`parse_named_node`].
+pub(crate) fn parse_term(s: &str) -> Option<Term> {
     if s.starts_with('<') {
         // Trusted-input decode path — see `parse_named_node`; `new_unchecked`
         // skips the `oxiri::Iri::parse` re-validation of an already-validated,
@@ -399,30 +383,27 @@ pub fn parse_quads_from_reader<R: std::io::Read + Send + 'static>(
 mod tests {
     use super::*;
     use crate::tests::escaping::escaped_literal_cases;
+    use futures::StreamExt;
 
     #[test]
-    fn parse_term_simple_literal() {
-        assert_eq!(
-            parse_term("\"Alice\"").unwrap(),
-            Term::Literal(Literal::new_simple_literal("Alice"))
-        );
-    }
-
-    #[test]
-    fn parse_term_language_tagged_literal() {
-        assert_eq!(
-            parse_term("\"Bob\"@en").unwrap(),
-            Term::Literal(Literal::new_language_tagged_literal("Bob", "en").unwrap())
-        );
-    }
-
-    #[test]
-    fn parse_term_typed_literal() {
+    fn parse_term_reads_each_literal_shape() {
         let dt = NamedNode::new("http://www.w3.org/2001/XMLSchema#integer").unwrap();
-        assert_eq!(
-            parse_term("\"42\"^^<http://www.w3.org/2001/XMLSchema#integer>").unwrap(),
-            Term::Literal(Literal::new_typed_literal("42", dt))
-        );
+        for (serialized, expected) in [
+            (
+                "\"Alice\"",
+                Term::Literal(Literal::new_simple_literal("Alice")),
+            ),
+            (
+                "\"Bob\"@en",
+                Term::Literal(Literal::new_language_tagged_literal("Bob", "en").unwrap()),
+            ),
+            (
+                "\"42\"^^<http://www.w3.org/2001/XMLSchema#integer>",
+                Term::Literal(Literal::new_typed_literal("42", dt)),
+            ),
+        ] {
+            assert_eq!(parse_term(serialized).unwrap(), expected, "{}", serialized);
+        }
     }
 
     #[test]
@@ -431,15 +412,13 @@ mod tests {
             parse_term("<http://example.org/x>").unwrap(),
             Term::NamedNode(NamedNode::new("http://example.org/x").unwrap())
         );
-        // Bare IRIs (no angle brackets) are accepted, e.g. from CLI arguments.
-        assert_eq!(
-            parse_term("http://example.org/x").unwrap(),
-            Term::NamedNode(NamedNode::new("http://example.org/x").unwrap())
-        );
         assert!(matches!(
             parse_term("_:b0").unwrap(),
             Term::BlankNode(b) if b.as_str() == "b0"
         ));
+        // Only the stored forms are terms; anything else is `None`.
+        assert_eq!(parse_term("http://example.org/x"), None);
+        assert_eq!(parse_term("not a term"), None);
     }
 
     #[test]
@@ -466,10 +445,37 @@ mod tests {
             ))
         );
 
+        // A bare IRI (no angle brackets) in the object slot takes the
+        // named-node arm.
+        assert_eq!(
+            parse_term_checked("http://example.org/x").unwrap(),
+            Term::NamedNode(NamedNode::new("http://example.org/x").unwrap())
+        );
+
         // A `None` slot stays free; "default" names the default graph.
         let (s, p, o, g) = parse_pattern_checked(None, None, None, Some("default")).unwrap();
         assert!(s.is_none() && p.is_none() && o.is_none());
         assert_eq!(g, Some(GraphName::DefaultGraph));
+    }
+
+    /// The user-typed default-graph spellings belong to the checked form
+    /// only; the trusted form reads the `""` the columns store.
+    #[test]
+    fn default_graph_spellings_split_between_trusted_and_checked() {
+        for s in ["", "default", "DEFAULT", "[]"] {
+            assert_eq!(
+                parse_graph_name_checked(s).unwrap(),
+                GraphName::DefaultGraph,
+                "{s:?}"
+            );
+        }
+        assert_eq!(parse_graph_name("").unwrap(), GraphName::DefaultGraph);
+        for s in ["default", "[]"] {
+            assert!(
+                matches!(parse_graph_name(s).unwrap(), GraphName::NamedNode(_)),
+                "{s:?}"
+            );
+        }
     }
 
     /// Pattern slots are user-typed, so they take the *checked* parse family: an
@@ -483,18 +489,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_term_agrees_with_get_as_term_on_literals() {
-        for s in [
-            "\"plain\"",
-            "\"tagged\"@en-GB",
-            "\"7\"^^<http://www.w3.org/2001/XMLSchema#byte>",
-            "\"an @ inside\"",
-        ] {
-            assert_eq!(parse_term(s).unwrap(), get_as_term(s).unwrap());
-        }
-    }
-
-    #[test]
     fn trusted_and_checked_parses_agree_on_escaped_literals() {
         for term in escaped_literal_cases() {
             let s = term.to_string();
@@ -505,7 +499,6 @@ mod tests {
                 "checked parse of {}",
                 s
             );
-            assert_eq!(get_as_term(&s).unwrap(), term, "get_as_term of {}", s);
         }
     }
 
@@ -536,6 +529,26 @@ mod tests {
             ("\"\\'\"", "'"),
             ("\"\\t\\n\\r\"", "\t\n\r"),
             ("\"\\\\\\\"\"", "\\\""),
+        ] {
+            let expected = Term::Literal(Literal::new_simple_literal(value));
+            assert_eq!(parse_term(serialized).unwrap(), expected, "{}", serialized);
+            assert_eq!(
+                parse_term_checked(serialized).unwrap(),
+                expected,
+                "{}",
+                serialized
+            );
+        }
+    }
+
+    /// A backslash that starts no recognized escape, or a truncated or
+    /// non-scalar `\u`, is kept as written — the decoder never loses input.
+    #[test]
+    fn unrecognized_escapes_are_preserved_verbatim() {
+        for (serialized, value) in [
+            ("\"\\q\"", "\\q"),
+            ("\"\\u12\"", "\\u12"),
+            ("\"\\uD800\"", "\\uD800"),
         ] {
             let expected = Term::Literal(Literal::new_simple_literal(value));
             assert_eq!(parse_term(serialized).unwrap(), expected, "{}", serialized);
@@ -594,6 +607,53 @@ mod tests {
             // Trusted decode is infallible: it must not panic and must yield a term.
             assert!(matches!(parse_term(s).unwrap(), Term::Literal(_)), "{}", s);
             assert!(parse_term_checked(s).is_err(), "{}", s);
+        }
+    }
+
+    const NQUADS: &str = "\
+<http://example.org/s> <http://example.org/p> \"say \\\"hi\\\"\\n\" .
+<http://example.org/s> <http://example.org/p> \"bonjour\"@fr <http://example.org/g> .
+_:b0 <http://example.org/p> \"7\"^^<http://www.w3.org/2001/XMLSchema#integer> .
+<http://example.org/s> <http://example.org/p> _:b0 <http://example.org/g> .
+";
+
+    /// The textual ingest boundary yields exactly what oxrdfio's own parse
+    /// does, in `RawQuad` form.
+    #[tokio::test]
+    async fn parse_quads_from_reader_matches_oxrdfio() {
+        let fields = |q: RawQuad| (q.s, q.p, q.o, q.g);
+        let expected: Vec<_> = RdfParser::from_format(RdfFormat::NQuads)
+            .for_reader(NQUADS.as_bytes())
+            .map(|q| fields(RawQuad::from_quad(&q.unwrap())))
+            .collect();
+        assert_eq!(expected.len(), 4);
+        let parsed: Vec<_> = parse_quads_from_reader(NQUADS.as_bytes(), RdfFormat::NQuads)
+            .map(|q| fields(q.unwrap()))
+            .collect()
+            .await;
+        assert_eq!(parsed, expected);
+        assert_eq!(parsed[0].2, "\"say \\\"hi\\\"\\n\"");
+        assert_eq!(parsed[1].3, "<http://example.org/g>");
+        assert_eq!(parsed[2].0, "_:b0");
+    }
+
+    #[tokio::test]
+    async fn parse_quads_from_reader_reports_a_malformed_document() {
+        let results: Vec<Result<RawQuad>> = parse_quads_from_reader(
+            "<http://example.org/s> nonsense".as_bytes(),
+            RdfFormat::NQuads,
+        )
+        .collect()
+        .await;
+        let err = results
+            .into_iter()
+            .find_map(|r| r.err())
+            .expect("a malformed document must yield an error");
+        match err {
+            VortexRdfError::Deserialization(msg) => {
+                assert!(msg.contains("Parse error"), "{msg}")
+            }
+            other => panic!("expected a Deserialization error, got {other:?}"),
         }
     }
 }

@@ -9,7 +9,7 @@ use vortex_array::arrays::struct_::StructArray;
 use vortex_array::arrays::{PrimitiveArray, VarBinViewArray};
 use vortex_array::{ArrayRef, ExecutionCtx, IntoArray, VortexSessionExecute};
 
-use crate::common::terms::{get_as_term, parse_graph_name, parse_named_node, parse_subject};
+use crate::common::terms::{parse_graph_name, parse_named_node, parse_subject, parse_term};
 use crate::error::{Result, VortexRdfError};
 use crate::session::VORTEX_SESSION;
 use crate::store::RawQuad;
@@ -48,7 +48,7 @@ pub(crate) fn build_columns(quads: &[RawQuad]) -> Result<Vec<ArrayRef>> {
     let mut langs: Vec<Option<String>> = Vec::with_capacity(n);
 
     for q in quads {
-        let term = get_as_term(&q.o).ok_or_else(|| {
+        let term = parse_term(&q.o).ok_or_else(|| {
             VortexRdfError::Deserialization(format!("Cannot parse object string: {}", q.o))
         })?;
         let (kind, value, dt, lang) = decompose_object(&term);
@@ -102,7 +102,7 @@ fn compose_object(
     // Trusted-input decode path — see `parse_named_node`: the sub-columns
     // were decomposed from already-validated terms at build time, so the
     // checked constructors' re-validation (a full `oxiri::Iri::parse` per
-    // IRI) is skipped, matching `get_as_term`.
+    // IRI) is skipped, matching `parse_term`.
     match kind {
         0 => Ok(Term::NamedNode(NamedNode::new_unchecked(value))),
         1 => Ok(Term::BlankNode(BlankNode::new_unchecked(value))),

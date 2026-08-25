@@ -8,9 +8,8 @@ use oxrdfio::RdfFormat;
 /// Infer the RDF format from a path's extension. `None` when there is no
 /// path, no extension, or the extension names no format oxrdfio knows — the
 /// caller then needs an explicit format.
-pub fn detect_format(path: &Option<std::path::PathBuf>) -> Option<RdfFormat> {
-    let path = path.as_ref()?;
-    let ext = path.extension()?.to_str()?;
+pub fn detect_format(path: Option<&std::path::Path>) -> Option<RdfFormat> {
+    let ext = path?.extension()?.to_str()?;
     RdfFormat::from_extension(ext)
 }
 
@@ -33,11 +32,8 @@ pub fn format_from_name(name: &str) -> Option<RdfFormat> {
     })
 }
 
-/// Every name [`format_from_name`] accepts, long spelling before its short
-/// aliases — the single list "unsupported format" error messages quote, so a
-/// binding's message cannot drift from the parser's table above. Kept
-/// adjacent to that match; a name belongs here exactly when it has an arm
-/// there (the test suite asserts each listed name parses).
+/// Every name [`format_from_name`] accepts, long spelling before its aliases
+/// — the list "unsupported format" errors quote.
 pub fn supported_format_names() -> &'static [&'static str] {
     &[
         "ntriples", "nt", "nquads", "nq", "turtle", "ttl", "trig", "n3", "rdfxml", "rdf", "xml",
@@ -49,25 +45,21 @@ pub fn supported_format_names() -> &'static [&'static str] {
 mod tests {
     use super::*;
 
-    // The alias table itself (every listed name parses, Display agreement,
-    // unknown names) is pinned centrally in `crate::tests::names`; this
-    // covers the mapping and its `None` arms.
+    // tests/names.rs asserts every supported_format_names() entry parses;
+    // this pins the extension mapping, case-insensitivity, and the None arms.
     #[test]
     fn detect_format_maps_extensions_and_declines_the_rest() {
-        let path = |p: &str| Some(std::path::PathBuf::from(p));
-        assert_eq!(detect_format(&path("data.nt")), Some(RdfFormat::NTriples));
-        assert_eq!(detect_format(&path("data.nq")), Some(RdfFormat::NQuads));
-        assert_eq!(
-            detect_format(&path("dir/data.ttl")),
-            Some(RdfFormat::Turtle)
-        );
-        assert_eq!(detect_format(&path("data.trig")), Some(RdfFormat::TriG));
-        assert_eq!(detect_format(&path("data.rdf")), Some(RdfFormat::RdfXml));
+        let path = |p: &str| detect_format(Some(std::path::Path::new(p)));
+        assert_eq!(path("data.nt"), Some(RdfFormat::NTriples));
+        assert_eq!(path("data.nq"), Some(RdfFormat::NQuads));
+        assert_eq!(path("dir/data.ttl"), Some(RdfFormat::Turtle));
+        assert_eq!(path("data.trig"), Some(RdfFormat::TriG));
+        assert_eq!(path("data.rdf"), Some(RdfFormat::RdfXml));
         // No path, no extension, or an extension naming no format: `None`,
         // so the caller asks for an explicit format.
-        assert_eq!(detect_format(&None), None);
-        assert_eq!(detect_format(&path("data")), None);
-        assert_eq!(detect_format(&path("data.parquet")), None);
+        assert_eq!(detect_format(None), None);
+        assert_eq!(path("data"), None);
+        assert_eq!(path("data.parquet"), None);
     }
 
     #[test]

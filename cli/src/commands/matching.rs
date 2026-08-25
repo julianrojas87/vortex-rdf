@@ -47,7 +47,7 @@ pub async fn run(args: MatchArgs) -> Result<()> {
         .context("Invalid --graph pattern (expected <iri>, _:blank, or default)")?;
 
     let output_format = output_format
-        .or_else(|| detect_format(&output))
+        .or_else(|| detect_format(output.as_deref()))
         .unwrap_or(RdfFormat::NQuads);
 
     let writer: Box<dyn Write> = match &output {
@@ -69,7 +69,7 @@ pub async fn run(args: MatchArgs) -> Result<()> {
         store
     } else {
         let input_format = input_format
-            .or_else(|| detect_format(&Some(input.clone())))
+            .or_else(|| detect_format(Some(input.as_path())))
             .ok_or_else(|| {
                 anyhow!("Could not detect RDF format. Please specify it with --input-format")
             })?;

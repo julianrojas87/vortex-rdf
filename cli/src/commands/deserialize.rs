@@ -21,7 +21,7 @@ pub async fn run(args: DeserializeArgs) -> Result<()> {
 
     let start = Instant::now();
     let format = format
-        .or_else(|| detect_format(&output))
+        .or_else(|| detect_format(output.as_deref()))
         .unwrap_or(RdfFormat::NQuads);
 
     let writer: Box<dyn Write> = match &output {
