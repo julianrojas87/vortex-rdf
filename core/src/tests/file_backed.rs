@@ -450,8 +450,8 @@ async fn test_file_subject_probe_requires_sorted() {
         .map(crate::store::RawQuad::from_quad)
         .collect();
     raws.rotate_left(7);
-    let (dict, id_map) = TermDictionary::from_quads_with_map(&raws).unwrap();
-    let codes = dictionary::encode_quads(&raws, &dict, &id_map).unwrap();
+    let (dict, code_map) = TermDictionary::from_quads_with_map(&raws).unwrap();
+    let codes = dictionary::encode_quads(&raws, &code_map).unwrap();
     let primary = dictionary::build_code_chunk(&codes, 0..raws.len(), false).unwrap();
     let mut bytes: Vec<u8> = Vec::new();
     let parts = crate::store::StoreParts {

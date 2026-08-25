@@ -46,8 +46,8 @@ pub(crate) const REF_P_COMPONENT: &str = "index:ref-p";
 
 /// Column names inside a reference component's persisted child.
 const CHILD_COLUMNS: [&str; 2] = ["val", "rid"];
-const CHILD_VAL_COL: &str = "val";
-const CHILD_RID_COL: &str = "rid";
+const COL_VAL: &str = "val";
+const COL_RID: &str = "rid";
 pub(crate) const O_IMPLEMENTATION: &str = "secondary-by-reference/o";
 pub(crate) const P_IMPLEMENTATION: &str = "secondary-by-reference/p";
 
@@ -171,7 +171,7 @@ pub(crate) fn resolve_in_memory(
     // Binary search bounds the run of rows equal to the probe — through the
     // component's cached probe when the column resolves one; an empty run
     // means the term is present in the schema but absent from the data.
-    let Some(run) = super::component_probe_run(component, CHILD_VAL_COL, &native, None)? else {
+    let Some(run) = super::component_probe_run(component, COL_VAL, &native, None)? else {
         return Ok(IndexResolution::Declined);
     };
     if run.is_empty() {
@@ -181,7 +181,7 @@ pub(crate) fn resolve_in_memory(
     // They come out in the index's order (the rid column is ordered by value,
     // not by row), so `sorted_row_ids` puts them back in base row order.
     let row_ids = sorted_row_ids(
-        rows.unmasked_field_by_name(CHILD_RID_COL)
+        rows.unmasked_field_by_name(COL_RID)
             .map_err(VortexRdfError::Vortex)?
             .slice(run)
             .map_err(VortexRdfError::Vortex)?,
@@ -243,12 +243,12 @@ pub(crate) async fn resolve_file(
         // The located range is exactly this index's matched rows: the value
         // column is the one and only constraint.
         let row_ids = if crate::store::selection::point_sized(range.end - range.start) {
-            super::rid_point_reads(file, name, CHILD_RID_COL, range.clone()).await?
+            super::rid_point_reads(file, name, COL_RID, range.clone()).await?
         } else {
             Some(
                 super::scan_located_row_ids(
                     reader.clone(),
-                    CHILD_RID_COL,
+                    COL_RID,
                     range,
                     file.bound_exprs(),
                     name,
@@ -269,8 +269,8 @@ pub(crate) async fn resolve_file(
     }
     super::resolve_eager_from_scan(
         reader,
-        &[(CHILD_VAL_COL, native)],
-        CHILD_RID_COL,
+        &[(COL_VAL, native)],
+        COL_RID,
         probe.resolves,
         file.bound_exprs(),
         name,
@@ -300,7 +300,7 @@ async fn locate_run(
     let Ok(needle) = u64::try_from(native) else {
         return Ok(None);
     };
-    let Some(chunks) = file.component_column_chunks(role.component_name(), CHILD_VAL_COL) else {
+    let Some(chunks) = file.component_column_chunks(role.component_name(), COL_VAL) else {
         return Ok(None);
     };
     chunks

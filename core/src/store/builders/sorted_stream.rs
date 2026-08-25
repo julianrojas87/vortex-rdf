@@ -286,15 +286,15 @@ pub(crate) async fn build_sorted_stream_chunk_stream(
         let want_copy = unique.contains(&IndexType::SecondaryByCopy);
         if let Some(b) = dict_builder {
             let dict_start = debug::timer();
-            let (dict, id_map) = b.finish()?;
-            let (dict, id_map) = (Arc::new(dict), Arc::new(id_map));
+            let (dict, code_map) = b.finish()?;
+            let (dict, code_map) = (Arc::new(dict), Arc::new(code_map));
             log::debug!(
                 "[SortedStreamBuilder] Finalized dictionary of {} terms in {:?} ({:?} since build start)",
                 dict.len(),
                 debug::elapsed(dict_start),
                 debug::elapsed(build_start)
             );
-            let ids = id_map.clone();
+            let codes = Arc::clone(&code_map);
             let (merged, spilled) = merge_to_spill(
                 runs,
                 heap,
@@ -302,16 +302,9 @@ pub(crate) async fn build_sorted_stream_chunk_stream(
                 chunk_size,
                 want_ref,
                 want_copy,
-                move |term| {
-                    ids.get(term).copied().ok_or_else(|| {
-                        VortexRdfError::Serialization(format!(
-                            "Term missing from dictionary during encoding: {}",
-                            term
-                        ))
-                    })
-                },
+                move |term| dictionary::code_of(&codes, term),
             )?;
-            return emit_presorted_dict_chunks(merged, spilled, dict, id_map, chunk_size, guard);
+            return emit_presorted_dict_chunks(merged, spilled, dict, code_map, chunk_size, guard);
         }
         let (merged, spilled) = merge_to_spill(
             runs,
@@ -336,15 +329,15 @@ pub(crate) async fn build_sorted_stream_chunk_stream(
     // ── No secondary indexes: lazily emit merged chunks ──
     if let Some(b) = dict_builder {
         let dict_start = debug::timer();
-        let (dict, id_map) = b.finish()?;
-        let (dict, id_map) = (Arc::new(dict), Arc::new(id_map));
+        let (dict, code_map) = b.finish()?;
+        let (dict, code_map) = (Arc::new(dict), Arc::new(code_map));
         log::debug!(
             "[SortedStreamBuilder] Finalized dictionary of {} terms in {:?} ({:?} since build start)",
             dict.len(),
             debug::elapsed(dict_start),
             debug::elapsed(build_start)
         );
-        return emit_dict_chunks(runs, heap, dict, id_map, chunk_size, guard);
+        return emit_dict_chunks(runs, heap, dict, code_map, chunk_size, guard);
     }
 
     // The first chunk is built eagerly so the schema dtype is known up front.
@@ -740,7 +733,7 @@ fn emit_presorted_dict_chunks(
     mut merged: Run<RawQuad>,
     spilled: SpilledIndexes<u32>,
     dict: Arc<TermDictionary>,
-    id_map: Arc<crate::store::layouts::dictionary::TermIdMap>,
+    code_map: Arc<crate::store::layouts::dictionary::TermCodeMap>,
     chunk_size: usize,
     guard: Arc<TempRunsGuard>,
 ) -> Result<BuiltStream> {
@@ -757,25 +750,25 @@ fn emit_presorted_dict_chunks(
     let first = if buf.is_empty() {
         dictionary::empty_struct()?
     } else {
-        dictionary::build_chunk(&buf, &dict, &id_map, true)?
+        dictionary::build_chunk(&buf, &code_map, true)?
     };
     let dtype = first.dtype().clone();
 
     let stream_dict = Arc::clone(&dict);
     let rest = stream::unfold(
-        (merged, stream_dict, id_map, guard),
-        move |(mut merged, dict, id_map, guard)| async move {
+        (merged, stream_dict, code_map, guard),
+        move |(mut merged, dict, code_map, guard)| async move {
             let chunk = (|| {
                 let buf = read_merged_batch(&mut merged, chunk_size)?;
                 if buf.is_empty() {
                     return Ok(None);
                 }
-                dictionary::build_chunk(&buf, &dict, &id_map, true).map(Some)
+                dictionary::build_chunk(&buf, &code_map, true).map(Some)
             })();
             match chunk {
                 Ok(None) => None,
-                Ok(Some(c)) => Some((Ok(c), (merged, dict, id_map, guard))),
-                Err(e) => Some((Err(into_vortex_error(e)), (merged, dict, id_map, guard))),
+                Ok(Some(c)) => Some((Ok(c), (merged, dict, code_map, guard))),
+                Err(e) => Some((Err(into_vortex_error(e)), (merged, dict, code_map, guard))),
             }
         },
     );
@@ -797,7 +790,7 @@ fn emit_dict_chunks(
     mut runs: Vec<Run<RawQuad>>,
     mut heap: BinaryHeap<HeapItem>,
     dict: Arc<TermDictionary>,
-    id_map: Arc<crate::store::layouts::dictionary::TermIdMap>,
+    code_map: Arc<crate::store::layouts::dictionary::TermCodeMap>,
     chunk_size: usize,
     guard: Arc<TempRunsGuard>,
 ) -> Result<BuiltStream> {
@@ -805,27 +798,29 @@ fn emit_dict_chunks(
     let first = if first_buf.is_empty() {
         dictionary::empty_struct()?
     } else {
-        dictionary::build_chunk(&first_buf, &dict, &id_map, true)?
+        dictionary::build_chunk(&first_buf, &code_map, true)?
     };
     let dtype = first.dtype().clone();
     drop(first_buf);
 
     let stream_dict = Arc::clone(&dict);
     let rest = stream::unfold(
-        (runs, heap, stream_dict, id_map, guard),
-        move |(mut runs, mut heap, dict, id_map, guard)| async move {
+        (runs, heap, stream_dict, code_map, guard),
+        move |(mut runs, mut heap, dict, code_map, guard)| async move {
             let buf = match next_sorted_chunk(&mut runs, &mut heap, chunk_size) {
                 Ok(b) => b,
                 Err(e) => {
-                    return Some((Err(into_vortex_error(e)), (runs, heap, dict, id_map, guard)));
+                    return Some((
+                        Err(into_vortex_error(e)),
+                        (runs, heap, dict, code_map, guard),
+                    ));
                 }
             };
             if buf.is_empty() {
                 return None;
             }
-            let chunk =
-                dictionary::build_chunk(&buf, &dict, &id_map, true).map_err(into_vortex_error);
-            Some((chunk, (runs, heap, dict, id_map, guard)))
+            let chunk = dictionary::build_chunk(&buf, &code_map, true).map_err(into_vortex_error);
+            Some((chunk, (runs, heap, dict, code_map, guard)))
         },
     );
 

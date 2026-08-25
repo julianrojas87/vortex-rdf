@@ -62,7 +62,7 @@ fn js_array_to_raw_quads(quads: js_sys::Array) -> Result<Vec<RawQuad>, JsValue> 
 /// interning [`DictionaryQuadSink`] and build the array from it.
 ///
 /// Unlike [`js_array_to_raw_quads`], nothing accumulates per quad but four
-/// u32 ids — each `RawQuad`'s Strings die inside `push` — so the ingest
+/// u32 term codes — each `RawQuad`'s Strings die inside `push` — so the ingest
 /// high-water holds one packed chunk plus one copy of every distinct term
 /// instead of four owned Strings per quad.
 pub(crate) fn js_array_to_dictionary_array(

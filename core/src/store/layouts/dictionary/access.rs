@@ -42,7 +42,7 @@ pub(crate) enum DictAccess {
     /// The dictionary left in its file, read on demand through wire-chunk
     /// point reads — chosen at open when the dictionary child outweighs the
     /// residency threshold *and* its layout shape is point-readable (see
-    /// `VortexRdfStore::from_file`).
+    /// [`VortexRdfStore::from_file_with_dict_residency`](crate::store::VortexRdfStore::from_file_with_dict_residency)).
     #[cfg(feature = "file-io")]
     FileBacked(FileBackedDict),
 }
@@ -62,7 +62,7 @@ impl DictAccess {
             DictAccess::Resident(dict) => {
                 let mut codes = PatternCodes::resident(Arc::clone(dict));
                 for term in pattern.bound_roles() {
-                    codes.resolve(term, |t| dict.get_id(t));
+                    codes.resolve(term, |t| dict.encode(t));
                 }
                 Ok(codes)
             }
@@ -80,11 +80,12 @@ impl DictAccess {
             #[cfg(feature = "file-io")]
             DictAccess::FileBacked(fb) => {
                 let rendered: Vec<String> = pattern.bound_roles().map(|t| t.to_string()).collect();
-                let ids = futures::future::join_all(rendered.iter().map(|t| fb.get_id(t))).await;
+                let resolved =
+                    futures::future::join_all(rendered.iter().map(|t| fb.encode(t))).await;
                 let mut codes = PatternCodes::preresolved();
-                for (term, id) in pattern.bound_roles().zip(ids) {
-                    let id = id?;
-                    codes.resolve(term, |_| id);
+                for (term, code) in pattern.bound_roles().zip(resolved) {
+                    let code = code?;
+                    codes.resolve(term, |_| code);
                 }
                 Ok(codes)
             }
@@ -112,7 +113,7 @@ impl DictAccess {
         match self {
             DictAccess::Resident(dict) => Ok(Arc::clone(dict)),
             #[cfg(feature = "file-io")]
-            DictAccess::FileBacked(fb) => Ok(Arc::new(fb.load_resident().await?)),
+            DictAccess::FileBacked(fb) => Ok(Arc::new(fb.lift_resident().await?)),
         }
     }
 

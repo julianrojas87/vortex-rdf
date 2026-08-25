@@ -290,7 +290,7 @@ pub(crate) fn build_parts_from_raws(
         )),
         LayoutStrategy::Dictionary => {
             let (dict, code_map) = TermDictionary::from_quads_with_map(raws)?;
-            let codes = dictionary::encode_quads(raws, &dict, &code_map)?;
+            let codes = dictionary::encode_quads(raws, &code_map)?;
             let primary = dictionary::build_code_chunk(&codes, 0..raws.len(), sorted)?;
             let components = build_components_from_codes(indexes, &codes)?;
             Ok((primary, components, Some(Arc::new(dict))))

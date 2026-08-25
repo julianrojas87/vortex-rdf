@@ -330,7 +330,7 @@ fn intersect_sorted_ids(left: &[u64], right: &[u64]) -> Buffer<u64> {
 /// (optimizer pass, execution context, canonicalization) whatever the row
 /// count, while point reads cost per row per column, so the crossover sits in
 /// the hundreds of rows and this threshold stays under it. The file-backed
-/// dictionary makes the same trade: `FileBackedDict::resolve_terms`
+/// dictionary makes the same trade: `FileBackedDict::decode_many`
 /// point-reads batches of up to this many codes through the chunk leaves and
 /// scans wider ones.
 pub(crate) const POINT_GATHER_MAX_ROWS: usize = 256;

@@ -30,8 +30,9 @@ use crate::store::array::{StrColReader, buf_as_str};
 use crate::store::native_file::NativeStoreFile;
 use crate::store::selection::POINT_GATHER_MAX_ROWS;
 
+use super::check_code;
 use super::term_dict::{
-    ChunkCursor, ProbeCache, TERM_FIELD, TermChunk, TermDictionary, dict_from_reader,
+    COL_DICT_TERM, ChunkCursor, ProbeCache, TermChunk, TermDictionary, chunk_of,
 };
 
 /// The dictionary child's flat chunk leaves, fetched on demand in their wire
@@ -39,19 +40,23 @@ use super::term_dict::{
 /// quad columns' chunk-probe handles on `NativeStoreFile`. A fetched leaf
 /// stays FSST when it arrived FSST (a row read decompresses one value) and
 /// is canonicalized once otherwise. The term column is globally sorted (wire
-/// contract), so term→ID probes binary-search rows through per-row reads,
-/// touching only the chunks the bisection crosses; ID→term reads decode
-/// exactly the probed rows.
+/// contract), so term → code probes binary-search rows through per-row
+/// reads, touching only the chunks the bisection crosses; code → term reads
+/// decode exactly the probed rows.
 pub(crate) struct TermChunks {
+    /// The leaves, in row order.
     specs: Vec<ChunkSpec>,
+    /// `starts[i]` = global row of leaf i's first term; ascending.
+    starts: Vec<usize>,
+    /// Terms in the column.
     row_count: u64,
+    /// Where the leaves' segments are fetched from.
     source: Arc<dyn SegmentSource>,
 }
 
 /// One flat term-chunk leaf and its fetched form (filled on first use).
 struct ChunkSpec {
     layout: LayoutRef,
-    row_offset: u64,
     rows: u64,
     cell: OnceLock<TermChunk>,
 }
@@ -72,7 +77,7 @@ impl TermChunks {
     pub(crate) fn resolve(dict: &LayoutRef, source: Arc<dyn SegmentSource>) -> Option<Self> {
         dict.as_opt::<StructLayout>()?;
         let column = (0..dict.nslots()).find_map(|i| {
-            matches!(dict.slot_type(i), Some(LayoutChildType::Field(ref n)) if n.as_ref() == TERM_FIELD)
+            matches!(dict.slot_type(i), Some(LayoutChildType::Field(ref n)) if n.as_ref() == COL_DICT_TERM)
                 .then(|| dict.slot(i).ok().flatten())
                 .flatten()
         })?;
@@ -84,13 +89,14 @@ impl TermChunks {
             return None;
         }
         let mut specs = Vec::new();
+        let mut starts = Vec::new();
         if data.is::<Flat>() {
             specs.push(ChunkSpec {
                 layout: data,
-                row_offset: 0,
                 rows: row_count,
                 cell: OnceLock::new(),
             });
+            starts.push(0);
         } else if data.is::<ChunkedLayout>() {
             for i in 0..data.nslots() {
                 let Some(LayoutChildType::Chunk((_, row_offset))) = data.slot_type(i) else {
@@ -106,16 +112,17 @@ impl TermChunks {
                 }
                 specs.push(ChunkSpec {
                     layout: leaf,
-                    row_offset,
                     rows,
                     cell: OnceLock::new(),
                 });
+                starts.push(usize::try_from(row_offset).ok()?);
             }
         } else {
             return None;
         }
         Some(Self {
             specs,
+            starts,
             row_count,
             source,
         })
@@ -123,11 +130,7 @@ impl TermChunks {
 
     /// The chunk holding global `row`, and the row local to it.
     fn locate(&self, row: u64) -> (usize, usize) {
-        let idx = self
-            .specs
-            .partition_point(|s| s.row_offset + s.rows <= row)
-            .min(self.specs.len() - 1);
-        (idx, (row - self.specs[idx].row_offset) as usize)
+        chunk_of(&self.starts, row as usize)
     }
 
     /// The fetched form of chunk `idx`, read and adopted on first use. The
@@ -182,42 +185,41 @@ impl TermChunks {
             .bytes_at(local))
     }
 
-    /// Term→ID: a binary search over per-row reads.
-    pub(crate) async fn get_id(&self, term: &str) -> Result<Option<u32>> {
+    /// Term → code: a binary search over per-row reads — the async twin of
+    /// `TermDictionary::search`, the same three-way compare per step that
+    /// returns as soon as the probe hits.
+    pub(crate) async fn encode(&self, term: &str) -> Result<Option<u32>> {
         let needle = term.as_bytes();
         let mut cursors: Vec<Option<ChunkCursor<'_>>> =
             (0..self.specs.len()).map(|_| None).collect();
         let (mut lo, mut hi) = (0u64, self.row_count);
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
-            if self.term_bytes(&mut cursors, mid).await? < needle {
-                lo = mid + 1;
-            } else {
-                hi = mid;
+            match self.term_bytes(&mut cursors, mid).await?.cmp(needle) {
+                std::cmp::Ordering::Less => lo = mid + 1,
+                std::cmp::Ordering::Equal => return Ok(Some(mid as u32)),
+                std::cmp::Ordering::Greater => hi = mid,
             }
         }
-        if lo == self.row_count {
-            return Ok(None);
-        }
-        Ok((self.term_bytes(&mut cursors, lo).await? == needle).then_some(lo as u32))
+        Ok(None)
     }
 
-    /// ID→terms for `codes` (in-bounds, the caller's contract), reading
-    /// exactly the probed rows.
-    pub(crate) async fn resolve_terms(&self, codes: &[u32]) -> Result<Vec<String>> {
+    /// Code → term for each of `codes` (in-bounds, the caller's contract),
+    /// reading exactly the probed rows.
+    pub(crate) async fn decode_many(&self, codes: &[u32]) -> Result<Vec<Arc<str>>> {
         let mut cursors: Vec<Option<ChunkCursor<'_>>> =
             (0..self.specs.len()).map(|_| None).collect();
         let mut out = Vec::with_capacity(codes.len());
         for &code in codes {
             let bytes = self.term_bytes(&mut cursors, u64::from(code)).await?;
-            out.push(buf_as_str(bytes)?.to_owned());
+            out.push(Arc::from(buf_as_str(bytes)?));
         }
         Ok(out)
     }
 }
 
-/// A term dictionary left in its layout child: term→ID probes and ID→term
-/// decodes read the sorted `_dict_term` column on demand instead of holding
+/// A term dictionary left in its layout child: term → code probes and
+/// code → term decodes read the sorted `_dict_term` column on demand instead of holding
 /// all terms resident.
 ///
 /// `reader` is the dictionary child's layout reader (the native store root's
@@ -288,36 +290,30 @@ impl FileBackedDict {
         )
     }
 
-    /// Term→ID: a point-read binary search of the chunk leaves, memoized.
-    pub(crate) async fn get_id(&self, term: &str) -> Result<Option<u32>> {
+    /// Term → code: a point-read binary search of the chunk leaves, memoized.
+    pub(crate) async fn encode(&self, term: &str) -> Result<Option<u32>> {
         if let Some(memo) = self.probes.get(term) {
             return Ok(memo);
         }
-        let code = self.chunks.get_id(term).await?;
+        let code = self.chunks.encode(term).await?;
         self.probes.put(term, code);
         Ok(code)
     }
 
-    /// ID→terms for reconstruction: resolve `codes` (ascending, unique) to
-    /// their term strings — the dictionary's code→string seam. The
-    /// layout-side chunk decode (`ResolvedLayout::decode_chunk_async`)
-    /// resolves a chunk's distinct codes through this. Small batches
-    /// point-read the chunk leaves; wide ones run a single row-index scan,
-    /// whose bulk decode wins once most of a leaf is wanted anyway.
-    pub(crate) async fn resolve_terms(&self, codes: &[u32]) -> Result<Vec<String>> {
+    /// Code → term for reconstruction: resolve `codes` (ascending, unique)
+    /// to their term strings — the dictionary's code → string seam. Batches
+    /// of at most [`POINT_GATHER_MAX_ROWS`] codes are point-read through the
+    /// chunk leaves; wider ones are read with one row-index scan of the
+    /// child.
+    pub(crate) async fn decode_many(&self, codes: &[u32]) -> Result<Vec<Arc<str>>> {
         if codes.is_empty() {
             return Ok(Vec::new());
         }
-        if let Some(&max) = codes.last()
-            && max as u64 >= self.len
-        {
-            return Err(VortexRdfError::Deserialization(format!(
-                "Term code {} out of dictionary bounds ({})",
-                max, self.len
-            )));
+        if let Some(&max) = codes.last() {
+            check_code(max, usize::try_from(self.len).unwrap_or(usize::MAX))?;
         }
         if codes.len() <= POINT_GATHER_MAX_ROWS {
-            return self.chunks.resolve_terms(codes).await;
+            return self.chunks.decode_many(codes).await;
         }
         let rows: vortex_buffer::Buffer<u64> = codes.iter().map(|&code| code as u64).collect();
         let rows = vortex_scan::strict_sorted_buffer::StrictSortedBuffer::try_new(rows)
@@ -325,7 +321,7 @@ impl FileBackedDict {
         let projection = match self.projection.get() {
             Some(bound) => bound.clone(),
             None => {
-                let bound = select([TERM_FIELD], root())
+                let bound = select([COL_DICT_TERM], root())
                     .bind(self.reader.dtype())
                     .map_err(VortexRdfError::Vortex)?;
                 self.projection.get_or_init(|| bound).clone()
@@ -342,7 +338,7 @@ impl FileBackedDict {
             .execute::<StructArray>(&mut ctx)
             .map_err(VortexRdfError::Vortex)?;
         let col = struct_arr
-            .unmasked_field_by_name(TERM_FIELD)
+            .unmasked_field_by_name(COL_DICT_TERM)
             .map_err(VortexRdfError::Vortex)?
             .clone()
             .execute::<VarBinViewArray>(&mut ctx)
@@ -356,7 +352,7 @@ impl FileBackedDict {
         }
         let reader = StrColReader::new(&col);
         (0..col.len())
-            .map(|i| reader.str_at(i).map(str::to_string))
+            .map(|i| reader.str_at(i).map(Arc::from))
             .collect()
     }
 
@@ -364,8 +360,8 @@ impl FileBackedDict {
     /// behind [`DictAccess::ensure_resident`].
     ///
     /// [`DictAccess::ensure_resident`]: super::access::DictAccess::ensure_resident
-    pub(crate) async fn load_resident(&self) -> Result<TermDictionary> {
-        dict_from_reader(self.reader.clone()).await
+    pub(crate) async fn lift_resident(&self) -> Result<TermDictionary> {
+        TermDictionary::from_child_reader(self.reader.clone()).await
     }
 }
 
@@ -435,18 +431,18 @@ mod tests {
         // Probes across every window: interior, first-of-window,
         // last-of-window, and absent.
         for (i, term) in terms.iter().enumerate().step_by(97) {
-            assert_eq!(fbd.get_id(term).await.unwrap(), Some(i as u32), "{term}");
+            assert_eq!(fbd.encode(term).await.unwrap(), Some(i as u32), "{term}");
         }
         for boundary in (0..600).step_by(100) {
             assert_eq!(
-                fbd.get_id(&terms[boundary]).await.unwrap(),
+                fbd.encode(&terms[boundary]).await.unwrap(),
                 Some(boundary as u32)
             );
             assert_eq!(
-                fbd.get_id(&terms[boundary + 99]).await.unwrap(),
+                fbd.encode(&terms[boundary + 99]).await.unwrap(),
                 Some((boundary + 99) as u32)
             );
         }
-        assert_eq!(fbd.get_id("<http://zzz>").await.unwrap(), None);
+        assert_eq!(fbd.encode("<http://zzz>").await.unwrap(), None);
     }
 }

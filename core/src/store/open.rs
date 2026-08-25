@@ -7,7 +7,7 @@ use crate::io::container;
 use crate::io::read;
 use crate::session::VORTEX_SESSION;
 use crate::store::indexes::{IndexComponent, KnownComponent};
-use crate::store::layouts::dictionary::dict_from_reader;
+use crate::store::layouts::dictionary::TermDictionary;
 #[cfg(feature = "file-io")]
 use crate::store::{
     QuadsSource,
@@ -216,7 +216,9 @@ impl VortexRdfStore {
                     Some(dict) => DictAccess::FileBacked(dict),
                     // One full scan of the dictionary child — chunks keep
                     // their FSST.
-                    None => DictAccess::Resident(Arc::new(dict_from_reader(reader).await?)),
+                    None => DictAccess::Resident(Arc::new(
+                        TermDictionary::from_child_reader(reader).await?,
+                    )),
                 };
                 ResolvedLayout::Dictionary(access)
             }
@@ -309,7 +311,7 @@ impl VortexRdfStore {
                 .map_err(VortexRdfError::Vortex)?;
             match kind {
                 ComponentKind::Dict => {
-                    dict = Some(Arc::new(dict_from_reader(reader).await?));
+                    dict = Some(Arc::new(TermDictionary::from_child_reader(reader).await?));
                 }
                 ComponentKind::Index(known) => {
                     // Adopted by reader, nothing read: the roster row comes

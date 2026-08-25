@@ -344,7 +344,7 @@ async fn test_dictionary_empty_dataset() {
 }
 
 /// The `_dict_term` column of one dictionary-child chunk (the form
-/// `dict_child_chunks` emits), for asserting on its encoding.
+/// `TermDictionary::child_chunks` emits), for asserting on its encoding.
 #[cfg(feature = "file-io")]
 fn term_chunk_of(chunk: &vortex_array::ArrayRef) -> vortex_array::ArrayRef {
     use vortex_array::VortexSessionExecute as _;
@@ -354,7 +354,7 @@ fn term_chunk_of(chunk: &vortex_array::ArrayRef) -> vortex_array::ArrayRef {
         .clone()
         .execute::<StructArray>(&mut ctx)
         .unwrap()
-        .unmasked_field_by_name(crate::store::layouts::dictionary::term_dict::TERM_FIELD)
+        .unmasked_field_by_name(crate::store::layouts::dictionary::term_dict::COL_DICT_TERM)
         .unwrap()
         .clone()
 }
@@ -391,7 +391,7 @@ async fn test_dictionary_terms_are_fsst_through_bytes() {
     // canonicalized (decompressed) any chunk fails here.
     let assert_fsst = |store: &VortexRdfStore, when: &str| {
         let dict = store.dictionary_snapshot().unwrap().0;
-        for chunk in crate::store::layouts::dictionary::dict_child_chunks(&dict).unwrap() {
+        for chunk in dict.child_chunks().unwrap() {
             assert_eq!(
                 term_chunk_of(&chunk).encoding_id().to_string(),
                 "vortex.fsst",
@@ -565,9 +565,7 @@ async fn test_foreign_vortex_file_is_rejected() {
 async fn test_large_dictionary_child_lift_keeps_fsst() {
     use crate::io::container::default_child_strategy;
     use crate::store::RawQuad;
-    use crate::store::layouts::dictionary::{
-        TermDictionaryBuilder, dict_child_chunks, dict_from_reader,
-    };
+    use crate::store::layouts::dictionary::{TermDictionary, TermDictionaryBuilder};
     use vortex_buffer::ByteBuffer;
     use vortex_file::OpenOptionsSessionExt as _;
 
@@ -583,7 +581,7 @@ async fn test_large_dictionary_child_lift_keeps_fsst() {
             g: format!("<http://example.org/graph/{i:07}>"),
         });
     }
-    let (dict, _id_map) = builder.finish().unwrap();
+    let (dict, _code_map) = builder.finish().unwrap();
     let len = dict.len() as u64;
 
     // A minimal native file: a one-row quad child plus the dictionary child.
@@ -636,10 +634,10 @@ async fn test_large_dictionary_child_lift_keeps_fsst() {
             &Default::default(),
         )
         .unwrap();
-    let lifted = dict_from_reader(reader).await.unwrap();
+    let lifted = TermDictionary::from_child_reader(reader).await.unwrap();
 
     // Multi-chunk, and every chunk still FSST.
-    let chunks = dict_child_chunks(&lifted).unwrap();
+    let chunks = lifted.child_chunks().unwrap();
     assert!(chunks.len() > 1, "large dictionary should lift multi-chunk");
     for chunk in &chunks {
         assert_eq!(
@@ -650,11 +648,11 @@ async fn test_large_dictionary_child_lift_keeps_fsst() {
 
     // Probe parity across chunk boundaries, both directions.
     for code in (0..len as u32).step_by(7919) {
-        let term = dict.term_at(code).unwrap();
-        assert_eq!(lifted.get_id(&term), Some(code), "{term}");
-        assert_eq!(lifted.term_at(code).as_deref(), Some(term.as_str()));
+        let term = dict.decode(code).unwrap();
+        assert_eq!(lifted.encode(&term), Some(code), "{term}");
+        assert_eq!(lifted.decode(code).as_deref(), Some(term.as_str()));
     }
-    assert_eq!(lifted.get_id("\u{10FFFF}"), None);
+    assert_eq!(lifted.encode("\u{10FFFF}"), None);
 }
 
 /// `code_read_snapshot` is the one "codes are decodable" gate the frontends

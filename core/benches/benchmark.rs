@@ -538,7 +538,7 @@ fn dict_open(bencher: divan::Bencher, residency: &DictResidency) {
         });
 }
 
-/// Cold term→ID probes: a fully bound pattern (four dictionary probes) on a
+/// Cold term → code probes: a fully bound pattern (four dictionary probes) on a
 /// store opened fresh each iteration, so neither the probe memo nor the
 /// file-backed dictionary's chunk cache carries anything over. Resident
 /// probes are in-memory binary searches; file-backed ones binary-search the

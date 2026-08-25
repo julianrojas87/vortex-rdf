@@ -105,7 +105,7 @@ pub enum LayoutStrategy {
     /// |---------------|-----------------------|-----------------------------------------------------|
     /// | `s`,`p`,`o`,`g` | `PrimitiveArray<u32>` | code = position of the term in the sorted dictionary |
     ///
-    /// Term IDs are lexicographic ranks, so code comparisons are
+    /// Term codes are lexicographic ranks, so code comparisons are
     /// order-isomorphic to string comparisons (sorted builders keep the
     /// subject binary-search fast path on the u32 column).
     ///
@@ -465,7 +465,7 @@ impl PatternCodes {
             )));
         };
         let dict = Arc::clone(dict);
-        Ok(self.resolve(term, |s| dict.get_id(s)))
+        Ok(self.resolve(term, |s| dict.encode(s)))
     }
 
     /// Scalar for probing a term column — the primary `s` column, a secondary
@@ -646,7 +646,7 @@ impl ResolvedLayout {
                 Ok(codes) => codes,
                 Err(e) => return vec![Err(e)],
             };
-            let terms: std::collections::HashMap<u32, String> = match fb.resolve_terms(&codes).await
+            let terms: std::collections::HashMap<u32, Arc<str>> = match fb.decode_many(&codes).await
             {
                 Ok(terms) => codes.into_iter().zip(terms).collect(),
                 Err(e) => return vec![Err(e)],
@@ -695,14 +695,11 @@ impl ResolvedLayout {
                 Ok(codes) => codes,
                 Err(e) => return vec![Err(e)],
             };
-            let terms: std::collections::HashMap<u32, Arc<str>> =
-                match fb.resolve_terms(&codes).await {
-                    Ok(terms) => codes
-                        .into_iter()
-                        .zip(terms.into_iter().map(Arc::from))
-                        .collect(),
-                    Err(e) => return vec![Err(e)],
-                };
+            let terms: std::collections::HashMap<u32, Arc<str>> = match fb.decode_many(&codes).await
+            {
+                Ok(terms) => codes.into_iter().zip(terms).collect(),
+                Err(e) => return vec![Err(e)],
+            };
             return dictionary::decode_chunk_mapped_shared(chunk, &terms);
         }
         self.decode_chunk_shared(chunk)

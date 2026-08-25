@@ -158,10 +158,10 @@ impl VortexRdfStore {
                 if raws.is_empty() {
                     return dictionary::empty_struct();
                 }
-                let (dict, code_map) = TermDictionary::from_quads_with_map(&raws)?;
+                let (_, code_map) = TermDictionary::from_quads_with_map(&raws)?;
                 // Appended rows break the base's subject sort, and no index
                 // set rides along: the chunk is the primary columns alone.
-                dictionary::build_chunk(&raws, &dict, &code_map, false)
+                dictionary::build_chunk(&raws, &code_map, false)
             }
             _ => {
                 // The tail is a second chunk in the base's own vocabulary —

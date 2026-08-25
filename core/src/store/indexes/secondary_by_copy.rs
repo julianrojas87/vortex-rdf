@@ -73,7 +73,7 @@ pub(crate) enum Family {
 /// plus the primary row id. Both families use the same names — the child's
 /// identity is what says which sort order the rows are in.
 const CHILD_COLUMNS: [&str; 5] = ["s", "p", "o", "g", "rid"];
-const CHILD_RID_COL: &str = "rid";
+const COL_RID: &str = "rid";
 const POSG_IMPLEMENTATION: &str = "secondary-by-copy/posg";
 const OSPG_IMPLEMENTATION: &str = "secondary-by-copy/ospg";
 
@@ -280,7 +280,7 @@ pub(crate) fn resolve_in_memory(
     // without the ids, so the decode+sort runs only if a consumer needs the
     // selection itself.
     let rids = rows
-        .unmasked_field_by_name(CHILD_RID_COL)
+        .unmasked_field_by_name(COL_RID)
         .map_err(VortexRdfError::Vortex)?
         .slice(run.clone())
         .map_err(VortexRdfError::Vortex)?;
@@ -293,7 +293,7 @@ pub(crate) fn resolve_in_memory(
         // `InMemoryServePlan`).
         serve: Some(InMemoryServePlan::new(
             ["s", "p", "o", "g"],
-            CHILD_RID_COL,
+            COL_RID,
             copy_decode_layout(layout),
             rows.clone().into_array(),
             run,
@@ -398,12 +398,12 @@ pub(crate) async fn resolve_file(
     // scan (which a count or chained match would then pay).
     let row_ids = match &located {
         Some(range) if crate::store::selection::point_sized(range.end - range.start) => {
-            match super::rid_point_reads(file, name, CHILD_RID_COL, range.clone()).await? {
+            match super::rid_point_reads(file, name, COL_RID, range.clone()).await? {
                 Some(ids) => ResolvedRowIds::Eager(ids),
                 None => ResolvedRowIds::Lazy(LazyRowIds::from_index_child_scan(
                     reader.clone(),
                     constraints.clone(),
-                    CHILD_RID_COL,
+                    COL_RID,
                     file.bound_exprs().clone(),
                     name,
                 )),
@@ -412,7 +412,7 @@ pub(crate) async fn resolve_file(
         _ => ResolvedRowIds::Lazy(LazyRowIds::from_index_child_scan(
             reader.clone(),
             constraints.clone(),
-            CHILD_RID_COL,
+            COL_RID,
             file.bound_exprs().clone(),
             name,
         )),
@@ -441,7 +441,7 @@ pub(crate) async fn resolve_file(
             super::resolve_eager_from_scan(
                 reader,
                 &constraints,
-                CHILD_RID_COL,
+                COL_RID,
                 probe.resolves,
                 file.bound_exprs(),
                 name,
@@ -495,7 +495,7 @@ fn build_serve_plan(
     };
     Ok(Some(FileServePlan::new(
         ["s", "p", "o", "g"],
-        CHILD_RID_COL,
+        COL_RID,
         copy_decode_layout(layout),
         reader,
         constraints,

@@ -350,27 +350,34 @@ async fn test_file_backed_dictionary_probe_parity() {
         .chain([0, len as u32 - 1])
         .collect();
     for &code in &sample {
-        let term = dict.term_at(code).unwrap();
-        assert_eq!(fb.get_id(&term).await.unwrap(), Some(code), "{term}");
-        assert_eq!(fb.get_id(&term).await.unwrap(), Some(code), "{term}");
+        let term = dict.decode(code).unwrap();
+        assert_eq!(fb.encode(&term).await.unwrap(), Some(code), "{term}");
+        assert_eq!(fb.encode(&term).await.unwrap(), Some(code), "{term}");
 
         // A control character sorts immediately after the stored term, so
         // the search lands on it and must still report absent.
         let absent = format!("{term}\u{1}");
-        assert_eq!(fb.get_id(&absent).await.unwrap(), None, "{absent}");
+        assert_eq!(fb.encode(&absent).await.unwrap(), None, "{absent}");
     }
     // Above every stored term: the search runs off the end.
-    assert_eq!(fb.get_id("\u{10FFFF}").await.unwrap(), None);
+    assert_eq!(fb.encode("\u{10FFFF}").await.unwrap(), None);
 
-    // ID→term parity under and over the point-read cap (the wide batch
+    // code → term parity under and over the point-read cap (the wide batch
     // exercises the row-index scan).
     for k in [64usize, 300] {
         let codes: Vec<u32> = (0..len as u32)
             .step_by((len as usize / k).max(1))
             .take(k)
             .collect();
-        let want: Vec<String> = codes.iter().map(|&c| dict.term_at(c).unwrap()).collect();
-        assert_eq!(fb.resolve_terms(&codes).await.unwrap(), want);
+        let want: Vec<String> = codes.iter().map(|&c| dict.decode(c).unwrap()).collect();
+        let got: Vec<String> = fb
+            .decode_many(&codes)
+            .await
+            .unwrap()
+            .iter()
+            .map(|t| t.to_string())
+            .collect();
+        assert_eq!(got, want);
     }
 }
 
@@ -399,7 +406,7 @@ async fn test_file_backed_dictionary_rejects_below_first_term() {
         .await
         .unwrap();
     let dict = resident.dictionary_snapshot().unwrap().0;
-    let first_term = dict.term_at(0).unwrap();
+    let first_term = dict.decode(0).unwrap();
     assert!(
         first_term.as_str() > "!",
         "fixture must have no term sorting at or below `!`, got {first_term:?}"
@@ -411,7 +418,7 @@ async fn test_file_backed_dictionary_rejects_below_first_term() {
         .unwrap()
         .expect("the dictionary child's chunk shape must resolve");
 
-    assert_eq!(fb.get_id("!").await.unwrap(), None);
+    assert_eq!(fb.encode("!").await.unwrap(), None);
     // And row 0 itself still resolves.
-    assert_eq!(fb.get_id(&first_term).await.unwrap(), Some(0));
+    assert_eq!(fb.encode(&first_term).await.unwrap(), Some(0));
 }
