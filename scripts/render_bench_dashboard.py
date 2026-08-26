@@ -309,6 +309,30 @@ def check_script_syntax(html, out_path):
     return False
 
 
+def check_scale_agreement(rust_quads, suites):
+    """Say out loud when a suite measured a different row count than the Rust run.
+
+    Every tab is rendered from whatever result file happens to be on disk, and a
+    partial refresh (`refresh.sh --only rust,render`) leaves the untouched
+    suites' files alone. A stale pilot run is then mixed into the page beside a
+    full-scale one -- the KPI row reads its quad count off the Rust run and its
+    distinct-term count off the cross-library config, so the tiles can state a
+    dataset that never existed. The page cannot detect this; only the render,
+    which sees all four configs at once, can.
+    """
+    if not rust_quads:
+        return
+    for name, config in suites:
+        quads = (config or {}).get("quadsCount")
+        if quads and quads != rust_quads:
+            print(
+                f"WARNING: the {name} results measured {quads:,} quads but the Rust run "
+                f"measured {rust_quads:,} -- the page will mix both scales. "
+                f"Re-run that suite (scripts/refresh.sh --only <stage>,render).",
+                file=sys.stderr,
+            )
+
+
 def load_rust_compare(path):
     """Load `core/benches/compare.rs`'s output -- the Rust tab's cross-library
     comparison against oxigraph, sophia and hdt.
@@ -429,6 +453,11 @@ def main():
     py_results, py_provenance, py_memory, py_sizes, py_config = ([], "", [], [], {})
     if py_path:
         py_results, py_provenance, py_memory, py_sizes, py_config = load_python_results(py_path)
+
+    check_scale_agreement(
+        (rust_dataset or {}).get("quads") or bench_size_override,
+        [("Rust cross-library", rc_config), ("JavaScript", js_config), ("Python", py_config)],
+    )
 
     # One duration format across all four sources (see `fmt_duration`).
     for rows in (results, rc_results, js_results, py_results):
