@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use vortex_error::{VortexResult, vortex_ensure_eq};
+use vortex_error::VortexResult;
 use vortex_layout::segments::SegmentSinkRef;
 use vortex_layout::sequence::{SendableSequentialStream, SequencePointer};
 use vortex_layout::{LayoutParts, LayoutRef, LayoutStrategy, LayoutWriterContext, layout_children};
@@ -122,7 +122,6 @@ impl LayoutStrategy for RdfStoreWriteStrategy {
                 // when the job completes.
                 let _reserved = child_ctx.reserve_buffered_bytes(component.source.buffered_bytes());
                 let child_stream = component.source.open()?;
-                vortex_ensure_eq!(child_stream.dtype(), &component.descriptor.dtype);
                 let layout = component
                     .strategy
                     .write_stream(

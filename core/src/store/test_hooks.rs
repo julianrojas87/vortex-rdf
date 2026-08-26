@@ -3,10 +3,6 @@
 //! serve plan, a deferred selection, a prefix-probe range, a retained wire
 //! encoding) rather than only the result.
 
-// Each feature set compiles a different subset of the tests; a hook only the
-// other subset reaches is still part of the module's surface.
-#![allow(dead_code)]
-
 use std::ops::Range;
 
 use vortex_array::ArrayRef;
@@ -80,22 +76,6 @@ impl VortexRdfStore {
         }
     }
 
-    /// Whether one named integer child of an in-memory base is a canonical
-    /// primitive. `None` when the base has no such child or is not in memory.
-    pub(crate) fn debug_base_child_int_canonical(&self, name: &str) -> Option<bool> {
-        use vortex_array::arrays::struct_::StructArrayExt;
-        use vortex_array::arrays::{Primitive, Struct};
-        match &self.quads {
-            QuadsSource::InMemory { base, .. } => {
-                let struct_arr = base.clone().try_downcast::<Struct>().ok()?;
-                let child = struct_arr.unmasked_field_by_name(name).ok()?;
-                child.dtype().is_int().then(|| child.is::<Primitive>())
-            }
-            #[cfg(feature = "file-io")]
-            QuadsSource::File { .. } => None,
-        }
-    }
-
     /// Whether the named in-memory component's rows hold canonical integer
     /// children. `None` when this store holds no such in-memory component.
     pub(crate) fn debug_index_component_int_children_canonical(&self, name: &str) -> Option<bool> {
@@ -134,20 +114,31 @@ impl VortexRdfStore {
             QuadsSource::File { .. } => false,
         }
     }
+}
 
+#[cfg(feature = "file-io")]
+impl VortexRdfStore {
     /// Whether the dictionary was left in its file child (a file-backed
     /// dictionary is only built around a point-readable wire-chunk handle).
     pub(crate) fn debug_dict_file_backed(&self) -> bool {
-        #[cfg(feature = "file-io")]
-        {
-            matches!(
-                &self.layout,
-                ResolvedLayout::Dictionary(DictAccess::FileBacked(_))
-            )
-        }
-        #[cfg(not(feature = "file-io"))]
-        {
-            false
+        matches!(
+            &self.layout,
+            ResolvedLayout::Dictionary(DictAccess::FileBacked(_))
+        )
+    }
+
+    /// Whether one named integer child of an in-memory base is a canonical
+    /// primitive. `None` when the base has no such child or is not in memory.
+    pub(crate) fn debug_base_child_int_canonical(&self, name: &str) -> Option<bool> {
+        use vortex_array::arrays::struct_::StructArrayExt;
+        use vortex_array::arrays::{Primitive, Struct};
+        match &self.quads {
+            QuadsSource::InMemory { base, .. } => {
+                let struct_arr = base.clone().try_downcast::<Struct>().ok()?;
+                let child = struct_arr.unmasked_field_by_name(name).ok()?;
+                child.dtype().is_int().then(|| child.is::<Primitive>())
+            }
+            QuadsSource::File { .. } => None,
         }
     }
 
@@ -159,14 +150,10 @@ impl VortexRdfStore {
                 .iter()
                 .find(|c| c.name == name)
                 .map(|c| c.is_materialized()),
-            #[cfg(feature = "file-io")]
             QuadsSource::File { .. } => None,
         }
     }
-}
 
-#[cfg(feature = "file-io")]
-impl VortexRdfStore {
     /// The index-child row range a file view's serve plan located for its
     /// run. `None` without a plan, or when the plan's run is unlocated.
     pub(crate) fn debug_serve_row_range(&self) -> Option<Range<u64>> {

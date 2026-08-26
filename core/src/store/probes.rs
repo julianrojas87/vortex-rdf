@@ -80,3 +80,36 @@ impl StructProbes {
             .collect()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use vortex_array::IntoArray;
+    use vortex_array::arrays::StructArray;
+    use vortex_array::validity::Validity;
+    use vortex_buffer::Buffer;
+
+    fn u32_struct(values: impl IntoIterator<Item = u32>) -> ArrayRef {
+        let s = Buffer::from_iter(values).into_array();
+        let len = s.len();
+        StructArray::try_new(["s"].into(), vec![s], len, Validity::NonNullable)
+            .unwrap()
+            .into_array()
+    }
+
+    /// The cells resolve for the first base only; every other base looks up
+    /// as a miss.
+    #[test]
+    fn cells_decline_a_different_base() {
+        let a = u32_struct(0..4);
+        let b = u32_struct(0..4);
+        let probes = StructProbes::new();
+        probes.warm(&a);
+        assert!(probes.cells(&a).is_some());
+        assert!(probes.child(&a, 0).is_some());
+        assert!(probes.by_name(&a, "s").is_some());
+        assert!(probes.cells(&b).is_none());
+        assert!(probes.child(&b, 0).is_none());
+        assert!(probes.by_name(&b, "s").is_none());
+    }
+}

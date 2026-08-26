@@ -315,8 +315,7 @@ impl IndexComponent {
     }
 
     /// Whether the rows have been canonicalized yet (a test-hook probe).
-    #[cfg(test)]
-    #[allow(dead_code)]
+    #[cfg(all(test, feature = "file-io"))]
     pub(crate) fn is_materialized(&self) -> bool {
         match &self.rows {
             ComponentRows::Built(_) => true,

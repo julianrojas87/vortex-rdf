@@ -437,8 +437,9 @@ async fn test_selected_rows_on_tailed_default_store() {
 }
 
 /// The in-memory `code_columns` fast path skips tombstoned rows in each of
-/// its selection shapes — the whole base, a subject range, a row-id list —
-/// so the codes it serves decode to exactly the surviving rows.
+/// its selection shapes — the whole base, a subject range, a row-id list,
+/// an index-served run — so the codes it serves decode to exactly the
+/// surviving rows.
 #[tokio::test]
 async fn test_code_columns_skips_tombstoned_rows_in_memory() {
     // Three quads per subject, so a subject match is a multi-row range.
@@ -484,10 +485,35 @@ async fn test_code_columns_skips_tombstoned_rows_in_memory() {
         "a reference index resolves to row ids, never a serve plan"
     );
 
-    for (tag, view, live) in [
-        ("owner", &deleted, 11),
-        ("subject range", &by_subject, 2),
-        ("row ids", &by_predicate, 3),
+    // The same rows under a by-copy index: the predicate match is served off
+    // the index's own columns, and the tombstone must be honoured there too.
+    let arr = build_array::<SortedInMemoryBuilder>(
+        quad_stream(quads.clone()),
+        LayoutStrategy::Dictionary,
+        vec![IndexType::SecondaryByCopy],
+    )
+    .await
+    .unwrap();
+    let served_deleted = VortexRdfStore::from_built(arr)
+        .unwrap()
+        .delete_quad(&quads[4])
+        .await
+        .unwrap();
+    let served_dict = served_deleted.code_read_snapshot().unwrap();
+    let served = served_deleted
+        .match_pattern(None, Some(&p1), None, None)
+        .await
+        .unwrap();
+    assert!(
+        served.debug_has_serve_plan(),
+        "a by-copy index serves the predicate match"
+    );
+
+    for (tag, view, dict, live) in [
+        ("owner", &deleted, &dict, 11),
+        ("subject range", &by_subject, &dict, 2),
+        ("row ids", &by_predicate, &dict, 3),
+        ("served, tombstoned", &served, &served_dict, 3),
     ] {
         let [s, p, o, g] = view
             .code_columns()

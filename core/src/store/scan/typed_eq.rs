@@ -420,4 +420,111 @@ mod tests {
         let want: Vec<u64> = (0..100u64).filter(|i| i % 3 == 2).collect();
         assert_eq!(ids.as_slice(), &want[..]);
     }
+
+    /// A lone slice-bound constraint declines a wide selection to the mask
+    /// scan and serves a narrow one.
+    #[test]
+    fn single_code_eq_declines_wide_selection() {
+        let n = (TYPED_EQ_MAX_ROWS as u32) * 2;
+        let sa = mixed_struct(n);
+        let eqs = eqs(&[("p", 3)]);
+        assert!(typed_residual_ids(&sa, &RowSelection::All, n as usize, &eqs).is_none());
+        let ids = typed_residual_ids(&sa, &RowSelection::Range(0..100), n as usize, &eqs).unwrap();
+        let want: Vec<u64> = (0..100u64).filter(|i| i % 7 == 3).collect();
+        assert_eq!(ids.as_slice(), &want[..]);
+    }
+
+    const LONG: &str = "a string longer than the twelve inline view bytes";
+
+    /// A struct of {canonical u32 `p`, Utf8 `o`} whose strings mix the
+    /// inlined (<= 12 bytes) and out-of-line view forms.
+    fn string_struct(n: u32) -> StructArray {
+        let p = Buffer::from_iter((0..n).map(|i| i % 3)).into_array();
+        let o = VarBinViewArray::from_iter_str((0..n).map(|i| match i % 4 {
+            0 => "short",
+            1 => LONG,
+            _ => "other",
+        }))
+        .into_array();
+        StructArray::try_new(
+            ["p", "o"].into(),
+            vec![p, o],
+            n as usize,
+            Validity::NonNullable,
+        )
+        .unwrap()
+    }
+
+    /// A Utf8 needle binds at the view level for both inlined and
+    /// out-of-line strings, alone and beside a code constraint.
+    #[test]
+    fn string_column_binds_at_view_level() {
+        let sa = string_struct(200);
+        let short = vec![("o", Scalar::from("short"))];
+        let ids = typed_residual_ids(&sa, &RowSelection::All, 200, &short).unwrap();
+        let want: Vec<u64> = (0..200u64).filter(|i| i % 4 == 0).collect();
+        assert_eq!(ids.as_slice(), &want[..]);
+
+        let long = vec![("o", Scalar::from(LONG))];
+        let ids = typed_residual_ids(&sa, &RowSelection::All, 200, &long).unwrap();
+        let want: Vec<u64> = (0..200u64).filter(|i| i % 4 == 1).collect();
+        assert_eq!(ids.as_slice(), &want[..]);
+
+        let mixed = vec![("p", Scalar::from(1u32)), ("o", Scalar::from(LONG))];
+        let ids = typed_residual_ids(&sa, &RowSelection::All, 200, &mixed).unwrap();
+        let want: Vec<u64> = (0..200u64).filter(|i| i % 3 == 1 && i % 4 == 1).collect();
+        assert_eq!(ids.as_slice(), &want[..]);
+    }
+
+    /// A nullable column declines even when its values are all valid.
+    #[test]
+    fn nullable_column_declines() {
+        let p = PrimitiveArray::new(
+            Buffer::from_iter((0..10u32).map(|i| i % 3)),
+            Validity::AllValid,
+        )
+        .into_array();
+        assert!(p.dtype().is_nullable());
+        let sa = StructArray::try_new(["p"].into(), vec![p], 10, Validity::NonNullable).unwrap();
+        let eqs = eqs(&[("p", 1)]);
+        assert!(typed_residual_ids(&sa, &RowSelection::All, 10, &eqs).is_none());
+    }
+
+    /// A needle that is neither a code nor a string declines: `Needle`
+    /// extraction answers `None` for it, before any column is bound.
+    #[test]
+    fn non_code_non_string_needle_declines() {
+        let sa = mixed_struct(10);
+        let eqs = vec![("p", Scalar::from(true))];
+        assert!(typed_residual_ids(&sa, &RowSelection::All, 10, &eqs).is_none());
+    }
+
+    fn code_struct(codes: &[u32]) -> ArrayRef {
+        let p = Buffer::from_iter(codes.iter().copied()).into_array();
+        StructArray::try_new(["p"].into(), vec![p], codes.len(), Validity::NonNullable)
+            .unwrap()
+            .into_array()
+    }
+
+    /// Positions over a chunked accretion are offset by the preceding
+    /// chunks' rows; a chunk that is not a struct declines.
+    #[test]
+    fn typed_positions_offsets_across_chunks() {
+        use vortex_array::arrays::ChunkedArray;
+        let first = code_struct(&[0, 1, 2]);
+        let second = code_struct(&[5, 7, 9]);
+        let dtype = first.dtype().clone();
+        let chunked = ChunkedArray::try_new(vec![first, second], dtype)
+            .unwrap()
+            .into_array();
+        let eqs = eqs(&[("p", 7)]);
+        assert_eq!(typed_positions(&chunked, &eqs), Some(vec![4]));
+
+        let plain = Buffer::from_iter([7u32, 7]).into_array();
+        let dtype = plain.dtype().clone();
+        let non_struct = ChunkedArray::try_new(vec![plain], dtype)
+            .unwrap()
+            .into_array();
+        assert!(typed_positions(&non_struct, &eqs).is_none());
+    }
 }

@@ -806,3 +806,254 @@ async fn test_from_parts_retains_dict_children() {
         }
     }
 }
+
+// ─── Open errors ───────────────────────────────────────────────────────
+
+/// Open `bytes` both ways — `from_bytes` over the buffer and `from_file` over
+/// a temp file holding the same bytes — so every open-path contract below
+/// is asserted on each reader.
+async fn open_both(
+    bytes: &[u8],
+) -> (
+    crate::error::Result<VortexRdfStore>,
+    crate::error::Result<VortexRdfStore>,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("store.vortex");
+    std::fs::write(&path, bytes).unwrap();
+    let from_file = VortexRdfStore::from_file(&path).await;
+    (VortexRdfStore::from_bytes(bytes).await, from_file)
+}
+
+/// A component descriptor of the shape a future change set could write: an
+/// index child with an implementation slug this version does not know.
+fn unknown_component(required: bool) -> container::NativeComponentWrite {
+    let rows = bare_code_quad_array(&[1, 2, 3]);
+    container::NativeComponentWrite::new(
+        container::StoreComponentDescriptor {
+            name: "index:future".into(),
+            role: container::StoreComponentRole::Index,
+            implementation: "future-index-v1".into(),
+            version: 1,
+            required,
+            sorted: false,
+            dtype: rows.dtype().clone(),
+        },
+        std::sync::Arc::new(container::BufferedComponentSource::try_new(vec![rows]).unwrap()),
+        container::default_child_strategy(),
+    )
+    .unwrap()
+}
+
+/// Dictionary-dtype rows written without a dictionary component: bare codes
+/// cannot self-describe, and both readers refuse to open them.
+#[tokio::test]
+async fn test_open_rejects_dictionary_rows_without_dictionary_component() {
+    let bytes = unstamped_store_bytes(vec![bare_code_quad_array(&[0, 1, 2])], vec![]).await;
+    let (from_bytes, from_file) = open_both(&bytes).await;
+    for (path, result) in [("from_bytes", from_bytes), ("from_file", from_file)] {
+        let err = result.err().expect("open should fail");
+        assert!(
+            err.to_string().contains("no dictionary"),
+            "{path}: unexpected error: {err}"
+        );
+    }
+}
+
+/// A dictionary component of an implementation this version does not know
+/// is rejected at open, before any term is read.
+#[tokio::test]
+async fn test_open_rejects_unknown_dictionary_implementation() {
+    let arr = build_array::<SortedInMemoryBuilder>(
+        quad_stream(dictionary_test_quads()),
+        LayoutStrategy::Dictionary,
+        vec![],
+    )
+    .await
+    .unwrap();
+    let parts = VortexRdfStore::from_built(arr)
+        .unwrap()
+        .to_serializable_parts()
+        .await
+        .unwrap();
+    let mut dict = parts.dict.as_ref().unwrap().to_write().unwrap();
+    dict.descriptor.implementation = "not-a-dictionary-v0".into();
+    let bytes = unstamped_store_bytes(vec![parts.array.clone()], vec![dict]).await;
+
+    let (from_bytes, from_file) = open_both(&bytes).await;
+    for (path, result) in [("from_bytes", from_bytes), ("from_file", from_file)] {
+        let err = result.err().expect("open should fail");
+        assert!(
+            err.to_string()
+                .contains("unsupported dictionary component implementation"),
+            "{path}: unexpected error: {err}"
+        );
+    }
+}
+
+/// A required component this version cannot interpret makes the store
+/// unopenable — skipping it could silently change query results — while an
+/// optional unknown component is skipped and the store answers as if it
+/// were absent.
+#[tokio::test]
+async fn test_open_required_unknown_component_rejected_optional_skipped() {
+    let quads = modular_quads(6, 3, 4);
+    let raws: Vec<crate::store::RawQuad> =
+        quads.iter().map(crate::store::RawQuad::from_quad).collect();
+    let rows = || {
+        crate::store::builders::build_struct_array(&raws, LayoutStrategy::Default, false).unwrap()
+    };
+
+    let bytes = unstamped_store_bytes(vec![rows()], vec![unknown_component(true)]).await;
+    let (from_bytes, from_file) = open_both(&bytes).await;
+    for (path, result) in [("from_bytes", from_bytes), ("from_file", from_file)] {
+        let err = result.err().expect("open should fail");
+        assert!(
+            err.to_string()
+                .contains("required component this version cannot"),
+            "{path}: unexpected error: {err}"
+        );
+    }
+
+    let bytes = unstamped_store_bytes(vec![rows()], vec![unknown_component(false)]).await;
+    let (from_bytes, from_file) = open_both(&bytes).await;
+    let p1 = NamedNode::new("http://example.org/p1").unwrap();
+    for (path, result) in [("from_bytes", from_bytes), ("from_file", from_file)] {
+        let store = result.unwrap_or_else(|e| panic!("{path}: open should succeed: {e}"));
+        assert_eq!(store.size().await.unwrap(), 6, "{path}");
+        assert!(store.indexes().is_empty(), "{path}");
+        assert_eq!(
+            view_strings(
+                &store
+                    .match_pattern(None, Some(&p1), None, None)
+                    .await
+                    .unwrap()
+            )
+            .await,
+            expected_strings(&quads, |i| i % 3 == 1),
+            "{path}"
+        );
+    }
+}
+
+/// An index child holding one row fewer than the quads is a corrupt or
+/// foreign file; both readers reject it at open with the row counts.
+#[tokio::test]
+async fn test_open_rejects_index_child_with_mismatched_rows() {
+    let arr = build_array::<SortedInMemoryBuilder>(
+        quad_stream(modular_quads(6, 3, 4)),
+        LayoutStrategy::Default,
+        vec![IndexType::SecondaryByCopy],
+    )
+    .await
+    .unwrap();
+    let parts = VortexRdfStore::from_built(arr)
+        .unwrap()
+        .to_serializable_parts()
+        .await
+        .unwrap();
+    let components: Vec<container::NativeComponentWrite> = parts
+        .components
+        .iter()
+        .map(|component| {
+            use vortex_array::IntoArray as _;
+            let descriptor = component.to_write().unwrap().descriptor;
+            let rows = component.rows().unwrap().clone().into_array();
+            let short = rows.slice(0..rows.len() - 1).unwrap();
+            container::NativeComponentWrite::new(
+                descriptor,
+                std::sync::Arc::new(
+                    container::BufferedComponentSource::try_new(vec![short]).unwrap(),
+                ),
+                container::default_child_strategy(),
+            )
+            .unwrap()
+        })
+        .collect();
+    let bytes = unstamped_store_bytes(vec![parts.array.clone()], components).await;
+
+    let (from_bytes, from_file) = open_both(&bytes).await;
+    for (path, result) in [("from_bytes", from_bytes), ("from_file", from_file)] {
+        let err = result.err().expect("open should fail");
+        assert!(
+            err.to_string().contains("holds 5 rows against 6 quad rows"),
+            "{path}: unexpected error: {err}"
+        );
+    }
+}
+
+/// A generic Vortex writer's output — a valid Vortex file under a plain root
+/// layout — is not a store, and `from_bytes` says so by naming the expected
+/// root layout.
+#[tokio::test]
+async fn test_from_bytes_rejects_foreign_vortex_bytes() {
+    use vortex_file::WriteOptionsSessionExt as _;
+
+    let array = bare_code_quad_array(&[1, 2, 3]);
+    let dtype = array.dtype().clone();
+    let stream = vortex_array::stream::ArrayStreamAdapter::new(
+        dtype,
+        Box::pin(futures::stream::once(async move { Ok(array) })),
+    );
+    let mut bytes: Vec<u8> = Vec::new();
+    crate::session::VORTEX_SESSION
+        .write_options()
+        .write(&mut bytes, stream)
+        .await
+        .unwrap();
+
+    let err = VortexRdfStore::from_bytes(&bytes)
+        .await
+        .err()
+        .expect("open should fail");
+    assert!(
+        err.to_string().contains("not a vortex-rdf store file"),
+        "unexpected error: {err}"
+    );
+}
+
+/// `serialize_parts` requires a Dictionary-layout primary to come with its
+/// dictionary; the precondition is a debug assertion, so it is pinned in
+/// debug builds only.
+#[cfg(debug_assertions)]
+#[tokio::test]
+#[should_panic(expected = "pairs a Dictionary primary with its dictionary")]
+async fn test_serialize_parts_requires_dictionary_beside_code_rows() {
+    let parts = crate::store::StoreParts {
+        array: bare_code_quad_array(&[1, 2, 3]),
+        components: Vec::new(),
+        dict: None,
+        quads_sorted: false,
+    };
+    let _ = crate::io::ser::serialize_parts(&parts, &mut Vec::new()).await;
+}
+
+// ─── Builder parity on the wire ────────────────────────────────────────
+
+/// The push-based sink and the sorted in-memory builder serialize the same
+/// quads to the same bytes: the sink's single-chunk array, dictionary and
+/// components are the builder's.
+#[tokio::test]
+async fn test_dictionary_quad_sink_serializes_like_the_builder() {
+    let quads = dictionary_test_quads();
+    let mut sink = DictionaryQuadSink::new(vec![IndexType::SecondaryByCopy]);
+    for quad in &quads {
+        sink.push(crate::store::RawQuad::from_quad(quad));
+    }
+    let sunk = VortexRdfStore::from_built(sink.finish().unwrap()).unwrap();
+    let built = VortexRdfStore::from_built(
+        build_array::<SortedInMemoryBuilder>(
+            quad_stream(quads),
+            LayoutStrategy::Dictionary,
+            vec![IndexType::SecondaryByCopy],
+        )
+        .await
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        sunk.to_bytes().await.unwrap(),
+        built.to_bytes().await.unwrap(),
+        "the sink's wire form must be the builder's"
+    );
+}

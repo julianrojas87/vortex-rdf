@@ -113,3 +113,71 @@ pub(crate) fn primitive_from_u64_reads(
         _ => return None,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use vortex_array::arrays::struct_::StructArrayExt;
+    use vortex_array::arrays::{Primitive, Struct, StructArray, VarBinViewArray};
+    use vortex_buffer::Buffer;
+
+    /// A five-row canonical u32 struct whose `s` column is the row id.
+    fn u32_struct() -> ArrayRef {
+        let s = Buffer::from_iter(0..5u32).into_array();
+        let p = Buffer::from_iter((0..5u32).map(|i| i % 2)).into_array();
+        StructArray::try_new(["s", "p"].into(), vec![s, p], 5, Validity::NonNullable)
+            .unwrap()
+            .into_array()
+    }
+
+    fn column_u32(rows: &ArrayRef, name: &str) -> Vec<u32> {
+        let sa = rows.clone().try_downcast::<Struct>().unwrap();
+        let col = sa.unmasked_field_by_name(name).unwrap().clone();
+        col.try_downcast::<Primitive>()
+            .unwrap()
+            .as_slice::<u32>()
+            .to_vec()
+    }
+
+    /// A point-sized id selection is read row by row with the tombstoned
+    /// rows dropped from the gathered struct.
+    #[test]
+    fn gather_by_point_reads_drops_tombstones() {
+        let base = u32_struct();
+        let selection = RowSelection::Ids(Buffer::from_iter([0u64, 2, 4]));
+        let deleted = Mask::from_indices(5, vec![2]);
+        let rows = gather_by_point_reads(&base, &selection, Some(&deleted), None)
+            .unwrap()
+            .expect("a point-sized selection over probeable columns is served");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(column_u32(&rows, "s"), vec![0, 4]);
+        assert_eq!(column_u32(&rows, "p"), vec![0, 0]);
+    }
+
+    /// A child no probe resolves (a string column) declines the whole read.
+    #[test]
+    fn gather_by_point_reads_declines_string_child() {
+        let s = Buffer::from_iter(0..3u32).into_array();
+        let o = VarBinViewArray::from_iter_str(["a", "b", "c"]).into_array();
+        let base = StructArray::try_new(["s", "o"].into(), vec![s, o], 3, Validity::NonNullable)
+            .unwrap()
+            .into_array();
+        let selection = RowSelection::Ids(Buffer::from_iter([0u64, 2]));
+        assert!(
+            gather_by_point_reads(&base, &selection, None, None)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// `All` is never point-sized, so it declines to the slice/take pipeline.
+    #[test]
+    fn gather_by_point_reads_declines_all() {
+        let base = u32_struct();
+        assert!(
+            gather_by_point_reads(&base, &RowSelection::All, None, None)
+                .unwrap()
+                .is_none()
+        );
+    }
+}

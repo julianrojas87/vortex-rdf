@@ -153,6 +153,74 @@ mod tests {
         assert!(d.validate().is_err(), "non-struct dtype must be rejected");
     }
 
+    #[test]
+    fn descriptor_rejects_empty_fields_and_zero_version() {
+        let valid = dict_descriptor(dict_chunk(&["a"]).dtype().clone());
+        assert!(valid.validate().is_ok());
+
+        let mut d = valid.clone();
+        d.name = String::new();
+        assert!(d.validate().is_err(), "empty name must be rejected");
+
+        let mut d = valid.clone();
+        d.implementation = String::new();
+        assert!(
+            d.validate().is_err(),
+            "empty implementation must be rejected"
+        );
+
+        let mut d = valid;
+        d.version = 0;
+        assert!(d.validate().is_err(), "version 0 must be rejected");
+    }
+
+    /// Absent root metadata decodes as an unsorted, component-less store.
+    #[test]
+    fn empty_metadata_decodes_to_no_components() {
+        assert_eq!(decode_store_metadata(b"").unwrap(), (false, Vec::new()));
+    }
+
+    /// A component write pairs a descriptor with a source of the same dtype;
+    /// a mismatch is rejected at construction.
+    #[test]
+    fn component_write_rejects_descriptor_source_dtype_mismatch() {
+        use std::sync::Arc;
+        let source =
+            Arc::new(sources::BufferedComponentSource::try_new(vec![dict_chunk(&["a"])]).unwrap());
+        let mismatched = dict_descriptor(quad_chunk(0, 1).dtype().clone());
+        assert!(
+            NativeComponentWrite::new(mismatched, source.clone(), default_child_strategy())
+                .is_err()
+        );
+        let matching = dict_descriptor(dict_chunk(&["a"]).dtype().clone());
+        assert!(NativeComponentWrite::new(matching, source, default_child_strategy()).is_ok());
+    }
+
+    #[test]
+    fn buffered_source_rejects_empty_and_mixed_dtypes() {
+        assert!(sources::BufferedComponentSource::try_new(Vec::new()).is_err());
+        assert!(
+            sources::BufferedComponentSource::try_new(vec![dict_chunk(&["a"]), quad_chunk(0, 1)])
+                .is_err()
+        );
+        assert!(
+            sources::BufferedComponentSource::try_new(vec![dict_chunk(&["a"]), dict_chunk(&["b"])])
+                .is_ok()
+        );
+    }
+
+    /// A pull-backed source hands out its stream once; a second open is an
+    /// error.
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    #[test]
+    fn pull_source_replays_once() {
+        use sources::{NativeComponentSource as _, PullComponentSource};
+        let dtype = dict_chunk(&["a"]).dtype().clone();
+        let source = PullComponentSource::new(dtype, 1, Box::new(|_| Ok(None)));
+        assert!(source.open().is_ok());
+        assert!(source.open().is_err());
+    }
+
     /// The write-side round trips, compiled only where a store can be
     /// written (natively behind `file-io`, and on wasm).
     #[cfg(any(feature = "file-io", target_arch = "wasm32"))]

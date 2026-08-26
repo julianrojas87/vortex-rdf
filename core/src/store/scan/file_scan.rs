@@ -621,3 +621,25 @@ pub(crate) async fn row_range_from_pruning(
     file.memoize_pruning_envelope(filter.clone(), envelope.clone());
     Ok(envelope)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use vortex_array::expr::{and, eq, get_item, root};
+
+    /// Only a conjunction of `field == literal` over root fields decodes to
+    /// `(column, code)` pairs; any other shape declines.
+    #[test]
+    fn eq_code_pairs_accepts_only_eq_conjunctions() {
+        let filter = and(
+            eq(get_item("p", root()), lit(3u32)),
+            eq(get_item("o", root()), lit(7u32)),
+        );
+        assert_eq!(
+            eq_code_pairs(&filter),
+            Some(vec![("p".to_string(), 3), ("o".to_string(), 7)])
+        );
+        assert!(eq_code_pairs(&lit(false)).is_none());
+        assert!(eq_code_pairs(&eq(get_item("p", root()), lit("x"))).is_none());
+    }
+}

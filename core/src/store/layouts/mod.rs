@@ -844,3 +844,30 @@ fn read_u32_column(struct_arr: &StructArray, name: &str) -> Result<Vec<u32>> {
     let col = field_as::<PrimitiveArray>(struct_arr, name, &mut ctx)?;
     Ok(col.as_slice::<u32>().to_vec())
 }
+
+#[cfg(all(test, feature = "file-io"))]
+mod tests {
+    use super::*;
+
+    /// A pre-resolved witness answers a probe for a role the prelude never
+    /// seeded with an error, and from the role cache once it is seeded.
+    #[test]
+    fn preresolved_witness_declines_unseeded_role() {
+        let subject = NamedOrBlankNode::from(NamedNode::new("http://example.org/s").unwrap());
+        let pattern = QuadPattern::new(Some(&subject), None, None, None);
+        let mut codes = PatternCodes::preresolved();
+        assert!(matches!(
+            codes.constraints(pattern),
+            Err(VortexRdfError::Deserialization(_))
+        ));
+
+        assert_eq!(
+            codes.resolve(TermRef::Subject(&subject), |_| Some(7)),
+            Some(7)
+        );
+        match codes.constraints(pattern).unwrap() {
+            Constraints::Eq(eqs) => assert_eq!(eqs, vec![(COL_S, Scalar::from(7u32))]),
+            Constraints::AlwaysFalse => panic!("a seeded role compiles to an equality"),
+        }
+    }
+}

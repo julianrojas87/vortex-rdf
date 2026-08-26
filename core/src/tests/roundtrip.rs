@@ -61,6 +61,185 @@ fn test_from_parts_rejects_bare_dictionary_array() {
     );
 }
 
+/// Rows for the decode-error cases: `modular_quads(3, 3, 4)` with row 1's
+/// object replaced by a string in none of the N-Triples term forms.
+fn raws_with_bad_object() -> Vec<crate::store::RawQuad> {
+    let mut raws: Vec<crate::store::RawQuad> = modular_quads(3, 3, 4)
+        .iter()
+        .map(crate::store::RawQuad::from_quad)
+        .collect();
+    raws[1].o = "bogus".to_string();
+    raws
+}
+
+/// `chunk` with one column replaced by `column`, everything else as it was.
+fn with_column(
+    chunk: &vortex_array::ArrayRef,
+    name: &str,
+    column: vortex_array::ArrayRef,
+) -> vortex_array::ArrayRef {
+    use vortex_array::arrays::struct_::{StructArray, StructArrayExt};
+    use vortex_array::{IntoArray as _, VortexSessionExecute as _};
+
+    let mut ctx = crate::session::VORTEX_SESSION.create_execution_ctx();
+    let struct_arr = chunk.clone().execute::<StructArray>(&mut ctx).unwrap();
+    let fields: Vec<vortex_array::ArrayRef> = struct_arr
+        .names()
+        .iter()
+        .map(|field| {
+            if field.as_ref() == name {
+                column.clone()
+            } else {
+                struct_arr
+                    .unmasked_field_by_name(field.as_ref())
+                    .unwrap()
+                    .clone()
+            }
+        })
+        .collect();
+    StructArray::try_new(
+        struct_arr.names().clone(),
+        fields,
+        struct_arr.len(),
+        vortex_array::validity::Validity::NonNullable,
+    )
+    .unwrap()
+    .into_array()
+}
+
+/// `layout`'s chunk over `raws`, paired with the resolved layout that
+/// decodes it.
+fn chunk_for(
+    layout: LayoutStrategy,
+    raws: &[crate::store::RawQuad],
+) -> (
+    vortex_array::ArrayRef,
+    crate::store::layouts::ResolvedLayout,
+) {
+    use crate::store::builders::build_struct_array;
+    use crate::store::layouts::dictionary::{self, TermDictionary};
+    use crate::store::layouts::{DictAccess, ResolvedLayout};
+
+    match layout {
+        LayoutStrategy::Default => (
+            build_struct_array(raws, layout, false).unwrap(),
+            ResolvedLayout::Default,
+        ),
+        LayoutStrategy::TypedObject => (
+            build_struct_array(raws, layout, false).unwrap(),
+            ResolvedLayout::TypedObject,
+        ),
+        LayoutStrategy::Dictionary => {
+            let (dict, code_map) = TermDictionary::from_quads_with_map(raws).unwrap();
+            let codes = dictionary::encode_quads(raws, &code_map).unwrap();
+            (
+                dictionary::build_code_chunk(&codes, 0..raws.len(), false).unwrap(),
+                ResolvedLayout::Dictionary(DictAccess::Resident(std::sync::Arc::new(dict))),
+            )
+        }
+    }
+}
+
+/// `chunk` without its `g` column (the last column of every layout).
+fn drop_graph_column(chunk: &vortex_array::ArrayRef) -> vortex_array::ArrayRef {
+    use vortex_array::arrays::struct_::{StructArray, StructArrayExt};
+    use vortex_array::{IntoArray as _, VortexSessionExecute as _};
+
+    let mut ctx = crate::session::VORTEX_SESSION.create_execution_ctx();
+    let struct_arr = chunk.clone().execute::<StructArray>(&mut ctx).unwrap();
+    let names: Vec<_> = struct_arr
+        .names()
+        .iter()
+        .take(struct_arr.names().len() - 1)
+        .cloned()
+        .collect();
+    let fields: Vec<vortex_array::ArrayRef> = names
+        .iter()
+        .map(|name| {
+            struct_arr
+                .unmasked_field_by_name(name.as_ref())
+                .unwrap()
+                .clone()
+        })
+        .collect();
+    StructArray::try_new(
+        names.into(),
+        fields,
+        struct_arr.len(),
+        vortex_array::validity::Validity::NonNullable,
+    )
+    .unwrap()
+    .into_array()
+}
+
+/// A chunk that cannot be read as the layout's columns at all decodes to a
+/// single `Err`, whatever its row count.
+#[test]
+fn decode_chunk_reports_chunk_failure_as_single_err() {
+    let raws: Vec<crate::store::RawQuad> = modular_quads(3, 3, 4)
+        .iter()
+        .map(crate::store::RawQuad::from_quad)
+        .collect();
+    for layout in [
+        LayoutStrategy::Default,
+        LayoutStrategy::TypedObject,
+        LayoutStrategy::Dictionary,
+    ] {
+        let (chunk, resolved) = chunk_for(layout, &raws);
+        let decoded = resolved.decode_chunk(&drop_graph_column(&chunk));
+        assert_eq!(decoded.len(), 1, "{layout:?}: one error for the chunk");
+        assert!(decoded[0].is_err(), "{layout:?}");
+    }
+}
+
+/// A row whose term fails to parse is reported at its own position, with the
+/// rows around it decoded: an object string in no term form under the
+/// layouts that store the object spelling, an unknown `o_kind` under the
+/// typed layout.
+#[test]
+fn decode_chunk_reports_bad_row_at_its_position() {
+    use vortex_array::IntoArray as _;
+    use vortex_array::arrays::PrimitiveArray;
+
+    let good: Vec<crate::store::RawQuad> = modular_quads(3, 3, 4)
+        .iter()
+        .map(crate::store::RawQuad::from_quad)
+        .collect();
+    let bad = raws_with_bad_object();
+    let typed = {
+        let (chunk, resolved) = chunk_for(LayoutStrategy::TypedObject, &good);
+        let kinds = PrimitiveArray::from_iter([2u8, 9, 2]).into_array();
+        (with_column(&chunk, "o_kind", kinds), resolved)
+    };
+    let cases = [
+        (
+            LayoutStrategy::Default,
+            chunk_for(LayoutStrategy::Default, &bad),
+        ),
+        (LayoutStrategy::TypedObject, typed),
+        (
+            LayoutStrategy::Dictionary,
+            chunk_for(LayoutStrategy::Dictionary, &bad),
+        ),
+    ];
+
+    for (layout, (chunk, resolved)) in cases {
+        let decoded = resolved.decode_chunk(&chunk);
+        assert_eq!(decoded.len(), 3, "{layout:?}: one result per row");
+        assert!(decoded[0].is_ok(), "{layout:?}: row 0");
+        assert!(
+            decoded[1].is_err(),
+            "{layout:?}: row 1 carries the bad object"
+        );
+        assert!(decoded[2].is_ok(), "{layout:?}: row 2");
+        assert_eq!(
+            decoded[2].as_ref().unwrap().subject.to_string(),
+            "<http://example.org/s02>",
+            "{layout:?}"
+        );
+    }
+}
+
 /// A rebuild over a base without the sorted stamp sorts every row: the
 /// re-emitted rows are in `(s, p, o, g)` order, the base and tail rows
 /// interleaved, and the adopted store carries the stamp.

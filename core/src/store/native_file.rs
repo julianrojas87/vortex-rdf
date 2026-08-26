@@ -319,3 +319,57 @@ impl NativeStoreFile {
         subtree_bytes(&child, self.file.footer().segment_map()).map(Some)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use vortex_array::dtype::{DType, Nullability, PType, StructFields};
+    use vortex_array::expr::{ExactBoundExpr, eq, get_item, lit, root};
+
+    /// Reaching the cap clears the memo before the next insert, so it never
+    /// holds more than `cap` entries.
+    #[test]
+    fn bounded_memo_clears_at_cap() {
+        let memo: BoundedMemo<u32, u32> = BoundedMemo::new(2);
+        memo.insert(1, 10);
+        memo.insert(2, 20);
+        assert_eq!(memo.map.lock().unwrap().len(), 2);
+        memo.insert(3, 30);
+        assert_eq!(memo.map.lock().unwrap().len(), 1);
+        assert_eq!(memo.get(&3), Some(30));
+        assert_eq!(memo.get(&1), None);
+
+        let built = memo.get_or_try_insert_with(4, || Ok(40)).unwrap();
+        assert_eq!(built, 40);
+        let hit = memo
+            .get_or_try_insert_with(4, || panic!("a hit does not rebuild"))
+            .unwrap();
+        assert_eq!(hit, 40);
+    }
+
+    /// Two binds of one shape hand out the same tree identity, which a fresh
+    /// bind of the same expression does not share.
+    #[test]
+    fn bound_expr_memo_pins_one_identity_per_shape() {
+        let dtype = DType::Struct(
+            StructFields::new(
+                vec![Arc::<str>::from("s")].into(),
+                vec![DType::Primitive(PType::U32, Nullability::NonNullable)],
+            ),
+            Nullability::NonNullable,
+        );
+        let expr = eq(get_item("s", root()), lit(1u32));
+        let memo = BoundExprMemo::new();
+        let first = memo.bind("quads", &expr, &dtype).unwrap();
+        let second = memo.bind("quads", &expr, &dtype).unwrap();
+        assert_eq!(ExactBoundExpr(first.clone()), ExactBoundExpr(second));
+
+        let fresh = expr.bind(&dtype).unwrap();
+        assert_eq!(fresh, first, "structurally the same tree");
+        assert_ne!(ExactBoundExpr(fresh), ExactBoundExpr(first.clone()));
+
+        let other_scope = memo.bind("index", &expr, &dtype).unwrap();
+        assert_ne!(ExactBoundExpr(other_scope), ExactBoundExpr(first));
+        assert_eq!(memo.0.map.lock().unwrap().len(), 2);
+    }
+}
