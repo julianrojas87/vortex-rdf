@@ -22,7 +22,7 @@ Vortex-RDF is a columnar RDF serialization and a queryable quad store built on t
 
 | Surface | Install | Notes |
 |---|---|---|
-| Rust | `vortex-rdf-core = "0.5.0"` | the default `file-io` feature adds path-based file reading/writing on Tokio; disable default features on wasm, where stores are exchanged as bytes |
+| Rust | `vortex-rdf-core = "0.10.0"` | the default `file-io` feature adds path-based file reading/writing on Tokio; disable default features on wasm, where stores are exchanged as bytes |
 | CLI | `cargo install vortex-rdf-cli` | |
 | JavaScript | `npm install @vortex-rdf/vortex-rdf-store` | [js/README.md](js/README.md) |
 | Python | `pip install vortex-rdf` | [python/README.md](python/README.md); [`vortex-rdflib`](https://pypi.org/project/vortex-rdflib/) builds an rdflib integration on it |
@@ -85,6 +85,11 @@ vortex-rdf-cli serialize -i data.ttl -o data.vortex --indexes secondary-by-refer
 vortex-rdf-cli deserialize -i data.vortex -o data.nq                                    # format from the extension, else N-Quads
 vortex-rdf-cli match -i data.vortex --predicate "http://xmlns.com/foaf/0.1/knows"       # matches to stdout as N-Quads
 # --layout: default | typed-object | dictionary    --indexes (repeatable): secondary-by-copy | secondary-by-reference
+
+# Any command takes RUST_LOG for the engine's own timings — which path resolved
+# a pattern (an index, a binary search, a mask scan) and how long each stage of
+# a match, an export, or a write took:
+RUST_LOG=vortex_rdf_core=debug vortex-rdf-cli match -i data.vortex --predicate "http://xmlns.com/foaf/0.1/knows"
 ```
 
 **Python**:

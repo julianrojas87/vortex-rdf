@@ -100,7 +100,7 @@ decoded values, the order the writer assigned codes in never matters.
 
 ```toml
 [dependencies]
-vortex-rdf-encoded-search = { version = "0.5", features = ["layout"] }
+vortex-rdf-encoded-search = { version = "0.10", features = ["layout"] }
 ```
 
 ## Performance
