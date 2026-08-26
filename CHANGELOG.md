@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased](https://github.com/vortex-rdf/vortex-rdf/compare/v0.5.0...HEAD)
+## [0.10.0](https://github.com/vortex-rdf/vortex-rdf/compare/v0.5.0...v0.10.0) - 2026-08-26
 
 ### Added
 
@@ -102,6 +102,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Fold patches into node, gate the layout tests, share test fixtures (encoded-search) ([`b8dfb5e`](https://github.com/vortex-rdf/vortex-rdf/commit/b8dfb5ec1e40ff63f9bd46604790c70c22879158) by @julianrojas87)
 - Share the JS and Python bench plumbing and pin the dataset generators (bench) ([`727fef9`](https://github.com/vortex-rdf/vortex-rdf/commit/727fef9e0dc13ec8bceca083f9d67e5c4f8c21df) by @julianrojas87)
 - Apply the full-recheck findings across core, bindings, cli and docs ([`a3f913c`](https://github.com/vortex-rdf/vortex-rdf/commit/a3f913c68f0e2a80d2e3e6e5d3a5cb070e5eea4f) by @julianrojas87)
+- Stop measuring the Default-layout variants no tab renders (bench) ([`4e36b72`](https://github.com/vortex-rdf/vortex-rdf/commit/4e36b727476785bc6db1fa935c9c5299b1b9f2e1) by @julianrojas87)
 
 ### Removed
 
@@ -130,6 +131,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Fmt complaints 3 ([`1ab5940`](https://github.com/vortex-rdf/vortex-rdf/commit/1ab5940cb42c95c17e39dbf8adffc9828a848972) by @julianrojas87)
 - Fmt complaints 4 ([`3f45458`](https://github.com/vortex-rdf/vortex-rdf/commit/3f454585a642db6c800cc69503b31a55ea10c671) by @julianrojas87)
 - Missing fixes for the CI ([`c9e10bf`](https://github.com/vortex-rdf/vortex-rdf/commit/c9e10bfa84f579df8a439aab22293e39ea99ba8c) by @julianrojas87)
+- Warn when a suite's scale disagrees with the Rust run (dashboard) ([`1e73f71`](https://github.com/vortex-rdf/vortex-rdf/commit/1e73f71b586ea2a378ecd4f633034ba172e6d30d) by @julianrojas87)
 
 ## [0.5.0](https://github.com/vortex-rdf/vortex-rdf/compare/v0.4.0...v0.5.0) - 2026-07-29
 
