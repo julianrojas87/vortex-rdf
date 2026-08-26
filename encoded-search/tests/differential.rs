@@ -7,29 +7,32 @@
 //! that silently reroutes a fixture to a different encoding fails the test
 //! instead of shrinking coverage.
 
+mod common;
+
+use common::session;
 use vortex_array::arrays::{ChunkedArray, ConstantArray, PrimitiveArray, SliceArray};
 use vortex_array::scalar::Scalar;
-use vortex_array::scalar_fn::session::ScalarFnSession;
 use vortex_array::search_sorted::{SearchSorted, SearchSortedSide};
-use vortex_array::session::ArraySession;
 use vortex_array::{ArrayRef, ExecutionCtx, IntoArray, VortexSessionExecute};
 use vortex_btrblocks::schemes::integer;
 use vortex_btrblocks::{BtrBlocksCompressorBuilder, Scheme};
-use vortex_io::session::RuntimeSession;
-use vortex_layout::session::LayoutSession;
 use vortex_rdf_encoded_search::{NodeKind, SortedProbe};
 use vortex_sequence::Sequence;
-use vortex_session::VortexSession;
 
-fn session() -> VortexSession {
-    let session = VortexSession::empty()
-        .with::<ArraySession>()
-        .with::<LayoutSession>()
-        .with::<ScalarFnSession>()
-        .with::<RuntimeSession>();
-    vortex_file::register_default_encodings(&session);
-    session
-}
+/// Top-level encoding ids the probe resolves; a declined array with one of
+/// these at its root is a resolver bug, not an unsupported shape.
+const SUPPORTED_ENCODINGS: &[&str] = &[
+    "vortex.primitive",
+    "vortex.constant",
+    "vortex.sequence",
+    "vortex.runend",
+    "fastlanes.for",
+    "fastlanes.bitpacked",
+    "vortex.slice",
+    "vortex.chunked",
+    "vortex.dict",
+    "vortex.shared",
+];
 
 fn ctx() -> ExecutionCtx {
     session().create_execution_ctx()
@@ -66,9 +69,44 @@ fn needles_for(data: &[u32]) -> Vec<u64> {
 }
 
 fn canonical_bounds(data: &[u32], needle: u64) -> (usize, usize) {
-    let lo = data.partition_point(|&v| u64::from(v) < needle);
-    let hi = data.partition_point(|&v| u64::from(v) <= needle);
-    (lo, hi)
+    let range = common::canonical_bounds(data, needle);
+    (range.start as usize, range.end as usize)
+}
+
+/// Sorted 11-row runs whose RunEnd children both land on Sequence.
+fn runend_sequence_22k() -> (Vec<u32>, ArrayRef) {
+    let data: Vec<u32> = (0..22_000u32).map(|i| i / 11).collect();
+    let arr = compress_with(&[&integer::RunEndScheme, &integer::SequenceScheme], &data);
+    (data, arr)
+}
+
+fn bitpacked_4k() -> (Vec<u32>, ArrayRef) {
+    let data: Vec<u32> = (0..4096u32).map(|i| i / 7).collect();
+    let arr = compress_with(&[&integer::BitPackingScheme], &data);
+    (data, arr)
+}
+
+fn for_bitpacked_4k() -> (Vec<u32>, ArrayRef) {
+    let data: Vec<u32> = (0..4096u32).map(|i| 1_000_000_000 + i / 3).collect();
+    let arr = compress_with(&[&integer::FoRScheme, &integer::BitPackingScheme], &data);
+    (data, arr)
+}
+
+/// Asserts a default-cascade fixture either probes exactly or declined
+/// because its root encoding is outside the supported set; returns whether
+/// it resolved.
+fn assert_probe_or_unsupported(arr: &ArrayRef, data: &[u32]) -> bool {
+    if SortedProbe::resolve(arr).is_some() {
+        assert_probe(arr, data, &[]);
+        true
+    } else {
+        let id = arr.encoding_id();
+        assert!(
+            !SUPPORTED_ENCODINGS.contains(&id.as_str()),
+            "a supported root encoding ({id}) declined"
+        );
+        false
+    }
 }
 
 fn generic_bounds(arr: &ArrayRef, needle: u32) -> (usize, usize) {
@@ -149,13 +187,29 @@ fn sorted_random(seed: u64, len: usize, max_step: u64) -> Vec<u32> {
 
 #[test]
 fn probes_bitpacked() {
-    let data: Vec<u32> = (0..4096u32).map(|i| i / 7).collect();
-    let arr = compress_with(&[&integer::BitPackingScheme], &data);
+    let (data, arr) = bitpacked_4k();
     assert_probe(&arr, &data, &[NodeKind::BitPacked]);
 }
 
 #[test]
+fn probes_bitpacked_zero_width() {
+    // An all-zero column packs to a zero bit width: no words to unpack.
+    let data = vec![0u32; 2048];
+    let packed = vortex_fastlanes::bitpack_compress::bitpack_encode(
+        &PrimitiveArray::from_iter(data.iter().copied()),
+        0,
+        None,
+        &mut ctx(),
+    )
+    .unwrap()
+    .into_array();
+    assert_probe(&packed, &data, &[NodeKind::BitPacked]);
+}
+
+#[test]
 fn probes_bitpacked_with_patches() {
+    use vortex_array::arrays::slice::SliceKernel;
+
     // Mostly narrow values with a sorted tail of outliers above the packed
     // width, so patches carry the tail.
     let mut data: Vec<u32> = (0..3000u32).map(|i| i % 500).collect();
@@ -166,21 +220,36 @@ fn probes_bitpacked_with_patches() {
         .unwrap()
         .into_array();
     assert_probe(&packed, &data, &[NodeKind::BitPacked, NodeKind::Patches]);
+
+    // Slicing through the encoding keeps the patches and moves their offset:
+    // windows starting inside a block, on a block boundary, inside the
+    // patched tail, and a single patched row.
+    for range in [1..3005usize, 1024..3005, 2990..3005, 3001..3002] {
+        let sliced = <vortex_fastlanes::BitPacked as SliceKernel>::slice(
+            packed.as_::<vortex_fastlanes::BitPacked>(),
+            range.clone(),
+            &mut ctx(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(sliced.encoding_id().as_str(), "fastlanes.bitpacked");
+        assert_probe(
+            &sliced,
+            &data[range],
+            &[NodeKind::BitPacked, NodeKind::Patches],
+        );
+    }
 }
 
 #[test]
 fn probes_for_bitpacked() {
-    let data: Vec<u32> = (0..4096u32).map(|i| 1_000_000_000 + i / 3).collect();
-    let arr = compress_with(&[&integer::FoRScheme, &integer::BitPackingScheme], &data);
+    let (data, arr) = for_bitpacked_4k();
     assert_probe(&arr, &data, &[NodeKind::FoR, NodeKind::BitPacked]);
 }
 
 #[test]
 fn probes_runend_uniform_runs() {
-    // Uniform 11-row runs: both ends and values are arithmetic, so the
-    // recursive children land on Sequence.
-    let data: Vec<u32> = (0..22_000u32).map(|i| i / 11).collect();
-    let arr = compress_with(&[&integer::RunEndScheme, &integer::SequenceScheme], &data);
+    let (data, arr) = runend_sequence_22k();
     assert_probe(&arr, &data, &[NodeKind::RunEnd, NodeKind::Sequence]);
 }
 
@@ -261,20 +330,32 @@ fn probes_constant() {
 }
 
 #[test]
-fn probes_slice_wrapper() {
-    let data: Vec<u32> = (0..22_000u32).map(|i| i / 11).collect();
-    let arr = compress_with(&[&integer::RunEndScheme, &integer::SequenceScheme], &data);
-    // Run boundary, mid-run, and non-1024-aligned windows.
-    for range in [11..22_000, 5..1000, 1030..2050, 21_990..22_000, 0..0] {
-        let sliced = SliceArray::new(arr.clone(), range.clone()).into_array();
-        assert_probe(&sliced, &data[range], &[NodeKind::Slice]);
+fn probes_sliced_runend() {
+    let (data, arr) = runend_sequence_22k();
+    // Run boundary, mid-run, single-row, empty, and non-1024-aligned windows,
+    // each both as an explicit Slice wrapper and as `ArrayRef::slice`, which
+    // may keep the wrapper or push the window into the RunEnd's offset (so
+    // no kind assert on that shape).
+    for range in [
+        11..22_000usize,
+        5..1000,
+        1030..2050,
+        21_990..22_000,
+        0..0,
+        3..15_000,
+        11..22,
+        12_345..12_346,
+    ] {
+        let wrapped = SliceArray::new(arr.clone(), range.clone()).into_array();
+        assert_probe(&wrapped, &data[range.clone()], &[NodeKind::Slice]);
+        let pushed = arr.slice(range.clone()).unwrap();
+        assert_probe(&pushed, &data[range], &[]);
     }
 }
 
 #[test]
 fn probes_optimizer_sliced() {
-    let data: Vec<u32> = (0..4096u32).map(|i| 1_000_000_000 + i / 3).collect();
-    let arr = compress_with(&[&integer::FoRScheme, &integer::BitPackingScheme], &data);
+    let (data, arr) = for_bitpacked_4k();
     for range in [0..4096usize, 7..4000, 1024..2048, 100..101] {
         // `ArrayRef::slice` may keep a Slice wrapper or push the window into
         // the child; both shapes must probe identically, so no kind assert.
@@ -284,13 +365,47 @@ fn probes_optimizer_sliced() {
 }
 
 #[test]
-fn probes_sliced_runend_offset() {
-    let data: Vec<u32> = (0..22_000u32).map(|i| i / 11).collect();
-    let arr = compress_with(&[&integer::RunEndScheme, &integer::SequenceScheme], &data);
-    for range in [3..15_000usize, 11..22, 12_345..12_346] {
-        let sliced = arr.slice(range.clone()).unwrap();
-        assert_probe(&sliced, &data[range], &[]);
-    }
+fn probes_chunked_of_contiguous_slices() {
+    let data: Vec<u32> = (0..8000u32).map(|i| i / 11).collect();
+    let parent = compress_with(&[&integer::RunEndScheme, &integer::SequenceScheme], &data);
+    let dtype = parent.dtype().clone();
+    let chunked = |ranges: &[std::ops::Range<usize>]| {
+        let chunks: Vec<ArrayRef> = ranges
+            .iter()
+            .map(|r| SliceArray::new(parent.clone(), r.clone()).into_array())
+            .collect();
+        ChunkedArray::try_new(chunks, dtype.clone())
+            .unwrap()
+            .into_array()
+    };
+
+    // Contiguous slices of one parent coalesce into a single window over it.
+    let arr = chunked(&[0..3000, 3000..5000, 5000..8000]);
+    let kinds = SortedProbe::resolve(&arr).unwrap().node_kinds();
+    assert!(
+        kinds.starts_with(&[NodeKind::Chunked, NodeKind::Slice, NodeKind::RunEnd])
+            && kinds.iter().filter(|k| **k == NodeKind::Slice).count() == 1,
+        "expected one merged window, got {kinds:?}"
+    );
+    assert_probe(&arr, &data, &[NodeKind::Chunked, NodeKind::Slice]);
+
+    // A gap between the windows keeps them as separate chunks.
+    let arr = chunked(&[0..3000, 3500..8000]);
+    let probe = SortedProbe::resolve(&arr).unwrap();
+    assert_eq!(
+        probe
+            .node_kinds()
+            .iter()
+            .filter(|k| **k == NodeKind::Slice)
+            .count(),
+        2
+    );
+    let expected: Vec<u32> = data[0..3000]
+        .iter()
+        .chain(&data[3500..8000])
+        .copied()
+        .collect();
+    assert_probe(&arr, &expected, &[NodeKind::Chunked, NodeKind::Slice]);
 }
 
 #[test]
@@ -328,16 +443,23 @@ fn probes_default_cascade_random() {
         (7, 5000, 65_536), // u16-crossing steps
         (8, 1, 5),         // single element
     ];
+    let mut resolved = 0usize;
+    let mut declined = Vec::new();
     for &(seed_base, len, max_step) in shapes {
         for salt in 0..8u64 {
             let data = sorted_random(seed_base * 1000 + salt, len, max_step);
             let arr = compress_default(&data);
-            // Encodings outside the supported set decline cleanly.
-            if SortedProbe::resolve(&arr).is_some() {
-                assert_probe(&arr, &data, &[]);
+            if assert_probe_or_unsupported(&arr, &data) {
+                resolved += 1;
+            } else {
+                declined.push(arr.encoding_id().to_string());
             }
         }
     }
+    assert!(
+        resolved > 0,
+        "every cascade output declined; root encodings: {declined:?}"
+    );
 }
 
 #[test]
@@ -420,9 +542,11 @@ fn bounds_on_empty_array() {
 fn bounds_all_equal() {
     let data = vec![42u32; 9000];
     let arr = compress_default(&data);
-    if SortedProbe::resolve(&arr).is_some() {
-        assert_probe(&arr, &data, &[]);
-    }
+    assert!(
+        assert_probe_or_unsupported(&arr, &data),
+        "an all-equal column must resolve; root encoding {}",
+        arr.encoding_id()
+    );
 }
 
 #[test]
@@ -475,8 +599,7 @@ fn probes_slice_of_piecewise_sorted() {
 
 #[test]
 fn bounds_in_edge_windows() {
-    let data: Vec<u32> = (0..4096u32).map(|i| i / 7).collect();
-    let arr = compress_with(&[&integer::BitPackingScheme], &data);
+    let (data, arr) = bitpacked_4k();
     let probe = SortedProbe::resolve(&arr).unwrap();
     // Empty window, single-row window, and the full array.
     assert_eq!(probe.bounds_in(100..100, 5), (100, 100));

@@ -15,10 +15,9 @@ nodes, then answers queries against the compressed representation directly:
 slice reads, integer arithmetic, and single bit-packed word extraction. No
 `ExecutionCtx`, no scalars, no canonicalization, no allocation per query.
 
-It is not RDF-specific. It was extracted from
-[vortex-rdf](https://github.com/vortex-rdf/vortex-rdf), where sorted code
-columns are the substrate of every quad-pattern lookup, but it knows nothing
-about RDF and depends on nothing from it.
+It is not RDF-specific: it depends on nothing from
+[vortex-rdf](https://github.com/vortex-rdf/vortex-rdf), which uses it to probe
+its sorted code columns.
 
 ## Example
 
@@ -53,6 +52,7 @@ assert_eq!(probe.value_at(11_000), 1_000);
 // Restrict a search to a window — useful when a column is sorted only
 // within the run of a preceding key.
 assert_eq!(probe.bounds_in(11_000..22_000, 1_500), (16_500, 16_511));
+# Ok::<(), vortex_error::VortexError>(())
 ```
 
 `resolve` returns `None` rather than failing: any array it does not support —
@@ -105,16 +105,18 @@ vortex-rdf-encoded-search = { version = "0.5", features = ["layout"] }
 
 ## Performance
 
-On a 2M-row run-end-encoded column, one two-sided `bounds` query costs ~0.3 µs
-against the compressed array, versus ~275 µs through Vortex's generic
-`search_sorted` on the same array, and ~0.14 µs against a fully decoded
-`Vec<u32>` with `partition_point`. In other words, it recovers most of the
-canonical binary-search floor while leaving the column compressed.
+Measured against Vortex 0.85 with `benches/probe.rs` (fastest of 100 samples,
+Intel Core Ultra 7 155H, 2026-08): on the 2M-row run-end-encoded `runend_2m`
+fixture, one two-sided `bounds` query costs ~0.7 µs against the compressed
+array, versus ~250 µs through Vortex's generic `search_sorted` on the same
+array, and ~0.14 µs against a fully decoded `Vec<u32>` with `partition_point`.
+It recovers most of the canonical binary-search floor while leaving the column
+compressed. The figures are refreshed with each Vortex minor bump.
 
 Reproduce with:
 
 ```console
-cargo bench -p vortex-rdf-encoded-search
+cargo bench -p vortex-rdf-encoded-search --all-features
 ```
 
 ## Compatibility
@@ -127,4 +129,4 @@ Minimum supported Rust version: 1.95 (edition 2024).
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+MIT. See [LICENSE](https://github.com/vortex-rdf/vortex-rdf/blob/main/encoded-search/LICENSE).

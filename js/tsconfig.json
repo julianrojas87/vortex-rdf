@@ -11,6 +11,8 @@
         ]
     },
     "include": [
+        "src/api.d.ts",
+        "entry/*.d.ts",
         "test/**/*.ts"
     ]
 }

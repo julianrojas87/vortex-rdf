@@ -111,7 +111,10 @@ mod tests {
         };
         assert_eq!(owned.len(), 4);
         assert_eq!(owned.bounds(3), (1, 3));
+        assert_eq!(owned.bounds_in(1..4, 3), (1, 3));
+        assert_eq!((owned.lower_bound(7), owned.upper_bound(7)), (3, 4));
         assert_eq!(owned.value_at(3), 7);
+        assert_eq!(owned.array().len(), 4);
     }
 
     #[test]

@@ -71,7 +71,7 @@ impl DictValues {
 /// values index into (when it holds a `vortex.dict` layout's codes rather
 /// than the column's values), and the fetched, resolved probe (filled on
 /// first use; `None` when the chunk's encoding declines resolution).
-struct ChunkSpec {
+struct ChunkLeaf {
     layout: LayoutRef,
     row_offset: u64,
     row_count: u64,
@@ -87,7 +87,7 @@ struct ChunkSpec {
 /// [`SortedProbe`](crate::SortedProbe). [`Self::value_at`] is exact
 /// regardless of sort order.
 pub struct ColumnChunks {
-    chunks: Vec<ChunkSpec>,
+    chunks: Vec<ChunkLeaf>,
     row_count: u64,
     dtype: DType,
 }
@@ -193,13 +193,11 @@ impl ColumnChunks {
         Ok(Some(lower..upper.max(lower)))
     }
 
-    /// [`Self::bounds`] restricted to `range`, in absolute rows. Only the
-    /// window must be sorted ascending — probes point-read through
-    /// [`Self::value_at`], so rows outside the window are never consulted (a
-    /// prefix probe searches a second key inside a lead run of a column that
-    /// is not sorted as a whole). Fetches only the chunks the bisection
-    /// touches (cached thereafter). `Ok(None)` when a needed chunk's encoding
-    /// declines.
+    /// [`Self::bounds`] restricted to `range`, in absolute rows, under the
+    /// window contract of [`SortedProbe::bounds_in`](crate::SortedProbe::bounds_in):
+    /// only the window must be sorted ascending, and rows outside it are never
+    /// read. Fetches only the chunks the bisection touches (cached
+    /// thereafter). `Ok(None)` when a needed chunk's encoding declines.
     ///
     /// # Panics
     /// Panics if `range.end > self.row_count()`.
@@ -271,23 +269,23 @@ impl ColumnChunks {
         source: &Arc<dyn SegmentSource>,
         session: &VortexSession,
     ) -> VortexResult<Option<&OwnedSortedProbe>> {
-        let spec = &self.chunks[idx];
-        if spec.cell.get().is_none() {
-            let flat = spec
+        let leaf = &self.chunks[idx];
+        if leaf.cell.get().is_none() {
+            let flat = leaf
                 .layout
                 .as_opt::<Flat>()
                 .vortex_expect("chunk leaves are validated flat at construction");
-            let array = fetch_flat(flat, spec.row_count, source, session).await?;
-            let array = match &spec.dict {
+            let array = fetch_flat(flat, leaf.row_count, source, session).await?;
+            let array = match &leaf.dict {
                 None => array,
                 Some(dict) => {
                     let values = dict.array(source, session).await?;
                     Array::<Dict>::try_new(array, values)?.into_array()
                 }
             };
-            let _ = spec.cell.set(OwnedSortedProbe::resolve(array));
+            let _ = leaf.cell.set(OwnedSortedProbe::resolve(array));
         }
-        Ok(spec
+        Ok(leaf
             .cell
             .get()
             .vortex_expect("chunk cell was just populated")
@@ -329,13 +327,13 @@ fn collect_leaves(
     node: LayoutRef,
     offset: u64,
     dict: Option<Arc<DictValues>>,
-    out: &mut Vec<ChunkSpec>,
+    out: &mut Vec<ChunkLeaf>,
 ) -> Option<()> {
     let node = unwrap_zoned(node)?;
     if node.is::<Flat>() {
         let row_count = node.row_count();
         if row_count > 0 {
-            out.push(ChunkSpec {
+            out.push(ChunkLeaf {
                 layout: node,
                 row_offset: offset,
                 row_count,

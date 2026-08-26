@@ -10,6 +10,7 @@ dynamic = ["version"]
 description = "Python bindings for Vortex-RDF, a high-performance columnar RDF store format"
 readme = "README.md"
 license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.11"
 keywords = ["rdf", "vortex", "columnar", "quad-store", "semantic-web"]
 classifiers = [
@@ -41,13 +42,18 @@ python-source = "."
 
 [tool.uv]
 # The extension must be rebuilt when the Rust sources change — the binding
-# crate's own and the core crate's it wraps (a path dependency). The workspace
-# manifest is a key too: it carries the version this package inherits.
+# crate's own and the path-dependency crates it links: core and the
+# encoded-search crate core wraps. The workspace manifest is a key too (it
+# carries the version this package inherits), as is the lock file so that
+# dependency bumps rebuild.
 cache-keys = [
   { file = "pyproject.toml" },
   { file = "Cargo.toml" },
   { file = "src/**/*.rs" },
   { file = "../Cargo.toml" },
+  { file = "../Cargo.lock" },
   { file = "../core/Cargo.toml" },
   { file = "../core/src/**/*.rs" },
+  { file = "../encoded-search/Cargo.toml" },
+  { file = "../encoded-search/src/**/*.rs" },
 ]

@@ -19,8 +19,7 @@ use vortex_fastlanes::{
 use vortex_runend::{RunEnd, RunEndArrayExt as _, RunEndSlots};
 use vortex_sequence::Sequence;
 
-use crate::node::{Chunk, Node, PackedNode, Words};
-use crate::patches::PatchProbe;
+use crate::node::{Chunk, Node, PackedNode, PatchProbe, Words};
 
 /// Child array at a fixed slot index, `'a`-borrowed from the erased slots.
 fn slot(slots: &[Option<ArrayRef>], idx: usize) -> Option<&ArrayRef> {
@@ -177,8 +176,7 @@ pub(crate) fn resolve_node<'a>(arr: &'a ArrayRef) -> Option<Node<'a>> {
             }
             // Consecutive chunks that are contiguous slices of one shared
             // parent (a coalesced block read back split-by-split) merge into
-            // a single window over that parent — fewer nodes to resolve and
-            // one search instead of a per-chunk cascade.
+            // a single window over that parent.
             if let Some((parent, mut range)) = as_slice_parts(child) {
                 let start = offsets[i];
                 let mut j = i + 1;

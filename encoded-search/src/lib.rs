@@ -1,23 +1,8 @@
-//! Bounds search and point access over compressed Vortex arrays without
-//! decoding.
-//!
-//! A [`SortedProbe`] resolves an encoded array into a borrowed probe tree and
-//! answers two-sided bounds queries and point reads directly against the
-//! compressed representation. Resolution walks the encoding tree with typed
-//! downcasts only; probing is slice reads, integer arithmetic, and single
-//! bit-packed word extraction — no `ExecutionCtx`, no canonicalization.
-//!
-//! Supported encoding nodes: Primitive, Constant, Sequence, RunEnd, FoR,
-//! BitPacked (with patches), Slice, Chunked, and Dict, composed arbitrarily;
-//! the transparent Shared wrapper resolves to whatever it wraps. Anything
-//! else — including nullable or non-unsigned-integer dtypes and non-host
-//! buffers — declines, and the caller falls back to its generic search path.
-
+#![doc = include_str!("../README.md")]
 #![deny(missing_docs)]
 
 mod node;
 mod owned;
-mod patches;
 mod resolve;
 
 pub use owned::OwnedSortedProbe;
@@ -76,11 +61,10 @@ impl<'a> SortedProbe<'a> {
     }
 
     /// [`Self::bounds`] restricted to `range`, in absolute indices. Only the
-    /// window must be sorted ascending — rows outside it are never read (a
-    /// prefix probe searches a second key inside a lead run of a column that
-    /// is not sorted as a whole). Probes point-read through [`Self::value_at`]
-    /// rather than descending the encoding structure, so the window's order is
-    /// the only order consulted.
+    /// window must be sorted ascending; rows outside it are never read.
+    /// Intended for columns that are sorted piecewise, e.g. per run of a
+    /// leading key. Probes point-read through [`Self::value_at`], so the
+    /// window's order is the only order consulted.
     ///
     /// # Panics
     /// Panics if `range.end > self.len()`.

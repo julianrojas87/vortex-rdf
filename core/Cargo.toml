@@ -72,7 +72,7 @@ mimalloc = ["dep:mimalloc"]
 clap = ["dep:clap"]
 
 [dev-dependencies]
-divan = { version = "5.0.1", package = "codspeed-divan-compat" }
+divan = { workspace = true }
 oxigraph = { version = "0.5.9", default-features = false, features = ["rocksdb"] }
 sophia = "0.10"
 hdt = { version = "0.7", features = ["nt"] }

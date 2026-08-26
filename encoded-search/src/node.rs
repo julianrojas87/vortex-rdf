@@ -4,8 +4,6 @@
 //! operation is a slice read, integer arithmetic, or a single bit-packed word
 //! extraction — no `ExecutionCtx`, no decoding, no allocation.
 
-use crate::patches::PatchProbe;
-
 /// Typed borrow of a canonical primitive buffer, one variant per unsigned width.
 pub(crate) enum Words<'a> {
     U8(&'a [u8]),
@@ -98,6 +96,25 @@ impl<'a> Chunk<'a> {
         *self
             .last
             .get_or_init(|| self.node.value_at(self.node.len() - 1))
+    }
+}
+
+/// Exception values of a bit-packed array, resolved as probe nodes: `indices`
+/// holds strictly increasing patched positions (searchable), `values` the
+/// replacement values (point access only, so its sort order never matters).
+pub(crate) struct PatchProbe<'a> {
+    pub(crate) indices: Box<Node<'a>>,
+    pub(crate) values: Box<Node<'a>>,
+    pub(crate) offset: usize,
+}
+
+impl PatchProbe<'_> {
+    /// Replacement value for logical index `i`, if that position is patched.
+    pub(crate) fn lookup(&self, i: usize) -> Option<u64> {
+        let key = (i + self.offset) as u64;
+        let at = self.indices.lower_bound(key);
+        (at < self.indices.len() && self.indices.value_at(at) == key)
+            .then(|| self.values.value_at(at))
     }
 }
 
@@ -304,9 +321,7 @@ impl Node<'_> {
                 }
             }
             Node::BitPacked(p) => partition(p.len, |i| p.value_at(i) < needle),
-            // Sortedness is asserted for the window only — rows outside it
-            // are in unspecified order (a prefix probe slices the sorted run
-            // out of a piecewise-sorted column) — so the search reads
+            // Sortedness is asserted for the window only, so the search reads
             // through the window, never the child's own order.
             Node::Slice { child, start, len } => {
                 partition(*len, |i| child.value_at(*start + i) < needle)

@@ -1,138 +1,149 @@
 //! Layout-feature test: chunk-probe bounds over a written vortex file must
 //! agree with the canonical `partition_point` floor across chunk boundaries.
-#![cfg(feature = "layout")]
 
+mod common;
+
+use std::sync::Arc;
+
+use common::{canonical_bounds, writer_session};
 use vortex_array::arrays::{PrimitiveArray, StructArray};
-use vortex_array::scalar_fn::session::ScalarFnSession;
-use vortex_array::session::ArraySession;
 use vortex_array::stream::ArrayStreamAdapter;
 use vortex_array::validity::Validity;
 use vortex_array::{ArrayRef, IntoArray};
 use vortex_file::{OpenOptionsSessionExt as _, WriteOptionsSessionExt as _};
-use vortex_io::session::RuntimeSession;
-use vortex_layout::session::LayoutSession;
+use vortex_layout::layouts::chunked::Chunked as ChunkedLayout;
+use vortex_layout::layouts::chunked::writer::ChunkedLayoutStrategy;
+use vortex_layout::layouts::dict::Dict as DictLayout;
+use vortex_layout::layouts::dict::writer::{
+    DictLayoutConstraints, DictLayoutOptions, DictStrategy,
+};
+use vortex_layout::layouts::flat::writer::FlatLayoutStrategy;
+use vortex_layout::layouts::repartition::{RepartitionStrategy, RepartitionWriterOptions};
+use vortex_layout::layouts::struct_::StructStrategy;
+use vortex_layout::{LayoutChildType, LayoutRef, LayoutStrategy};
 use vortex_rdf_encoded_search::ColumnChunks;
 use vortex_session::VortexSession;
 
-fn session() -> VortexSession {
-    use vortex_io::session::RuntimeSessionExt as _;
-    let session = VortexSession::empty()
-        .with::<ArraySession>()
-        .with::<LayoutSession>()
-        .with::<ScalarFnSession>()
-        .with::<RuntimeSession>()
-        .with_tokio();
-    vortex_file::register_default_encodings(&session);
-
-    // The file writer is gated on the session's enabled editions; declare one
-    // covering every registered array, layout and dtype plus the default
-    // zone-map aggregates, as vortex-file's own tests do.
-    use vortex_array::dtype::session::DTypeSessionExt as _;
-    use vortex_array::session::ArraySessionExt as _;
-    use vortex_edition::{
-        ComponentKind, Edition, EditionId, EditionInclusion, EditionSessionExt as _,
-    };
-    use vortex_layout::session::LayoutSessionExt as _;
-    const TEST_EDITION: EditionId = EditionId::new("test", 2026, 7, 0);
-    let editions = session.editions();
-    editions
-        .declare_edition(Edition {
-            id: TEST_EDITION,
-            min_vortex_version: None,
-        })
-        .unwrap();
-    let registered = [
-        (
-            ComponentKind::Array,
-            session
-                .arrays()
-                .registry()
-                .read(|map| map.keys().copied().collect::<Vec<_>>()),
-        ),
-        (
-            ComponentKind::Layout,
-            session
-                .layouts()
-                .registry()
-                .read(|map| map.keys().copied().collect::<Vec<_>>()),
-        ),
-        (
-            ComponentKind::DType,
-            session
-                .dtypes()
-                .registry()
-                .read(|map| map.keys().copied().collect::<Vec<_>>()),
-        ),
-    ];
-    for (kind, ids) in &registered {
-        for id in ids {
-            editions
-                .declare_inclusion(EditionInclusion::new(*kind, id, TEST_EDITION))
-                .unwrap();
-        }
-    }
-    for id in [
-        "vortex.bounded_max",
-        "vortex.bounded_min",
-        "vortex.max",
-        "vortex.min",
-        "vortex.nan_count",
-        "vortex.null_count",
-    ] {
-        editions
-            .declare_inclusion(EditionInclusion::new(
-                ComponentKind::Aggregate,
-                id,
-                TEST_EDITION,
-            ))
-            .unwrap();
-    }
-    session.enable_edition(TEST_EDITION).unwrap();
-    session
-}
-
-fn chunk(data: &[u32]) -> ArrayRef {
-    let s = PrimitiveArray::from_iter(data.iter().copied()).into_array();
-    StructArray::try_new(["s"].into(), vec![s], data.len(), Validity::NonNullable)
+/// A struct chunk over the given arrays, all of one length.
+fn struct_of(columns: Vec<(&str, ArrayRef)>) -> ArrayRef {
+    let len = columns[0].1.len();
+    let (names, arrays): (Vec<&str>, Vec<ArrayRef>) = columns.into_iter().unzip();
+    StructArray::try_new(names.into(), arrays, len, Validity::NonNullable)
         .unwrap()
         .into_array()
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn layout_chunks_probe_matches_canonical() {
-    let session = session();
+/// A struct chunk over non-nullable `u32` columns.
+fn struct_chunk(columns: &[(&str, &[u32])]) -> ArrayRef {
+    struct_of(
+        columns
+            .iter()
+            .map(|(name, data)| {
+                (
+                    *name,
+                    PrimitiveArray::from_iter(data.iter().copied()).into_array(),
+                )
+            })
+            .collect(),
+    )
+}
 
-    // Sorted with 11-row runs, sized so the write strategy's coalescing still
-    // yields multiple flat chunks; an equal run crosses every input boundary.
-    let data: Vec<u32> = (0..600_000).map(|i| (i / 11) as u32).collect();
-    let chunks: Vec<ArrayRef> = data.chunks(200_000).map(chunk).collect();
+/// Writes `chunks` as one file (through `strategy` when given) and returns
+/// the opened file.
+async fn write_file(
+    session: &VortexSession,
+    chunks: Vec<ArrayRef>,
+    strategy: Option<Arc<dyn LayoutStrategy>>,
+) -> vortex_file::VortexFile {
     let dtype = chunks[0].dtype().clone();
-
+    let mut options = session.write_options();
+    if let Some(strategy) = strategy {
+        options = options.with_strategy(strategy);
+    }
     let mut bytes = Vec::new();
-    session
-        .write_options()
+    options
         .write(
             &mut bytes,
             ArrayStreamAdapter::new(dtype, futures::stream::iter(chunks.into_iter().map(Ok))),
         )
         .await
         .unwrap();
+    session.open_options().open_buffer(bytes).unwrap()
+}
 
-    let file = session.open_options().open_buffer(bytes).unwrap();
+/// A field's data node beneath its zoned wrappers, for shape assertions.
+fn data_node(root: &LayoutRef, field: &str) -> LayoutRef {
+    use vortex_layout::layouts::zoned::Zoned;
+    let mut node = (0..root.nslots())
+        .find_map(|i| {
+            matches!(root.slot_type(i), Some(LayoutChildType::Field(ref name)) if name.as_ref() == field)
+                .then(|| root.slot(i).ok().flatten())
+                .flatten()
+        })
+        .expect("field present");
+    while node.is::<Zoned>() {
+        node = node.slot(0).unwrap().unwrap();
+    }
+    node
+}
+
+/// A dictionary strategy with the given codes and values strategies and a
+/// `max_len`-bounded dictionary.
+fn dict_strategy<C: LayoutStrategy, V: LayoutStrategy>(
+    codes: C,
+    values: V,
+    max_len: u16,
+) -> DictStrategy {
+    use vortex_btrblocks::BtrBlocksCompressorBuilder;
+    use vortex_layout::layouts::compressed::CompressorPlugin;
+    let compressor: Arc<dyn CompressorPlugin> =
+        Arc::new(BtrBlocksCompressorBuilder::default().build());
+    DictStrategy::new(
+        codes,
+        values,
+        FlatLayoutStrategy::default(),
+        DictLayoutOptions {
+            constraints: DictLayoutConstraints {
+                max_len,
+                ..Default::default()
+            },
+        },
+        compressor,
+    )
+}
+
+fn struct_strategy<S: LayoutStrategy>(field: S) -> Arc<dyn LayoutStrategy> {
+    Arc::new(StructStrategy::new(
+        Arc::new(FlatLayoutStrategy::default()),
+        Arc::new(field),
+    ))
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn column_chunks_match_canonical() {
+    let session = writer_session();
+
+    // Sorted with 11-row runs, fed as three input chunks so the column spans
+    // several flat leaves; an equal run crosses every input boundary.
+    let data: Vec<u32> = (0..600_000).map(|i| (i / 11) as u32).collect();
+    let chunks: Vec<ArrayRef> = data
+        .chunks(200_000)
+        .map(|c| struct_chunk(&[("s", c)]))
+        .collect();
+    let file = write_file(&session, chunks, None).await;
     let root = file.footer().layout().clone();
+    let node = data_node(&root, "s");
+    assert!(
+        node.is::<ChunkedLayout>() && node.nslots() >= 2,
+        "fixture must span several leaves: {}",
+        node.display_tree()
+    );
 
     let column =
         ColumnChunks::from_struct_layout(&root, "s").expect("the written shape must resolve");
-    assert!(ColumnChunks::from_struct_layout(&root, "absent").is_none());
     assert_eq!(column.row_count(), data.len() as u64);
 
     let source = file.segment_source();
-    let canonical = |needle: u64| {
-        let lo = data.partition_point(|&v| u64::from(v) < needle) as u64;
-        let hi = data.partition_point(|&v| u64::from(v) <= needle) as u64;
-        lo..hi.max(lo)
-    };
-
     let max = u64::from(*data.last().unwrap());
     let mut needles: Vec<u64> = vec![0, 1, max, max + 1, u64::MAX];
     // Every ~997th distinct value and its neighbors, plus the values at the
@@ -152,7 +163,7 @@ async fn layout_chunks_probe_matches_canonical() {
             .await
             .unwrap()
             .expect("all chunks are probeable");
-        assert_eq!(got, canonical(needle), "needle {needle}");
+        assert_eq!(got, canonical_bounds(&data, needle), "needle {needle}");
     }
 
     // Point reads across chunk interiors and boundaries need no sort order
@@ -178,49 +189,156 @@ async fn layout_chunks_probe_matches_canonical() {
                 .await
                 .unwrap()
                 .expect("all chunks are probeable");
-            let lo = wdata.partition_point(|&v| u64::from(v) < needle) as u64;
-            let hi = wdata.partition_point(|&v| u64::from(v) <= needle) as u64;
+            let want = canonical_bounds(wdata, needle);
             assert_eq!(
                 got,
-                window.start + lo..window.start + hi,
+                window.start + want.start..window.start + want.end,
                 "window {window:?} needle {needle}"
             );
         }
     }
 }
 
-/// A struct chunk over two `u32` columns `p` and `o`.
-fn struct_chunk(p: &[u32], o: &[u32]) -> ArrayRef {
-    assert_eq!(p.len(), o.len());
-    let len = p.len();
-    let p = PrimitiveArray::from_iter(p.iter().copied()).into_array();
-    let o = PrimitiveArray::from_iter(o.iter().copied()).into_array();
-    StructArray::try_new(["p", "o"].into(), vec![p, o], len, Validity::NonNullable)
+/// Only non-nullable unsigned-integer fields of the struct resolve.
+#[tokio::test(flavor = "multi_thread")]
+async fn column_chunks_decline_unsupported_fields() {
+    let session = writer_session();
+    let n = 4_000usize;
+    let chunk = struct_of(vec![
+        (
+            "s",
+            PrimitiveArray::from_iter((0..n).map(|i| i as u32)).into_array(),
+        ),
+        (
+            "n",
+            PrimitiveArray::from_option_iter((0..n).map(|i| (i % 3 != 0).then_some(i as u32)))
+                .into_array(),
+        ),
+        (
+            "i",
+            PrimitiveArray::from_iter((0..n).map(|i| i as i32)).into_array(),
+        ),
+    ]);
+    let file = write_file(&session, vec![chunk], None).await;
+    let root = file.footer().layout().clone();
+
+    assert!(ColumnChunks::from_struct_layout(&root, "s").is_some());
+    assert!(ColumnChunks::from_struct_layout(&root, "n").is_none());
+    assert!(ColumnChunks::from_struct_layout(&root, "i").is_none());
+    assert!(ColumnChunks::from_struct_layout(&root, "absent").is_none());
+}
+
+/// A zero-row column resolves to a column with no leaves and answers empty
+/// bounds without fetching.
+#[tokio::test(flavor = "multi_thread")]
+async fn column_chunks_empty_column() {
+    let session = writer_session();
+    let file = write_file(&session, vec![struct_chunk(&[("s", &[])])], None).await;
+    let root = file.footer().layout().clone();
+    let column = ColumnChunks::from_struct_layout(&root, "s").expect("an empty column resolves");
+    assert_eq!(column.row_count(), 0);
+    let source = file.segment_source();
+    assert_eq!(
+        column.bounds(5, &source, &session).await.unwrap(),
+        Some(0..0)
+    );
+    assert_eq!(
+        column.bounds_in(0..0, 5, &source, &session).await.unwrap(),
+        Some(0..0)
+    );
+}
+
+/// A leaf whose wire encoding the probe does not support (delta) declines
+/// with `Ok(None)` at query time, while the column itself still resolves.
+#[tokio::test(flavor = "multi_thread")]
+async fn column_chunks_decline_unsupported_leaf() {
+    use vortex_array::VortexSessionExecute as _;
+    use vortex_fastlanes::Delta;
+
+    let session = writer_session();
+    let data: Vec<u32> = (0..4_096).map(|i| i / 5).collect();
+    let primitive = PrimitiveArray::from_iter(data.iter().copied());
+    let delta = Delta::try_from_primitive_array(&primitive, &mut session.create_execution_ctx())
         .unwrap()
-        .into_array()
+        .into_array();
+    assert_eq!(delta.encoding_id().as_str(), "fastlanes.delta");
+    // The flat strategy writes the chunk in the encoding it arrives in.
+    let strategy = struct_strategy(FlatLayoutStrategy::default());
+    let file = write_file(
+        &session,
+        vec![struct_of(vec![("s", delta)])],
+        Some(strategy),
+    )
+    .await;
+    let root = file.footer().layout().clone();
+
+    let column = ColumnChunks::from_struct_layout(&root, "s").expect("a flat leaf resolves");
+    assert_eq!(column.row_count(), data.len() as u64);
+    let source = file.segment_source();
+    assert_eq!(column.bounds(7, &source, &session).await.unwrap(), None);
+    assert_eq!(column.value_at(7, &source, &session).await.unwrap(), None);
+    assert_eq!(
+        column
+            .bounds_in(0..100, 7, &source, &session)
+            .await
+            .unwrap(),
+        None
+    );
 }
 
-/// A field's data node beneath its zoned wrappers, for shape assertions.
-fn data_node(root: &vortex_layout::LayoutRef, field: &str) -> vortex_layout::LayoutRef {
-    use vortex_layout::LayoutChildType;
-    use vortex_layout::layouts::zoned::Zoned;
-    let mut node = (0..root.nslots())
-        .find_map(|i| {
-            matches!(root.slot_type(i), Some(LayoutChildType::Field(ref name)) if name.as_ref() == field)
-                .then(|| root.slot(i).ok().flatten())
-                .flatten()
-        })
-        .expect("field present");
-    while node.is::<Zoned>() {
-        node = node.slot(0).unwrap().unwrap();
-    }
-    node
-}
+/// Dictionary layouts whose shape the probe does not support decline at
+/// construction: a dictionary nested inside another's codes, and a values
+/// child that is not a single flat leaf.
+#[tokio::test(flavor = "multi_thread")]
+async fn column_chunks_reject_unsupported_dict_shapes() {
+    let session = writer_session();
+    let data: Vec<u32> = (0..20_000).map(|i| (i / 500) as u32).collect();
+    let chunk = struct_chunk(&[("s", &data)]);
 
-fn canonical_bounds(data: &[u32], needle: u64) -> std::ops::Range<u64> {
-    let lo = data.partition_point(|&v| u64::from(v) < needle) as u64;
-    let hi = data.partition_point(|&v| u64::from(v) <= needle) as u64;
-    lo..hi.max(lo)
+    // Codes strategy that is itself a dictionary strategy.
+    let nested = dict_strategy(
+        dict_strategy(
+            FlatLayoutStrategy::default(),
+            FlatLayoutStrategy::default(),
+            u16::MAX,
+        ),
+        FlatLayoutStrategy::default(),
+        u16::MAX,
+    );
+    let file = write_file(&session, vec![chunk.clone()], Some(struct_strategy(nested))).await;
+    let root = file.footer().layout().clone();
+    let node = data_node(&root, "s");
+    assert!(
+        node.is::<DictLayout>() && node.slot(1).unwrap().unwrap().is::<DictLayout>(),
+        "fixture must nest a dictionary inside the codes: {}",
+        node.display_tree()
+    );
+    assert!(ColumnChunks::from_struct_layout(&root, "s").is_none());
+
+    // Values strategy that yields a chunked values child: the values are
+    // repartitioned into 8-row blocks under a chunked layout.
+    let chunked_values = dict_strategy(
+        FlatLayoutStrategy::default(),
+        RepartitionStrategy::new(
+            ChunkedLayoutStrategy::new(FlatLayoutStrategy::default()),
+            RepartitionWriterOptions {
+                block_size_minimum: 1,
+                block_len_multiple: 8,
+                block_size_target: None,
+                canonicalize: false,
+            },
+        ),
+        u16::MAX,
+    );
+    let file = write_file(&session, vec![chunk], Some(struct_strategy(chunked_values))).await;
+    let root = file.footer().layout().clone();
+    let node = data_node(&root, "s");
+    assert!(
+        node.is::<DictLayout>() && node.slot(0).unwrap().unwrap().is::<ChunkedLayout>(),
+        "fixture must chunk the values leaf: {}",
+        node.display_tree()
+    );
+    assert!(ColumnChunks::from_struct_layout(&root, "s").is_none());
 }
 
 /// A column the default write strategy dictionary-encodes at the layout
@@ -229,26 +347,12 @@ fn canonical_bounds(data: &[u32], needle: u64) -> std::ops::Range<u64> {
 /// lead column, point reads anywhere, and windowed bounds over a second
 /// column sorted only within each lead run.
 #[tokio::test(flavor = "multi_thread")]
-async fn layout_chunks_probe_dictionary_coded_columns() {
-    use vortex_layout::layouts::dict::Dict as DictLayout;
-
-    let session = session();
+async fn column_chunks_probe_dictionary_coded_columns() {
+    let session = writer_session();
     // Three lead runs of 3,000 rows; the second column restarts inside each.
     let p: Vec<u32> = (0..9_000).map(|i| (i / 3_000) as u32).collect();
     let o: Vec<u32> = (0..9_000).map(|i| ((i % 3_000) / 300) as u32).collect();
-    let chunk = struct_chunk(&p, &o);
-    let dtype = chunk.dtype().clone();
-
-    let mut bytes = Vec::new();
-    session
-        .write_options()
-        .write(
-            &mut bytes,
-            ArrayStreamAdapter::new(dtype, futures::stream::iter([Ok(chunk)])),
-        )
-        .await
-        .unwrap();
-    let file = session.open_options().open_buffer(bytes).unwrap();
+    let file = write_file(&session, vec![struct_chunk(&[("p", &p), ("o", &o)])], None).await;
     let root = file.footer().layout().clone();
     for field in ["p", "o"] {
         assert!(
@@ -308,54 +412,22 @@ async fn layout_chunks_probe_dictionary_coded_columns() {
 /// of dictionary layouts, each with its own values leaf and chunked codes;
 /// probes address rows across dictionary boundaries exactly.
 #[tokio::test(flavor = "multi_thread")]
-async fn layout_chunks_probe_run_of_dictionaries() {
-    use std::sync::Arc;
-
-    use vortex_btrblocks::BtrBlocksCompressorBuilder;
-    use vortex_layout::layouts::chunked::Chunked as ChunkedLayout;
-    use vortex_layout::layouts::chunked::writer::ChunkedLayoutStrategy;
-    use vortex_layout::layouts::compressed::CompressorPlugin;
-    use vortex_layout::layouts::dict::Dict as DictLayout;
-    use vortex_layout::layouts::dict::writer::{
-        DictLayoutConstraints, DictLayoutOptions, DictStrategy,
-    };
-    use vortex_layout::layouts::flat::writer::FlatLayoutStrategy;
-    use vortex_layout::layouts::struct_::StructStrategy;
-
-    let session = session();
+async fn column_chunks_probe_run_of_dictionaries() {
+    let session = writer_session();
     // Forty distinct values of 500 rows each, fed as four input chunks; a
     // dictionary holds at most sixteen values, so the column becomes three
     // dictionaries whose codes leaves follow the input chunking.
     let data: Vec<u32> = (0..20_000).map(|i| (i / 500) as u32).collect();
-    let chunks: Vec<ArrayRef> = data.chunks(5_000).map(chunk).collect();
-    let dtype = chunks[0].dtype().clone();
-    let compressor: Arc<dyn CompressorPlugin> =
-        Arc::new(BtrBlocksCompressorBuilder::default().build());
-    let dict = DictStrategy::new(
+    let chunks: Vec<ArrayRef> = data
+        .chunks(5_000)
+        .map(|c| struct_chunk(&[("s", c)]))
+        .collect();
+    let dict = dict_strategy(
         ChunkedLayoutStrategy::new(FlatLayoutStrategy::default()),
         FlatLayoutStrategy::default(),
-        FlatLayoutStrategy::default(),
-        DictLayoutOptions {
-            constraints: DictLayoutConstraints {
-                max_len: 16,
-                ..Default::default()
-            },
-        },
-        compressor,
+        16,
     );
-    let strategy = StructStrategy::new(Arc::new(FlatLayoutStrategy::default()), Arc::new(dict));
-
-    let mut bytes = Vec::new();
-    session
-        .write_options()
-        .with_strategy(Arc::new(strategy))
-        .write(
-            &mut bytes,
-            ArrayStreamAdapter::new(dtype, futures::stream::iter(chunks.into_iter().map(Ok))),
-        )
-        .await
-        .unwrap();
-    let file = session.open_options().open_buffer(bytes).unwrap();
+    let file = write_file(&session, chunks, Some(struct_strategy(dict))).await;
     let root = file.footer().layout().clone();
     let node = data_node(&root, "s");
     assert!(

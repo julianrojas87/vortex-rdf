@@ -23,5 +23,4 @@ doctest = false
 vortex-rdf-core = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread"] }
 pyo3 = { workspace = true, features = ["extension-module", "abi3-py311"] }
-oxrdf.workspace = true
 vortex-buffer.workspace = true
