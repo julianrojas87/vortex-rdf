@@ -180,7 +180,7 @@ order), then tail rows, tombstones already excluded.
 
 ## 5. Compaction
 
-[`compact`](../core/src/store/compaction.rs#L30) (keep the current index set)
+[`compact`](../core/src/store/compaction.rs#L29) (keep the current index set)
 / [`compact_with_indexes`](../core/src/store/compaction.rs#L57) (rebuild a
 chosen set) are the only operations that rewrite data. A compaction:
 
@@ -235,7 +235,7 @@ flowchart TD
 `add_quads` is append-then-check: the append itself is policy-free, and
 whichever call pushes the tail past a threshold
 ([`should_auto_compact`](../core/src/store/compaction.rs#L166) →
-[`tail_needs_compaction`](../core/src/store/compaction.rs#L204)) pays for
+[`tail_needs_compaction`](../core/src/store/compaction.rs#L197)) pays for
 folding it back into the base, which amortizes the O(n log n) rebuild to
 roughly constant cost per appended row. The tail is folded once it reaches
 either of:
@@ -276,9 +276,9 @@ runs the mutation on the store the view came from.
 |---|---|---|---|
 | `TAIL_FLATTEN_FLOOR` | 1,024 | [`mutation.rs`](../core/src/store/mutation.rs#L275) | accreted tail chunks are folded into the flat prefix once their rows reach `max(flat_len, TAIL_FLATTEN_FLOOR)` |
 | `TAIL_MAX_CHUNKS` | 64 | [`mutation.rs`](../core/src/store/mutation.rs#L279) | the tail is flattened once it holds more chunks than this, whatever their row counts |
-| `AUTO_COMPACT_TAIL_FLOOR` | 4,096 | [`compaction.rs`](../core/src/store/compaction.rs#L186) | below this many tail rows `add_quads` never compacts |
-| `AUTO_COMPACT_BASE_RATIO` | 10 | [`compaction.rs`](../core/src/store/compaction.rs#L193) | compact once the tail reaches base / 10 |
-| `AUTO_COMPACT_TAIL_CAP` | 100,000 (= `DEFAULT_CHUNK_ROWS`) | [`compaction.rs`](../core/src/store/compaction.rs#L200) | compact once the tail could fill a builder chunk, however large the base |
+| `AUTO_COMPACT_TAIL_FLOOR` | 4,096 | [`compaction.rs`](../core/src/store/compaction.rs#L179) | below this many tail rows `add_quads` never compacts |
+| `AUTO_COMPACT_BASE_RATIO` | 10 | [`compaction.rs`](../core/src/store/compaction.rs#L186) | compact once the tail reaches base / 10 |
+| `AUTO_COMPACT_TAIL_CAP` | 100,000 (= `DEFAULT_CHUNK_ROWS`) | [`compaction.rs`](../core/src/store/compaction.rs#L193) | compact once the tail could fill a builder chunk, however large the base |
 
 ---
 

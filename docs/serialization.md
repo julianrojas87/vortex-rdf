@@ -36,7 +36,7 @@ flowchart LR
 | Term dictionary | a `TermDictionary` inside the resolved layout | the required `dictionary` child |
 
 A builder hands these back in one of two shapes
-([`builders/mod.rs`](../core/src/store/builders/mod.rs#L75)):
+([`builders/mod.rs`](../core/src/store/builders/mod.rs#L77)):
 
 - **`BuiltArray`** — everything materialized: the quad array, the components,
   the dictionary. What `VortexRdfStore::from_built` adopts.
@@ -178,7 +178,7 @@ stream as replayable sources.
 
 ## 6. Pipeline B — sorted out of core
 
-[`SortedStreamBuilder`](../core/src/store/builders/sorted_stream.rs#L49) is an
+[`SortedStreamBuilder`](../core/src/store/builders/sorted_stream.rs#L47) is an
 external merge sort: peak memory is bounded by the chunk size (plus the
 distinct terms, under the Dictionary layout), not by the dataset.
 
@@ -431,7 +431,7 @@ artifact therefore always claims `quads_sorted` truthfully.
 
 ### 11.2 Compaction
 
-[`compact`](../core/src/store/compaction.rs#L30) /
+[`compact`](../core/src/store/compaction.rs#L29) /
 [`compact_with_indexes`](../core/src/store/compaction.rs#L57) gather every live
 quad, sort, and rebuild:
 
@@ -445,7 +445,7 @@ quad, sort, and rebuild:
   adopts the result exactly as `from_built` does.
 
 `add_quads` compacts automatically when the tail crosses a threshold
-([`tail_needs_compaction`](../core/src/store/compaction.rs#L204)):
+([`tail_needs_compaction`](../core/src/store/compaction.rs#L197)):
 
 | Trigger | Value |
 |---|---|
