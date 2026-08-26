@@ -4,8 +4,8 @@
 //!
 //! The library exposes three independent axes — layout, secondary index, and
 //! source (file vs in-memory) — plus a query pattern with 15 shapes. Their
-//! full cross product is ~360 match instances; the suite spends its upload
-//! budget differently per group:
+//! full cross product is far more match instances than an upload budget
+//! allows; the suite spends that budget differently per group:
 //!
 //! * **Serialize (Group 1)** is a star (one-factor-at-a-time) sweep: most
 //!   write-path cross-products measure the same code, so we fix a baseline and
@@ -13,7 +13,7 @@
 //!   change behaviour (e.g. Dictionary × index, where the index columns hold
 //!   u32 codes rather than term strings).
 //! * **Match (Group 2)** is a full 18-cell layout × index × source factorial
-//!   (× 6 routing patterns × 2 cache regimes), plus a chained-view pair. Some
+//!   (× 8 routing patterns × 2 cache regimes), plus a chained-view pair. Some
 //!   cells are redundant on paper — a bound subject
 //!   declines every secondary index in favour of the primary sorted `s`
 //!   column, and a bound graph never routes through an index at all — but
@@ -64,46 +64,28 @@ use std::fmt;
 use std::hint::black_box;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock};
 
 use futures::stream;
-use oxrdf::{GraphName, NamedNode, NamedOrBlankNode, Quad, Term};
+use oxrdf::{NamedNode, NamedOrBlankNode};
 
 use vortex_rdf_core::{LayoutStrategy, VortexRdfError, VortexRdfStore, io};
 
 // The module is shared with `match_lazy.rs` and compiled per-target; items
-// only the other target uses (the `Bytes` source axis) are dead here by
-// design.
+// only the other target uses are dead here by design.
 #[allow(dead_code)]
+#[macro_use]
 mod support;
 use support::*;
 
 fn main() {
-    // What this run actually generated, before any timing: the moduli follow
-    // from the row count through a coprimality nudge, so the only reliable
-    // record of a run's selectivity is the run itself. The dashboard reads this
-    // line out of the bench log; divan's parser ignores it.
+    // Stamp what this run generated; the dashboard reads the line, divan
+    // ignores it.
     println!(
         "{}",
         dataset::shape_line(bench_size(), dataset::WANT_GRAPHS)
     );
     divan::main();
-}
-
-// The payload is `Arc`-wrapped so a cache hit is a pointer bump, not a
-// multi-MB buffer copy per `with_inputs` call around the measured region.
-static BYTES_CACHE: OnceLock<Mutex<HashMap<CacheKey, Arc<Vec<u8>>>>> = OnceLock::new();
-
-fn cached_store_bytes(layout: Layout, index: Index, size: usize) -> Arc<Vec<u8>> {
-    let cache = BYTES_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    let key = (layout, index, size);
-    if let Some(bytes) = cache.lock().unwrap().get(&key) {
-        return Arc::clone(bytes);
-    }
-    let store = cached_store(layout, index, size);
-    let buf = Arc::new(rt().block_on(store.to_bytes()).expect("store bytes"));
-    cache.lock().unwrap().insert(key, Arc::clone(&buf));
-    buf
 }
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -181,112 +163,14 @@ fn serialize(bencher: divan::Bencher, cfg: &SerCfg) {
 // ══════════════════════════════════════════════════════════════════════════
 // Group 2 — MATCH (query path)
 //
-// Baseline: default / by_copy / file. Each config sweeps the
-// eight routing patterns. SortedInMemory is omitted because it is
-// query-indistinguishable from SortedStream (identical stamped columns).
+// Every layout × index × source cell sweeps the eight routing patterns in
+// both cache regimes.
 // ══════════════════════════════════════════════════════════════════════════
 
-/// Run one match config across a pattern, COLD: each sample gets a store
-/// opened fresh and answers its FIRST query on it — no chunk probes resolved,
-/// no segment cache, no dictionary memos, and (for `Source::InMemory`) no
-/// component adoption yet run.
-///
-/// The open is deliberately outside the measurement (`with_inputs` is untimed):
-/// what this arm isolates is the cost of a query against empty caches, not the
-/// cost of constructing a store. Opening is its own benchmark — `open_file`
-/// here, `open::<slug>` on the comparative tabs — so the two costs stay
-/// separately attributable instead of one column reporting their sum.
-///
-/// This is process-level cold, not storage-level: the OS page cache stays warm,
-/// and dropping it would need root.
-fn run_match_cold(
-    bencher: divan::Bencher,
-    layout: Layout,
-    index: Index,
-    source: Source,
-    pattern: Pattern,
-) {
-    // Probe construction stays OUTSIDE the timed closure (as dict_probe_warm's
-    // does): its handful of String allocations per iteration is fixed setup,
-    // and would otherwise show up as noise against the match itself.
-    let (s, p, o, g) = terms_for(pattern);
-    bencher
-        .with_inputs(|| make_store(source, layout, index, bench_size()))
-        .bench_refs(|store| {
-            rt().block_on(async {
-                let matched = store
-                    .match_pattern(s.as_ref(), p.as_ref(), o.as_ref(), g.as_ref())
-                    .await
-                    .expect("match_pattern failed");
-                let quads = matched.quads_vec().await.expect("execute match");
-                black_box(quads)
-            })
-        });
-}
-
-/// Run one match config across a pattern, WARM: one store, reused across every
-/// iteration, so each measurement is a repeat query against caches the earlier
-/// iterations populated — the steady state a long-lived process reaches.
-///
-/// This arm is what makes caching work visible at all: a cold-only suite
-/// measures the same store construction over and over, and reports a
-/// cache-resolution improvement as noise.
-fn run_match_warm(
-    bencher: divan::Bencher,
-    layout: Layout,
-    index: Index,
-    source: Source,
-    pattern: Pattern,
-) {
-    let (s, p, o, g) = terms_for(pattern);
-    let store = make_store(source, layout, index, bench_size());
-    // One untimed query resolves the probes and fills the caches, so even the
-    // first measured iteration is genuinely warm.
-    rt().block_on(async {
-        let matched = store
-            .match_pattern(s.as_ref(), p.as_ref(), o.as_ref(), g.as_ref())
-            .await
-            .expect("match_pattern failed");
-        black_box(matched.quads_vec().await.expect("execute match"));
-    });
-    bencher.bench(|| {
-        rt().block_on(async {
-            let matched = store
-                .match_pattern(s.as_ref(), p.as_ref(), o.as_ref(), g.as_ref())
-                .await
-                .expect("match_pattern failed");
-            let quads = matched.quads_vec().await.expect("execute match");
-            black_box(quads)
-        })
-    });
-}
-
-/// Both cache regimes for one matrix cell: `match_cold_*` opens a store per
-/// iteration and answers its first query, `match_warm_*` reuses one store. The
-/// pair is the point — see [`run_match_warm`] on why a cold-only suite cannot
-/// see caching work.
-macro_rules! match_bench {
-    ($cold:ident, $warm:ident, $layout:expr, $index:expr, $source:expr) => {
-        #[divan::bench(args = PATTERNS, sample_count = QUERY_SAMPLES)]
-        fn $cold(bencher: divan::Bencher, pattern: &Pattern) {
-            run_match_cold(bencher, $layout, $index, $source, *pattern);
-        }
-
-        #[divan::bench(args = PATTERNS, sample_count = QUERY_SAMPLES)]
-        fn $warm(bencher: divan::Bencher, pattern: &Pattern) {
-            run_match_warm(bencher, $layout, $index, $source, *pattern);
-        }
-    };
-}
-
-/// The full layout × source × index match matrix, in both cache regimes. Two
-/// groups per cell, named `match_{cold,warm}_{layout}_{index}_{source}`.
-macro_rules! match_matrix {
-    ($(($layout:expr, $index:expr, $source:expr) => $cold:ident / $warm:ident,)*) => {
-        $(match_bench!($cold, $warm, $layout, $index, $source);)*
-    };
-}
+// The full layout × source × index match matrix, materializing, in both cache
+// regimes: two groups per cell, named `match_{cold,warm}_{layout}_{index}_{source}`.
 match_matrix!(
+    true;
     // No secondary index.
     (Layout::Default, Index::None, Source::InMemory) => match_cold_default_noindex_mem / match_warm_default_noindex_mem,
     (Layout::Default, Index::None, Source::File) => match_cold_default_noindex_file / match_warm_default_noindex_file,
@@ -398,10 +282,9 @@ fn decode_all(bencher: divan::Bencher, cfg: &DecodeCfg) {
         });
 }
 
-/// [`decode_all`] over a literal-bearing dataset (plain, language-tagged,
-/// typed, and escape-carrying values — see the generator's doc): the star
-/// dataset is named-node-only, so this is the one benchmark whose decode
-/// reaches the literal unescape path.
+/// [`decode_all`] over a literal-bearing dataset. The main dataset's literals
+/// are plain and escape-free, so this is the one benchmark whose decode reaches
+/// the language-tag, datatype and unescape paths.
 #[divan::bench(sample_count = HEAVY_SAMPLES)]
 fn decode_all_literals(bencher: divan::Bencher) {
     bencher
@@ -415,8 +298,9 @@ fn decode_all_literals(bencher: divan::Bencher) {
 }
 
 /// Open a file-backed store. Default and TypedObject read the footer only;
-/// Dictionary also reads its term dictionary up front (an extra single-column
-/// scan), so the layouts are worth distinguishing.
+/// Dictionary also lifts its term dictionary resident when it is under the
+/// residency threshold (the default for a file this size), so the layouts are
+/// worth distinguishing.
 #[divan::bench(args = [Layout::Default, Layout::TypedObject, Layout::Dictionary], sample_count = HEAVY_SAMPLES)]
 fn open_file(bencher: divan::Bencher, layout: &Layout) {
     let layout = *layout;
@@ -435,7 +319,7 @@ fn open_file(bencher: divan::Bencher, layout: &Layout) {
 #[divan::bench(sample_count = HEAVY_SAMPLES)]
 fn from_bytes(bencher: divan::Bencher) {
     bencher
-        .with_inputs(|| cached_store_bytes(Layout::Default, Index::None, bench_size()))
+        .with_inputs(|| cached_bytes(Layout::Default, Index::None, bench_size()))
         .bench_refs(|bytes| {
             rt().block_on(async {
                 let store = VortexRdfStore::from_bytes(bytes).await.expect("from_bytes");
@@ -487,33 +371,34 @@ impl fmt::Debug for DictResidency {
 
 const DICT_CONFIGS: &[DictResidency] = &[DictResidency::Resident, DictResidency::FileBacked];
 
-static DICT_FILE_CACHE: OnceLock<Mutex<HashMap<usize, PathBuf>>> = OnceLock::new();
+static WRITER_FILE_CACHE: OnceLock<Mutex<HashMap<usize, PathBuf>>> = OnceLock::new();
 
-/// A Dictionary-layout file (no indexes), built once per size.
-fn cached_dict_file(size: usize) -> PathBuf {
-    let cache = DICT_FILE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Some(path) = cache.lock().unwrap().get(&size) {
-        return path.clone();
-    }
-    let dir = PathBuf::from("target/bench_vortex_files");
-    std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join(format!("dict_{size}.vortex"));
-    rt().block_on(async {
-        io::quads_stream_to_vortex_file(
-            generate_rdf_data_stream(size),
-            &path,
-            LayoutStrategy::Dictionary,
-            Vec::new(),
-        )
-        .await
-        .expect("write dictionary bench file");
-    });
-    cache.lock().unwrap().insert(size, path.clone());
-    path
+/// A Dictionary-layout file (no indexes), built once per size as the
+/// `quads_stream_to_vortex_file` product — the on-disk file the CLI and the
+/// bindings write, with the writer's own column encodings. The Group 2/3 file
+/// cells open a different artifact: `cached_file`, the `to_bytes`
+/// re-serialization of a built store. Every Group 4 cell opens this one.
+fn cached_writer_file(size: usize) -> PathBuf {
+    memoized(&WRITER_FILE_CACHE, size, || {
+        let dir = PathBuf::from("target/bench_vortex_files");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("dict_{size}.vortex"));
+        rt().block_on(async {
+            io::quads_stream_to_vortex_file(
+                generate_rdf_data_stream(size),
+                &path,
+                LayoutStrategy::Dictionary,
+                Vec::new(),
+            )
+            .await
+            .expect("write dictionary bench file");
+        });
+        path
+    })
 }
 
 fn open_dict_store(residency: DictResidency, size: usize) -> VortexRdfStore {
-    let path = cached_dict_file(size);
+    let path = cached_writer_file(size);
     rt().block_on(async {
         VortexRdfStore::from_file_with_dict_residency(&path, residency.threshold())
             .await
@@ -527,7 +412,7 @@ fn open_dict_store(residency: DictResidency, size: usize) -> VortexRdfStore {
 fn dict_open(bencher: divan::Bencher, residency: &DictResidency) {
     let residency = *residency;
     bencher
-        .with_inputs(|| (cached_dict_file(bench_size()), residency.threshold()))
+        .with_inputs(|| (cached_writer_file(bench_size()), residency.threshold()))
         .bench_refs(|(path, threshold)| {
             rt().block_on(async {
                 let store = VortexRdfStore::from_file_with_dict_residency(&*path, *threshold)
@@ -691,7 +576,8 @@ fn dict_decode_matched(bencher: divan::Bencher, residency: &DictResidency) {
 /// floor folds the tail into the base, which is a rebuild rather than an append
 /// — `mutate_compact` times that — and for a file-backed store the fold rewrites
 /// its source file in place, which is the shared artifact every other file
-/// benchmark here opens.
+/// benchmark here opens. The comparative suite's `MUT_BATCH` (`compare.rs`) is
+/// not clamped: its add row deliberately includes the auto-compaction.
 fn mut_batch() -> usize {
     /// One below `AUTO_COMPACT_TAIL_FLOOR`, the smallest tail the store will
     /// fold (the ratio trigger only raises that bar).
@@ -706,26 +592,6 @@ fn mut_batch() -> usize {
     })
 }
 
-/// A batch in a namespace disjoint from the dataset's, so every add is a
-/// genuine insert rather than a set-semantics no-op. Same spelling as the
-/// comparative suite's `fresh_quads`, down to the default graph, so an add cell
-/// here and its row on the comparative tab insert the same terms.
-fn fresh_quads(n: usize) -> Vec<Quad> {
-    let base = dataset::BASE;
-    (0..n)
-        .map(|i| {
-            Quad::new(
-                NamedNode::new_unchecked(format!("{base}/fresh/2026/subject/{i:09}")),
-                NamedNode::new_unchecked(format!("{base}/fresh/2026/property/0000")),
-                Term::NamedNode(NamedNode::new_unchecked(format!(
-                    "{base}/fresh/2026/object/{i:09}"
-                ))),
-                GraphName::DefaultGraph,
-            )
-        })
-        .collect()
-}
-
 /// Deletes per [`mutate_delete_loop`], capped well below [`mut_batch`]. Nothing
 /// accumulates across a delete loop the way an append's tail does — each delete
 /// resolves its pattern and unions a mask, so the count only averages — and a
@@ -734,16 +600,6 @@ fn fresh_quads(n: usize) -> Vec<Quad> {
 fn delete_batch() -> usize {
     const CAP: usize = 64;
     mut_batch().min(CAP)
-}
-
-/// The first `take` rows of the generated dataset — the delete batch has to name
-/// rows the store actually holds, or the cell prices the absent-term path
-/// instead of the tombstoning it is about.
-fn dataset_prefix(take: usize) -> Vec<Quad> {
-    let m = bench_moduli();
-    (0..take.min(bench_size()))
-        .map(|i| dataset_quad(i, m))
-        .collect()
 }
 
 #[derive(Copy, Clone)]
@@ -796,7 +652,7 @@ const MUT_CONFIGS: &[MutCfg] = &[
 /// check per quad, the shape a per-quad ingest API takes.
 #[divan::bench(sample_count = HEAVY_SAMPLES)]
 fn mutate_add_loop(bencher: divan::Bencher) {
-    let fresh = fresh_quads(mut_batch());
+    let fresh = dataset::fresh_quads(mut_batch());
     bencher.bench(|| {
         rt().block_on(async {
             let mut store = VortexRdfStore::empty();
@@ -812,7 +668,7 @@ fn mutate_add_loop(bencher: divan::Bencher) {
 /// per quad, but the tail is built once.
 #[divan::bench(sample_count = HEAVY_SAMPLES)]
 fn mutate_add_batch(bencher: divan::Bencher) {
-    let fresh = fresh_quads(mut_batch());
+    let fresh = dataset::fresh_quads(mut_batch());
     bencher.bench(|| {
         rt().block_on(async {
             let store = VortexRdfStore::empty()
@@ -832,7 +688,7 @@ fn mutate_add_batch(bencher: divan::Bencher) {
 #[divan::bench(args = MUT_CONFIGS, sample_count = HEAVY_SAMPLES)]
 fn mutate_append_loop(bencher: divan::Bencher, cfg: &MutCfg) {
     let cfg = *cfg;
-    let fresh = fresh_quads(mut_batch());
+    let fresh = dataset::fresh_quads(mut_batch());
     bencher
         .with_inputs(|| make_store(cfg.source, cfg.layout, cfg.index, bench_size()))
         .bench_values(|store| {
@@ -851,7 +707,7 @@ fn mutate_append_loop(bencher: divan::Bencher, cfg: &MutCfg) {
 #[divan::bench(args = MUT_CONFIGS, sample_count = HEAVY_SAMPLES)]
 fn mutate_append_batch(bencher: divan::Bencher, cfg: &MutCfg) {
     let cfg = *cfg;
-    let fresh = fresh_quads(mut_batch());
+    let fresh = dataset::fresh_quads(mut_batch());
     bencher
         .with_inputs(|| make_store(cfg.source, cfg.layout, cfg.index, bench_size()))
         .bench_values(|store| {
@@ -873,7 +729,7 @@ fn mutate_append_batch(bencher: divan::Bencher, cfg: &MutCfg) {
 #[divan::bench(args = MUT_CONFIGS, sample_count = HEAVY_SAMPLES)]
 fn mutate_delete_loop(bencher: divan::Bencher, cfg: &MutCfg) {
     let cfg = *cfg;
-    let doomed = dataset_prefix(delete_batch());
+    let doomed = dataset::dataset_prefix(bench_size(), bench_moduli(), delete_batch());
     bencher
         .with_inputs(|| make_store(cfg.source, cfg.layout, cfg.index, bench_size()))
         .bench_values(|store| {
@@ -896,7 +752,7 @@ fn mutate_delete_loop(bencher: divan::Bencher, cfg: &MutCfg) {
 #[divan::bench(args = [Layout::Default, Layout::Dictionary], sample_count = HEAVY_SAMPLES)]
 fn mutate_compact(bencher: divan::Bencher, layout: &Layout) {
     let layout = *layout;
-    let fresh = fresh_quads(mut_batch());
+    let fresh = dataset::fresh_quads(mut_batch());
     bencher
         .with_inputs(|| {
             let store = make_store(Source::InMemory, layout, Index::None, bench_size());

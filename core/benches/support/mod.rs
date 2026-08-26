@@ -1,17 +1,17 @@
 //! Infrastructure shared by the bench targets (`benchmark.rs`, the CodSpeed
 //! suite, and `match_lazy.rs`, the local-only lazy-match matrix): the axis
 //! enums, dataset/store/file construction with their caches, and the match
-//! pattern probes. Compiled once per target; the caches are per-process, so
-//! each target builds its own artifacts.
+//! drivers. Compiled once per target; the caches are per-process, so each
+//! target builds its own artifacts.
 
 use std::collections::HashMap;
 use std::fmt;
+use std::hash::Hash;
 use std::path::PathBuf;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use futures::{Stream, StreamExt, stream};
 use oxrdf::{GraphName, Literal, NamedNode, NamedOrBlankNode, Quad, Term};
-use tokio::runtime::Runtime;
 
 use vortex_rdf_core::{
     BuiltArray, IndexType, LayoutStrategy, RawQuad, Result, SortedStreamBuilder,
@@ -20,25 +20,18 @@ use vortex_rdf_core::{
 
 // The dataset shape — moduli, term spellings, probe patterns — lives on its own
 // so `compare.rs` can include just that file (`#[path = "support/dataset.rs"]`)
-// without the store-building machinery it has no use for. One definition is what
-// keeps the instrumented suite's rows comparable with the comparative suite's.
+// without the store-building machinery it has no use for.
 pub mod dataset;
 pub use dataset::{PATTERNS, Pattern, terms_for};
 
-/// Single dataset size for the whole suite. In simulation mode CodSpeed counts
-/// instructions deterministically, so one representative size catches
-/// regressions in every path; larger sizes only multiply valgrind cost without
-/// adding signal (CodSpeed does not analyse scaling curves).
-///
-/// The default is the size all three CodSpeed suites share — `CODSPEED_BENCH_DIM`
-/// is 32 in `js/bench/codspeed.bench.ts` and `python/bench/test_codspeed.py`,
-/// and 32³ is this number — so one shared-core regression lands in all three
-/// tabs at comparable magnitude instead of showing up in one and hiding in
-/// another. It is also 4 zones of 8,192 rows, the smallest round size at which
-/// zone pruning has anything to prune.
-///
-/// Override for a different scale: `BENCH_SIZE=1048576 cargo bench` matches the
-/// comparative suites' default, which is what the dashboard workflow runs.
+mod runtime;
+pub use runtime::rt;
+
+/// Rows per generated dataset. Default 32,768 = `CODSPEED_BENCH_DIM`³ (32,
+/// shared with `js/bench/codspeed.bench.ts` and `python/bench/test_codspeed.py`)
+/// and 4 zones of 8,192 rows, the smallest size at which zone pruning has
+/// anything to prune. `BENCH_SIZE` overrides it (`BENCH_SIZE=1048576` is the
+/// comparative suites' default, which the dashboard workflow runs).
 pub fn bench_size() -> usize {
     static SIZE: OnceLock<usize> = OnceLock::new();
     *SIZE.get_or_init(|| {
@@ -52,31 +45,17 @@ pub fn bench_size() -> usize {
 /// Samples per query benchmark — the repetition count every comparative suite
 /// uses for a query (`QUERY_OPTS.iterations` in `js/bench/shared.ts`,
 /// `QUERY_ITERS` in `python/bench/worker.py`), so one number describes a
-/// repetition across all three environments.
-///
-/// Set per bench rather than through `DIVAN_SAMPLE_COUNT` so a plain
-/// `cargo bench` reproduces the dashboard's regime without remembering an env
-/// var. CodSpeed ignores it entirely: its simulation mode measures one
-/// invocation per case, deterministically.
+/// repetition across all three environments. No effect under CodSpeed, which
+/// measures one invocation per case.
 pub const QUERY_SAMPLES: u32 = 10;
 
-/// Samples per heavy benchmark — ingest, full decode, open, serialize. These
-/// run for seconds per iteration at the dashboard's 2M scale, where ten
-/// samples would add tens of minutes to a refresh for a number that barely
-/// moves; the comparative suites make the same trade (`HEAVY_OPTS`,
-/// `HEAVY_ITERS`).
+/// Samples per heavy benchmark (ingest, full decode, open, serialize) — the
+/// comparative suites' heavy iteration count (`HEAVY_OPTS`, `HEAVY_ITERS`).
 pub const HEAVY_SAMPLES: u32 = 3;
-
-// ── shared tokio runtime ────────────────────────────────────────────────────
-
-static TOKIO_RUNTIME: OnceLock<Runtime> = OnceLock::new();
-
-pub fn rt() -> &'static Runtime {
-    TOKIO_RUNTIME.get_or_init(|| Runtime::new().unwrap())
-}
 
 // ── configuration axes ──────────────────────────────────────────────────────
 
+/// Bench axis: the store layout the rows are encoded with.
 #[derive(Copy, Clone, PartialEq, Eq, Hash)]
 pub enum Layout {
     Default,
@@ -85,6 +64,7 @@ pub enum Layout {
 }
 
 impl Layout {
+    /// The core's strategy for this layout.
     pub fn strategy(self) -> LayoutStrategy {
         match self {
             Self::Default => LayoutStrategy::Default,
@@ -92,6 +72,7 @@ impl Layout {
             Self::Dictionary => LayoutStrategy::Dictionary,
         }
     }
+    /// The spelling used in artifact file names and `Debug` output.
     pub fn short(self) -> &'static str {
         match self {
             Self::Default => "default",
@@ -107,6 +88,7 @@ impl fmt::Debug for Layout {
     }
 }
 
+/// Bench axis: the secondary index the store carries.
 #[derive(Copy, Clone, PartialEq, Eq, Hash)]
 pub enum Index {
     None,
@@ -115,6 +97,7 @@ pub enum Index {
 }
 
 impl Index {
+    /// The index types to build for this axis value.
     pub fn types(self) -> Vec<IndexType> {
         match self {
             Self::None => vec![],
@@ -122,6 +105,7 @@ impl Index {
             Self::ByCopy => vec![IndexType::SecondaryByCopy],
         }
     }
+    /// The spelling used in artifact file names and `Debug` output.
     pub fn short(self) -> &'static str {
         match self {
             Self::None => "no_index",
@@ -131,6 +115,7 @@ impl Index {
     }
 }
 
+/// Bench axis: where the store's data is served from.
 #[derive(Copy, Clone, PartialEq, Eq, Hash)]
 pub enum Source {
     File,
@@ -142,6 +127,7 @@ pub enum Source {
 }
 
 impl Source {
+    /// The spelling used in artifact file names and `Debug` output.
     pub fn short(self) -> &'static str {
         match self {
             Self::File => "file",
@@ -172,84 +158,102 @@ pub fn materialize_quads(size: usize) -> Vec<RawQuad> {
     })
 }
 
-/// Run a config's ingest to the builder's `BuiltArray`: the quad array plus
-/// whatever travels beside it — under the Dictionary layout the array holds
-/// only u32 codes and the term dictionary rides alongside; `from_built` is
-/// the one constructor that accepts that pair.
-fn build_built(layout: Layout, index: Index, size: usize) -> BuiltArray {
+/// Run a quad stream's ingest to the builder's `BuiltArray`: the quad array
+/// plus whatever travels beside it — under the Dictionary layout the array
+/// holds only u32 codes and the term dictionary rides alongside; `from_built`
+/// is the one constructor that accepts that pair.
+fn ingest(
+    quads: impl Stream<Item = Result<RawQuad>> + Unpin + Send + 'static,
+    layout: LayoutStrategy,
+    indexes: Vec<IndexType>,
+) -> BuiltArray {
     rt().block_on(async move {
-        SortedStreamBuilder::build_vortex_array(
-            Box::new(generate_rdf_data_stream(size)),
-            layout.strategy(),
-            index.types(),
-        )
-        .await
-        .expect("failed to build vortex array")
+        SortedStreamBuilder::build_vortex_array(Box::new(quads), layout, indexes)
+            .await
+            .expect("failed to build vortex array")
     })
 }
 
-pub type CacheKey = (Layout, Index, usize);
+/// Get-or-build memo over a process-wide cache: the first call for `key` runs
+/// `build` and stores its product, later calls clone the stored product.
+pub fn memoized<K: Eq + Hash + Clone, V: Clone>(
+    cache: &'static OnceLock<Mutex<HashMap<K, V>>>,
+    key: K,
+    build: impl FnOnce() -> V,
+) -> V {
+    let cache = cache.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(v) = cache.lock().unwrap().get(&key) {
+        return v.clone();
+    }
+    let v = build();
+    cache.lock().unwrap().insert(key, v.clone());
+    v
+}
+
+type CacheKey = (Layout, Index, usize);
 
 /// Cache of ingest products (`BuiltArray`, cheaply cloneable: Arc-shared
 /// buffers). Only the expensive ingest is cached — stores are rebuilt per
 /// handout, see [`cached_store`]. Only a handful of distinct configs are ever
 /// requested, so this stays naturally bounded.
-static BUILT_CACHE: OnceLock<Mutex<HashMap<CacheKey, BuiltArray>>> = OnceLock::new();
+static INGEST_CACHE: OnceLock<Mutex<HashMap<CacheKey, BuiltArray>>> = OnceLock::new();
 static FILE_CACHE: OnceLock<Mutex<HashMap<CacheKey, PathBuf>>> = OnceLock::new();
+// `Arc`-wrapped so a cache hit hands out a shared buffer.
+static FILE_BYTES_CACHE: OnceLock<Mutex<HashMap<CacheKey, Arc<Vec<u8>>>>> = OnceLock::new();
 
-fn cached_built(layout: Layout, index: Index, size: usize) -> BuiltArray {
-    let cache = BUILT_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    let key = (layout, index, size);
-    if let Some(built) = cache.lock().unwrap().get(&key) {
-        return built.clone();
-    }
-    let built = build_built(layout, index, size);
-    cache.lock().unwrap().insert(key, built.clone());
-    built
+fn cached_ingest(layout: Layout, index: Index, size: usize) -> BuiltArray {
+    memoized(&INGEST_CACHE, (layout, index, size), || {
+        ingest(
+            generate_rdf_data_stream(size),
+            layout.strategy(),
+            index.types(),
+        )
+    })
 }
 
-/// A FRESH store over a config's cached ingest product: `from_built` re-runs
-/// component adoption and store construction every call, so no store-level
-/// state is shared between the stores this returns. Under CodSpeed's
-/// single-measured-invocation model a task must start cold and
-/// order-independent, which clones of one cached store cannot be: whatever an
-/// earlier benchmark warms on the shared store shifts every later baseline.
-///
-/// Known residual: the immutable Arc'd buffers — and vortex's
-/// interior-mutable per-array stats riding on them — remain shared with the
-/// cache, so any stat a read lazily computes lands on the shared array.
-/// Closing that too would take a deep copy per handout.
+/// A fresh store over a config's cached ingest product: `from_built` re-runs
+/// component adoption and store construction per call, so every handout starts
+/// cold and order-independent — nothing an earlier benchmark warms on one store
+/// is visible to the next. The Arc'd buffers, and vortex's interior-mutable
+/// per-array stats riding on them, stay shared with the cache.
 pub fn cached_store(layout: Layout, index: Index, size: usize) -> VortexRdfStore {
-    VortexRdfStore::from_built(cached_built(layout, index, size))
+    VortexRdfStore::from_built(cached_ingest(layout, index, size))
         .expect("failed to build vortex store")
 }
 
+/// The serialized store file for a config (`to_bytes` of its cached store),
+/// written once per process under `target/bench_vortex_files`.
 pub fn cached_file(layout: Layout, index: Index, size: usize) -> PathBuf {
-    let cache = FILE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    let key = (layout, index, size);
-    if let Some(path) = cache.lock().unwrap().get(&key) {
-        return path.clone();
-    }
-    let store = cached_store(layout, index, size);
-    let dir = PathBuf::from("target/bench_vortex_files");
-    std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join(format!(
-        "{}_{}_{}.vortex",
-        layout.short(),
-        index.short(),
-        size
-    ));
-    rt().block_on(async {
-        let bytes = store.to_bytes().await.expect("serialize store");
-        std::fs::write(&path, bytes).expect("write file");
-    });
-    cache.lock().unwrap().insert(key, path.clone());
-    path
+    memoized(&FILE_CACHE, (layout, index, size), || {
+        let store = cached_store(layout, index, size);
+        let dir = PathBuf::from("target/bench_vortex_files");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!(
+            "{}_{}_{}.vortex",
+            layout.short(),
+            index.short(),
+            size
+        ));
+        rt().block_on(async {
+            let bytes = store.to_bytes().await.expect("serialize store");
+            std::fs::write(&path, bytes).expect("write file");
+        });
+        path
+    })
 }
 
-/// Construct a store over a config's data, from the requested source. Both are
-/// untimed: `from_file` reads the footer only, and the in-memory arm rebuilds
-/// a fresh store from the cached ingest product (see [`cached_store`]).
+/// The bytes of [`cached_file`] for a config, read once per process.
+pub fn cached_bytes(layout: Layout, index: Index, size: usize) -> Arc<Vec<u8>> {
+    memoized(&FILE_BYTES_CACHE, (layout, index, size), || {
+        Arc::new(std::fs::read(cached_file(layout, index, size)).expect("read serialized store"))
+    })
+}
+
+/// Construct a store over a config's data from the requested source, all
+/// untimed: `File` opens the cached file (footer read only), `InMemory`
+/// rebuilds a fresh store from the cached ingest product (see
+/// [`cached_store`]), `Bytes` copies the cached file's bytes and adopts them
+/// through `from_bytes_owned`.
 pub fn make_store(source: Source, layout: Layout, index: Index, size: usize) -> VortexRdfStore {
     match source {
         Source::File => {
@@ -262,8 +266,7 @@ pub fn make_store(source: Source, layout: Layout, index: Index, size: usize) -> 
         }
         Source::InMemory => cached_store(layout, index, size),
         Source::Bytes => {
-            let path = cached_file(layout, index, size);
-            let bytes = std::fs::read(path).expect("read serialized store");
+            let bytes = Vec::clone(&cached_bytes(layout, index, size));
             rt().block_on(async {
                 VortexRdfStore::from_bytes_owned(bytes)
                     .await
@@ -273,53 +276,126 @@ pub fn make_store(source: Source, layout: Layout, index: Index, size: usize) -> 
     }
 }
 
+// ── match drivers ───────────────────────────────────────────────────────────
+
+/// The cache regime a match cell runs in.
+#[derive(Copy, Clone)]
+pub enum Regime {
+    /// Each sample gets a store built fresh (`with_inputs`, untimed) and
+    /// answers its first query on it — no chunk probes resolved, no segment
+    /// cache, no dictionary memos, and (for `Source::InMemory`) no component
+    /// adoption yet run. Process-level cold, not storage-level: the OS page
+    /// cache stays warm.
+    Cold,
+    /// One store, reused across every iteration after one untimed priming
+    /// query (match and materialize), so each measurement is a repeat query
+    /// against populated caches — the steady state a long-lived process
+    /// reaches.
+    Warm,
+}
+
+/// One match cell: `match_pattern` for `pattern` on a store of the given
+/// config, in `regime`. With `materialize` the timed region also decodes the
+/// matched quads (`quads_vec`); without it only resolution and selection
+/// composition are timed. The product is returned from the timed closure, so
+/// its drop is not measured.
+///
+/// Opening a store is never inside the measurement — it is its own benchmark
+/// (`open_file`). The warm priming query also checks the matched row count
+/// against the dataset's declared selectivity.
+pub fn run_match(
+    bencher: divan::Bencher,
+    layout: Layout,
+    index: Index,
+    source: Source,
+    pattern: Pattern,
+    regime: Regime,
+    materialize: bool,
+) {
+    // Probe terms are built outside the timed closure. Both timed closures
+    // return their product so the bencher drops it outside the measurement.
+    let (s, p, o, g) = terms_for(pattern);
+    let lazy = |store: &VortexRdfStore| {
+        rt().block_on(async {
+            store
+                .match_pattern(s.as_ref(), p.as_ref(), o.as_ref(), g.as_ref())
+                .await
+                .expect("match_pattern failed")
+        })
+    };
+    let full = |store: &VortexRdfStore| {
+        rt().block_on(async {
+            store
+                .match_pattern(s.as_ref(), p.as_ref(), o.as_ref(), g.as_ref())
+                .await
+                .expect("match_pattern failed")
+                .quads_vec()
+                .await
+                .expect("execute match")
+        })
+    };
+    let fresh = || make_store(source, layout, index, bench_size());
+    match (regime, materialize) {
+        (Regime::Cold, true) => bencher.with_inputs(fresh).bench_refs(|store| full(store)),
+        (Regime::Cold, false) => bencher.with_inputs(fresh).bench_refs(|store| lazy(store)),
+        (Regime::Warm, materialize) => {
+            let store = fresh();
+            let quads = full(&store);
+            bench_moduli().assert_matched(bench_size(), pattern, quads.len());
+            drop(quads);
+            if materialize {
+                bencher.bench(|| full(&store));
+            } else {
+                bencher.bench(|| lazy(&store));
+            }
+        }
+    }
+}
+
+/// The layout × index × source match matrix in both cache regimes: one
+/// `(layout, index, source) => cold / warm` row per cell, each naming the
+/// cell's two benchmark functions. The leading flag is [`run_match`]'s
+/// `materialize`.
+macro_rules! match_matrix {
+    ($materialize:expr; $(($layout:expr, $index:expr, $source:expr) => $cold:ident / $warm:ident,)*) => {
+        $(
+            #[divan::bench(args = PATTERNS, sample_count = QUERY_SAMPLES)]
+            fn $cold(bencher: divan::Bencher, pattern: &Pattern) {
+                run_match(bencher, $layout, $index, $source, *pattern, Regime::Cold, $materialize);
+            }
+
+            #[divan::bench(args = PATTERNS, sample_count = QUERY_SAMPLES)]
+            fn $warm(bencher: divan::Bencher, pattern: &Pattern) {
+                run_match(bencher, $layout, $index, $source, *pattern, Regime::Warm, $materialize);
+            }
+        )*
+    };
+}
+
 // ── dataset generation ──────────────────────────────────────────────────────
 
 /// The moduli this process's dataset was generated with, at the size
 /// [`bench_size`] resolved. Every consumer that needs a term index — the
-/// distinct-probe walk, the shape line — derives it from here rather than
-/// assuming a cardinality, because the moduli follow from the row count.
+/// distinct-probe walk, the shape line — derives it from here, because the
+/// moduli follow from the row count.
 pub fn bench_moduli() -> dataset::Moduli {
     static M: OnceLock<dataset::Moduli> = OnceLock::new();
     *M.get_or_init(|| dataset::moduli(bench_size(), dataset::WANT_GRAPHS))
 }
 
-/// Generate the bench dataset as a stream of quads — the same rows
-/// `write_dataset` writes for the comparative suites, built in process.
-///
-/// In process is not incidental: `benchmark.rs` is uploaded to CodSpeed and run
-/// under valgrind, where reading a multi-hundred-MB N-Triples file would swamp
-/// the instruction counts (and the file does not exist in CI at all). The
-/// generator is what lets the instrumented suite share the comparative suites'
-/// term shape without sharing their delivery.
+/// Generate the bench dataset as a stream of quads — the rows `compare.rs`'s
+/// `ensure_quads_dataset` writes, built in process.
 pub fn generate_rdf_data_stream(size: usize) -> impl Stream<Item = Result<RawQuad>> {
     let m = dataset::moduli(size, dataset::WANT_GRAPHS);
 
-    stream::iter((0..size).map(move |i| Ok(RawQuad::from_quad(&dataset_quad(i, m)))))
+    stream::iter((0..size).map(move |i| Ok(RawQuad::from_quad(&dataset::dataset_quad(i, m)))))
 }
 
-/// Row `i` of the generated dataset, under moduli `m`: one definition of what a
-/// row *is*, shared by the generator above and by the mutation benchmarks,
-/// whose delete batch has to name rows the store actually holds.
-pub fn dataset_quad(i: usize, m: dataset::Moduli) -> Quad {
-    Quad::new(
-        NamedOrBlankNode::NamedNode(NamedNode::new_unchecked(dataset::subject_iri(i % m.n_subj))),
-        NamedNode::new_unchecked(dataset::predicate_iri(i % m.n_pred)),
-        dataset::object_term(i % m.n_obj).into_oxrdf(),
-        GraphName::NamedNode(NamedNode::new_unchecked(dataset::graph_iri(i % m.n_graph))),
-    )
-}
-
-/// Like [`generate_rdf_data_stream`], but with literal objects of every shape —
+/// Like [`generate_rdf_data_stream`] but with literal objects of every shape —
 /// plain, language-tagged, typed, and escape-bearing (quotes, backslashes,
-/// newlines, and `"@`/`^^` lookalikes inside the value). The dataset above
-/// carries plain literals only, deliberately: escaping cost inside the
-/// comparative suites would land in every external adapter's parse timing. So
-/// this is what lets a benchmark reach the escape/unescape paths at all.
-///
-/// Subject and predicate cardinality follow the shared moduli, so the only
-/// axis that differs from [`generate_rdf_data_stream`] is what the objects are.
-pub fn generate_literal_rdf_data_stream(size: usize) -> impl Stream<Item = Result<RawQuad>> {
+/// newlines, `"@`/`^^` lookalikes) — in the default graph. Subject and
+/// predicate cardinality follow the shared moduli.
+fn generate_literal_rdf_data_stream(size: usize) -> impl Stream<Item = Result<RawQuad>> {
     let m = dataset::moduli(size, dataset::WANT_GRAPHS);
 
     stream::iter((0..size).map(move |i| {
@@ -352,28 +428,17 @@ pub fn generate_literal_rdf_data_stream(size: usize) -> impl Stream<Item = Resul
     }))
 }
 
-/// The literal-bearing store for `decode_all_literals`: Dictionary layout, no
-/// index — the config whose full decode term-decodes every row. Cached and
-/// handed out like the main dataset's stores: only the ingest product is
-/// cached, and each call rebuilds a fresh store from it (see
-/// [`cached_store`] for why shared clones are a contamination hazard).
+/// The Dictionary/no-index store over [`generate_literal_rdf_data_stream`];
+/// the ingest product is cached per size, the store is rebuilt per call as in
+/// [`cached_store`].
 pub fn cached_literal_store(size: usize) -> VortexRdfStore {
     static CACHE: OnceLock<Mutex<HashMap<usize, BuiltArray>>> = OnceLock::new();
-    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    let built = if let Some(built) = cache.lock().unwrap().get(&size) {
-        built.clone()
-    } else {
-        let built = rt().block_on(async move {
-            SortedStreamBuilder::build_vortex_array(
-                Box::new(generate_literal_rdf_data_stream(size)),
-                LayoutStrategy::Dictionary,
-                Vec::new(),
-            )
-            .await
-            .expect("failed to build literal array")
-        });
-        cache.lock().unwrap().insert(size, built.clone());
-        built
-    };
+    let built = memoized(&CACHE, size, || {
+        ingest(
+            generate_literal_rdf_data_stream(size),
+            LayoutStrategy::Dictionary,
+            Vec::new(),
+        )
+    });
     VortexRdfStore::from_built(built).expect("failed to build literal store")
 }

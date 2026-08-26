@@ -36,12 +36,16 @@ use sophia::api::term::{IriRef, SimpleTerm};
 use vortex_rdf_core::common::terms::parse_quads_from_reader;
 use vortex_rdf_core::{IndexType, LayoutStrategy, VortexRdfStore};
 
+#[path = "support/runtime.rs"]
+mod runtime;
+use runtime::rt;
+
 // ─── Scale ──────────────────────────────────────────────────────────────────
 
 /// Rows in the comparative dataset — 2^20 by default, the dashboard's
 /// indicative-overview scale. The JavaScript and Python suites read the same
 /// `BENCH_SIZE` variable, so the three comparative tables share it.
-fn dataset_size() -> usize {
+fn bench_size() -> usize {
     std::env::var("BENCH_SIZE")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -69,9 +73,7 @@ const QUERY_WARMUP: usize = 5;
 #[allow(dead_code)]
 mod dataset;
 
-use dataset::{
-    BASE, graph_iri as graph_term, predicate_iri as predicate_term, subject_iri as subject_term,
-};
+use dataset::{dataset_prefix, fresh_quads, graph_iri, predicate_iri, subject_iri};
 
 /// Moduli for the comparative dataset. `WANT_GRAPHS` is nudged to a count
 /// coprime with the other roles, so the graph column does not track them; the
@@ -82,7 +84,7 @@ fn moduli(n: usize) -> dataset::Moduli {
 }
 
 /// Objects in their N-Triples spelling: angle-bracketed IRI or quoted literal.
-fn object_term(i: usize) -> String {
+fn object_ntriples(i: usize) -> String {
     dataset::object_term(i).to_ntriples()
 }
 
@@ -94,44 +96,7 @@ fn object_term(i: usize) -> String {
 /// file and answers every pattern on it, so a row count means the same thing in
 /// every cell of every tab.
 fn ensure_quads_dataset(n: usize) -> PathBuf {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
-    let path = root
-        .join("python/bench/.data")
-        .join(format!("quads_{n}.nq"));
-    if path.exists() {
-        return path;
-    }
-    eprintln!("generating {} quads -> {}", n, path.display());
-    std::fs::create_dir_all(path.parent().unwrap()).expect("create data dir");
-    let m = moduli(n);
-    let tmp = path.with_extension("partial");
-    let mut w = BufWriter::with_capacity(1 << 20, std::fs::File::create(&tmp).expect("create"));
-    let mut line = String::with_capacity(256);
-    for i in 0..n {
-        line.clear();
-        writeln!(
-            line,
-            "<{}> <{}> {} <{}> .",
-            subject_term(i % m.n_subj),
-            predicate_term(i % m.n_pred),
-            object_term(i % m.n_obj),
-            graph_term(i % m.n_graph)
-        )
-        .unwrap();
-        w.write_all(line.as_bytes()).expect("write");
-    }
-    w.flush().expect("flush");
-    // Never leave a half-written dataset that looks complete.
-    std::fs::rename(&tmp, &path).expect("rename");
-    path
-}
-
-/// The N-Triples file every adapter ingests. Shared with the Python suite, which
-/// writes it to the same path -- whichever runs first pays for it.
-fn dataset_path(n: usize) -> PathBuf {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
-    root.join("python/bench/.data")
-        .join(format!("triples_{n}.nt"))
+    write_dataset(&data_dir().join(format!("quads_{n}.nq")), n, true)
 }
 
 /// The triples projection of [`ensure_quads_dataset`]: the same rows under the
@@ -142,12 +107,31 @@ fn dataset_path(n: usize) -> PathBuf {
 /// patterns over exactly the rows the graph-capable ones do — the counts stay
 /// comparable, and what they lack is the graph, not rows. `G`/`SPOG` are
 /// unsupported for them, which is the only place the difference shows.
-fn ensure_dataset(n: usize) -> PathBuf {
-    let path = dataset_path(n);
+fn ensure_triples_dataset(n: usize) -> PathBuf {
+    write_dataset(&data_dir().join(format!("triples_{n}.nt")), n, false)
+}
+
+/// Where the dataset files live. Shared with the Python suite, which writes
+/// them to the same paths -- whichever runs first pays for them.
+fn data_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("python/bench/.data")
+}
+
+/// Write the `n`-row dataset to `path` as N-Quads (`with_graphs`) or as its
+/// N-Triples projection, unless the file already exists.
+fn write_dataset(path: &Path, n: usize, with_graphs: bool) -> PathBuf {
     if path.exists() {
-        return path;
+        return path.to_path_buf();
     }
-    eprintln!("projecting {} quads to triples -> {}", n, path.display());
+    eprintln!(
+        "generating {} {} -> {}",
+        n,
+        if with_graphs { "quads" } else { "triples" },
+        path.display()
+    );
     std::fs::create_dir_all(path.parent().unwrap()).expect("create data dir");
     let m = moduli(n);
     let tmp = path.with_extension("partial");
@@ -155,25 +139,29 @@ fn ensure_dataset(n: usize) -> PathBuf {
     let mut line = String::with_capacity(256);
     for i in 0..n {
         line.clear();
-        writeln!(
+        write!(
             line,
-            "<{}> <{}> {} .",
-            subject_term(i % m.n_subj),
-            predicate_term(i % m.n_pred),
-            object_term(i % m.n_obj)
+            "<{}> <{}> {}",
+            subject_iri(i % m.n_subj),
+            predicate_iri(i % m.n_pred),
+            object_ntriples(i % m.n_obj),
         )
         .unwrap();
+        if with_graphs {
+            write!(line, " <{}>", graph_iri(i % m.n_graph)).unwrap();
+        }
+        line.push_str(" .\n");
         w.write_all(line.as_bytes()).expect("write");
     }
     w.flush().expect("flush");
     // Never leave a half-written dataset that looks complete.
-    std::fs::rename(&tmp, &path).expect("rename");
-    path
+    std::fs::rename(&tmp, path).expect("rename");
+    path.to_path_buf()
 }
 
 /// A triple pattern probe. Terms are fixed at index 0, so every probe matches at
 /// least row 0 and no pattern silently measures a zero-row query.
-struct Pat {
+struct Probe {
     name: &'static str,
     s: Option<String>,
     p: Option<String>,
@@ -181,54 +169,54 @@ struct Pat {
     g: Option<String>,
 }
 
-fn probes() -> Vec<Pat> {
-    let s0 = format!("<{}>", subject_term(0));
-    let p0 = format!("<{}>", predicate_term(0));
-    let o0 = object_term(0);
+fn probes() -> Vec<Probe> {
+    let s0 = format!("<{}>", subject_iri(0));
+    let p0 = format!("<{}>", predicate_iri(0));
+    let o0 = object_ntriples(0);
     vec![
-        Pat {
+        Probe {
             name: "S",
             s: Some(s0.clone()),
             p: None,
             o: None,
             g: None,
         },
-        Pat {
+        Probe {
             name: "P",
             s: None,
             p: Some(p0.clone()),
             o: None,
             g: None,
         },
-        Pat {
+        Probe {
             name: "O",
             s: None,
             p: None,
             o: Some(o0.clone()),
             g: None,
         },
-        Pat {
+        Probe {
             name: "SP",
             s: Some(s0.clone()),
             p: Some(p0.clone()),
             o: None,
             g: None,
         },
-        Pat {
+        Probe {
             name: "PO",
             s: None,
             p: Some(p0.clone()),
             o: Some(o0.clone()),
             g: None,
         },
-        Pat {
+        Probe {
             name: "SPO",
             s: Some(s0),
             p: Some(p0),
             o: Some(o0),
             g: None,
         },
-        Pat {
+        Probe {
             name: "full",
             s: None,
             p: None,
@@ -241,20 +229,20 @@ fn probes() -> Vec<Pat> {
 /// The two probes that bind a graph. Index-0 terms, like every other probe, so
 /// both match at least row 0. Only a library whose model has graphs answers
 /// them; the rest report `unsupported` (see `Adapter::handles_graphs`).
-fn graph_probes() -> Vec<Pat> {
-    let s0 = format!("<{}>", subject_term(0));
-    let p0 = format!("<{}>", predicate_term(0));
-    let o0 = object_term(0);
-    let g0 = format!("<{}>", graph_term(0));
+fn graph_probes() -> Vec<Probe> {
+    let s0 = format!("<{}>", subject_iri(0));
+    let p0 = format!("<{}>", predicate_iri(0));
+    let o0 = object_ntriples(0);
+    let g0 = format!("<{}>", graph_iri(0));
     vec![
-        Pat {
+        Probe {
             name: "G",
             s: None,
             p: None,
             o: None,
             g: Some(g0.clone()),
         },
-        Pat {
+        Probe {
             name: "SPOG",
             s: Some(s0),
             p: Some(p0),
@@ -478,6 +466,13 @@ trait Adapter {
     fn handles_graphs(&self) -> bool {
         true
     }
+
+    /// The add and delete phases, for a library that can mutate. Add:
+    /// `MUT_BATCH` per-quad inserts into an empty store; `add_batch` is the
+    /// one-call path. Delete: `MUT_BATCH` deletes against the full store,
+    /// whose reopen/rebuild happens in untimed per-iteration setup. The
+    /// default measures nothing.
+    fn mutate(&self, _src: &Path, _artifact: &Path, _n: usize, _rows: &mut Vec<Row>) {}
 }
 
 /// Which RDF format a source path carries: the dataset is N-Quads, its
@@ -508,12 +503,12 @@ trait Queryable {
     /// term into a `black_box`ed accumulator, which is the same rule the
     /// JavaScript tab's `consumeQuads` applies. What is timed is producing the
     /// terms; what is returned is the row count the harness cross-checks.
-    fn count(&self, pat: &Pat) -> usize;
+    fn count(&self, probe: &Probe) -> usize;
 
     /// Resolve the same pattern and return only how many rows matched — no
     /// term is read. Each library's cheapest correct count path, the
     /// COUNT/ASK shape of the workload.
-    fn count_only(&self, pat: &Pat) -> usize;
+    fn count_only(&self, probe: &Probe) -> usize;
 }
 
 /// The lexical bytes of one oxrdf term — the read that forces a matched row's
@@ -563,11 +558,10 @@ struct VortexAdapter {
     /// The same axis the Python tab crosses with the secondary index, and the
     /// configuration that matches how the in-memory libraries here hold data.
     in_memory: bool,
-}
-
-fn rt() -> &'static tokio::runtime::Runtime {
-    static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
-    RT.get_or_init(|| tokio::runtime::Runtime::new().unwrap())
+    /// Whether this variant runs the mutation phase. One Vortex row does: the
+    /// add phase starts from an empty store, which no layout/index knob
+    /// reaches.
+    measures_mutations: bool,
 }
 
 impl Adapter for VortexAdapter {
@@ -616,19 +610,98 @@ impl Adapter for VortexAdapter {
         });
         Box::new(VortexStore(store))
     }
+
+    fn mutate(&self, _src: &Path, artifact: &Path, n: usize, rows: &mut Vec<Row>) {
+        if !self.measures_mutations {
+            return;
+        }
+        let slug = self.slug();
+        let batch = mut_batch();
+        let log = |m: &str| eprintln!("  [{slug}] {m}");
+        let fresh = fresh_quads(batch);
+        log("add (per-quad)…");
+        measure(
+            &format!("add::{slug}"),
+            || {
+                rt().block_on(async {
+                    let mut store = VortexRdfStore::empty();
+                    for q in &fresh {
+                        store = store.add_quad(q.clone()).await.expect("add_quad");
+                    }
+                    store
+                });
+            },
+            rows,
+            HEAVY_ITERS,
+            0,
+            None,
+        );
+        log("add (batch)…");
+        measure(
+            &format!("add_batch::{slug}"),
+            || {
+                rt().block_on(async {
+                    VortexRdfStore::empty()
+                        .add_quads(fresh.iter().cloned())
+                        .await
+                        .expect("add_quads")
+                });
+            },
+            rows,
+            HEAVY_ITERS,
+            0,
+            None,
+        );
+        log("delete…");
+        let del = dataset_prefix(n, moduli(n), batch);
+        measure_with_setup(
+            &format!("delete::{slug}"),
+            || {
+                rt().block_on(VortexRdfStore::from_file(artifact))
+                    .expect("reopen")
+            },
+            |store| {
+                rt().block_on(async {
+                    let mut s = store;
+                    for q in &del {
+                        s = s.delete_quad(q).await.expect("delete_quad");
+                    }
+                    s
+                });
+            },
+            rows,
+            HEAVY_ITERS,
+            None,
+        );
+    }
 }
 
 struct VortexStore(VortexRdfStore);
 
+/// A probe as oxrdf terms, in `match_pattern`'s argument order.
+type OxrdfProbe = (
+    Option<oxrdf::NamedOrBlankNode>,
+    Option<oxrdf::NamedNode>,
+    Option<oxrdf::Term>,
+    Option<oxrdf::GraphName>,
+);
+
+impl VortexStore {
+    fn parse(probe: &Probe) -> OxrdfProbe {
+        (
+            probe.s.as_ref().map(|t| parse_subject(t)),
+            probe.p.as_ref().map(|t| parse_predicate(t)),
+            probe.o.as_ref().map(|t| parse_object(t)),
+            probe.g.as_ref().map(|t| {
+                oxrdf::GraphName::NamedNode(oxrdf::NamedNode::new_unchecked(strip_iri(t)))
+            }),
+        )
+    }
+}
+
 impl Queryable for VortexStore {
-    fn count(&self, pat: &Pat) -> usize {
-        let s = pat.s.as_ref().map(|t| parse_subject(t));
-        let p = pat.p.as_ref().map(|t| parse_predicate(t));
-        let o = pat.o.as_ref().map(|t| parse_object(t));
-        let g = pat
-            .g
-            .as_ref()
-            .map(|t| oxrdf::GraphName::NamedNode(oxrdf::NamedNode::new_unchecked(strip_iri(t))));
+    fn count(&self, probe: &Probe) -> usize {
+        let (s, p, o, g) = Self::parse(probe);
         rt().block_on(async {
             let view = self
                 .0
@@ -647,14 +720,8 @@ impl Queryable for VortexStore {
         })
     }
 
-    fn count_only(&self, pat: &Pat) -> usize {
-        let s = pat.s.as_ref().map(|t| parse_subject(t));
-        let p = pat.p.as_ref().map(|t| parse_predicate(t));
-        let o = pat.o.as_ref().map(|t| parse_object(t));
-        let g = pat
-            .g
-            .as_ref()
-            .map(|t| oxrdf::GraphName::NamedNode(oxrdf::NamedNode::new_unchecked(strip_iri(t))));
+    fn count_only(&self, probe: &Probe) -> usize {
+        let (s, p, o, g) = Self::parse(probe);
         rt().block_on(async {
             let view = self
                 .0
@@ -710,6 +777,55 @@ impl Adapter for OxigraphAdapter {
     fn open(&self, _artifact: &Path, src: &Path) -> Box<dyn Queryable> {
         Box::new(OxStore(load_oxigraph(src, oxigraph_format(src))))
     }
+
+    fn mutate(&self, src: &Path, _artifact: &Path, n: usize, rows: &mut Vec<Row>) {
+        let slug = self.slug();
+        let batch = mut_batch();
+        let log = |m: &str| eprintln!("  [{slug}] {m}");
+        let fresh = fresh_quads(batch);
+        log("add (per-quad)…");
+        measure(
+            &format!("add::{slug}"),
+            || {
+                let store = oxigraph::store::Store::new().expect("new store");
+                for q in &fresh {
+                    store.insert(q.as_ref()).expect("insert");
+                }
+            },
+            rows,
+            HEAVY_ITERS,
+            0,
+            None,
+        );
+        log("add (batch)…");
+        measure(
+            &format!("add_batch::{slug}"),
+            || {
+                let store = oxigraph::store::Store::new().expect("new store");
+                let mut loader = store.bulk_loader();
+                loader.load_quads(fresh.iter().cloned()).expect("bulk load");
+                loader.commit().expect("commit");
+            },
+            rows,
+            HEAVY_ITERS,
+            0,
+            None,
+        );
+        log("delete…");
+        let del = dataset_prefix(n, moduli(n), batch);
+        measure_with_setup(
+            &format!("delete::{slug}"),
+            || load_oxigraph(src, oxigraph_format(src)),
+            |store| {
+                for q in &del {
+                    store.remove(q.as_ref()).expect("remove");
+                }
+            },
+            rows,
+            HEAVY_ITERS,
+            None,
+        );
+    }
 }
 
 fn load_oxigraph(src: &Path, format: oxigraph::io::RdfFormat) -> oxigraph::store::Store {
@@ -722,24 +838,24 @@ fn load_oxigraph(src: &Path, format: oxigraph::io::RdfFormat) -> oxigraph::store
 struct OxStore(oxigraph::store::Store);
 
 impl Queryable for OxStore {
-    fn count(&self, pat: &Pat) -> usize {
-        self.run(pat, true)
+    fn count(&self, probe: &Probe) -> usize {
+        self.run(probe, true)
     }
 
-    fn count_only(&self, pat: &Pat) -> usize {
+    fn count_only(&self, probe: &Probe) -> usize {
         // No count API in oxigraph: the iterator still decodes owned quads,
         // which is this store's floor for answering a count.
-        self.run(pat, false)
+        self.run(probe, false)
     }
 }
 
 impl OxStore {
-    fn run(&self, pat: &Pat, consume: bool) -> usize {
+    fn run(&self, probe: &Probe, consume: bool) -> usize {
         use oxigraph::model::{GraphNameRef, NamedNodeRef, NamedOrBlankNodeRef, TermRef};
-        let s = pat.s.as_ref().map(|t| strip_iri(t));
-        let p = pat.p.as_ref().map(|t| strip_iri(t));
-        let o = pat.o.clone();
-        let g = pat.g.as_ref().map(|t| strip_iri(t));
+        let s = probe.s.as_ref().map(|t| strip_iri(t));
+        let p = probe.p.as_ref().map(|t| strip_iri(t));
+        let o = probe.o.clone();
+        let g = probe.g.as_ref().map(|t| strip_iri(t));
         let s_ref = s
             .as_ref()
             .map(|v| NamedOrBlankNodeRef::NamedNode(NamedNodeRef::new_unchecked(v)));
@@ -819,6 +935,71 @@ impl Adapter for OxigraphRocksAdapter {
             oxigraph::store::Store::open_read_only(artifact).expect("open rocksdb read-only"),
         ))
     }
+
+    fn mutate(&self, src: &Path, artifact: &Path, n: usize, rows: &mut Vec<Row>) {
+        let slug = self.slug();
+        let batch = mut_batch();
+        let log = |m: &str| eprintln!("  [{slug}] {m}");
+        let fresh = fresh_quads(batch);
+        // A scratch database per iteration; deleting the previous one is
+        // untimed setup, but creating the store is part of what an add
+        // costs on this backend, so it stays in the timed region — the
+        // memory arm's `Store::new` sits inside its timed region too.
+        let tmp = artifact.parent().unwrap().join("mut_tmp.rocksdb");
+        log("add (per-quad)…");
+        measure_with_setup(
+            &format!("add::{slug}"),
+            || {
+                let _ = std::fs::remove_dir_all(&tmp);
+                tmp.clone()
+            },
+            |dir| {
+                let store = oxigraph::store::Store::open(&dir).expect("open rocksdb");
+                for q in &fresh {
+                    store.insert(q.as_ref()).expect("insert");
+                }
+            },
+            rows,
+            HEAVY_ITERS,
+            None,
+        );
+        log("add (batch)…");
+        measure_with_setup(
+            &format!("add_batch::{slug}"),
+            || {
+                let _ = std::fs::remove_dir_all(&tmp);
+                tmp.clone()
+            },
+            |dir| {
+                let store = oxigraph::store::Store::open(&dir).expect("open rocksdb");
+                let mut loader = store.bulk_loader();
+                loader.load_quads(fresh.iter().cloned()).expect("bulk load");
+                loader.commit().expect("commit");
+            },
+            rows,
+            HEAVY_ITERS,
+            None,
+        );
+        log("delete…");
+        let del = dataset_prefix(n, moduli(n), batch);
+        // Deletes need a read-write store holding the full dataset, and
+        // each iteration removes rows the next one must find again — so
+        // setup rebuilds the scratch database from the source, the same
+        // per-iteration reload the memory arm does.
+        measure_with_setup(
+            &format!("delete::{slug}"),
+            || build_oxigraph_rocksdb(&tmp, src, oxigraph_format(src)),
+            |store| {
+                for q in &del {
+                    store.remove(q.as_ref()).expect("remove");
+                }
+            },
+            rows,
+            HEAVY_ITERS,
+            None,
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 }
 
 /// Bulk-load `src` into a fresh RocksDB store at `dir`, flushed so the data is
@@ -865,6 +1046,76 @@ impl Adapter for SophiaAdapter {
     fn open(&self, _artifact: &Path, src: &Path) -> Box<dyn Queryable> {
         Box::new(SophiaDataset(load_sophia_dataset(src)))
     }
+
+    fn mutate(&self, src: &Path, _artifact: &Path, n: usize, rows: &mut Vec<Row>) {
+        let slug = self.slug();
+        let batch = mut_batch();
+        let log = |m: &str| eprintln!("  [{slug}] {m}");
+        use sophia::api::dataset::MutableDataset;
+        let fresh = fresh_quads(batch);
+        let fresh_terms: Vec<[SimpleTerm<'static>; 3]> = fresh
+            .iter()
+            .map(|q| {
+                [
+                    simple_iri(q.subject.to_string().as_str()),
+                    simple_iri(q.predicate.to_string().as_str()),
+                    simple_iri(q.object.to_string().as_str()),
+                ]
+            })
+            .collect();
+        log("add (per-quad)…");
+        measure(
+            &format!("add::{slug}"),
+            || {
+                let mut d = sophia::inmem::dataset::FastDataset::new();
+                for [s, p, o] in &fresh_terms {
+                    d.insert(s, p, o, None::<&SimpleTerm<'static>>)
+                        .expect("insert");
+                }
+            },
+            rows,
+            HEAVY_ITERS,
+            0,
+            None,
+        );
+        rows.push(unsupported_row(
+            &format!("add_batch::{slug}"),
+            "no batch-insert API distinct from the per-quad loop",
+        ));
+        log("delete…");
+        let del = dataset_prefix(n, moduli(n), batch);
+        let del_terms: Vec<[SimpleTerm<'static>; 4]> = del
+            .iter()
+            .map(|q| {
+                let o = match &q.object {
+                    oxrdf::Term::Literal(l) => simple_object(&format!("\"{}\"", l.value())),
+                    other => simple_iri(other.to_string().as_str()),
+                };
+                let g = match &q.graph_name {
+                    oxrdf::GraphName::NamedNode(n) => simple_iri(n.as_str()),
+                    _ => simple_iri(""),
+                };
+                [
+                    simple_iri(q.subject.to_string().as_str()),
+                    simple_iri(q.predicate.to_string().as_str()),
+                    o,
+                    g,
+                ]
+            })
+            .collect();
+        measure_with_setup(
+            &format!("delete::{slug}"),
+            || load_sophia_dataset(src),
+            |mut d| {
+                for [s, p, o, g] in &del_terms {
+                    d.remove(s, p, o, Some(g)).expect("remove");
+                }
+            },
+            rows,
+            HEAVY_ITERS,
+            None,
+        );
+    }
 }
 
 fn load_sophia_dataset(src: &Path) -> sophia::inmem::dataset::FastDataset {
@@ -882,28 +1133,31 @@ fn load_sophia_dataset(src: &Path) -> sophia::inmem::dataset::FastDataset {
 
 struct SophiaDataset(sophia::inmem::dataset::FastDataset);
 
+impl SophiaDataset {
+    /// The probe as matchers (see `AnyOr`); the graph position needs a
+    /// GraphNameMatcher, which `gn()` derives from a TermMatcher at the call.
+    fn parse(probe: &Probe) -> (AnyOr, AnyOr, AnyOr, AnyOr) {
+        let iri = |t: &Option<String>| {
+            t.as_ref()
+                .map_or(AnyOr::Any, |t| AnyOr::Exactly(simple_iri(t)))
+        };
+        (
+            iri(&probe.s),
+            iri(&probe.p),
+            probe
+                .o
+                .as_ref()
+                .map_or(AnyOr::Any, |t| AnyOr::Exactly(simple_object(t))),
+            iri(&probe.g),
+        )
+    }
+}
+
 impl Queryable for SophiaDataset {
-    fn count(&self, pat: &Pat) -> usize {
+    fn count(&self, probe: &Probe) -> usize {
         use sophia::api::dataset::Dataset;
         use sophia::api::term::matcher::TermMatcher;
-        // Same matcher rules as the graph (see `AnyOr`); the graph position
-        // needs a GraphNameMatcher, which `gn()` derives from a TermMatcher.
-        let s = pat
-            .s
-            .as_ref()
-            .map_or(AnyOr::Any, |t| AnyOr::Exactly(simple_iri(t)));
-        let p = pat
-            .p
-            .as_ref()
-            .map_or(AnyOr::Any, |t| AnyOr::Exactly(simple_iri(t)));
-        let o = pat
-            .o
-            .as_ref()
-            .map_or(AnyOr::Any, |t| AnyOr::Exactly(simple_object(t)));
-        let g = pat
-            .g
-            .as_ref()
-            .map_or(AnyOr::Any, |t| AnyOr::Exactly(simple_iri(t)));
+        let (s, p, o, g) = Self::parse(probe);
         use sophia::api::quad::Quad;
         let mut rows = 0usize;
         let mut bytes = 0usize;
@@ -919,25 +1173,10 @@ impl Queryable for SophiaDataset {
         rows
     }
 
-    fn count_only(&self, pat: &Pat) -> usize {
+    fn count_only(&self, probe: &Probe) -> usize {
         use sophia::api::dataset::Dataset;
         use sophia::api::term::matcher::TermMatcher;
-        let s = pat
-            .s
-            .as_ref()
-            .map_or(AnyOr::Any, |t| AnyOr::Exactly(simple_iri(t)));
-        let p = pat
-            .p
-            .as_ref()
-            .map_or(AnyOr::Any, |t| AnyOr::Exactly(simple_iri(t)));
-        let o = pat
-            .o
-            .as_ref()
-            .map_or(AnyOr::Any, |t| AnyOr::Exactly(simple_object(t)));
-        let g = pat
-            .g
-            .as_ref()
-            .map_or(AnyOr::Any, |t| AnyOr::Exactly(simple_iri(t)));
+        let (s, p, o, g) = Self::parse(probe);
         self.0.quads_matching(s, p, o, g.gn()).count()
     }
 }
@@ -1026,24 +1265,42 @@ impl Adapter for HdtAdapter {
         let hdt = hdt::Hdt::read(std::io::BufReader::new(f)).expect("read hdt");
         Box::new(HdtStore(hdt))
     }
+
+    fn mutate(&self, _src: &Path, _artifact: &Path, _n: usize, rows: &mut Vec<Row>) {
+        let slug = self.slug();
+        for id in ["add", "add_batch", "delete"] {
+            rows.push(unsupported_row(
+                &format!("{id}::{slug}"),
+                "an HDT file is immutable once built",
+            ));
+        }
+    }
 }
 
 struct HdtStore(hdt::Hdt);
 
+impl HdtStore {
+    /// The probe in HDT's dictionary spelling: IRIs without angle brackets,
+    /// literals with their quotes — what `object_ntriples` already produces
+    /// for literals, so only IRIs need unwrapping.
+    fn parse(probe: &Probe) -> (Option<String>, Option<String>, Option<String>) {
+        (
+            probe.s.as_ref().map(|t| strip_iri(t)),
+            probe.p.as_ref().map(|t| strip_iri(t)),
+            probe.o.as_ref().map(|t| {
+                if t.starts_with('"') {
+                    t.clone()
+                } else {
+                    strip_iri(t)
+                }
+            }),
+        )
+    }
+}
+
 impl Queryable for HdtStore {
-    fn count(&self, pat: &Pat) -> usize {
-        // HDT dictionary strings are bare: IRIs without angle brackets, literals
-        // with their quotes. That is exactly what `object_term` already produces
-        // for literals, so only IRIs need unwrapping.
-        let s = pat.s.as_ref().map(|t| strip_iri(t));
-        let p = pat.p.as_ref().map(|t| strip_iri(t));
-        let o = pat.o.as_ref().map(|t| {
-            if t.starts_with('"') {
-                t.clone()
-            } else {
-                strip_iri(t)
-            }
-        });
+    fn count(&self, probe: &Probe) -> usize {
+        let (s, p, o) = Self::parse(probe);
         let mut rows = 0usize;
         let mut bytes = 0usize;
         for t in self
@@ -1057,56 +1314,24 @@ impl Queryable for HdtStore {
         rows
     }
 
-    fn count_only(&self, pat: &Pat) -> usize {
+    fn count_only(&self, probe: &Probe) -> usize {
         // The crate's iterator materializes its term strings internally either
         // way; walking it without reading them is hdt's floor for a count.
-        let s = pat.s.as_ref().map(|t| strip_iri(t));
-        let p = pat.p.as_ref().map(|t| strip_iri(t));
-        let o = pat.o.as_ref().map(|t| {
-            if t.starts_with('"') {
-                t.clone()
-            } else {
-                strip_iri(t)
-            }
-        });
+        let (s, p, o) = Self::parse(probe);
         self.0
             .triples_with_pattern(s.as_deref(), p.as_deref(), o.as_deref())
             .count()
     }
 }
 
-/// Time `f` with a fresh `setup()` product per iteration, setup untimed — the
-/// delete phase's shape: reopening (or rebuilding) the store must not land in
-/// the timed region, or the cell measures the setup instead of the deletes.
-fn measure_with_setup<T>(
+/// Time `f` with a fresh `setup()` product per iteration, setup untimed —
+/// the shape of the cold query arms (a per-iteration `open`) and of the
+/// mutation phases (a store reopened or rebuilt per iteration). Only
+/// `f(target)` is timed; whatever it returns is dropped after the clock stops.
+fn measure_with_setup<T, R>(
     id: &str,
     mut setup: impl FnMut() -> T,
-    mut f: impl FnMut(T),
-    rows: &mut Vec<Row>,
-    iters: usize,
-) {
-    let cutoff = slow_phase_cutoff_ns();
-    let mut samples = Vec::with_capacity(iters);
-    for _ in 0..iters {
-        let target = setup();
-        let t = Instant::now();
-        f(target);
-        let ns = t.elapsed().as_nanos() as f64;
-        samples.push(ns);
-        // See `slow_phase_cutoff_ns`: one sample of a multi-ten-second phase.
-        if cutoff > 0.0 && samples.len() == 1 && ns > cutoff {
-            break;
-        }
-    }
-    rows.push(row_from(id, samples, None));
-}
-
-/// [`measure_with_setup`] for a cell that carries a cache regime -- the cold
-/// query arms, whose per-iteration `open` must stay outside the timed region.
-fn measure_with_setup_regime<T>(
-    id: &str,
-    mut setup: impl FnMut() -> T,
-    mut f: impl FnMut(&T),
+    mut f: impl FnMut(T) -> R,
     rows: &mut Vec<Row>,
     iters: usize,
     regime: Option<&'static str>,
@@ -1116,9 +1341,11 @@ fn measure_with_setup_regime<T>(
     for _ in 0..iters {
         let target = setup();
         let t = Instant::now();
-        f(&target);
+        let r = f(target);
         let ns = t.elapsed().as_nanos() as f64;
+        drop(r);
         samples.push(ns);
+        // See `slow_phase_cutoff_ns`: one sample of a multi-ten-second phase.
         if cutoff > 0.0 && samples.len() == 1 && ns > cutoff {
             break;
         }
@@ -1126,49 +1353,13 @@ fn measure_with_setup_regime<T>(
     rows.push(row_from(id, samples, regime));
 }
 
+/// Quads per mutation batch (`MUT_BATCH`), unclamped: the add row includes
+/// whatever auto-compaction the batch triggers.
 fn mut_batch() -> usize {
     std::env::var("MUT_BATCH")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(10_000)
-}
-
-/// A batch in a namespace disjoint from the dataset's, so the add phase
-/// inserts rows the store cannot already hold. Port of datasets.py's
-/// `fresh_quads`.
-fn fresh_quads(n: usize) -> Vec<oxrdf::Quad> {
-    (0..n)
-        .map(|i| {
-            oxrdf::Quad::new(
-                oxrdf::NamedNode::new_unchecked(format!("{BASE}/fresh/2026/subject/{i:09}")),
-                oxrdf::NamedNode::new_unchecked(format!("{BASE}/fresh/2026/property/0000")),
-                oxrdf::Term::NamedNode(oxrdf::NamedNode::new_unchecked(format!(
-                    "{BASE}/fresh/2026/object/{i:09}"
-                ))),
-                oxrdf::GraphName::DefaultGraph,
-            )
-        })
-        .collect()
-}
-
-/// The first `take` quads of the dataset, graph and all — the delete phase needs
-/// a batch of rows that actually exist in the store. Port of datasets.py's
-/// `dataset_prefix`.
-fn dataset_prefix(n: usize, take: usize) -> Vec<oxrdf::Quad> {
-    let m = moduli(n);
-    (0..take.min(n))
-        .map(|i| {
-            let o = object_term(i % m.n_obj);
-            oxrdf::Quad::new(
-                oxrdf::NamedNode::new_unchecked(subject_term(i % m.n_subj)),
-                oxrdf::NamedNode::new_unchecked(predicate_term(i % m.n_pred)),
-                parse_object(&o),
-                oxrdf::GraphName::NamedNode(oxrdf::NamedNode::new_unchecked(graph_term(
-                    i % m.n_graph,
-                ))),
-            )
-        })
-        .collect()
 }
 
 // ─── One adapter's run ──────────────────────────────────────────────────────
@@ -1184,6 +1375,7 @@ fn adapters() -> Vec<Box<dyn Adapter>> {
         layout: LayoutStrategy,
         indexes: Vec<IndexType>,
         in_memory: bool,
+        measures_mutations: bool,
     ) -> Box<dyn Adapter> {
         Box::new(VortexAdapter {
             slug,
@@ -1191,24 +1383,34 @@ fn adapters() -> Vec<Box<dyn Adapter>> {
             layout,
             indexes,
             in_memory,
+            measures_mutations,
         })
     }
     use IndexType::{SecondaryByCopy, SecondaryByReference};
     use LayoutStrategy::{Default as DefaultLayout, Dictionary};
     vec![
-        vortex("vortex_dict", "Vortex Dict", Dictionary, vec![], false),
+        vortex(
+            "vortex_dict",
+            "Vortex Dict",
+            Dictionary,
+            vec![],
+            false,
+            true,
+        ),
         vortex(
             "vortex_dict_mem",
             "Vortex Dict (in-memory)",
             Dictionary,
             vec![],
             true,
+            false,
         ),
         vortex(
             "vortex_default",
             "Vortex Default",
             DefaultLayout,
             vec![],
+            false,
             false,
         ),
         vortex(
@@ -1217,6 +1419,7 @@ fn adapters() -> Vec<Box<dyn Adapter>> {
             Dictionary,
             vec![SecondaryByCopy],
             false,
+            false,
         ),
         vortex(
             "vortex_dict_bycopy_mem",
@@ -1224,12 +1427,14 @@ fn adapters() -> Vec<Box<dyn Adapter>> {
             Dictionary,
             vec![SecondaryByCopy],
             true,
+            false,
         ),
         vortex(
             "vortex_dict_byref",
             "Vortex Dict+ByRef",
             Dictionary,
             vec![SecondaryByReference],
+            false,
             false,
         ),
         vortex(
@@ -1238,6 +1443,7 @@ fn adapters() -> Vec<Box<dyn Adapter>> {
             Dictionary,
             vec![SecondaryByReference],
             true,
+            false,
         ),
         Box::new(OxigraphAdapter),
         Box::new(OxigraphRocksAdapter),
@@ -1262,7 +1468,7 @@ fn run_adapter(a: &dyn Adapter, n: usize) -> WorkerOut {
     let src = if a.handles_graphs() {
         ensure_quads_dataset(n)
     } else {
-        ensure_dataset(n)
+        ensure_triples_dataset(n)
     };
     let workdir = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -1316,17 +1522,17 @@ fn run_adapter(a: &dyn Adapter, n: usize) -> WorkerOut {
     }
 
     let handle = a.open(&artifact, &src);
-    let mut pats = probes();
+    let mut all_probes = probes();
     if a.handles_graphs() {
-        pats.extend(graph_probes());
+        all_probes.extend(graph_probes());
     } else {
         // Not a gap in the run: this library has no graph in its model, so the
         // cells say so rather than leaving a hole that reads as unmeasured.
-        for pat in graph_probes() {
+        for probe in graph_probes() {
             for regime in ["warm", "cold"] {
                 for suffix in ["", "::count"] {
                     let mut r = unsupported_row(
-                        &format!("{}::{}{}", a.slug(), pat.name, suffix),
+                        &format!("{}::{}{}", a.slug(), probe.name, suffix),
                         "this library's model has no graphs — it reads the triples projection",
                     );
                     r.regime = Some(regime);
@@ -1337,14 +1543,14 @@ fn run_adapter(a: &dyn Adapter, n: usize) -> WorkerOut {
     }
     let mut counts = std::collections::BTreeMap::new();
 
-    for pat in &pats {
-        let heavy = pat.name == "full";
-        counts.insert(pat.name.to_string(), handle.count(pat));
-        log(&format!("match {} (warm)…", pat.name));
+    for probe in &all_probes {
+        let heavy = probe.name == "full";
+        counts.insert(probe.name.to_string(), handle.count(probe));
+        log(&format!("match {} (warm)…", probe.name));
         measure(
-            &format!("{}::{}", a.slug(), pat.name),
+            &format!("{}::{}", a.slug(), probe.name),
             || {
-                handle.count(pat);
+                handle.count(probe);
             },
             &mut rows,
             if heavy { HEAVY_ITERS } else { QUERY_ITERS },
@@ -1358,12 +1564,13 @@ fn run_adapter(a: &dyn Adapter, n: usize) -> WorkerOut {
         // something different from the cold columns on every other tab, which
         // all exclude it.
         if a.has_distinct_open() {
-            log(&format!("match {} (cold)…", pat.name));
-            measure_with_setup_regime(
-                &format!("{}::{}", a.slug(), pat.name),
+            log(&format!("match {} (cold)…", probe.name));
+            measure_with_setup(
+                &format!("{}::{}", a.slug(), probe.name),
                 || a.open(&artifact, &src),
                 |h| {
-                    h.count(pat);
+                    h.count(probe);
+                    h
                 },
                 &mut rows,
                 if heavy { HEAVY_ITERS } else { QUERY_ITERS },
@@ -1375,19 +1582,19 @@ fn run_adapter(a: &dyn Adapter, n: usize) -> WorkerOut {
         // shape. Verified against the consuming count first, so a count path
         // that resolves differently fails loudly instead of timing the wrong
         // work.
-        let n_count = handle.count_only(pat);
+        let n_count = handle.count_only(probe);
         assert_eq!(
             n_count,
-            counts[pat.name],
+            counts[probe.name],
             "count_only disagrees with count for {} on {}",
-            pat.name,
+            probe.name,
             a.slug()
         );
-        log(&format!("count {} (warm)…", pat.name));
+        log(&format!("count {} (warm)…", probe.name));
         measure(
-            &format!("{}::{}::count", a.slug(), pat.name),
+            &format!("{}::{}::count", a.slug(), probe.name),
             || {
-                handle.count_only(pat);
+                handle.count_only(probe);
             },
             &mut rows,
             if heavy { HEAVY_ITERS } else { QUERY_ITERS },
@@ -1395,12 +1602,13 @@ fn run_adapter(a: &dyn Adapter, n: usize) -> WorkerOut {
             Some("warm"),
         );
         if a.has_distinct_open() {
-            log(&format!("count {} (cold)…", pat.name));
-            measure_with_setup_regime(
-                &format!("{}::{}::count", a.slug(), pat.name),
+            log(&format!("count {} (cold)…", probe.name));
+            measure_with_setup(
+                &format!("{}::{}::count", a.slug(), probe.name),
                 || a.open(&artifact, &src),
                 |h| {
-                    h.count_only(pat);
+                    h.count_only(probe);
+                    h
                 },
                 &mut rows,
                 if heavy { HEAVY_ITERS } else { QUERY_ITERS },
@@ -1411,7 +1619,7 @@ fn run_adapter(a: &dyn Adapter, n: usize) -> WorkerOut {
 
     drop(handle);
 
-    run_mutation_phase(a.slug(), &src, &artifact, n, &mut rows);
+    a.mutate(&src, &artifact, n, &mut rows);
 
     WorkerOut {
         slug: a.slug().to_string(),
@@ -1423,261 +1631,11 @@ fn run_adapter(a: &dyn Adapter, n: usize) -> WorkerOut {
     }
 }
 
-/// Add & delete, for the libraries that can. Curated to one Vortex row: the
-/// add phase starts from an empty store, which no layout/index knob reaches,
-/// so per-variant rows would measure the same thing seven times.
-///
-/// Add: `MUT_BATCH` per-quad inserts into an empty store (Vortex checks
-/// presence per add — set semantics — and auto-compacts when the tail crosses
-/// a chunk); `add_batch` is the one-call `add_quads` path. Delete: `MUT_BATCH`
-/// tombstoning deletes against the full store, whose reopen/rebuild happens in
-/// untimed per-iteration setup.
-fn run_mutation_phase(slug: &str, src: &Path, artifact: &Path, n: usize, rows: &mut Vec<Row>) {
-    let batch = mut_batch();
-    let log = |m: &str| eprintln!("  [{slug}] {m}");
-    match slug {
-        "vortex_dict" => {
-            let fresh = fresh_quads(batch);
-            log("add (per-quad)…");
-            measure(
-                &format!("add::{slug}"),
-                || {
-                    rt().block_on(async {
-                        let mut store = VortexRdfStore::empty();
-                        for q in &fresh {
-                            store = store.add_quad(q.clone()).await.expect("add_quad");
-                        }
-                        store
-                    });
-                },
-                rows,
-                HEAVY_ITERS,
-                0,
-                None,
-            );
-            log("add (batch)…");
-            measure(
-                &format!("add_batch::{slug}"),
-                || {
-                    rt().block_on(async {
-                        VortexRdfStore::empty()
-                            .add_quads(fresh.iter().cloned())
-                            .await
-                            .expect("add_quads")
-                    });
-                },
-                rows,
-                HEAVY_ITERS,
-                0,
-                None,
-            );
-            log("delete…");
-            let del = dataset_prefix(n, batch);
-            measure_with_setup(
-                &format!("delete::{slug}"),
-                || {
-                    rt().block_on(VortexRdfStore::from_file(artifact))
-                        .expect("reopen")
-                },
-                |store| {
-                    rt().block_on(async {
-                        let mut s = store;
-                        for q in &del {
-                            s = s.delete_quad(q).await.expect("delete_quad");
-                        }
-                        s
-                    });
-                },
-                rows,
-                HEAVY_ITERS,
-            );
-        }
-        "oxigraph" => {
-            let fresh = fresh_quads(batch);
-            log("add (per-quad)…");
-            measure(
-                &format!("add::{slug}"),
-                || {
-                    let store = oxigraph::store::Store::new().expect("new store");
-                    for q in &fresh {
-                        store.insert(q.as_ref()).expect("insert");
-                    }
-                },
-                rows,
-                HEAVY_ITERS,
-                0,
-                None,
-            );
-            log("add (batch)…");
-            measure(
-                &format!("add_batch::{slug}"),
-                || {
-                    let store = oxigraph::store::Store::new().expect("new store");
-                    let mut loader = store.bulk_loader();
-                    loader.load_quads(fresh.iter().cloned()).expect("bulk load");
-                    loader.commit().expect("commit");
-                },
-                rows,
-                HEAVY_ITERS,
-                0,
-                None,
-            );
-            log("delete…");
-            let del = dataset_prefix(n, batch);
-            measure_with_setup(
-                &format!("delete::{slug}"),
-                || load_oxigraph(src, oxigraph_format(src)),
-                |store| {
-                    for q in &del {
-                        store.remove(q.as_ref()).expect("remove");
-                    }
-                },
-                rows,
-                HEAVY_ITERS,
-            );
-        }
-        "oxigraph_rocksdb" => {
-            let fresh = fresh_quads(batch);
-            // A scratch database per iteration; deleting the previous one is
-            // untimed setup, but creating the store is part of what an add
-            // costs on this backend, so it stays in the timed region — the
-            // memory arm's `Store::new` sits inside its timed region too.
-            let tmp = artifact.parent().unwrap().join("mut_tmp.rocksdb");
-            log("add (per-quad)…");
-            measure_with_setup(
-                &format!("add::{slug}"),
-                || {
-                    let _ = std::fs::remove_dir_all(&tmp);
-                    tmp.clone()
-                },
-                |dir| {
-                    let store = oxigraph::store::Store::open(&dir).expect("open rocksdb");
-                    for q in &fresh {
-                        store.insert(q.as_ref()).expect("insert");
-                    }
-                },
-                rows,
-                HEAVY_ITERS,
-            );
-            log("add (batch)…");
-            measure_with_setup(
-                &format!("add_batch::{slug}"),
-                || {
-                    let _ = std::fs::remove_dir_all(&tmp);
-                    tmp.clone()
-                },
-                |dir| {
-                    let store = oxigraph::store::Store::open(&dir).expect("open rocksdb");
-                    let mut loader = store.bulk_loader();
-                    loader.load_quads(fresh.iter().cloned()).expect("bulk load");
-                    loader.commit().expect("commit");
-                },
-                rows,
-                HEAVY_ITERS,
-            );
-            log("delete…");
-            let del = dataset_prefix(n, batch);
-            // Deletes need a read-write store holding the full dataset, and
-            // each iteration removes rows the next one must find again — so
-            // setup rebuilds the scratch database from the source, the same
-            // per-iteration reload the memory arm does.
-            measure_with_setup(
-                &format!("delete::{slug}"),
-                || build_oxigraph_rocksdb(&tmp, src, oxigraph_format(src)),
-                |store| {
-                    for q in &del {
-                        store.remove(q.as_ref()).expect("remove");
-                    }
-                },
-                rows,
-                HEAVY_ITERS,
-            );
-            let _ = std::fs::remove_dir_all(&tmp);
-        }
-        "sophia" => {
-            use sophia::api::dataset::MutableDataset;
-            let fresh = fresh_quads(batch);
-            let fresh_terms: Vec<[SimpleTerm<'static>; 3]> = fresh
-                .iter()
-                .map(|q| {
-                    [
-                        simple_iri(q.subject.to_string().as_str()),
-                        simple_iri(q.predicate.to_string().as_str()),
-                        simple_iri(q.object.to_string().as_str()),
-                    ]
-                })
-                .collect();
-            log("add (per-quad)…");
-            measure(
-                &format!("add::{slug}"),
-                || {
-                    let mut d = sophia::inmem::dataset::FastDataset::new();
-                    for [s, p, o] in &fresh_terms {
-                        d.insert(s, p, o, None::<&SimpleTerm<'static>>)
-                            .expect("insert");
-                    }
-                },
-                rows,
-                HEAVY_ITERS,
-                0,
-                None,
-            );
-            rows.push(unsupported_row(
-                &format!("add_batch::{slug}"),
-                "no batch-insert API distinct from the per-quad loop",
-            ));
-            log("delete…");
-            let del = dataset_prefix(n, batch);
-            let del_terms: Vec<[SimpleTerm<'static>; 4]> = del
-                .iter()
-                .map(|q| {
-                    let o = match &q.object {
-                        oxrdf::Term::Literal(l) => simple_object(&format!("\"{}\"", l.value())),
-                        other => simple_iri(other.to_string().as_str()),
-                    };
-                    let g = match &q.graph_name {
-                        oxrdf::GraphName::NamedNode(n) => simple_iri(n.as_str()),
-                        _ => simple_iri(""),
-                    };
-                    [
-                        simple_iri(q.subject.to_string().as_str()),
-                        simple_iri(q.predicate.to_string().as_str()),
-                        o,
-                        g,
-                    ]
-                })
-                .collect();
-            measure_with_setup(
-                &format!("delete::{slug}"),
-                || load_sophia_dataset(src),
-                |mut d| {
-                    for [s, p, o, g] in &del_terms {
-                        d.remove(s, p, o, Some(g)).expect("remove");
-                    }
-                },
-                rows,
-                HEAVY_ITERS,
-            );
-        }
-        "hdt" => {
-            for id in ["add", "add_batch", "delete"] {
-                rows.push(unsupported_row(
-                    &format!("{id}::{slug}"),
-                    "an HDT file is immutable once built",
-                ));
-            }
-        }
-        // The other Vortex variants: mutation starts from an empty store, which
-        // no layout/index knob reaches — measured once, on vortex_dict.
-        _ => {}
-    }
-}
-
 // ─── Driver ─────────────────────────────────────────────────────────────────
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let n = dataset_size();
+    let n = bench_size();
 
     // Child mode: measure one adapter and print its JSON. One process per adapter,
     // so a cheap pattern is never measured in the shadow of another library's scan.
@@ -1700,7 +1658,7 @@ fn main() {
     // Both files up front: a library reads one or the other, and generating them
     // here keeps that cost out of whichever adapter happens to run first.
     ensure_quads_dataset(n);
-    ensure_dataset(n);
+    ensure_triples_dataset(n);
 
     let exe = std::env::current_exe().expect("current exe");
     let mut rows: Vec<serde_json::Value> = Vec::new();
@@ -1746,15 +1704,15 @@ fn main() {
     let mut warnings: Vec<String> = Vec::new();
     let mut merged: std::collections::BTreeMap<String, u64> = Default::default();
     for (slug, counts) in &counts_by_slug {
-        for (pat, v) in counts.as_object().into_iter().flatten() {
+        for (probe, v) in counts.as_object().into_iter().flatten() {
             let v = v.as_u64().unwrap_or(0);
-            match merged.get(pat) {
+            match merged.get(probe) {
                 None => {
-                    merged.insert(pat.clone(), v);
+                    merged.insert(probe.clone(), v);
                 }
                 Some(&seen) if seen != v => {
                     warnings.push(format!(
-                        "{pat}: {slug} matched {v}, an earlier library matched {seen}"
+                        "{probe}: {slug} matched {v}, an earlier library matched {seen}"
                     ));
                 }
                 _ => {}

@@ -11,12 +11,10 @@
 //!
 //! # Cardinality
 //!
-//! Term cardinality is an explicit knob, independent of row count. Drawing
-//! millions of rows from a namespace of a few dozen IRIs makes every store's term
-//! handling — dictionaries, interning, string storage — invisible to the
-//! benchmark, and is nothing like real RDF, where distinct terms scale with the
-//! data. The defaults are ten triples per subject, a 32-term predicate
-//! vocabulary, and one distinct object per two rows.
+//! Term cardinality is a knob independent of row count, sized so term handling
+//! (dictionaries, interning, string storage) is exercised: ten triples per
+//! subject, a 32-term predicate vocabulary, one distinct object per two rows,
+//! `WANT_GRAPHS` named graphs.
 //!
 //! # Uniqueness
 //!
@@ -30,24 +28,24 @@
 //! Deliberate consequence: index 0 exists for every role, so row 0 satisfies all
 //! four single-term probes and no pattern can silently measure a zero-row query.
 
-use oxrdf::{GraphName, Literal, NamedNode, NamedOrBlankNode, Term};
+use oxrdf::{GraphName, Literal, NamedNode, NamedOrBlankNode, Quad, Term};
 
-pub const BASE: &str = "http://data.example.org";
+const BASE: &str = "http://data.example.org";
 
 /// Distinct subjects per row: 0.1 is ten triples describing each resource.
-pub const SUBJECT_RATIO: f64 = 0.1;
+const SUBJECT_RATIO: f64 = 0.1;
 /// Distinct predicates — a small closed vocabulary, as in real data.
-pub const PREDICATES: usize = 32;
+const PREDICATES: usize = 32;
 /// Distinct objects per row.
-pub const OBJECT_RATIO: f64 = 0.5;
+const OBJECT_RATIO: f64 = 0.5;
 /// Objects out of every ten that are literals rather than IRIs
 /// (`literal_frac = 0.4` in the Python and JavaScript generators).
-pub const LITERALS_PER_TEN: usize = 4;
+const LITERALS_PER_TEN: usize = 4;
 
 /// Named graphs the *generated* dataset asks for, before the coprimality nudge.
 ///
-/// The comparative suite's N-Quads file requests the same 8 (`moduli_with_graphs`
-/// in `compare.rs`), so the graph role has the same shape wherever a bench binds
+/// The comparative suite's N-Quads file requests the same 8 (`moduli` in
+/// `compare.rs`), so the graph role has the same shape wherever a bench binds
 /// one. It cannot be 1: a single-graph dataset has no graph term to bind, which
 /// would quietly turn `G` into a second full scan and `SPOG` into `SPO`.
 pub const WANT_GRAPHS: usize = 8;
@@ -74,9 +72,19 @@ impl Moduli {
         if n == 0 { 0 } else { (n - 1) / k + 1 }
     }
 
+    /// Check a store's answer to `pattern` over `n` rows against the
+    /// selectivity the `#dataset` line reports.
+    pub fn assert_matched(&self, n: usize, pattern: Pattern, got: usize) {
+        assert_eq!(
+            got,
+            self.matched_rows(n, pattern),
+            "dataset selectivity drifted for {pattern:?}"
+        );
+    }
+
     /// Rows each probe pattern matches over `n` rows — the selectivity that makes
-    /// a timing interpretable, derived rather than remembered.
-    pub fn matched_rows(&self, n: usize, pattern: Pattern) -> usize {
+    /// a timing interpretable.
+    fn matched_rows(&self, n: usize, pattern: Pattern) -> usize {
         // Saturating, not wrapping: a conjunction's period exceeds usize long
         // before it exceeds `n`, and all that matters then is that it is bigger.
         let both = |a: usize, b: usize| a.saturating_mul(b);
@@ -204,6 +212,46 @@ impl ObjectTerm {
     }
 }
 
+// ── rows ────────────────────────────────────────────────────────────────────
+
+/// Row `i` of the generated dataset, under moduli `m`: one definition of what a
+/// row *is*, shared by the in-process generator and by the mutation benchmarks,
+/// whose delete batch has to name rows the store actually holds.
+pub fn dataset_quad(i: usize, m: Moduli) -> Quad {
+    Quad::new(
+        NamedOrBlankNode::NamedNode(NamedNode::new_unchecked(subject_iri(i % m.n_subj))),
+        NamedNode::new_unchecked(predicate_iri(i % m.n_pred)),
+        object_term(i % m.n_obj).into_oxrdf(),
+        GraphName::NamedNode(NamedNode::new_unchecked(graph_iri(i % m.n_graph))),
+    )
+}
+
+/// The first `take` rows of an `n`-row dataset generated under moduli `m` —
+/// the delete batch of every mutation bench, so each delete tombstones a row
+/// the store holds.
+pub fn dataset_prefix(n: usize, m: Moduli, take: usize) -> Vec<Quad> {
+    (0..take.min(n)).map(|i| dataset_quad(i, m)).collect()
+}
+
+/// A batch in a namespace disjoint from the dataset's, so every add is a
+/// genuine insert. Same spelling as `fresh_quads` in `python/bench/datasets.py`,
+/// down to the default graph, so an add cell on every tab inserts the same
+/// terms.
+pub fn fresh_quads(n: usize) -> Vec<Quad> {
+    (0..n)
+        .map(|i| {
+            Quad::new(
+                NamedNode::new_unchecked(format!("{BASE}/fresh/2026/subject/{i:09}")),
+                NamedNode::new_unchecked(format!("{BASE}/fresh/2026/property/0000")),
+                Term::NamedNode(NamedNode::new_unchecked(format!(
+                    "{BASE}/fresh/2026/object/{i:09}"
+                ))),
+                GraphName::DefaultGraph,
+            )
+        })
+        .collect()
+}
+
 // ── probe patterns ──────────────────────────────────────────────────────────
 
 // Each variant names the bound components by letter (Subject/Predicate/
@@ -262,13 +310,10 @@ pub fn terms_for(
     }
 }
 
-/// One machine-readable line describing what a run actually generated, printed
-/// once per bench process.
-///
-/// The dashboard reads its selectivity figures out of this rather than
-/// re-deriving them: the moduli follow from the row count through a coprimality
-/// nudge, so any prose that names them is one `BENCH_SIZE` away from being
-/// wrong.
+/// The `#dataset {...}` JSON line a bench process prints once before timing:
+/// row count, per-role moduli, distinct terms, and the rows each probe matches.
+/// The dashboard reads its selectivity figures from this line (divan's parser
+/// ignores it).
 pub fn shape_line(n: usize, graphs: usize) -> String {
     let m = moduli(n, graphs);
     let rows = |p: Pattern| m.matched_rows(n, p);
