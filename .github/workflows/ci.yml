@@ -37,6 +37,8 @@ jobs:
         uses: Swatinem/rust-cache@v2
       - name: Check formatting
         run: cargo fmt --check
+      - name: Check doc anchors
+        run: scripts/check-doc-anchors.sh
       - name: Run clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
       # The no-default-features build has its own dead-code surface (items only

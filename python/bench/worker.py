@@ -379,9 +379,9 @@ def run_query(adapter: Adapter, args: argparse.Namespace) -> dict:
     return {
         "rows": rows,
         "counts": counts,
-        # Reported rather than assumed by the caller: these are env-tunable, so
-        # the only figure that is certainly right is the one the process that
-        # did the timing used. The dashboard shows them next to the numbers.
+        # Reported here because these are env-tunable: the only figure that is
+        # certainly right is the one the process that did the timing used. The
+        # dashboard shows them next to the numbers.
         "iters": {
             "query": QUERY_ITERS,
             "queryWarmup": QUERY_WARMUP,

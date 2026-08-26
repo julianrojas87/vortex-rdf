@@ -22,6 +22,13 @@ join_list() {
   printf '%s' "$out"
 }
 
+# --- docs step ---
+# Cheap and tool-free, so it runs first: a broken `#L` anchor should fail the
+# push before the compilers are even warm.
+info "scripts/check-doc-anchors.sh"
+scripts/check-doc-anchors.sh
+passed+=(docs)
+
 # --- lint job ---
 info "cargo fmt --check"
 cargo fmt --check

@@ -65,9 +65,9 @@ from vortex_rdf import VortexRdfStore, serialize_rdf  # noqa: E402
 #
 # The defaults are the size all three CodSpeed suites share -- 32**3 = 32,768,
 # which core/benches/support/mod.rs takes as its BENCH_SIZE default -- so one
-# shared-core regression lands in all three tabs at comparable magnitude. It is also 4 zones of
-# 8,192 rows, the smallest round size at which zone pruning has anything to
-# prune.
+# shared-core regression lands in all three tabs at comparable magnitude. It
+# is also 4 zones of 8,192 rows, the smallest round size at which zone pruning
+# has anything to prune.
 DIM = int(os.environ.get("CODSPEED_BENCH_DIM", 32))  # triples: DIM**3 rows
 DIM_QUADS = int(os.environ.get("CODSPEED_BENCH_DIM_QUADS", 13))  # quads: DIM_QUADS**4 rows
 

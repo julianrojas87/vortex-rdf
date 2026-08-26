@@ -78,5 +78,11 @@ use mimalloc::MiMalloc;
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
+/// Compiles the README's Rust snippets as doctests. The file-conversion
+/// snippet uses the `file-io` entry points, so the hook follows that gate.
+#[cfg(all(doctest, feature = "file-io"))]
+#[doc = include_str!("../../README.md")]
+struct ReadmeDoctests;
+
 #[cfg(test)]
 mod tests;

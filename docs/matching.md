@@ -803,6 +803,8 @@ N-Triples strings. On the resulting store:
 The tail's cost is its size: a few rows compared as raw bytes, which is why a
 presence check on a small tail is not visible next to the base match.
 
+See [docs/mutations.md](mutations.md) for the tail, tombstone and compaction model.
+
 ---
 
 ## 10. Pattern-shape cheat sheet

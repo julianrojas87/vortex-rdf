@@ -50,9 +50,9 @@ import {
 // per-distinct-term decode invisible.
 // The defaults are the size all three CodSpeed suites share — 32³ = 32,768,
 // which `core/benches/support/mod.rs` takes as its BENCH_SIZE default — so one
-// shared-core regression lands in all three tabs at comparable magnitude. It is also 4 zones of
-// 8,192 rows, the smallest round size at which zone pruning has anything to
-// prune.
+// shared-core regression lands in all three tabs at comparable magnitude. It
+// is also 4 zones of 8,192 rows, the smallest round size at which zone pruning
+// has anything to prune.
 const DIM = Number(process.env.CODSPEED_BENCH_DIM ?? 32); // triples: DIM³ rows
 const DIM_QUADS = Number(process.env.CODSPEED_BENCH_DIM_QUADS ?? 13); // quads: DIM_QUADS⁴ rows
 const MUT_N = Number(process.env.CODSPEED_MUT_N ?? 500); // add/delete batch size

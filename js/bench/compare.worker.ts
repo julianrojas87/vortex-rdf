@@ -107,8 +107,9 @@ const delta = (a: number | null, b: number | null) => (a === null || b === null 
 
 /** Count every probe once (the cross-adapter agreement check), timing each —
  *  the timings drive [`splitBySpeed`]. A probe that cannot be counted is
- *  recorded as a failure and excluded from the benches; the worker carries on: this pre-pass runs the same consume the benches run, so it is
- *  also where a consume-budget breach surfaces first. */
+ *  recorded as a failure and excluded from the benches; the worker carries
+ *  on. This pre-pass runs the same consume the benches run, so it is also
+ *  where a consume-budget breach surfaces first. */
 async function countAll(a: StoreAdapter, h: unknown, pats: Pat[]): Promise<Record<string, number>> {
     const costMs: Record<string, number> = {};
     for (const p of pats) {

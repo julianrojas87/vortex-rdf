@@ -15,6 +15,11 @@ against. Each venv is provisioned once and reused.
 The Vortex bindings are not installed into their venv -- the compiled extension
 is abi3 and `python/vortex_rdf/` is a plain package directory, so putting it on
 PYTHONPATH is enough and avoids a maturin build per run.
+
+Every adapter counts every query pattern before timing it; a disagreement
+between libraries is recorded under `config.countWarnings` in `results.json`.
+A phase a library lacks is emitted as an explained `unsupported` cell instead
+of a missing row, so the dashboard can say why the cell is empty.
 """
 
 from __future__ import annotations
@@ -312,8 +317,7 @@ def meminfo_mb() -> dict[str, int]:
     Recorded because a library whose peak RSS approaches what the machine had
     free was measured under swap pressure, and its *timings* are then a
     property of this machine rather than of the library. The dashboard compares
-    each peak against these figures and says so rather than leaving the reader
-    to trust a number that quietly includes page-fault time.
+    each peak against these figures and labels the machine-bound ones.
     """
     out = {}
     try:

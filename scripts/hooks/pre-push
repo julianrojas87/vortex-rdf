@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Installed as the repo's pre-push hook (see scripts/install-git-hooks.sh).
-# Runs scripts/ci-check.sh before allowing a push, so local pushes fail the
-# same way GitHub Actions would. Skip once with `git push --no-verify`.
+# Runs scripts/ci-check.sh (doc anchors first, then the CI jobs) before
+# allowing a push, so local pushes fail the same way GitHub Actions would.
+# Skip once with `git push --no-verify`.
 set -euo pipefail
 
 repo_root="$(git rev-parse --show-toplevel)"
