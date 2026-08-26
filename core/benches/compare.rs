@@ -1365,10 +1365,14 @@ fn mut_batch() -> usize {
 // ─── One adapter's run ──────────────────────────────────────────────────────
 
 fn adapters() -> Vec<Box<dyn Adapter>> {
-    /// The same layout x index x residency matrix the Python tab shows, so the two
-    /// tabs' Vortex rows line up one for one. A (file, memory) pair builds the same
+    /// The same index x residency matrix the Python tab shows, so the two tabs'
+    /// Vortex rows line up one for one. A (file, memory) pair builds the same
     /// configuration in its own process and differs only in how it opens the result,
     /// so their Build cells agreeing is a free consistency check on the harness.
+    ///
+    /// Dictionary is the only layout here: the layout axis belongs to the
+    /// instrumented suite's matrix, and an adapter the dashboard does not list
+    /// costs a whole process to measure and then discards the rows.
     fn vortex(
         slug: &'static str,
         label: &'static str,
@@ -1387,7 +1391,7 @@ fn adapters() -> Vec<Box<dyn Adapter>> {
         })
     }
     use IndexType::{SecondaryByCopy, SecondaryByReference};
-    use LayoutStrategy::{Default as DefaultLayout, Dictionary};
+    use LayoutStrategy::Dictionary;
     vec![
         vortex(
             "vortex_dict",
@@ -1403,14 +1407,6 @@ fn adapters() -> Vec<Box<dyn Adapter>> {
             Dictionary,
             vec![],
             true,
-            false,
-        ),
-        vortex(
-            "vortex_default",
-            "Vortex Default",
-            DefaultLayout,
-            vec![],
-            false,
             false,
         ),
         vortex(

@@ -117,7 +117,9 @@ export function reclaim(a: StoreAdapter, h: unknown): void {
     global.gc?.();
 }
 
-// Vortex: one adapter per curated build variant (mirrors the Rust star design axes).
+// Vortex: one adapter per curated build variant. The Dictionary rows are the
+// cross-library comparison (see COMPARE_VARIANTS); the Default rows exist for
+// dict-memory.bench.ts, which sweeps them to isolate what is *not* the dictionary.
 export const VORTEX_VARIANTS: { slug: string; label: string; options: BuildOptions }[] = [
     { slug: 'vortex_dict', label: 'Vortex Dict', options: { layout: 'dictionary' } },
     { slug: 'vortex_dict_byref', label: 'Vortex Dict+ByRef', options: { layout: 'dictionary', indexes: ['secondary-by-reference'] } },
@@ -299,9 +301,15 @@ export function hdtAdapter(): StoreAdapter<Hdt> {
     };
 }
 
+// The variants the comparative tab renders: Dictionary layout across the index
+// axis, the same axis the Rust and Python tabs cross. Derived from the layout so
+// a variant added above cannot silently join the comparison — a Default-layout
+// build here would cost an ingest and a full probe sweep for rows no tab lists.
+export const COMPARE_VARIANTS = VORTEX_VARIANTS.filter((v) => v.options.layout === 'dictionary');
+
 // Full matrix for ingest + query.
 export const ADAPTERS: StoreAdapter[] = [
-    ...VORTEX_VARIANTS.map(vortexAdapter),
+    ...COMPARE_VARIANTS.map(vortexAdapter),
     rdfStoresAdapter('default', 'rdf-stores (default)'),
     rdfStoresAdapter('single', 'rdf-stores (1 index)'),
     oxigraphAdapter(),
