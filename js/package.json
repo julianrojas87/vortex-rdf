@@ -12,28 +12,27 @@
         "access": "public"
     },
     "main": "./entry/browser.js",
-    "types": "./entry/browser.d.ts",
+    "types": "./entry/types.d.ts",
     "exports": {
         ".": {
             "node": {
-                "types": "./entry/node.d.ts",
+                "types": "./entry/types.d.ts",
                 "default": "./entry/node.js"
             },
             "browser": {
-                "types": "./entry/browser.d.ts",
+                "types": "./entry/types.d.ts",
                 "default": "./entry/browser.js"
             },
             "default": {
-                "types": "./entry/browser.d.ts",
+                "types": "./entry/types.d.ts",
                 "default": "./entry/browser.js"
             }
         }
     },
     "files": [
         "entry/node.js",
-        "entry/node.d.ts",
         "entry/browser.js",
-        "entry/browser.d.ts",
+        "entry/types.d.ts",
         "pkg/web/vortex_rdf.js",
         "pkg/web/vortex_rdf.d.ts",
         "pkg/web/vortex_rdf_bg.wasm",

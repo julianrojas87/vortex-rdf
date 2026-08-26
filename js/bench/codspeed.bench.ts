@@ -27,7 +27,7 @@ import { Bench, type BenchOptions } from 'tinybench';
 import { withCodSpeed } from '@codspeed/tinybench-plugin';
 import type { Quad } from '@rdfjs/types';
 
-import { VortexRdfStore, type BuildOptions } from '../entry/node.js';
+import { VortexRdfStore, type BuildOptions } from '@vortex-rdf/vortex-rdf-store';
 // Only the pure bench modules are importable here — ./util.js and
 // ./datasets.js, the two with no store library behind them (see their purity
 // contracts); shared.ts loads oxigraph and rdf-stores at module scope, which

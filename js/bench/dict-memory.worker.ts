@@ -21,7 +21,7 @@ import {
     type DatasetOpts, type DictMemoryPoint,
 } from './shared.js';
 import { decodeAll } from './util.js';
-import type { VortexRdfStore } from '../entry/node.js';
+import type { VortexRdfStore } from '@vortex-rdf/vortex-rdf-store';
 
 const [, , slugArg, nArg, subjRatioArg, objRatioArg, outFile] = process.argv;
 if (!slugArg || !nArg || !subjRatioArg || !objRatioArg || !outFile) {

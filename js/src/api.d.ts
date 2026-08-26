@@ -43,7 +43,11 @@ export type RdfFormatName =
  * lookups.
  */
 export interface BuildOptions {
-    /** @default 'dictionary' */
+    /**
+     * Column layout. Defaults to `'dictionary'`, the single default shared by
+     * every vortex-rdf frontend (JS, Python and the CLI).
+     * @default 'dictionary'
+     */
     layout?: LayoutStrategy;
     /** @default [] */
     indexes?: IndexType[];
@@ -154,5 +158,13 @@ export class TermDict {
     [Symbol.dispose](): void;
 }
 
-export function rdf_to_vortex(input: string, format: RdfFormatName, options?: BuildOptions): Promise<Uint8Array>;
-export function vortex_to_rdf(vortex_bytes: Uint8Array, format: RdfFormatName): Promise<string>;
+/**
+ * One-shot serialization: RDF text in, native-container bytes out
+ * (`VortexRdfStore.fromString(...).toBytes()` without holding a store).
+ */
+export function serializeRdf(input: string, format: RdfFormatName, options?: BuildOptions): Promise<Uint8Array>;
+/**
+ * One-shot deserialization: native-container bytes in, RDF text out
+ * (`VortexRdfStore.fromBytes(...).toRdf(format)` without holding a store).
+ */
+export function deserializeRdf(vortex_bytes: Uint8Array, format: RdfFormatName): Promise<string>;

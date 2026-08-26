@@ -103,7 +103,15 @@ class VortexRdfStore:
 def serialize_rdf(
     input_path: _StrPath,
     output_path: _StrPath,
-    layout: str = "default",
+    *,
     format: Optional[str] = None,
+    layout: str = "dictionary",
     indexes: Sequence[str] = ...,
-) -> None: ...
+) -> None:
+    """Serialize an RDF file into a `.vortex` store file.
+
+    The options after the two paths are keyword-only. `format` is detected
+    from the input file extension when omitted; `layout` defaults to
+    `"dictionary"`, the default shared by the JS bindings and the CLI.
+    """
+    ...

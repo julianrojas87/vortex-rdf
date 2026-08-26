@@ -95,7 +95,9 @@ discard.
 ## Layouts
 
 `serialize_rdf(..., layout=...)` accepts `"default"`, `"typed-object"` and
-`"dictionary"`; `store.layout()` reports the same names. `indexes=[...]`
+`"dictionary"`; `store.layout()` reports the same names. `layout` defaults
+to `"dictionary"` — the same default the JS bindings and the CLI use — and
+every option after the two paths is keyword-only. `indexes=[...]`
 lists secondary index components to build into the file
 (`"secondary-by-copy"`, `"secondary-by-reference"`). `format=` is an RDF
 format name (`"ntriples"`, `"nquads"`, `"turtle"`, `"trig"`, `"n3"`,

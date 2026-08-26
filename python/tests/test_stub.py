@@ -81,7 +81,11 @@ def test_stub_class_methods_match_runtime(name):
 _NO_DEFAULT = inspect.Parameter.empty
 
 
+_KEYWORD_ONLY = inspect.Parameter.KEYWORD_ONLY
+
+
 def _stub_signature(func):
+    """`(name, default, keyword_only)` per parameter, in declaration order."""
     args = func.args
     positional = args.posonlyargs + args.args
     defaults = [_NO_DEFAULT] * (len(positional) - len(args.defaults)) + list(args.defaults)
@@ -90,7 +94,11 @@ def _stub_signature(func):
         if arg.arg == "self":
             continue
         params.append(
-            (arg.arg, _NO_DEFAULT if default is _NO_DEFAULT else ast.literal_eval(default))
+            (arg.arg, _NO_DEFAULT if default is _NO_DEFAULT else ast.literal_eval(default), False)
+        )
+    for arg, default in zip(args.kwonlyargs, args.kw_defaults):
+        params.append(
+            (arg.arg, _NO_DEFAULT if default is None else ast.literal_eval(default), True)
         )
     return params
 
@@ -100,7 +108,7 @@ def _runtime_signature(obj):
     for p in inspect.signature(obj).parameters.values():
         if p.name == "self":
             continue
-        params.append((p.name, p.default))
+        params.append((p.name, p.default, p.kind is _KEYWORD_ONLY))
     return params
 
 
@@ -132,8 +140,8 @@ def test_stub_signatures_match_text_signature(func):
     _, stub_node, runtime = func
     expected = _stub_signature(stub_node)
     actual = _runtime_signature(runtime)
-    assert [n for n, _ in expected] == [n for n, _ in actual]
-    for (name, stub_default), (_, runtime_default) in zip(expected, actual):
+    assert [(n, k) for n, _, k in expected] == [(n, k) for n, _, k in actual]
+    for (name, stub_default, _), (_, runtime_default, _) in zip(expected, actual):
         # A runtime default rendered as `...` has no literal spelling; the
         # stub may write any default for it.
         if runtime_default is Ellipsis:

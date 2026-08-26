@@ -1,5 +1,5 @@
 //! WebAssembly bindings for `vortex_rdf_core`: the RDF/JS-flavored
-//! `VortexRdfStore` API plus the `rdf_to_vortex`/`vortex_to_rdf` conversion
+//! `VortexRdfStore` API plus the `serializeRdf`/`deserializeRdf` conversion
 //! entry points. The lazy RDF/JS read model (LazyQuad/LazyTerm + stream) lives
 //! in js-snippets/lazy-rdf.js and the bulk-ingest quad packer in
 //! js-snippets/pack-quads.js, both copied verbatim into the generated pkg.
@@ -28,8 +28,8 @@ pub fn init_panic_hook() {
 /// entry points it delegates to define the semantics — including that the
 /// bytes are a complete container carrying, under the Dictionary layout, the
 /// term dictionary and index copies.
-#[wasm_bindgen(skip_typescript)]
-pub async fn rdf_to_vortex(
+#[wasm_bindgen(js_name = serializeRdf, skip_typescript)]
+pub async fn serialize_rdf(
     input: String,
     format_name: &str,
     options: JsValue,
@@ -42,8 +42,8 @@ pub async fn rdf_to_vortex(
 
 /// One-shot conversion: native-container bytes in, RDF text out. `Vec<u8>`
 /// for the same one-copy reason as [`VortexRdfStore::from_bytes`].
-#[wasm_bindgen(skip_typescript)]
-pub async fn vortex_to_rdf(vortex_bytes: Vec<u8>, format_name: &str) -> Result<String, JsValue> {
+#[wasm_bindgen(js_name = deserializeRdf, skip_typescript)]
+pub async fn deserialize_rdf(vortex_bytes: Vec<u8>, format_name: &str) -> Result<String, JsValue> {
     VortexRdfStore::from_bytes(vortex_bytes)
         .await?
         .to_rdf(format_name)

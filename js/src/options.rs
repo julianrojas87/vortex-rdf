@@ -32,8 +32,8 @@ pub(crate) struct BuildConfig {
 impl Default for BuildConfig {
     fn default() -> Self {
         Self {
-            // Dictionary is the JS default: it is the most compact layout and
-            // backs the zero-copy code-based read model (integer `.equals`).
+            // Dictionary is the default layout in every vortex-rdf frontend: the
+            // most compact layout, and it backs the code-based read model.
             layout: LayoutStrategy::Dictionary,
             indexes: Vec::new(),
         }
@@ -42,7 +42,7 @@ impl Default for BuildConfig {
 
 /// Run the quad stream through the builder.
 ///
-/// Every entry point (`fromString`, `fromQuads`, `rdf_to_vortex`) builds
+/// Every entry point (`fromString`, `fromQuads`, `serializeRdf`) builds
 /// through here. WebAssembly has no filesystem for the out-of-core strategy's
 /// spill runs, so the in-memory sort is the one builder compiled in.
 pub(crate) async fn build_array(

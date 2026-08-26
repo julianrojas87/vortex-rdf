@@ -231,6 +231,22 @@ def test_serialize_rejects_unknown_options(fixture_nt_path, tmp_path):
         serialize_rdf(fixture_nt_path, out, format="nope")
 
 
+def test_serialize_options_are_keyword_only(fixture_nt_path, tmp_path):
+    out = tmp_path / "out.vortex"
+    with pytest.raises(TypeError):
+        serialize_rdf(fixture_nt_path, out, "nquads")
+    with pytest.raises(TypeError):
+        serialize_rdf(fixture_nt_path, out, None, "dictionary")
+
+
+def test_serialize_defaults_to_dictionary_layout(fixture_nt_path, tmp_path):
+    out = tmp_path / "out.vortex"
+    serialize_rdf(fixture_nt_path, out)
+    store = VortexRdfStore(out)
+    assert store.layout() == "dictionary"
+    assert len(store) == 5
+
+
 def test_serialize_format_and_detect_failure(fixture_nt_path, tmp_path):
     source = tmp_path / "data"
     shutil.copyfile(fixture_nt_path, source)

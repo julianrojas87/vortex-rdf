@@ -188,15 +188,17 @@ if (cols) {
 For one-shot conversions without holding a store:
 
 ```javascript
-import { rdf_to_vortex, vortex_to_rdf } from '@vortex-rdf/vortex-rdf-store';
+import { serializeRdf, deserializeRdf } from '@vortex-rdf/vortex-rdf-store';
 
-const bytes = await rdf_to_vortex(turtleText, 'turtle', { layout: 'dictionary' });
-const text  = await vortex_to_rdf(bytes, 'nquads');
+const bytes = await serializeRdf(turtleText, 'turtle', { layout: 'dictionary' });
+const text  = await deserializeRdf(bytes, 'nquads');
 
 // N-Quads is just another format
-const bytes2 = await rdf_to_vortex(nquadsText, 'nquads');
-const text2  = await vortex_to_rdf(bytes2, 'nquads');
+const bytes2 = await serializeRdf(nquadsText, 'nquads');
+const text2  = await deserializeRdf(bytes2, 'nquads');
 ```
+
+`layout` defaults to `'dictionary'` in every vortex-rdf frontend (JS, Python and the CLI), so the explicit option above only matters when you want a different layout.
 
 ### TypeScript support
 

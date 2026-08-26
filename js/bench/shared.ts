@@ -21,7 +21,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
 
-import { VortexRdfStore, type BuildOptions } from '../entry/node.js';
+import { VortexRdfStore, type BuildOptions } from '@vortex-rdf/vortex-rdf-store';
 import { fmtNs, consumeQuads, consumeStrings } from './util.js';
 import { df, moduli, type Pat } from './datasets.js';
 import {
