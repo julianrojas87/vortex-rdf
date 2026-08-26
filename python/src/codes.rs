@@ -1,6 +1,6 @@
 //! The Dictionary-layout code path: matched rows as zero-copy `u32` term-code
 //! columns plus a dictionary handle, mirroring the JS bindings' lazy payload
-//! (`js/src/store.rs::match_columns`). Python decodes each distinct code once
+//! (`js/src/store.rs::match_payload`). Python decodes each distinct code once
 //! and never materializes per-occurrence term strings.
 
 use std::os::raw::{c_int, c_void};
@@ -13,7 +13,7 @@ use pyo3::types::PyString;
 use vortex_buffer::Buffer;
 use vortex_rdf_core::DictSnapshot;
 
-/// Buckets in the decode-sharing cache (see [`TermDict::decode_owned`]).
+/// Buckets in the decode-sharing cache (see [`TermDict::decode_slice`]).
 /// A power of two, so the bucket index is a mask rather than a division; 256
 /// entries keep the table at 2 KiB, small enough to stay cache-resident and to
 /// zero cheaply for a short column.
@@ -32,19 +32,18 @@ pub struct TermDict {
 }
 
 impl TermDict {
-    /// The GIL (Global Interpreter Lock)-released bulk decode behind [`decode_many`](Self::decode_many)
-    /// once the codes are owned. Releasing the GIL needs owned codes: pyo3's
-    /// borrowed buffer views (`ReadOnlyCell`) may not cross a GIL release,
-    /// and lending Python-owned memory to a detached thread would race a
-    /// writable exporter mutated from another Python thread anyway.
+    /// Decodes `codes` GIL-released into one Python string per distinct
+    /// code, sharing that object across every occurrence of the code. Callers
+    /// must hand over codes copied out of any Python buffer: a borrowed
+    /// buffer view cannot cross the GIL release.
     ///
-    /// Repeated codes share one Python string. A direct-mapped cache of
-    /// `RECENT_BUCKETS` entries, indexed by `code & (RECENT_BUCKETS - 1)`,
-    /// holds the `(code, slot)` most recently decoded into each bucket; an
-    /// occurrence whose bucket holds its own code reuses that slot instead of
-    /// decompressing and allocating again. A hit requires the stored code to
-    /// match, so a collision — or a column holding more live terms than there
-    /// are buckets — costs only a re-decode and never yields a wrong term.
+    /// A direct-mapped cache of `RECENT_BUCKETS` entries, indexed by
+    /// `code & (RECENT_BUCKETS - 1)`, holds the `(code, slot)` most recently
+    /// decoded into each bucket; an occurrence whose bucket holds its own code
+    /// reuses that slot instead of decompressing and allocating again. A hit
+    /// requires the stored code to match, so a collision — or a column holding
+    /// more live terms than there are buckets — costs only a re-decode and
+    /// never yields a wrong term.
     ///
     /// Runs in two phases, because Python objects cannot be built while
     /// detached from the interpreter. The decode loop runs GIL-released and
@@ -52,10 +51,7 @@ impl TermDict {
     /// GIL is then retaken to build one `PyString` per distinct term and clone
     /// a reference per occurrence. When nothing was shared those indices are
     /// the identity, and the strings are built straight from the decode order.
-    ///
-    /// `codes` is borrowed so a matched `Buffer<u32>` column can be decoded in
-    /// place.
-    pub(crate) fn decode_owned(&self, py: Python<'_>, codes: &[u32]) -> Vec<Option<Py<PyString>>> {
+    pub(crate) fn decode_slice(&self, py: Python<'_>, codes: &[u32]) -> Vec<Option<Py<PyString>>> {
         // `slots[i]` indexes `decoded` for the i-th code, so the mapping from
         // occurrence to decoded term survives the GIL boundary as plain data.
         let (slots, decoded) = py.detach(|| {
@@ -106,11 +102,15 @@ impl TermDict {
         self.snapshot.decode(code)
     }
 
+    /// The code of the N-Triples term string `term`, or `None` when this
+    /// dictionary does not hold the term. The inverse of
+    /// [`decode`](Self::decode).
+    fn encode(&self, term: &str) -> Option<u32> {
+        self.snapshot.encode(term)
+    }
+
     /// Decode a batch of codes in one call, releasing the GIL for the whole
-    /// batch — the bulk companion to [`decode`](Self::decode) for large
-    /// result sets (each FSST-backed decode pays a per-term decompression;
-    /// per-code Python calls additionally pay the FFI round-trip and hold
-    /// the GIL throughout).
+    /// batch.
     ///
     /// `codes` is preferably a u32 buffer (`memoryview(col).cast("I")`,
     /// `array("I", ...)`, a `uint32` NumPy array), read in one bulk copy
@@ -120,15 +120,15 @@ impl TermDict {
     /// Any other sequence of ints still works, at one `PyLong` extraction
     /// per code.
     ///
-    /// A repeated code yields the *same* Python string object rather than an
-    /// equal copy; see [`decode_owned`](Self::decode_owned).
+    /// A repeated code yields the *same* Python string object; see
+    /// [`decode_slice`](Self::decode_slice).
     fn decode_many(
         &self,
         py: Python<'_>,
         codes: &Bound<'_, PyAny>,
     ) -> PyResult<Vec<Option<Py<PyString>>>> {
         if let Ok(buf) = PyBuffer::<u32>::get(codes) {
-            return Ok(self.decode_owned(py, &buf.to_vec(py)?));
+            return Ok(self.decode_slice(py, &buf.to_vec(py)?));
         }
         if let Ok(buf) = PyBuffer::<u8>::get(codes) {
             let bytes = buf.to_vec(py)?;
@@ -144,9 +144,9 @@ impl TermDict {
                 .iter()
                 .map(|b| u32::from_ne_bytes(*b))
                 .collect();
-            return Ok(self.decode_owned(py, &codes));
+            return Ok(self.decode_slice(py, &codes));
         }
-        Ok(self.decode_owned(py, &codes.extract::<Vec<u32>>()?))
+        Ok(self.decode_slice(py, &codes.extract::<Vec<u32>>()?))
     }
 
     fn __len__(&self) -> usize {

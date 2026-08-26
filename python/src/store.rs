@@ -1,14 +1,16 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
-use pyo3::exceptions::{PyFileNotFoundError, PyValueError};
+use pyo3::exceptions::PyFileNotFoundError;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyString};
+use vortex_buffer::Buffer;
 use vortex_rdf_core::common::terms::{Pattern, parse_pattern_checked};
-use vortex_rdf_core::{SharedQuad, VortexRdfError, VortexRdfStore as CoreStore};
+use vortex_rdf_core::{VortexRdfError as CoreError, VortexRdfStore as CoreStore};
 
 use crate::codes::{TermDict, U32Column};
-use crate::{RUNTIME, parse_err, store_err};
+use crate::{RUNTIME, VortexRdfError, parse_err, store_err};
 
 /// `(s, p, o, g)` code columns as returned by [`VortexRdfStore::match_codes`].
 type CodeColumns = (U32Column, U32Column, U32Column, U32Column);
@@ -27,7 +29,8 @@ type StringColumns = (
     Vec<Py<PyString>>,
 );
 
-/// Unwrap decoded columns, rejecting anything that cannot be a valid result.
+/// Unwrap decoded columns, raising `VortexRdfError` on anything that cannot
+/// be a valid result.
 ///
 /// A `None` term is a matched row carrying a code the dictionary snapshot
 /// cannot resolve; unequal column lengths are a match that produced ragged
@@ -36,7 +39,7 @@ type StringColumns = (
 fn resolve_columns(columns: [Vec<Option<Py<PyString>>>; 4]) -> PyResult<[Vec<Py<PyString>>; 4]> {
     let rows = columns[0].len();
     if columns.iter().any(|c| c.len() != rows) {
-        return Err(PyValueError::new_err(format!(
+        return Err(VortexRdfError::new_err(format!(
             "matched code columns have unequal lengths: {:?}",
             columns.iter().map(Vec::len).collect::<Vec<_>>()
         )));
@@ -47,7 +50,7 @@ fn resolve_columns(columns: [Vec<Option<Py<PyString>>>; 4]) -> PyResult<[Vec<Py<
             match term {
                 Some(term) => out[position].push(term),
                 None => {
-                    return Err(PyValueError::new_err(format!(
+                    return Err(VortexRdfError::new_err(format!(
                         "matched row {row} has a term code outside the store dictionary"
                     )));
                 }
@@ -57,31 +60,42 @@ fn resolve_columns(columns: [Vec<Option<Py<PyString>>>; 4]) -> PyResult<[Vec<Py<
     Ok(out)
 }
 
-/// A read-only Vortex-RDF store opened from a `.vortex` file.
+/// A read-only Vortex-RDF store opened from a `.vortex` file or from
+/// native-container bytes. A file open reads only the footer up front and,
+/// under the Dictionary layout, lifts the term dictionary when it fits the
+/// residency budget; each match then scans the file, so one instance is meant
+/// to be kept and queried repeatedly.
 ///
-/// The file is opened lazily: constructing the object reads only the file
-/// footer (and, for the Dictionary layout, lifts the term dictionary when it
-/// fits the residency budget). Keeping one instance warm across queries is
-/// what makes rdflib `triples()` traffic cheap — reopening per call would
-/// re-lift the dictionary every time.
+/// The Python bindings are read-only: stores are built with `serialize_rdf`
+/// (file to file), then opened and queried. There is no in-memory build, RDF
+/// export, membership test or mutation.
 #[pyclass(frozen, module = "vortex_rdf._native")]
 pub struct VortexRdfStore {
     store: CoreStore,
-    /// `None` for stores opened from bytes rather than a file.
-    path: Option<String>,
+    /// `None` for stores opened from bytes.
+    path: Option<PathBuf>,
 }
 
 impl VortexRdfStore {
-    /// Runs the pattern match off the GIL and returns the matched quads with
-    /// shared-string terms — each distinct term of a decoded chunk is one
-    /// `Arc<str>`, handed to every row repeating it.
-    async fn matched_shared(&self, pattern: &Pattern) -> Result<Vec<SharedQuad>, VortexRdfError> {
+    /// The store view matching `pattern`.
+    async fn matched(&self, pattern: &Pattern) -> Result<CoreStore, CoreError> {
         let (s, p, o, g) = pattern;
-        let view = self
-            .store
+        self.store
             .match_pattern(s.as_ref(), p.as_ref(), o.as_ref(), g.as_ref())
-            .await?;
-        view.shared_quads_vec().await
+            .await
+    }
+
+    /// The matched rows as `(s, p, o, g)` term-code columns, gathered off the
+    /// GIL, or `None` when the match declines the code path.
+    fn matched_code_columns(
+        &self,
+        py: Python<'_>,
+        pattern: &Pattern,
+    ) -> PyResult<Option<[Buffer<u32>; 4]>> {
+        py.detach(|| -> Result<_, CoreError> {
+            RUNTIME.block_on(async { self.matched(pattern).await?.code_columns_gathered().await })
+        })
+        .map_err(store_err)
     }
 
     /// The matched rows as four columns of N-Triples strings, in
@@ -96,42 +110,25 @@ impl VortexRdfStore {
         pattern: &Pattern,
     ) -> PyResult<[Vec<Py<PyString>>; 4]> {
         if let Some(snapshot) = self.store.code_read_snapshot() {
-            let columns = py
-                .detach(|| -> Result<_, VortexRdfError> {
-                    RUNTIME.block_on(async {
-                        let (s, p, o, g) = pattern;
-                        self.store
-                            .match_pattern(s.as_ref(), p.as_ref(), o.as_ref(), g.as_ref())
-                            .await?
-                            .code_columns_gathered()
-                            .await
-                    })
-                })
-                .map_err(store_err)?;
             // `code_read_snapshot` reports only that the path can apply; the
             // match itself still decides, so fall through when it declines.
-            if let Some(codes) = columns {
+            if let Some(codes) = self.matched_code_columns(py, pattern)? {
                 let dict = TermDict { snapshot };
-                let decoded = std::array::from_fn(|i| dict.decode_owned(py, codes[i].as_slice()));
+                let decoded = std::array::from_fn(|i| dict.decode_slice(py, codes[i].as_slice()));
                 return resolve_columns(decoded);
             }
         }
 
+        // The matched quads with shared-string terms: each distinct term of a
+        // decoded chunk is one `Arc<str>`, handed to every row repeating it.
         let rows = py
-            .detach(|| RUNTIME.block_on(self.matched_shared(pattern)))
+            .detach(|| -> Result<_, CoreError> {
+                RUNTIME.block_on(async { self.matched(pattern).await?.shared_quads_vec().await })
+            })
             .map_err(store_err)?;
-        // One `PyString` per distinct term, as the code path's `decode_owned`
-        // does: the shared rows hand equal terms out as one `Arc<str>`
-        // wherever the decoder could, so the allocation's address keys the
-        // interning. Those keys are valid only while `rows` keeps every `Arc`
-        // alive — it is held for the whole loop, so no address is recycled —
-        // and a term the decoder did not share simply gets an equal-content
-        // string of its own. `rows` is also the only holder of every `Arc`
-        // (the decoder's memo is gone by now), so a strong count of one means
-        // no other row carries the term and it skips the map altogether — on
-        // a string layout that is every term. The shared rows spell the
-        // default graph as the empty string already, which is what the
-        // pattern parser accepts.
+        // Intern by `Arc` address: `rows` holds every `Arc` for the whole
+        // loop, so an address identifies one term. A strong count of one means
+        // no other row shares the term, so it skips the map.
         let mut interned: HashMap<usize, Py<PyString>> = HashMap::new();
         let mut out: [Vec<Py<PyString>>; 4] =
             std::array::from_fn(|_| Vec::with_capacity(rows.len()));
@@ -167,13 +164,16 @@ impl VortexRdfStore {
     #[pyo3(signature = (path, max_resident_bytes=None, in_memory=false))]
     fn new(
         py: Python<'_>,
-        path: String,
+        path: PathBuf,
         max_resident_bytes: Option<u64>,
         in_memory: bool,
     ) -> PyResult<Self> {
-        if !std::path::Path::new(&path).is_file() {
+        // Core reports a missing path as `VortexRdfError::Vortex`, not `Io`,
+        // so the `FileNotFoundError` contract is honoured here.
+        if !path.is_file() {
             return Err(PyFileNotFoundError::new_err(format!(
-                "no such Vortex file: {path}"
+                "no such Vortex file: {}",
+                path.display()
             )));
         }
         let store = py
@@ -202,11 +202,11 @@ impl VortexRdfStore {
         })
     }
 
-    /// Open a store from native-container bytes — what [`Self::to_bytes`]
-    /// (or the JS bindings' `toBytes`, or reading a `.vortex` file into
-    /// memory) produces. Unlike the path constructor there is no file to
-    /// stay lazily backed by: the whole store lives in memory, and the
-    /// buffer crosses the Python boundary in one bulk copy.
+    /// Open a store from native-container bytes: what [`Self::to_bytes`],
+    /// the JS bindings' `toBytes`, or reading a `.vortex` file into memory
+    /// produces. The whole store lives in memory. `data` should be `bytes`
+    /// (or `bytearray`), copied in one memcpy; any other int sequence is
+    /// accepted but extracted element by element.
     #[staticmethod]
     fn from_bytes(py: Python<'_>, data: Vec<u8>) -> PyResult<Self> {
         let store = py
@@ -232,6 +232,16 @@ impl VortexRdfStore {
         self.store.layout().to_string()
     }
 
+    /// The secondary indexes the store carries, as core's canonical
+    /// kebab-case names ("secondary-by-copy", "secondary-by-reference").
+    fn indexes(&self) -> Vec<String> {
+        self.store
+            .indexes()
+            .iter()
+            .map(ToString::to_string)
+            .collect()
+    }
+
     fn __len__(&self, py: Python<'_>) -> PyResult<usize> {
         py.detach(|| RUNTIME.block_on(self.store.size()))
             .map_err(store_err)
@@ -241,7 +251,7 @@ impl VortexRdfStore {
         match &self.path {
             Some(path) => format!(
                 "VortexRdfStore(path={:?}, layout={:?})",
-                path,
+                path.display().to_string(),
                 self.layout()
             ),
             None => format!("VortexRdfStore(layout={:?})", self.layout()),
@@ -294,15 +304,8 @@ impl VortexRdfStore {
         g: Option<&str>,
     ) -> PyResult<usize> {
         let pattern = parse_pattern_checked(s, p, o, g).map_err(parse_err)?;
-        py.detach(|| -> Result<usize, VortexRdfError> {
-            RUNTIME.block_on(async {
-                let (s, p, o, g) = &pattern;
-                self.store
-                    .match_pattern(s.as_ref(), p.as_ref(), o.as_ref(), g.as_ref())
-                    .await?
-                    .size()
-                    .await
-            })
+        py.detach(|| -> Result<usize, CoreError> {
+            RUNTIME.block_on(async { self.matched(&pattern).await?.size().await })
         })
         .map_err(store_err)
     }
@@ -355,22 +358,11 @@ impl VortexRdfStore {
         o: Option<&str>,
         g: Option<&str>,
     ) -> PyResult<Option<CodeColumns>> {
+        let pattern = parse_pattern_checked(s, p, o, g).map_err(parse_err)?;
         if self.store.code_read_snapshot().is_none() {
             return Ok(None);
         }
-        let pattern = parse_pattern_checked(s, p, o, g).map_err(parse_err)?;
-        let columns = py
-            .detach(|| -> Result<_, VortexRdfError> {
-                RUNTIME.block_on(async {
-                    let (s, p, o, g) = &pattern;
-                    self.store
-                        .match_pattern(s.as_ref(), p.as_ref(), o.as_ref(), g.as_ref())
-                        .await?
-                        .code_columns_gathered()
-                        .await
-                })
-            })
-            .map_err(store_err)?;
+        let columns = self.matched_code_columns(py, &pattern)?;
         Ok(columns.map(|[s, p, o, g]| {
             (
                 U32Column { codes: s },

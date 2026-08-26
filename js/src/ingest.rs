@@ -1,6 +1,5 @@
 //! Bulk quad ingestion across the wasm boundary: length-prefixed packed
-//! buffers (one boundary crossing per chunk instead of ~16–20 `Reflect` calls
-//! per quad) and RDF/JS `Stream<Quad>` adaptation.
+//! buffers decoded with a linear cursor, and RDF/JS `Stream<Quad>` adaptation.
 
 use futures::channel::mpsc;
 use futures::{Stream, stream};
@@ -16,11 +15,9 @@ use crate::terms::js_to_quad;
 
 #[wasm_bindgen(module = "/js-snippets/pack-quads.js")]
 extern "C" {
-    /// Flatten an RDF/JS quad array into one length-prefixed byte buffer
-    /// host-side, so bulk ingestion crosses the wasm boundary once instead of
-    /// ~16–20 Reflect calls per quad. Decoded by [`packed_to_quads_into`].
-    /// Throws
-    /// on a malformed quad (hence `catch`).
+    /// Flatten a range of an RDF/JS quad array into one length-prefixed byte
+    /// buffer host-side, decoded by [`packed_to_quads_into`]. Throws on a
+    /// malformed quad (hence `catch`).
     #[wasm_bindgen(js_name = packQuads, catch)]
     fn pack_quads(
         quads: &js_sys::Array,
@@ -30,10 +27,8 @@ extern "C" {
 }
 
 /// Quads per `packQuads` call. The packed buffer is copied into linear memory
-/// and must stay live while the quads in it are decoded, so packing the whole
-/// array at once put a second full copy of the dataset's term bytes on the wasm
-/// high-water mark. Packing a range at a time bounds that to one chunk; the
-/// boundary crossing it saves is per-chunk rather than per-quad either way.
+/// and stays live until its quads are decoded, so this bounds the ingest
+/// transient to one chunk's term bytes.
 const PACK_CHUNK: u32 = 1 << 16;
 
 /// Decode a JS quad array in `PACK_CHUNK`-sized ranges, converting with `emit`.
@@ -85,14 +80,12 @@ pub(crate) fn js_array_to_quads(quads: js_sys::Array) -> Result<Vec<Quad>, JsVal
 }
 
 /// Decode the buffer [`pack_quads`] produced back into owned quads. Term
-/// construction/validation mirrors [`js_to_quad`]: IRIs and language tags are
-/// validated, blank-node ids are taken as-is.
+/// construction mirrors [`js_to_quad`]: IRIs, blank-node labels and language
+/// tags are validated; a failure is reported with the quad's index.
 ///
 /// `emit` converts each decoded quad as it is produced, so on the ingest path
-/// the `oxrdf::Quad` dies inside the loop. Collecting `Vec<Quad>` and
-/// converting afterwards — which is what every builder did with it — held a
-/// second owned copy of every term in the dataset live at once, and that copy
-/// was a large part of the wasm ingest high-water mark.
+/// the `oxrdf::Quad` is dropped inside the loop and at most one packed chunk's
+/// terms are live at a time.
 fn packed_to_quads_into<T>(
     bytes: &[u8],
     emit: &mut impl FnMut(Quad) -> T,
@@ -140,7 +133,9 @@ fn packed_to_quads_into<T>(
         // subject: NamedNode | BlankNode
         let s = match cur.u8()? {
             0 => NamedOrBlankNode::NamedNode(NamedNode::new(cur.str()?).map_err(|_| invalid(i))?),
-            1 => NamedOrBlankNode::BlankNode(oxrdf::BlankNode::new_unchecked(cur.str()?)),
+            1 => NamedOrBlankNode::BlankNode(
+                oxrdf::BlankNode::new(cur.str()?).map_err(|_| invalid(i))?,
+            ),
             _ => return Err(invalid(i)),
         };
         // predicate: NamedNode
@@ -151,7 +146,7 @@ fn packed_to_quads_into<T>(
         // object: any term
         let o = match cur.u8()? {
             0 => Term::NamedNode(NamedNode::new(cur.str()?).map_err(|_| invalid(i))?),
-            1 => Term::BlankNode(oxrdf::BlankNode::new_unchecked(cur.str()?)),
+            1 => Term::BlankNode(oxrdf::BlankNode::new(cur.str()?).map_err(|_| invalid(i))?),
             2 => Term::Literal(oxrdf::Literal::new_simple_literal(cur.str()?)),
             3 => {
                 let value = cur.str()?.to_owned();
@@ -171,7 +166,7 @@ fn packed_to_quads_into<T>(
         // graph: NamedNode | BlankNode | DefaultGraph
         let g = match cur.u8()? {
             0 => GraphName::NamedNode(NamedNode::new(cur.str()?).map_err(|_| invalid(i))?),
-            1 => GraphName::BlankNode(oxrdf::BlankNode::new_unchecked(cur.str()?)),
+            1 => GraphName::BlankNode(oxrdf::BlankNode::new(cur.str()?).map_err(|_| invalid(i))?),
             5 => GraphName::DefaultGraph,
             _ => return Err(invalid(i)),
         };
@@ -223,13 +218,17 @@ fn rdfjs_stream_to_quads(stream_val: JsValue) -> Result<BoxedQuadStream, JsValue
     let (tx, rx) = mpsc::unbounded::<CoreResult<RawQuad>>();
 
     let tx_data = tx.clone();
+    let mut position = 0usize;
     let on_data = Closure::wrap(Box::new(move |quad_js: JsValue| {
         let item = js_to_quad(quad_js)
             .as_ref()
             .map(RawQuad::from_quad)
             .ok_or_else(|| {
-                VortexRdfError::Deserialization("Invalid quad object in RDF/JS stream".to_string())
+                VortexRdfError::Deserialization(format!(
+                    "Invalid quad object in RDF/JS stream at position {position}"
+                ))
             });
+        position += 1;
         let _ = tx_data.unbounded_send(item);
     }) as Box<dyn FnMut(JsValue)>);
 

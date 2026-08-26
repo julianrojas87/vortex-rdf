@@ -6,13 +6,14 @@ use std::fmt::Display;
 
 use wasm_bindgen::JsValue;
 
-/// A failure as the JS exception value: the message alone.
+/// A failure as the JS exception value: a `js_sys::Error` carrying the
+/// message alone.
 pub(crate) fn js_err(message: impl Display) -> JsValue {
-    JsValue::from_str(&message.to_string())
+    js_sys::Error::new(&message.to_string()).into()
 }
 
 /// [`js_err`] labelled with the operation that failed: `"{context}: {cause}"`.
 /// Use it only where the cause alone would not say which step failed.
 pub(crate) fn js_err_ctx(context: &str, cause: impl Display) -> JsValue {
-    JsValue::from_str(&format!("{}: {}", context, cause))
+    js_err(format!("{}: {}", context, cause))
 }

@@ -2,11 +2,10 @@
 // read model in lazy-rdf.js, implemented as a local wasm-bindgen snippet
 // (copied verbatim into the generated pkg; no runtime npm dependency).
 //
-// Converting RDF/JS quads term-by-term across the wasm boundary costs ~16–20
-// Reflect calls per quad, which dominates bulk ingestion.
-// Instead `fromQuads`/`addQuads` flatten a range of the array host-side into
-// one length-prefixed byte buffer and cross the boundary once; the Rust side
-// (js/src/ingest.rs) decodes it with a linear cursor.
+// `fromQuads`/`addQuads` flatten a range of the array host-side into one
+// length-prefixed byte buffer: one boundary crossing per chunk instead of one
+// property read per term field. The Rust side (js/src/ingest.rs) decodes it
+// with a linear cursor.
 //
 // Layout (little-endian u32 lengths):
 //   u32 quadCount, then per quad the four terms s,p,o,g. Per term: 1 tag byte
@@ -36,7 +35,11 @@ export function packQuads(quads, start = 0, end = quads.length) {
         pos += 4 + written;
     };
     const term = (t, i) => {
-        switch (t && t.termType) {
+        const type = t == null ? undefined : t.termType;
+        if (type !== undefined && type !== 'DefaultGraph' && typeof t.value !== 'string') {
+            throw new Error(`Invalid quad object at index ${i}`);
+        }
+        switch (type) {
             case 'NamedNode': ensure(1); buf[pos++] = 0; str(t.value); return;
             case 'BlankNode': ensure(1); buf[pos++] = 1; str(t.value); return;
             case 'Literal': {
@@ -48,8 +51,8 @@ export function packQuads(quads, start = 0, end = quads.length) {
             }
             case 'DefaultGraph': ensure(1); buf[pos++] = 5; return;
             default:
-                // A missing graph position means the default graph (mirrors the
-                // pre-packing per-term conversion); anything else is malformed.
+                // A missing graph position means the default graph; anything
+                // else is malformed.
                 if (t === undefined || t === null) { ensure(1); buf[pos++] = 5; return; }
                 throw new Error(`Invalid quad object at index ${i}`);
         }

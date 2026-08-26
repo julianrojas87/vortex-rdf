@@ -55,7 +55,7 @@ A builder hands these back in one of two shapes
 | Rust | [`SortedStreamBuilder::build_vortex_array`](../core/src/store/builders/sorted_stream.rs#L82) or [`SortedInMemoryBuilder::build_vortex_array`](../core/src/store/builders/sorted_in_memory.rs#L35), then [`VortexRdfStore::from_built`](../core/src/store/mod.rs#L279) | either | in-memory store |
 | Rust | [`VortexRdfStore::to_bytes`](../core/src/store/serialize.rs#L243) | — (re-serializes a store) | bytes |
 | Rust | [`to_serializable_parts`](../core/src/store/serialize.rs#L223) → [`from_parts`](../core/src/store/mod.rs#L172) | — | in-memory round trip |
-| Python | `serialize_rdf(input_path, output_path, layout="default", format=None, indexes=[])` ([`convert.rs`](../python/src/convert.rs#L30)) | out-of-core | file |
+| Python | `serialize_rdf(input_path, output_path, layout="default", format=None, indexes=[])` ([`serialize.rs`](../python/src/serialize.rs#L30)) | out-of-core | file |
 | Python | `VortexRdfStore(path, in_memory=True)` | — (opens, then lifts through `to_serializable_parts` → `from_parts`) | in-memory store |
 | Python | `store.to_bytes()` / `VortexRdfStore.from_bytes(data)` | — | bytes |
 | JavaScript | `VortexRdfStore.fromQuads(quads \| Stream<Quad>, {layout, indexes})`, `fromString(text, format, options)`, `rdf_to_vortex(text, format, options)` ([`store.rs`](../js/src/store.rs#L142)) | in memory (the only pipeline compiled to wasm) | in-memory store / bytes |
@@ -493,4 +493,4 @@ every other format decodes to `oxrdf` terms and drives the `oxrdfio` serializer.
 | In-memory adoption, compressed-resident form | [`core/src/store/mod.rs`](../core/src/store/mod.rs), [`array.rs`](../core/src/store/array.rs), [`probes.rs`](../core/src/store/probes.rs) |
 | Serialization of mutated stores, compaction, mutation policy | [`core/src/store/serialize.rs`](../core/src/store/serialize.rs), [`compaction.rs`](../core/src/store/compaction.rs), [`mutation.rs`](../core/src/store/mutation.rs) |
 | Export to RDF text | [`core/src/common/export.rs`](../core/src/common/export.rs) |
-| Bindings | [`cli/src/main.rs`](../cli/src/main.rs), [`python/src/convert.rs`](../python/src/convert.rs), [`js/src/store.rs`](../js/src/store.rs), [`js/src/ingest.rs`](../js/src/ingest.rs), [`js/src/options.rs`](../js/src/options.rs) |
+| Bindings | [`cli/src/main.rs`](../cli/src/main.rs), [`python/src/serialize.rs`](../python/src/serialize.rs), [`js/src/store.rs`](../js/src/store.rs), [`js/src/ingest.rs`](../js/src/ingest.rs), [`js/src/options.rs`](../js/src/options.rs) |

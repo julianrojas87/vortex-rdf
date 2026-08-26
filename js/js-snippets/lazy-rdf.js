@@ -2,10 +2,10 @@
 // local wasm-bindgen snippet (copied verbatim into the generated pkg; no runtime
 // npm dependency).
 //
-// `match()`/`getQuads()` hand back LazyQuads over columnar term data rather than
-// building eager Quad objects. A term's string is decoded from UTF-8 bytes only
-// when `.value`/`.termType` is read (and then interned), never eagerly and never
-// per-term across the wasm boundary. Two column backings:
+// `match()`/`getQuads()` hand back LazyQuads over columnar term data. A term's
+// string is decoded from UTF-8 bytes only when `.value`/`.termType` is read (and
+// then interned), never eagerly and never per-term across the wasm boundary.
+// Two column backings:
 //   - Dictionary layout: a Uint32Array of codes + a shared LazyDict over an
 //     immutable snapshot of the store's term dictionary, decoding codes on
 //     demand. `.equals` between terms of the same store is an integer code
@@ -73,14 +73,10 @@ function namedNode(value) {
 }
 
 // ── Dictionary decoded on demand, interned per code ──────────────────────────
-// Wraps a `TermDict` — an immutable snapshot of the store's dictionary — rather
-// than a copy of its bytes. Flattening the whole dictionary across the boundary
-// cost two full copies of every term (one to build the buffers wasm-side, one to
-// receive them here) on the first read after every mutation, however few terms
-// the query touched. Decoding on demand costs one boundary crossing per
-// *distinct* code observed; the cache absorbs repeats, and a query that only
-// counts rows — or compares terms via the integer fast path below — never
-// crosses at all.
+// Wraps a `TermDict` (an immutable snapshot of the store's dictionary).
+// Decoding is on demand and memoized per code, so a query pays one boundary
+// crossing per distinct code it observes; a query that only counts rows, or
+// compares terms through the integer fast path below, never crosses.
 class LazyDict {
     constructor(dict) {
         this.dict = dict;
@@ -167,7 +163,7 @@ export function makeLazyQuadStream(payloadPromise) {
 }
 
 // ── Minimal RDF/JS Stream over a Promise<item[]> (data/end/error, read(),
-// Symbol.asyncIterator). Same behavior as the former quad-stream.js. ─────────
+// Symbol.asyncIterator). ─────────────────────────────────────────────────────
 class QuadStream {
     constructor(itemsPromise) {
         this._promise = Promise.resolve(itemsPromise);
