@@ -25,9 +25,9 @@ fn canonical_names_round_trip() {
     }
 }
 
-/// Parsing is strict: only the canonical kebab-case names are accepted;
+/// Parsing is strict: only the canonical kebab-case names are accepted.
 /// PascalCase, snake_case and short forms are rejected rather than folded
-/// into a canonical arm.
+/// into a canonical arm, and so are names that match nothing at all.
 #[test]
 fn non_canonical_spellings_are_rejected() {
     assert!("TypedObject".parse::<LayoutStrategy>().is_err());
@@ -41,10 +41,8 @@ fn non_canonical_spellings_are_rejected() {
     assert!(err.to_string().contains("\"dictionary\""));
     let err = "typed_object".parse::<LayoutStrategy>().unwrap_err();
     assert!(err.to_string().contains("\"typed-object\""));
-}
 
-#[test]
-fn unknown_names_error() {
+    // Names that match nothing at all.
     assert!("columnar".parse::<LayoutStrategy>().is_err());
     assert!("btree".parse::<IndexType>().is_err());
 }

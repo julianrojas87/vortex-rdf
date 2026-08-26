@@ -3,6 +3,8 @@
 //! dictionary-coded index children, and the reference family's file
 //! resolution.
 
+use super::indexes::{ServeExpectations, copy_index_script_dataset, run_copy_index_serving_script};
+use super::matching::{above_gate_quads, run_subject_range_then_index_routing_above_gate};
 use super::*;
 
 // ─── Deletes over a file ───────────────────────────────────────────────
@@ -88,147 +90,28 @@ async fn test_file_backed_delete_keeps_indexes() {
 
 // ─── SecondaryByCopy on a file ─────────────────────────────────────────
 
-/// The file-backed copy index end to end: pattern shapes it accelerates,
-/// copy-served `quads()` streams (including residual graph constraints and
-/// tombstoned rows filtered through the family's rid column), and chained
-/// matches falling back to row ids.
+/// The copy index's serving script over a file of `layout`. A residual
+/// graph constraint rides the copy-served scan's filter, so the plan is kept
+/// on every layout; what `located` changes is when the ids resolve: a
+/// located run (sorted dictionary-code copies) point-reads its small runs'
+/// ids at match time and proves an empty run there, an unlocated one leaves
+/// the rid scan pending until a consumer needs it.
 async fn run_copy_index_file_test(layout: LayoutStrategy, located: bool) {
-    let graphs = [
-        GraphName::NamedNode(NamedNode::new("http://example.org/g0").unwrap()),
-        GraphName::NamedNode(NamedNode::new("http://example.org/g1").unwrap()),
-    ];
-    let quads = graph_modular_quads(30, 2, 3, 5, &graphs);
-
+    let (quads, graphs) = copy_index_script_dataset();
     let (_dir, path) =
         write_store_file(quads.clone(), layout, vec![IndexType::SecondaryByCopy]).await;
-
     let store = VortexRdfStore::from_file(&path).await.unwrap();
-    assert_eq!(store.indexes(), &[IndexType::SecondaryByCopy]);
-
-    // Predicate-bound: i ≡ 1 (mod 3), served from the POSG family. On a
-    // located resolution (sorted dictionary-code copies) the small run's
-    // ids resolve eagerly by rid point reads; otherwise the rid scan stays
-    // pending until `size` — the served `quads()` never runs it either way.
-    let p1 = NamedNode::new("http://example.org/p1").unwrap();
-    let by_p = store
-        .match_pattern(None, Some(&p1), None, None)
-        .await
-        .unwrap();
-    assert!(by_p.debug_has_serve_plan());
-    assert_eq!(by_p.debug_selection_pending(), !located);
-    assert_eq!(by_p.size().await.unwrap(), 10);
-    assert_eq!(
-        view_strings(&by_p).await,
-        expected_strings(&quads, |i| i % 3 == 1)
-    );
-    // A base-order gather cannot ride the plan: it materializes the pending
-    // ids (the deferred index-child scan) and must agree with the served read.
-    assert_eq!(by_p.selected_rows().await.unwrap().len(), 10);
-
-    // Object-bound: i ≡ 2 (mod 5), served from the OSPG family.
-    let o2 = Term::Literal(Literal::new_simple_literal("o2"));
-    let by_o = store
-        .match_pattern(None, None, Some(&o2), None)
-        .await
-        .unwrap();
-    assert!(by_o.debug_has_serve_plan());
-    assert_eq!(by_o.debug_selection_pending(), !located);
-    assert_eq!(by_o.size().await.unwrap(), 6);
-    assert_eq!(
-        view_strings(&by_o).await,
-        expected_strings(&quads, |i| i % 5 == 2)
-    );
-
-    // Predicate and object bound: one (p, o) prefix resolution —
-    // i ≡ 1 (mod 3) ∧ i ≡ 1 (mod 5) ⇔ i ≡ 1 (mod 15).
-    let o1 = Term::Literal(Literal::new_simple_literal("o1"));
-    let by_po = store
-        .match_pattern(None, Some(&p1), Some(&o1), None)
-        .await
-        .unwrap();
-    assert_eq!(by_po.size().await.unwrap(), 2);
-    assert_eq!(
-        view_strings(&by_po).await,
-        expected_strings(&quads, |i| i % 15 == 1)
-    );
-
-    // A residual graph constraint rides the copy-served scan's filter; the
-    // selection's ids cover the resolved predicate only — `size` evaluates
-    // the residual on top of them (eager on a located resolution, pending
-    // otherwise).
-    let p2 = NamedNode::new("http://example.org/p2").unwrap();
-    let by_pg = store
-        .match_pattern(None, Some(&p2), None, Some(&graphs[0]))
-        .await
-        .unwrap();
-    assert!(by_pg.debug_has_serve_plan());
-    assert_eq!(by_pg.debug_selection_pending(), !located);
-    assert_eq!(by_pg.size().await.unwrap(), 5);
-    assert_eq!(
-        view_strings(&by_pg).await,
-        expected_strings(&quads, |i| i % 3 == 2 && i % 2 == 0)
-    );
-
-    // Chaining a second match narrows the first view's row ids (the copy
-    // plan is dropped — its filter no longer selects exactly the rows).
-    let chained = by_p
-        .match_pattern(None, None, Some(&o1), None)
-        .await
-        .unwrap();
-    assert!(!chained.debug_has_serve_plan());
-    assert!(!chained.debug_selection_pending());
-    assert_eq!(
-        view_strings(&chained).await,
-        expected_strings(&quads, |i| i % 3 == 1 && i % 5 == 1)
-    );
-
-    // A term the store has never seen short-circuits to empty.
-    let missing = NamedNode::new("http://example.org/nope").unwrap();
-    let none = store
-        .match_pattern(None, Some(&missing), None, None)
-        .await
-        .unwrap();
-    assert_eq!(none.size().await.unwrap(), 0);
-
-    // A term the store knows — but never as a predicate — probes the index
-    // child and finds nothing.
-    let subject_as_p = NamedNode::new("http://example.org/s00").unwrap();
-    let zero = store
-        .match_pattern(None, Some(&subject_as_p), None, None)
-        .await
-        .unwrap();
-    // A located resolution proves the emptiness at match time and
-    // short-circuits; an unlocated one only discovers it at the consumer.
-    assert_eq!(zero.debug_selection_pending(), !located);
-    assert_eq!(view_strings(&zero).await, Vec::<String>::new());
-    assert_eq!(zero.size().await.unwrap(), 0);
-
-    // A tombstoned row must vanish from copy-served streams too: the scan
-    // reads copy rows, so the delete reaches it through the rid column.
-    let deleted = store.delete_quad(&quads[4]).await.unwrap();
-    let by_p_after = deleted
-        .match_pattern(None, Some(&p1), None, None)
-        .await
-        .unwrap();
-    assert_eq!(by_p_after.size().await.unwrap(), 9);
-    assert_eq!(
-        view_strings(&by_p_after).await,
-        expected_strings(&quads, |i| i % 3 == 1 && i != 4)
-    );
-
-    // Deleting by a served pattern: the matcher's doomed view carries pending
-    // ids, which the delete materializes into tombstones.
-    let wiped = deleted
-        .delete_matching(None, Some(&p1), None, None)
-        .await
-        .unwrap();
-    assert_eq!(wiped.size().await.unwrap(), 20);
-    let by_p_wiped = wiped
-        .match_pattern(None, Some(&p1), None, None)
-        .await
-        .unwrap();
-    assert_eq!(by_p_wiped.size().await.unwrap(), 0);
-    assert_eq!(view_strings(&by_p_wiped).await, Vec::<String>::new());
+    run_copy_index_serving_script(
+        store,
+        &quads,
+        &graphs,
+        ServeExpectations {
+            served_pending: !located,
+            residual_graph_served: true,
+            never_predicate_pending: !located,
+        },
+    )
+    .await;
 }
 
 /// A located run wider than the point-read cap keeps the deferred contract:
@@ -417,6 +300,70 @@ async fn test_copy_index_file_typed_object() {
 #[tokio::test]
 async fn test_copy_index_file_dictionary() {
     run_copy_index_file_test(LayoutStrategy::Dictionary, true).await;
+}
+
+/// A bound subject on a file locates its row range first; a residual object
+/// over a range at or above the routing gate is then still resolved by the
+/// copy index and intersected with the range.
+#[tokio::test]
+async fn test_file_subject_range_then_index_routing_above_gate() {
+    let quads = above_gate_quads();
+    let (_dir, path) = write_store_file(
+        quads.clone(),
+        LayoutStrategy::Dictionary,
+        vec![IndexType::SecondaryByCopy],
+    )
+    .await;
+    let store = VortexRdfStore::from_file(&path).await.unwrap();
+    run_subject_range_then_index_routing_above_gate(&store, &quads).await;
+}
+
+/// A file carrying both index families opens with both, answers the shapes
+/// each family covers exactly like the in-memory build, and keeps both
+/// through a `to_bytes`/`from_bytes` round trip.
+#[tokio::test]
+async fn test_file_with_both_index_kinds() {
+    let quads = modular_quads(24, 3, 4);
+    let both = vec![IndexType::SecondaryByCopy, IndexType::SecondaryByReference];
+    let (_dir, path) = write_store_file(quads.clone(), LayoutStrategy::Default, both.clone()).await;
+    let file = VortexRdfStore::from_file(&path).await.unwrap();
+    assert_eq!(file.indexes(), both.as_slice());
+
+    let arr = build_array::<SortedInMemoryBuilder>(
+        quad_stream(quads.clone()),
+        LayoutStrategy::Default,
+        both.clone(),
+    )
+    .await
+    .unwrap();
+    let memory = VortexRdfStore::from_built(arr).unwrap();
+    assert_eq!(memory.indexes(), both.as_slice());
+
+    let adopted = VortexRdfStore::from_bytes(&file.to_bytes().await.unwrap())
+        .await
+        .unwrap();
+    assert_eq!(adopted.indexes(), both.as_slice());
+
+    let p1 = NamedNode::new("http://example.org/p1").unwrap();
+    let o1 = Term::Literal(Literal::new_simple_literal("object 1"));
+    for (tag, p, o) in [
+        ("P", Some(&p1), None),
+        ("O", None, Some(&o1)),
+        ("PO", Some(&p1), Some(&o1)),
+    ] {
+        let want = view_strings(&memory.match_pattern(None, p, o, None).await.unwrap()).await;
+        assert!(!want.is_empty(), "{tag}");
+        assert_eq!(
+            view_strings(&file.match_pattern(None, p, o, None).await.unwrap()).await,
+            want,
+            "{tag}: file"
+        );
+        assert_eq!(
+            view_strings(&adopted.match_pattern(None, p, o, None).await.unwrap()).await,
+            want,
+            "{tag}: adopted"
+        );
+    }
 }
 
 // ─── SecondaryByReference on a file ────────────────────────────────────

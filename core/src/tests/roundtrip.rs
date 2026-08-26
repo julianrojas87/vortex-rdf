@@ -61,6 +61,54 @@ fn test_from_parts_rejects_bare_dictionary_array() {
     );
 }
 
+/// A rebuild over a base without the sorted stamp sorts every row: the
+/// re-emitted rows are in `(s, p, o, g)` order, the base and tail rows
+/// interleaved, and the adopted store carries the stamp.
+#[tokio::test]
+async fn test_unstamped_base_rebuild_sorts_fully() {
+    let quads = modular_quads(12, 3, 4);
+    let reversed: Vec<Quad> = quads.iter().rev().cloned().collect();
+    let base = unstamped_store(&reversed);
+    assert!(!base.debug_base_subject_sorted());
+
+    let appended = vec![
+        make_quad(
+            "http://example.org/s05a",
+            "http://example.org/p9",
+            "object 9",
+            GraphName::DefaultGraph,
+        ),
+        make_quad(
+            "http://example.org/s00a",
+            "http://example.org/p9",
+            "object 9",
+            GraphName::DefaultGraph,
+        ),
+    ];
+    let tailed = base.add_quads(appended.clone()).await.unwrap();
+    let rebuilt =
+        VortexRdfStore::from_parts(tailed.to_serializable_parts().await.unwrap()).unwrap();
+    assert!(
+        rebuilt.debug_base_subject_sorted(),
+        "a rebuild over an unstamped base must sort and stamp its rows"
+    );
+
+    let got = rebuilt.quads_vec().await.unwrap();
+    let mut union: Vec<crate::store::RawQuad> = quads
+        .iter()
+        .chain(appended.iter())
+        .map(crate::store::RawQuad::from_quad)
+        .collect();
+    union.sort();
+    let union: Vec<(String, String, String, String)> =
+        union.into_iter().map(|r| (r.s, r.p, r.o, r.g)).collect();
+    assert_eq!(
+        tuple_rows(&got),
+        union,
+        "rows must come back in (s, p, o, g) order"
+    );
+}
+
 // ─── Textual export ────────────────────────────────────────────────────
 
 /// Quads whose terms exercise everything the N-Triples escape and suffix
@@ -101,33 +149,41 @@ fn oxrdf_reference(quads: &[Quad], format: oxrdfio::RdfFormat) -> String {
     String::from_utf8(reference).unwrap()
 }
 
-/// The N-Quads export fast path writes the store's raw column strings
+/// The three layouts whose raw chunk decoding the export fast path reads
+/// through: verbatim string columns, the typed object columns, and codes
+/// against the dictionary.
+const EXPORT_LAYOUTS: [LayoutStrategy; 3] = [
+    LayoutStrategy::Default,
+    LayoutStrategy::TypedObject,
+    LayoutStrategy::Dictionary,
+];
+
+/// The N-Quads export fast path writes the store's raw term strings
 /// verbatim; this pins it byte-for-byte against oxrdfio's serializer over
 /// terms that exercise escaping, tags, datatypes, blank nodes, and a named
-/// graph.
+/// graph, under every layout's raw chunk decoding.
 #[tokio::test]
 async fn test_export_nquads_fast_path_matches_oxrdf() {
     let quads = export_test_quads();
-    let arr = build_array::<SortedInMemoryBuilder>(
-        quad_stream(quads.clone()),
-        LayoutStrategy::Default,
-        vec![],
-    )
-    .await
-    .unwrap();
-    let store = VortexRdfStore::from_built(arr).unwrap();
+    for layout in EXPORT_LAYOUTS {
+        let arr = build_array::<SortedInMemoryBuilder>(quad_stream(quads.clone()), layout, vec![])
+            .await
+            .unwrap();
+        let store = VortexRdfStore::from_built(arr).unwrap();
 
-    let stored: Vec<Quad> = store.quads().unwrap().try_collect().await.unwrap();
-    let mut exported = Vec::new();
-    crate::export_rdf(store, &mut exported, oxrdfio::RdfFormat::NQuads)
-        .await
-        .unwrap();
-    // The reference follows the store's own row order, so what this pins is
-    // the byte-level escaping rather than the build's ordering.
-    assert_eq!(
-        String::from_utf8(exported).unwrap(),
-        oxrdf_reference(&stored, oxrdfio::RdfFormat::NQuads)
-    );
+        let stored: Vec<Quad> = store.quads().unwrap().try_collect().await.unwrap();
+        let mut exported = Vec::new();
+        crate::export_rdf(store, &mut exported, oxrdfio::RdfFormat::NQuads)
+            .await
+            .unwrap();
+        // The reference follows the store's own row order, so what this pins
+        // is the byte-level escaping rather than the build's ordering.
+        assert_eq!(
+            String::from_utf8(exported).unwrap(),
+            oxrdf_reference(&stored, oxrdfio::RdfFormat::NQuads),
+            "{layout:?}"
+        );
+    }
 }
 
 /// The N-Triples fast path: byte-for-byte on a default-graph store, and the
@@ -174,23 +230,27 @@ async fn test_export_ntriples_fast_path_and_named_graph_refusal() {
 }
 
 /// The fast path's file arm: the raw chunk stream over a scan must produce
-/// the same bytes as the in-memory arm.
+/// the same bytes as the in-memory arm under every layout — the file-backed
+/// dictionary's codes resolved through the async read path included.
 #[cfg(feature = "file-io")]
 #[tokio::test]
 async fn test_export_nquads_fast_path_file_backed() {
     let quads = export_test_quads();
-    let (_dir, path) = write_store_file(quads.clone(), LayoutStrategy::Default, vec![]).await;
+    for layout in EXPORT_LAYOUTS {
+        let (_dir, path) = write_store_file(quads.clone(), layout, vec![]).await;
 
-    let store = VortexRdfStore::from_file(&path).await.unwrap();
-    let stored: Vec<Quad> = store.quads().unwrap().try_collect().await.unwrap();
-    let mut exported = Vec::new();
-    crate::export_rdf(store, &mut exported, oxrdfio::RdfFormat::NQuads)
-        .await
-        .unwrap();
-    assert_eq!(
-        String::from_utf8(exported).unwrap(),
-        oxrdf_reference(&stored, oxrdfio::RdfFormat::NQuads)
-    );
+        let store = VortexRdfStore::from_file(&path).await.unwrap();
+        let stored: Vec<Quad> = store.quads().unwrap().try_collect().await.unwrap();
+        let mut exported = Vec::new();
+        crate::export_rdf(store, &mut exported, oxrdfio::RdfFormat::NQuads)
+            .await
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(exported).unwrap(),
+            oxrdf_reference(&stored, oxrdfio::RdfFormat::NQuads),
+            "{layout:?}"
+        );
+    }
 }
 
 /// The full textual round trip through both export paths: N-Quads (the raw

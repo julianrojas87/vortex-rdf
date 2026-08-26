@@ -5,20 +5,16 @@ use super::*;
 
 // ─── In-memory matching ────────────────────────────────────────────────
 
-async fn run_match_pattern_test<B: VortexArrayBuilder>() {
-    let arr = build_array::<B>(quad_stream(two_quads()), LayoutStrategy::Default, vec![])
-        .await
-        .expect("build failed");
+#[tokio::test]
+async fn test_match_pattern_default_layout() {
+    let arr = build_array::<SortedInMemoryBuilder>(
+        quad_stream(two_quads()),
+        LayoutStrategy::Default,
+        vec![],
+    )
+    .await
+    .expect("build failed");
     probe_default(VortexRdfStore::from_built(arr).unwrap()).await;
-}
-
-#[tokio::test]
-async fn test_match_sorted_in_memory() {
-    run_match_pattern_test::<SortedInMemoryBuilder>().await;
-}
-#[tokio::test]
-async fn test_match_sorted_stream() {
-    run_match_pattern_test::<SortedStreamBuilder>().await;
 }
 
 #[tokio::test]
@@ -35,50 +31,178 @@ async fn test_match_typed_object_layout() {
     probe_typed_object(store).await;
 }
 
+/// Every term kind in every role round-trips through each layout and binds
+/// exactly its rows: a blank-node subject, a blank-node graph, the default
+/// graph bound explicitly, and IRI / blank / plain / language-tagged / typed
+/// objects — with and without the copy index, whose sorted copies carry the
+/// same terms.
 #[tokio::test]
-async fn test_sorted_subject_binary_search() {
-    // Multiple quads per subject: the binary-search fast path must return
-    // the full [lo, hi) range for the matched subject.
-    let mut quads: Vec<Quad> = Vec::new();
-    for i in (0..10).rev() {
-        for p in ["http://example.org/p1", "http://example.org/p2"] {
-            quads.push(make_quad(
-                &format!("http://example.org/s{:02}", i),
-                p,
-                "o",
-                GraphName::DefaultGraph,
-            ));
+async fn test_term_kinds_match_under_every_layout() {
+    let quads = term_kind_quads();
+    let blank_subject = quads
+        .iter()
+        .find_map(|q| match &q.subject {
+            NamedOrBlankNode::BlankNode(_) => Some(q.subject.clone()),
+            _ => None,
+        })
+        .unwrap();
+    let blank_graph = quads
+        .iter()
+        .find_map(|q| match &q.graph_name {
+            GraphName::BlankNode(_) => Some(q.graph_name.clone()),
+            _ => None,
+        })
+        .unwrap();
+    for layout in [
+        LayoutStrategy::Default,
+        LayoutStrategy::TypedObject,
+        LayoutStrategy::Dictionary,
+    ] {
+        for indexes in [vec![], vec![IndexType::SecondaryByCopy]] {
+            let tag = format!("{layout:?} {indexes:?}");
+            let arr =
+                build_array::<SortedInMemoryBuilder>(quad_stream(quads.clone()), layout, indexes)
+                    .await
+                    .unwrap();
+            let store = VortexRdfStore::from_built(arr).unwrap();
+            assert_eq!(view_strings(&store).await, quad_strings(&quads), "{tag}");
+
+            let by_blank_s = store
+                .match_pattern(Some(&blank_subject), None, None, None)
+                .await
+                .unwrap();
+            assert_eq!(
+                view_strings(&by_blank_s).await,
+                expected_strings(&quads, |i| quads[i].subject == blank_subject),
+                "{tag}: blank subject"
+            );
+            let by_blank_g = store
+                .match_pattern(None, None, None, Some(&blank_graph))
+                .await
+                .unwrap();
+            assert_eq!(
+                view_strings(&by_blank_g).await,
+                expected_strings(&quads, |i| quads[i].graph_name == blank_graph),
+                "{tag}: blank graph"
+            );
+            let by_default_g = store
+                .match_pattern(None, None, None, Some(&GraphName::DefaultGraph))
+                .await
+                .unwrap();
+            let default_rows = by_default_g.quads_vec().await.unwrap();
+            assert_eq!(
+                quad_strings(&default_rows),
+                expected_strings(&quads, |i| quads[i].graph_name == GraphName::DefaultGraph),
+                "{tag}: default graph"
+            );
+            assert!(
+                default_rows
+                    .iter()
+                    .all(|q| q.graph_name == GraphName::DefaultGraph),
+                "{tag}: default graph rows must decode to the default graph"
+            );
+            for quad in &quads {
+                let by_o = store
+                    .match_pattern(None, None, Some(&quad.object), None)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    view_strings(&by_o).await,
+                    vec![quad.to_string()],
+                    "{tag}: object {}",
+                    quad.object
+                );
+            }
         }
     }
+}
 
-    let arr =
-        build_array::<SortedInMemoryBuilder>(quad_stream(quads), LayoutStrategy::Default, vec![])
-            .await
-            .unwrap();
+/// One subject wide enough to sit at or above the index-routing gate
+/// (5,000 rows over 3 predicates and 1,667 objects) and a second, narrow
+/// one sharing its objects — so a subject-then-object match can only be
+/// right when the index resolution is intersected with the subject range.
+pub(super) fn above_gate_quads() -> Vec<Quad> {
+    let mut quads: Vec<Quad> = (0..5_000)
+        .map(|i| {
+            make_quad(
+                "http://example.org/s0",
+                &format!("http://example.org/p{}", i % 3),
+                &format!("o{}", i % 1_667),
+                GraphName::DefaultGraph,
+            )
+        })
+        .collect();
+    quads.push(make_quad(
+        "http://example.org/s1",
+        "http://example.org/p0",
+        "o5",
+        GraphName::DefaultGraph,
+    ));
+    quads.push(make_quad(
+        "http://example.org/s1",
+        "http://example.org/p1",
+        "o7",
+        GraphName::DefaultGraph,
+    ));
+    quads
+}
+
+/// Over [`above_gate_quads`] with the copy index: a bound subject resolves
+/// to its row range first, and the residual object is then resolved by the
+/// index whenever the range is at or above the routing gate — the result is
+/// the intersection (exact ids, no longer a range, and never served, since
+/// the subject already restricts the view). Below the gate the residual is
+/// filtered column-wise to the same answer.
+pub(super) async fn run_subject_range_then_index_routing_above_gate(
+    store: &VortexRdfStore,
+    quads: &[Quad],
+) {
+    let s0 = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/s0").unwrap());
+    let s1 = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/s1").unwrap());
+    let o5 = Term::Literal(Literal::new_simple_literal("o5"));
+
+    // "o5" is on s0 at i ≡ 5 (mod 1667) — 3 rows — and once on s1.
+    let by_o = store
+        .match_pattern(None, None, Some(&o5), None)
+        .await
+        .unwrap();
+    assert_eq!(by_o.size().await.unwrap(), 4);
+
+    let above = store
+        .match_pattern(Some(&s0), None, Some(&o5), None)
+        .await
+        .unwrap();
+    assert_eq!(above.debug_selection_range(), None);
+    assert!(!above.debug_has_serve_plan());
+    assert_eq!(
+        view_strings(&above).await,
+        expected_strings(quads, |i| quads[i].subject == s0 && quads[i].object == o5)
+    );
+
+    let below = store
+        .match_pattern(Some(&s1), None, Some(&o5), None)
+        .await
+        .unwrap();
+    assert_eq!(below.debug_selection_range(), None);
+    assert!(!below.debug_has_serve_plan());
+    assert_eq!(
+        view_strings(&below).await,
+        expected_strings(quads, |i| quads[i].subject == s1 && quads[i].object == o5)
+    );
+}
+
+#[tokio::test]
+async fn test_subject_range_then_index_routing_above_gate() {
+    let quads = above_gate_quads();
+    let arr = build_array::<SortedInMemoryBuilder>(
+        quad_stream(quads.clone()),
+        LayoutStrategy::Dictionary,
+        vec![IndexType::SecondaryByCopy],
+    )
+    .await
+    .unwrap();
     let store = VortexRdfStore::from_built(arr).unwrap();
-
-    let s5 = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/s05").unwrap());
-    let matched = store
-        .match_pattern(Some(&s5), None, None, None)
-        .await
-        .unwrap();
-    assert_eq!(matched.size().await.unwrap(), 2);
-
-    // Subject + predicate narrows within the sliced range.
-    let p1 = NamedNode::new("http://example.org/p1").unwrap();
-    let matched_sp = store
-        .match_pattern(Some(&s5), Some(&p1), None, None)
-        .await
-        .unwrap();
-    assert_eq!(matched_sp.size().await.unwrap(), 1);
-
-    // Missing subject → empty via binary search short-circuit.
-    let s99 = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/s99").unwrap());
-    let empty = store
-        .match_pattern(Some(&s99), None, None, None)
-        .await
-        .unwrap();
-    assert_eq!(empty.size().await.unwrap(), 0);
+    run_subject_range_then_index_routing_above_gate(&store, &quads).await;
 }
 
 // ─── Prefix probe: nested binary search over the (s, p, o, g) order ────
@@ -226,10 +350,12 @@ async fn test_prefix_probe_stops_at_the_first_unbound_role() {
 }
 
 /// Under a string layout only the subject has a searchable column: the
-/// prefix stops after it and the rest is answered by the residual scan.
+/// prefix stops after it and the rest is answered by the residual scan. A
+/// subject the store never saw narrows to an empty range.
 #[tokio::test]
 async fn test_prefix_probe_string_layout_narrows_by_subject_only() {
     let (s, p, o, _) = prefix_terms();
+    let s99 = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/s99").unwrap());
     for layout in [LayoutStrategy::Default, LayoutStrategy::TypedObject] {
         let arr = build_array::<SortedInMemoryBuilder>(quad_stream(prefix_quads()), layout, vec![])
             .await
@@ -246,6 +372,18 @@ async fn test_prefix_probe_string_layout_narrows_by_subject_only() {
             .unwrap();
         assert_eq!(by_spo.debug_selection_range(), None, "{layout:?}");
         assert_eq!(by_spo.size().await.unwrap(), 2, "{layout:?}");
+
+        let by_missing = store
+            .match_pattern(Some(&s99), None, None, None)
+            .await
+            .unwrap();
+        assert!(
+            by_missing
+                .debug_selection_range()
+                .is_some_and(|r| r.is_empty()),
+            "{layout:?}: a missing subject must narrow to an empty range"
+        );
+        assert_eq!(by_missing.size().await.unwrap(), 0, "{layout:?}");
     }
 }
 

@@ -228,6 +228,7 @@ async fn test_file_backed_dictionary_serializes_and_mutates() {
     mutated = mutated.add_quad(extra.clone()).await.unwrap();
     assert_eq!(mutated.size().await.unwrap(), quads.len() + 1);
     assert!(mutated.contains(&extra).await.unwrap());
+    assert_shared_matches_quads(&mutated, "file-backed tailed").await;
     let merged = mutated.to_bytes().await.unwrap();
     let merged_store = VortexRdfStore::from_bytes(&merged).await.unwrap();
     assert_eq!(merged_store.size().await.unwrap(), quads.len() + 1);
@@ -236,6 +237,7 @@ async fn test_file_backed_dictionary_serializes_and_mutates() {
     // dictionary; the reopened store serves the surviving quads.
     let doomed = quads[0].clone();
     let deleted = fb.delete_quad(&doomed).await.unwrap();
+    assert_shared_matches_quads(&deleted, "file-backed tombstoned").await;
     let compacted = deleted.compact().await.unwrap();
     assert_eq!(compacted.size().await.unwrap(), quads.len() - 1);
     assert!(!compacted.contains(&doomed).await.unwrap());
@@ -379,6 +381,55 @@ async fn test_file_backed_dictionary_probe_parity() {
             .collect();
         assert_eq!(got, want);
     }
+    // A code past the last term is rejected, an empty batch resolves to
+    // nothing.
+    assert!(matches!(
+        fb.decode_many(&[len as u32]).await,
+        Err(VortexRdfError::Deserialization(_))
+    ));
+    assert!(fb.decode_many(&[]).await.unwrap().is_empty());
+}
+
+/// A copy-served run wider than the point-read cap on a file-backed
+/// dictionary is decoded chunk by chunk through the async term resolution,
+/// agreeing row for row with the resident open of the same file.
+#[tokio::test]
+async fn test_file_backed_dictionary_serves_wide_run() {
+    let quads = modular_quads(900, 3, 4);
+    let (_dir, path) = write_store_file(
+        quads.clone(),
+        LayoutStrategy::Dictionary,
+        vec![IndexType::SecondaryByCopy],
+    )
+    .await;
+    let resident = VortexRdfStore::from_file(&path).await.unwrap();
+    let fb = VortexRdfStore::from_file_with_dict_residency(&path, 0)
+        .await
+        .unwrap();
+    assert!(fb.debug_dict_file_backed());
+    assert!(!resident.debug_dict_file_backed());
+
+    // 300 rows per predicate: past the point-read cap, so the run is read
+    // by range.
+    let p1 = NamedNode::new("http://example.org/p1").unwrap();
+    let served = fb.match_pattern(None, Some(&p1), None, None).await.unwrap();
+    assert!(served.debug_has_serve_plan());
+    assert_eq!(served.size().await.unwrap(), 300);
+    assert!(served.size().await.unwrap() > crate::store::selection::POINT_GATHER_MAX_ROWS);
+    let want = expected_strings(&quads, |i| i % 3 == 1);
+    assert_eq!(view_strings(&served).await, want);
+    assert_eq!(
+        view_strings(
+            &resident
+                .match_pattern(None, Some(&p1), None, None)
+                .await
+                .unwrap()
+        )
+        .await,
+        want
+    );
+    let shared = assert_shared_matches_quads(&served, "file-backed wide run").await;
+    assert_eq!(shared.len(), 300);
 }
 
 /// A probe sorting below every dictionary term must come back absent rather
@@ -421,6 +472,110 @@ async fn test_file_backed_dictionary_rejects_below_first_term() {
     assert_eq!(fb.encode("!").await.unwrap(), None);
     // And row 0 itself still resolves.
     assert_eq!(fb.encode(&first_term).await.unwrap(), Some(0));
+}
+
+/// A dictionary child whose layout shape cannot be point-read — one flat
+/// leaf holding the whole struct, with no struct layout to find the term
+/// column under — declines the file-backed handle, and an open that asked
+/// for a file-backed dictionary lifts it resident instead, answering every
+/// pattern exactly.
+#[tokio::test]
+async fn test_file_backed_dictionary_unaddressable_child_lifts_resident() {
+    use crate::io::container::{
+        BufferedComponentSource, NativeComponentWrite, StoreComponentDescriptor, StoreComponentRole,
+    };
+    use std::sync::Arc;
+    use vortex_layout::layouts::flat::writer::FlatLayoutStrategy;
+
+    let quads = dictionary_test_quads();
+    let built = build_array::<SortedInMemoryBuilder>(
+        quad_stream(quads.clone()),
+        LayoutStrategy::Dictionary,
+        vec![],
+    )
+    .await
+    .unwrap();
+    let dict = built
+        .dict
+        .clone()
+        .expect("a Dictionary build carries its dictionary");
+    let chunks = dict.child_chunks().unwrap();
+    let dtype = chunks[0].dtype().clone();
+    // The dictionary component written as a single flat leaf.
+    let flat = NativeComponentWrite::new(
+        StoreComponentDescriptor {
+            name: DICT_COMPONENT_NAME.into(),
+            role: StoreComponentRole::Dictionary,
+            implementation: container::DICT_IMPLEMENTATION.into(),
+            version: 1,
+            required: true,
+            sorted: true,
+            dtype,
+        },
+        Arc::new(BufferedComponentSource::try_new(chunks).unwrap()),
+        Arc::new(FlatLayoutStrategy::default()),
+    )
+    .unwrap();
+    let mut bytes: Vec<u8> = Vec::new();
+    container::write_store(
+        &crate::session::VORTEX_SESSION,
+        &mut bytes,
+        vortex_array::stream::ArrayStreamAdapter::new(
+            built.array.dtype().clone(),
+            Box::pin(stream::iter([Ok(built.array.clone())])),
+        ),
+        container::default_child_strategy(),
+        true,
+        vec![flat],
+    )
+    .await
+    .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("flat.vortex");
+    std::fs::write(&path, &bytes).unwrap();
+
+    let outer =
+        NativeStoreFile::try_new(crate::io::read::open_vortex_file(&path).await.unwrap()).unwrap();
+    assert!(
+        FileBackedDict::open(&outer).unwrap().is_none(),
+        "a flat dictionary child must decline the point-read handle"
+    );
+
+    let store = VortexRdfStore::from_file_with_dict_residency(&path, 0)
+        .await
+        .unwrap();
+    assert!(!store.debug_dict_file_backed());
+    assert!(store.dictionary_snapshot().is_some());
+    assert_eq!(view_strings(&store).await, quad_strings(&quads));
+    let p0 = NamedNode::new("http://example.org/p0").unwrap();
+    assert_eq!(
+        matched_strings(&store, None, Some(&p0), None, None).await,
+        expected_strings(&quads, |i| i % 3 == 0)
+    );
+
+    // An empty dictionary child declines the same way (nothing to
+    // point-read) and opens resident — reachable only when the child still
+    // occupies bytes the zero threshold cannot cover.
+    let (_dir, empty_path) = write_store_file(Vec::new(), LayoutStrategy::Dictionary, vec![]).await;
+    let empty_file = NativeStoreFile::try_new(
+        crate::io::read::open_vortex_file(&empty_path)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    if empty_file
+        .component_bytes(DICT_COMPONENT_NAME)
+        .unwrap()
+        .is_some_and(|bytes| bytes > 0)
+    {
+        assert!(FileBackedDict::open(&empty_file).unwrap().is_none());
+        let empty = VortexRdfStore::from_file_with_dict_residency(&empty_path, 0)
+            .await
+            .unwrap();
+        assert!(!empty.debug_dict_file_backed());
+        assert!(empty.dictionary_snapshot().is_some());
+        assert_eq!(empty.size().await.unwrap(), 0);
+    }
 }
 
 // ─── Dictionary child round-trips ──────────────────────────────────────

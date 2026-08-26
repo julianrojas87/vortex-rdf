@@ -5,7 +5,7 @@ use super::*;
 
 // ─── Dictionary layout ─────────────────────────────────────────────────
 
-async fn run_dictionary_roundtrip<B: VortexArrayBuilder>() {
+async fn run_dictionary_roundtrip<B: VortexArrayBuilder>(builder: &str) {
     let quads = dictionary_test_quads();
     let arr = build_array::<B>(
         quad_stream(quads.clone()),
@@ -13,13 +13,68 @@ async fn run_dictionary_roundtrip<B: VortexArrayBuilder>() {
         vec![],
     )
     .await
-    .expect("dictionary build failed");
+    .unwrap_or_else(|e| panic!("{builder}: dictionary build failed: {e}"));
 
     let store = VortexRdfStore::from_built(arr).unwrap();
-    assert_eq!(store.layout(), LayoutStrategy::Dictionary);
+    assert_eq!(store.layout(), LayoutStrategy::Dictionary, "{builder}");
 
     let decoded: Vec<Quad> = store.quads().unwrap().try_collect().await.unwrap();
-    assert_eq!(quad_strings(&decoded), quad_strings(&quads));
+    assert_eq!(quad_strings(&decoded), quad_strings(&quads), "{builder}");
+}
+
+#[tokio::test]
+async fn test_dictionary_roundtrip_both_builders() {
+    run_dictionary_roundtrip::<SortedInMemoryBuilder>("SortedInMemoryBuilder").await;
+    run_dictionary_roundtrip::<SortedStreamBuilder>("SortedStreamBuilder").await;
+}
+
+/// The push-based sink builds what the sorted in-memory builder builds from
+/// the same quads: the same decoded quads, index roster and component
+/// names, and a store that serves its index-routed matches the same way.
+#[tokio::test]
+async fn test_dictionary_quad_sink_matches_sorted_in_memory_builder() {
+    use crate::store::RawQuad;
+    use crate::store::layouts::dictionary::DictionaryQuadSink;
+
+    let quads = dictionary_test_quads();
+    let mut sink = DictionaryQuadSink::new(vec![IndexType::SecondaryByCopy]);
+    for quad in &quads {
+        sink.push(RawQuad::from_quad(quad));
+    }
+    let sunk = sink.finish().unwrap();
+    let built = build_array::<SortedInMemoryBuilder>(
+        quad_stream(quads.clone()),
+        LayoutStrategy::Dictionary,
+        vec![IndexType::SecondaryByCopy],
+    )
+    .await
+    .unwrap();
+    assert_eq!(component_names(&sunk), component_names(&built));
+    assert_eq!(sunk.array.len(), built.array.len());
+
+    let sunk = VortexRdfStore::from_built(sunk).unwrap();
+    let built = VortexRdfStore::from_built(built).unwrap();
+    assert_eq!(sunk.layout(), LayoutStrategy::Dictionary);
+    assert_eq!(sunk.indexes(), built.indexes());
+    assert_eq!(view_strings(&sunk).await, quad_strings(&quads));
+    assert_eq!(view_strings(&sunk).await, view_strings(&built).await);
+
+    let p0 = NamedNode::new("http://example.org/p0").unwrap();
+    let served = sunk
+        .match_pattern(None, Some(&p0), None, None)
+        .await
+        .unwrap();
+    assert!(served.debug_has_serve_plan());
+    assert_eq!(
+        view_strings(&served).await,
+        view_strings(
+            &built
+                .match_pattern(None, Some(&p0), None, None)
+                .await
+                .unwrap()
+        )
+        .await
+    );
 }
 
 /// Decoding memoizes each role's terms in a fixed-size, direct-mapped table,
@@ -82,15 +137,6 @@ async fn test_dictionary_decode_survives_memo_slot_collisions() {
         .collect();
     assert!(!expected.is_empty());
     assert_eq!(quad_strings(&matched), quad_strings(&expected));
-}
-
-#[tokio::test]
-async fn test_dictionary_sorted_in_memory() {
-    run_dictionary_roundtrip::<SortedInMemoryBuilder>().await;
-}
-#[tokio::test]
-async fn test_dictionary_sorted_stream() {
-    run_dictionary_roundtrip::<SortedStreamBuilder>().await;
 }
 
 #[tokio::test]
@@ -380,4 +426,76 @@ async fn test_code_read_snapshot_gate() {
             .unwrap();
     let string_store = VortexRdfStore::from_built(arr).unwrap();
     assert!(string_store.code_read_snapshot().is_none());
+}
+
+/// A store adopted from its own bytes hands out a code-read snapshot, and
+/// the codes its rows and its matched views gather decode against that
+/// snapshot to exactly the quads it was built from.
+#[cfg(feature = "file-io")]
+#[tokio::test]
+async fn test_code_read_snapshot_survives_from_bytes() {
+    let quads = dictionary_test_quads();
+    let arr = build_array::<SortedInMemoryBuilder>(
+        quad_stream(quads.clone()),
+        LayoutStrategy::Dictionary,
+        vec![IndexType::SecondaryByCopy],
+    )
+    .await
+    .unwrap();
+    let store = VortexRdfStore::from_built(arr).unwrap();
+    let adopted = VortexRdfStore::from_bytes(&store.to_bytes().await.unwrap())
+        .await
+        .unwrap();
+    let dict = adopted
+        .code_read_snapshot()
+        .expect("an adopted Dictionary store is code-readable");
+
+    let decode_rows = |cols: &[vortex_buffer::Buffer<u32>; 4]| -> Vec<String> {
+        let mut rows: Vec<String> = (0..cols[0].len())
+            .map(|i| {
+                let term = |c: &vortex_buffer::Buffer<u32>| {
+                    dict.decode(c[i])
+                        .expect("codes address the adopted dictionary")
+                };
+                format!(
+                    "{} {} {} {}",
+                    term(&cols[0]),
+                    term(&cols[1]),
+                    term(&cols[2]),
+                    term(&cols[3])
+                )
+            })
+            .collect();
+        rows.sort();
+        rows
+    };
+    let raw_rows = |keep: &dyn Fn(&Quad) -> bool| -> Vec<String> {
+        let mut rows: Vec<String> = quads
+            .iter()
+            .filter(|q| keep(q))
+            .map(|q| {
+                let r = crate::store::RawQuad::from_quad(q);
+                format!("{} {} {} {}", r.s, r.p, r.o, r.g)
+            })
+            .collect();
+        rows.sort();
+        rows
+    };
+
+    let gathered = adopted.code_columns_gathered().await.unwrap().unwrap();
+    assert_eq!(decode_rows(&gathered), raw_rows(&|_| true));
+
+    // The gather the bindings pair with the snapshot: a served match's
+    // codes, read off the answering index.
+    let p0 = NamedNode::new("http://example.org/p0").unwrap();
+    let matched = adopted
+        .match_pattern(None, Some(&p0), None, None)
+        .await
+        .unwrap();
+    assert!(matched.debug_has_serve_plan());
+    let matched_codes = matched.code_columns_gathered().await.unwrap().unwrap();
+    assert_eq!(
+        decode_rows(&matched_codes),
+        raw_rows(&|q| q.predicate == p0.as_ref())
+    );
 }

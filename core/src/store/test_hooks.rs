@@ -22,6 +22,8 @@ use crate::store::layouts::{DictAccess, ResolvedLayout};
 use crate::store::selection::{RowSelection, ViewSelection};
 use crate::store::{QuadsSource, VortexRdfStore};
 
+pub(crate) use crate::store::mutation::{TAIL_FLATTEN_FLOOR, TAIL_MAX_CHUNKS};
+
 #[cfg(feature = "file-io")]
 use oxrdf::NamedOrBlankNode;
 

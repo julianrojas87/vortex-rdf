@@ -147,7 +147,9 @@ async fn test_dictionary_streaming_chunk_boundaries() {
 /// several runs, so the quad merge and every index family's `(value, row id)`
 /// sort take the spill-and-K-way-merge branch: the chunks come out `[3; 8]`,
 /// every quad survives in global subject order, and the merged index columns
-/// still route P, O and PO matches to their exact selectivities.
+/// still route P, O and PO matches to their exact selectivities — under the
+/// string layout and the code layout (whose index children carry codes
+/// against the merged dictionary) alike.
 #[tokio::test]
 async fn test_sorted_streaming_spilled_indexes_match_in_memory() {
     let indexes = vec![IndexType::SecondaryByCopy, IndexType::SecondaryByReference];
@@ -156,88 +158,126 @@ async fn test_sorted_streaming_spilled_indexes_match_in_memory() {
     let mut quads = modular_quads(24, 3, 4);
     quads.reverse();
 
-    // The quad chunk stream is primary-only (index families stream as native
-    // components beside it); chunk sizes still follow the merge windows.
-    let built = sorted_stream::build_chunk_stream(
-        Box::new(quad_stream(quads.clone())),
-        LayoutStrategy::Default,
-        indexes.clone(),
-        3,
-        None,
-    )
-    .await
-    .expect("spilled build");
-    assert_eq!(
-        built.components.len(),
-        4,
-        "posg/ospg/ref-o/ref-p components"
-    );
-    let chunks: Vec<_> = built
-        .chunks
-        .collect::<Vec<_>>()
+    for layout in [LayoutStrategy::Default, LayoutStrategy::Dictionary] {
+        // The quad chunk stream is primary-only (index families stream as
+        // native components beside it); chunk sizes still follow the merge
+        // windows.
+        let built = sorted_stream::build_chunk_stream(
+            Box::new(quad_stream(quads.clone())),
+            layout,
+            indexes.clone(),
+            3,
+            None,
+        )
         .await
-        .into_iter()
-        .map(|c| c.expect("chunk"))
-        .collect();
-    assert_eq!(
-        chunks.iter().map(|c| c.len()).collect::<Vec<_>>(),
-        [3, 3, 3, 3, 3, 3, 3, 3],
-        "unexpected chunk sizes"
-    );
+        .expect("spilled build");
+        assert_eq!(
+            built.components.len(),
+            4,
+            "{layout:?}: posg/ospg/ref-o/ref-p components"
+        );
+        let chunks: Vec<_> = built
+            .chunks
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .map(|c| c.expect("chunk"))
+            .collect();
+        assert_eq!(
+            chunks.iter().map(|c| c.len()).collect::<Vec<_>>(),
+            [3, 3, 3, 3, 3, 3, 3, 3],
+            "{layout:?}: unexpected chunk sizes"
+        );
 
-    // The materializing path re-glues the streamed components into the
-    // in-memory build, index routing included.
-    let built = sorted_stream::build_array(
-        Box::new(quad_stream(quads.clone())),
+        // The materializing path re-glues the streamed components into the
+        // in-memory build, index routing included.
+        let built = sorted_stream::build_array(
+            Box::new(quad_stream(quads.clone())),
+            layout,
+            indexes.clone(),
+            3,
+        )
+        .await
+        .expect("spilled array build");
+        let store = VortexRdfStore::from_built(built).unwrap();
+        assert_eq!(store.layout(), layout);
+        assert_eq!(store.indexes(), &indexes[..]);
+
+        // Every quad survived the spill round-trip, in global subject order.
+        let decoded: Vec<Quad> = store.quads().unwrap().try_collect().await.unwrap();
+        let mut expected = quad_strings(&quads);
+        expected.sort();
+        assert_eq!(quad_strings(&decoded), expected, "{layout:?}");
+
+        // And the index columns the spill merge emitted actually route: the
+        // same selectivities the single-run copy-index test asserts.
+        let p1 = NamedNode::new("http://example.org/p1").unwrap();
+        let o1 = Term::Literal(Literal::new_simple_literal("object 1"));
+        for (tag, pp, po, want) in [
+            ("P", Some(&p1), None, 8),
+            ("O", None, Some(&o1), 6),
+            ("PO", Some(&p1), Some(&o1), 2),
+        ] {
+            assert_eq!(
+                store
+                    .match_pattern(None, pp, po, None)
+                    .await
+                    .unwrap()
+                    .size()
+                    .await
+                    .unwrap(),
+                want,
+                "{layout:?}: {tag}"
+            );
+        }
+    }
+}
+
+/// An empty input through the streaming builder yields an empty store that
+/// still declares the requested index set, under every layout.
+#[tokio::test]
+async fn test_sorted_stream_empty_dataset() {
+    for layout in [
         LayoutStrategy::Default,
-        indexes.clone(),
-        3,
-    )
-    .await
-    .expect("spilled array build");
-    let store = VortexRdfStore::from_built(built).unwrap();
-    assert_eq!(store.indexes(), &indexes[..]);
-
-    // Every quad survived the spill round-trip, in global subject order.
-    let decoded: Vec<Quad> = store.quads().unwrap().try_collect().await.unwrap();
-    let mut expected = quad_strings(&quads);
-    expected.sort();
-    assert_eq!(quad_strings(&decoded), expected);
-
-    // And the index columns the spill merge emitted actually route: the
-    // same selectivities the single-run copy-index test asserts.
-    let p1 = NamedNode::new("http://example.org/p1").unwrap();
-    let o1 = Term::Literal(Literal::new_simple_literal("object 1"));
-    assert_eq!(
-        store
-            .match_pattern(None, Some(&p1), None, None)
+        LayoutStrategy::TypedObject,
+        LayoutStrategy::Dictionary,
+    ] {
+        for indexes in [
+            vec![],
+            vec![IndexType::SecondaryByCopy, IndexType::SecondaryByReference],
+        ] {
+            let built = sorted_stream::build_array(
+                Box::new(quad_stream(vec![])),
+                layout,
+                indexes.clone(),
+                3,
+            )
             .await
-            .unwrap()
-            .size()
-            .await
-            .unwrap(),
-        8
-    );
-    assert_eq!(
-        store
-            .match_pattern(None, None, Some(&o1), None)
-            .await
-            .unwrap()
-            .size()
-            .await
-            .unwrap(),
-        6
-    );
-    assert_eq!(
-        store
-            .match_pattern(None, Some(&p1), Some(&o1), None)
-            .await
-            .unwrap()
-            .size()
-            .await
-            .unwrap(),
-        2
-    );
+            .unwrap_or_else(|e| panic!("{layout:?}/{indexes:?}: {e}"));
+            assert_eq!(built.array.len(), 0, "{layout:?}/{indexes:?}");
+            assert_eq!(
+                built.components.len(),
+                2 * indexes.len(),
+                "{layout:?}/{indexes:?}: two components per index kind"
+            );
+            let store = VortexRdfStore::from_built(built).unwrap();
+            assert_eq!(store.layout(), layout);
+            assert_eq!(store.indexes(), indexes.as_slice());
+            assert_eq!(store.size().await.unwrap(), 0, "{layout:?}/{indexes:?}");
+            let p = NamedNode::new("http://example.org/p0").unwrap();
+            assert_eq!(
+                store
+                    .match_pattern(None, Some(&p), None, None)
+                    .await
+                    .unwrap()
+                    .size()
+                    .await
+                    .unwrap(),
+                0,
+                "{layout:?}/{indexes:?}"
+            );
+        }
+    }
 }
 
 /// The writer's output read back through `from_bytes`: quads fed in reverse
@@ -301,8 +341,10 @@ fn reverse_order_quads() -> Vec<Quad> {
     quads
 }
 
+/// Both sorted builders stamp the `s` column sorted — the streaming one
+/// after materializing several chunks into one array.
 #[tokio::test]
-async fn test_sorted_builder_stamps_is_sorted() {
+async fn test_sorted_builders_stamp_is_sorted() {
     let quads = reverse_order_quads();
 
     let sorted = build_array::<SortedInMemoryBuilder>(
@@ -313,4 +355,14 @@ async fn test_sorted_builder_stamps_is_sorted() {
     .await
     .unwrap();
     assert_subject_stamp(sorted.array, true, "sorted_in_memory");
+
+    let streamed = sorted_stream::build_array(
+        Box::new(quad_stream(quads)),
+        LayoutStrategy::Default,
+        vec![],
+        3,
+    )
+    .await
+    .unwrap();
+    assert_subject_stamp(streamed.array, true, "sorted_stream");
 }

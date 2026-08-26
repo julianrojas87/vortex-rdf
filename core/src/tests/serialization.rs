@@ -175,6 +175,73 @@ async fn test_serialize_to_empty_keeps_indexes() {
     }
 }
 
+/// A narrowed view serializes its rows alone: the round-tripped store holds
+/// exactly the matched quads and declares no indexes, whatever the source
+/// carried.
+#[tokio::test]
+async fn test_narrowed_view_serializes_rows_only() {
+    let quads = modular_quads(12, 3, 4);
+    let arr = build_array::<SortedInMemoryBuilder>(
+        quad_stream(quads.clone()),
+        LayoutStrategy::Default,
+        vec![IndexType::SecondaryByCopy, IndexType::SecondaryByReference],
+    )
+    .await
+    .unwrap();
+    let store = VortexRdfStore::from_built(arr).unwrap();
+    let p1 = NamedNode::new("http://example.org/p1").unwrap();
+    let view = store
+        .match_pattern(None, Some(&p1), None, None)
+        .await
+        .unwrap();
+    assert_eq!(view.size().await.unwrap(), 4);
+
+    let reread = VortexRdfStore::from_bytes(&view.to_bytes().await.unwrap())
+        .await
+        .unwrap();
+    assert!(
+        reread.indexes().is_empty(),
+        "a narrowed view's serialization carries no index components"
+    );
+    assert_eq!(reread.size().await.unwrap(), 4);
+    assert_eq!(
+        view_strings(&reread).await,
+        expected_strings(&quads, |i| i % 3 == 1)
+    );
+}
+
+/// An unstamped owner passes its rows through untouched, so the wire
+/// records `quads_sorted == false` and a reader neither stamps the base nor
+/// loses the rows to a subject-bound match.
+#[tokio::test]
+async fn test_unstamped_owner_to_bytes_records_unsorted() {
+    let mut quads = modular_quads(12, 3, 4);
+    quads.reverse();
+    let store = unstamped_store(&quads);
+
+    let bytes = store.to_bytes().await.unwrap();
+    let (quads_sorted, _) = container::store_metadata_of_bytes(&bytes);
+    assert!(
+        !quads_sorted,
+        "an unstamped owner's serialization must not claim sorted order"
+    );
+
+    let reread = VortexRdfStore::from_bytes(&bytes).await.unwrap();
+    assert!(!reread.debug_base_subject_sorted());
+    assert_eq!(reread.size().await.unwrap(), 12);
+    let s07 = subject_node(7, 2);
+    assert_eq!(
+        view_strings(
+            &reread
+                .match_pattern(Some(&s07), None, None, None)
+                .await
+                .unwrap()
+        )
+        .await,
+        expected_strings(&quads, |i| quads[i].subject == s07)
+    );
+}
+
 /// An unrefined file-backed store's `to_bytes` reads its index children
 /// wholesale, so the byte round-trip keeps the index set.
 #[tokio::test]

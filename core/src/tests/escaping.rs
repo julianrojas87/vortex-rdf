@@ -103,20 +103,21 @@ async fn escaped_literals_roundtrip_typed_object_layout() {
     run_escaped_literal_roundtrip(LayoutStrategy::TypedObject, vec![]).await;
 }
 
-/// The object index stores the serialized (escaped) object term, so an
-/// index-routed match has to agree with the scan on the same spelling.
+/// An index-routed O-bound match must agree with the scan on the stored
+/// object spelling (escaped string): both secondary index kinds hold that
+/// spelling — the by-reference object family and the by-copy `ospg` family —
+/// under the string and code layouts alike.
 #[tokio::test]
-async fn escaped_literals_roundtrip_with_object_index() {
-    run_escaped_literal_roundtrip(
-        LayoutStrategy::Default,
-        vec![IndexType::SecondaryByReference],
-    )
-    .await;
-    run_escaped_literal_roundtrip(
-        LayoutStrategy::Dictionary,
-        vec![IndexType::SecondaryByReference],
-    )
-    .await;
+async fn escaped_literals_roundtrip_with_secondary_indexes() {
+    for layout in [LayoutStrategy::Default, LayoutStrategy::Dictionary] {
+        for indexes in [
+            vec![IndexType::SecondaryByReference],
+            vec![IndexType::SecondaryByCopy],
+            vec![IndexType::SecondaryByCopy, IndexType::SecondaryByReference],
+        ] {
+            run_escaped_literal_roundtrip(layout, indexes).await;
+        }
+    }
 }
 
 #[test]

@@ -337,6 +337,58 @@ async fn probe_typed_object(store: VortexRdfStore) {
     assert_eq!(empty.size().await.unwrap(), 0);
 }
 
+/// One row per term kind in every role, each object distinct: an IRI, a
+/// blank node, a plain, a language-tagged and a typed literal as objects;
+/// a blank-node subject; a blank-node graph beside a named one and the
+/// default graph.
+fn term_kind_quads() -> Vec<Quad> {
+    use oxrdf::BlankNode;
+    let s = NamedOrBlankNode::NamedNode(NamedNode::new("http://example.org/s").unwrap());
+    let blank_s = NamedOrBlankNode::BlankNode(BlankNode::new("bs").unwrap());
+    let p1 = NamedNode::new("http://example.org/p1").unwrap();
+    let p2 = NamedNode::new("http://example.org/p2").unwrap();
+    let g = GraphName::NamedNode(NamedNode::new("http://example.org/g").unwrap());
+    let blank_g = GraphName::BlankNode(BlankNode::new("bg").unwrap());
+    let plain = |text: &str| Term::Literal(Literal::new_simple_literal(text));
+    vec![
+        Quad::new(
+            s.clone(),
+            p1.clone(),
+            Term::NamedNode(NamedNode::new("http://example.org/o-iri").unwrap()),
+            GraphName::DefaultGraph,
+        ),
+        Quad::new(
+            s.clone(),
+            p1.clone(),
+            Term::BlankNode(BlankNode::new("bo").unwrap()),
+            GraphName::DefaultGraph,
+        ),
+        Quad::new(s.clone(), p2.clone(), plain("plain"), g.clone()),
+        Quad::new(
+            s.clone(),
+            p2.clone(),
+            Term::Literal(Literal::new_language_tagged_literal("hello", "en").unwrap()),
+            g,
+        ),
+        Quad::new(
+            s,
+            p2.clone(),
+            Term::Literal(Literal::new_typed_literal(
+                "42",
+                NamedNode::new("http://www.w3.org/2001/XMLSchema#integer").unwrap(),
+            )),
+            GraphName::DefaultGraph,
+        ),
+        Quad::new(
+            blank_s.clone(),
+            p1,
+            plain("blank subject, blank graph"),
+            blank_g.clone(),
+        ),
+        Quad::new(blank_s, p2, plain("blank subject, second row"), blank_g),
+    ]
+}
+
 /// 2,000 quads with ~4,000 distinct terms: enough for the dictionary to be
 /// FSST-compressed as built.
 fn fsst_dictionary_quads() -> Vec<Quad> {

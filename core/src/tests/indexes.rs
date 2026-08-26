@@ -115,11 +115,11 @@ async fn test_in_memory_derived_view_keeps_indexes() {
     );
 }
 
-/// `compact_with_indexes` gathers the live rows and rebuilds the requested
-/// indexes over the fresh `0..n` row order — so an independent, compacted
-/// store keeps routing through its index instead of degrading to a full
-/// scan. It also lets a store be re-indexed: the requested set is what the
-/// result carries, whatever the source had.
+/// `compact_with_indexes` carries exactly the requested index set, whatever
+/// the source had: an empty set drops the index while keeping every live
+/// row, the source is left untouched, and a store built without indexes
+/// gains one it never had. (The rebuild over the fresh row order is pinned
+/// per layout by `run_compact_with_indexes_layout`.)
 #[tokio::test]
 async fn test_compact_with_indexes_rebuilds() {
     let quads = modular_quads(24, 3, 4);
@@ -141,35 +141,15 @@ async fn test_compact_with_indexes_rebuilds() {
         .unwrap();
     assert_eq!(view.size().await.unwrap(), 6);
 
-    // An empty index set drops the index; a non-empty one rebuilds it.
-    assert!(
-        view.compact_with_indexes(vec![])
-            .await
-            .unwrap()
-            .indexes()
-            .is_empty()
-    );
-    let indexed = view
-        .compact_with_indexes(vec![IndexType::SecondaryByReference])
-        .await
-        .unwrap();
-    assert_eq!(indexed.indexes(), &[IndexType::SecondaryByReference]);
-    assert_eq!(indexed.size().await.unwrap(), 6);
-
-    // The rebuilt index routes over the new row order: of those 6 rows,
-    // predicate p1 is i ≡ 1 (mod 3) ⇒ 1, 13. The result must be exact and
-    // the store independent of its source.
-    let predicate = NamedNode::new("http://example.org/p1").unwrap();
-    let routed = indexed
-        .match_pattern(None, Some(&predicate), None, None)
-        .await
-        .unwrap();
+    // An empty index set drops the index and keeps exactly the view's rows.
+    let sorted = view.compact_with_indexes(vec![]).await.unwrap();
+    assert!(sorted.indexes().is_empty());
+    assert_eq!(sorted.size().await.unwrap(), 6);
     assert_eq!(
-        subjects_of(&routed).await,
-        vec![
-            "<http://example.org/s01>".to_string(),
-            "<http://example.org/s13>".to_string(),
-        ]
+        subjects_of(&sorted).await,
+        [1, 5, 9, 13, 17, 21]
+            .map(|i| format!("<http://example.org/s{i:02}>"))
+            .to_vec()
     );
     assert_eq!(store.size().await.unwrap(), 24, "source untouched");
 
@@ -255,6 +235,35 @@ async fn run_compact_with_indexes_layout(layout: LayoutStrategy) {
             .unwrap(),
         6,
     );
+
+    // The copy family rebuilds the same way: its sorted copies are cut from
+    // the gathered rows, and a predicate match is then served from them.
+    let by_copy = store
+        .match_pattern(None, None, Some(&object), None)
+        .await
+        .unwrap()
+        .compact_with_indexes(vec![IndexType::SecondaryByCopy])
+        .await
+        .unwrap();
+    assert_eq!(by_copy.indexes(), &[IndexType::SecondaryByCopy]);
+    assert_eq!(by_copy.size().await.unwrap(), 6);
+    let served = by_copy
+        .match_pattern(None, Some(&predicate), None, None)
+        .await
+        .unwrap();
+    assert!(
+        served.debug_has_serve_plan(),
+        "{layout:?}: a rebuilt copy index must serve the predicate match"
+    );
+    assert_eq!(
+        view_strings(&served).await,
+        expected_strings(&quads, |i| i % 4 == 1 && i % 3 == 1)
+    );
+}
+
+#[tokio::test]
+async fn test_compact_with_indexes_default() {
+    run_compact_with_indexes_layout(LayoutStrategy::Default).await;
 }
 
 /// Compacting down to nothing still builds the requested indexes: a store
@@ -308,6 +317,48 @@ async fn test_compact_to_empty_keeps_indexes_default() {
 #[tokio::test]
 async fn test_compact_to_empty_keeps_indexes_dictionary() {
     run_compact_to_empty_keeps_indexes(LayoutStrategy::Dictionary).await;
+}
+
+#[tokio::test]
+async fn test_compact_to_empty_keeps_indexes_typed_object() {
+    run_compact_to_empty_keeps_indexes(LayoutStrategy::TypedObject).await;
+}
+
+/// The TypedObject rebuild recomposes every object kind from the typed
+/// sub-columns — IRI, blank node, plain, language-tagged and typed literals
+/// — so a reference index built by compaction routes each of them to exactly
+/// its row.
+#[tokio::test]
+async fn test_compact_with_indexes_typed_object_routes_every_object_kind() {
+    let quads = term_kind_quads();
+    let arr = build_array::<SortedInMemoryBuilder>(
+        quad_stream(quads.clone()),
+        LayoutStrategy::TypedObject,
+        vec![],
+    )
+    .await
+    .unwrap();
+    let store = VortexRdfStore::from_built(arr).unwrap();
+    assert!(store.indexes().is_empty());
+
+    let indexed = store
+        .compact_with_indexes(vec![IndexType::SecondaryByReference])
+        .await
+        .unwrap();
+    assert_eq!(indexed.indexes(), &[IndexType::SecondaryByReference]);
+    assert_eq!(view_strings(&indexed).await, quad_strings(&quads));
+    for quad in &quads {
+        let by_o = indexed
+            .match_pattern(None, None, Some(&quad.object), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            view_strings(&by_o).await,
+            vec![quad.to_string()],
+            "object {} must route to exactly its row",
+            quad.object
+        );
+    }
 }
 
 #[tokio::test]
@@ -429,6 +480,10 @@ async fn run_index_matrix_cell<B: VortexArrayBuilder>(
         "size mismatch for builder={builder_name} layout={layout_name} indexes={index_name}",
     );
 
+    // The copy family serves a predicate- or object-bound match whenever it
+    // is present, whatever else is; without it nothing serves.
+    let expect_served = indexes.contains(&IndexType::SecondaryByCopy);
+
     let p0 = NamedNode::new("http://example.org/p0").unwrap();
     let by_pred = store
         .match_pattern(None, Some(&p0), None, None)
@@ -438,6 +493,11 @@ async fn run_index_matrix_cell<B: VortexArrayBuilder>(
         by_pred.size().await.unwrap(),
         8,
         "predicate match mismatch for builder={builder_name} layout={layout_name} indexes={index_name}",
+    );
+    assert_eq!(
+        by_pred.debug_has_serve_plan(),
+        expect_served,
+        "predicate serve plan mismatch for builder={builder_name} layout={layout_name} indexes={index_name}",
     );
 
     let o1 = Term::Literal(Literal::new_simple_literal("object 1"));
@@ -449,6 +509,11 @@ async fn run_index_matrix_cell<B: VortexArrayBuilder>(
         by_obj.size().await.unwrap(),
         6,
         "object match mismatch for builder={builder_name} layout={layout_name} indexes={index_name}",
+    );
+    assert_eq!(
+        by_obj.debug_has_serve_plan(),
+        expect_served,
+        "object serve plan mismatch for builder={builder_name} layout={layout_name} indexes={index_name}",
     );
 
     let p1 = NamedNode::new("http://example.org/p1").unwrap();
@@ -529,98 +594,116 @@ async fn test_index_matrix_sorted_stream() {
 
 // ─── SecondaryByCopy: sorted full-copy index ───────────────────────────
 
-/// The in-memory copy index's serving path: predicate / object /
-/// predicate+object matches read the matched quads straight from the copy
-/// family's contiguous run (a plain slice of the base, no row-id gather),
-/// while a residual graph constraint or a chained match — which force a mask
-/// scan or narrow the selection further — fall back to the row ids. Serving
-/// applies exactly when the index fully resolves the pattern, which is also
-/// exactly when no gather would otherwise happen.
-#[tokio::test]
-async fn test_in_memory_copy_index_serving() {
+/// The two graphs and the 30-quad dataset every copy-index serving script
+/// runs over: `s{i:02} p{i % 3} "o{i % 5}"` alternating between the graphs.
+pub(super) fn copy_index_script_dataset() -> (Vec<Quad>, [GraphName; 2]) {
     let graphs = [
         GraphName::NamedNode(NamedNode::new("http://example.org/g0").unwrap()),
         GraphName::NamedNode(NamedNode::new("http://example.org/g1").unwrap()),
     ];
-    let quads = graph_modular_quads(30, 2, 3, 5, &graphs);
+    (graph_modular_quads(30, 2, 3, 5, &graphs), graphs)
+}
 
-    let arr = build_array::<SortedInMemoryBuilder>(
-        quad_stream(quads.clone()),
-        LayoutStrategy::Default,
-        vec![IndexType::SecondaryByCopy],
-    )
-    .await
-    .unwrap();
-    let store = VortexRdfStore::from_built(arr).unwrap();
+/// What differs between the copy index's serving paths — in memory versus on
+/// a file, and a located run versus a scanned one — while the served results
+/// stay the same.
+pub(super) struct ServeExpectations {
+    /// Whether a served match leaves its exact row ids pending: an in-memory
+    /// run and an unlocated file run answer `size` from the run itself, a
+    /// located file run resolves its ids eagerly by point reads.
+    pub(super) served_pending: bool,
+    /// Whether a residual graph constraint keeps the serve plan (the file
+    /// scan carries the residual as a filter) or drops it (the in-memory
+    /// path runs a mask scan that already gathers the rows).
+    pub(super) residual_graph_served: bool,
+    /// Whether a known term that never occurs as a predicate is only found
+    /// empty at the consumer (pending) or proven empty at match time.
+    pub(super) never_predicate_pending: bool,
+}
+
+/// The copy index's serving script over `store`, built from `quads` (the
+/// [`copy_index_script_dataset`]) with `SecondaryByCopy`: predicate / object
+/// / predicate+object matches read the matched quads straight from the copy
+/// family's contiguous run, a residual graph constraint and a chained match
+/// still answer exactly, appended and tombstoned rows reach the served
+/// stream, and a delete by a served pattern lands its tombstones.
+pub(super) async fn run_copy_index_serving_script(
+    store: VortexRdfStore,
+    quads: &[Quad],
+    graphs: &[GraphName],
+    expect: ServeExpectations,
+) {
     assert_eq!(store.indexes(), &[IndexType::SecondaryByCopy]);
 
-    // Predicate-bound: served from the POSG family's contiguous run — the
-    // served `quads()` and the row-id `size()` must agree. The resolution's
-    // exact ids stay pending (`size` answers from the run's width; only a
-    // consumer that needs the ids decodes them).
+    // Predicate-bound: i ≡ 1 (mod 3), served from the POSG family's run —
+    // the served `quads()` and the row-id `size()` must agree.
     let p1 = NamedNode::new("http://example.org/p1").unwrap();
     let by_p = store
         .match_pattern(None, Some(&p1), None, None)
         .await
         .unwrap();
     assert!(by_p.debug_has_serve_plan());
-    assert!(by_p.debug_selection_pending());
+    assert_eq!(by_p.debug_selection_pending(), expect.served_pending);
     assert_eq!(by_p.size().await.unwrap(), 10);
     assert_eq!(
         view_strings(&by_p).await,
-        expected_strings(&quads, |i| i % 3 == 1)
+        expected_strings(quads, |i| i % 3 == 1)
     );
     // The derived view keeps the index.
     assert_eq!(by_p.indexes(), &[IndexType::SecondaryByCopy]);
-    // A base-order gather cannot ride the plan: it materializes the pending
-    // ids and must agree with the served read.
+    // A base-order gather cannot ride the plan: it materializes the ids and
+    // must agree with the served read.
     assert_eq!(by_p.selected_rows().await.unwrap().len(), 10);
 
-    // Object-bound: served from the OSPG family.
+    // Object-bound: i ≡ 2 (mod 5), served from the OSPG family.
     let o2 = Term::Literal(Literal::new_simple_literal("o2"));
     let by_o = store
         .match_pattern(None, None, Some(&o2), None)
         .await
         .unwrap();
     assert!(by_o.debug_has_serve_plan());
-    assert!(by_o.debug_selection_pending());
+    assert_eq!(by_o.debug_selection_pending(), expect.served_pending);
+    assert_eq!(by_o.size().await.unwrap(), 6);
     assert_eq!(
         view_strings(&by_o).await,
-        expected_strings(&quads, |i| i % 5 == 2)
+        expected_strings(quads, |i| i % 5 == 2)
     );
 
-    // Predicate and object: one (p, o) prefix probe fully resolves the
-    // pattern, so the narrowed run is served directly.
+    // Predicate and object: one (p, o) prefix resolution fully resolves the
+    // pattern — i ≡ 1 (mod 3) ∧ i ≡ 1 (mod 5) ⇔ i ≡ 1 (mod 15) — so the
+    // narrowed run is served directly.
     let o1 = Term::Literal(Literal::new_simple_literal("o1"));
     let by_po = store
         .match_pattern(None, Some(&p1), Some(&o1), None)
         .await
         .unwrap();
     assert!(by_po.debug_has_serve_plan());
-    assert!(by_po.debug_selection_pending());
+    assert_eq!(by_po.debug_selection_pending(), expect.served_pending);
+    assert_eq!(by_po.size().await.unwrap(), 2);
     assert_eq!(
         view_strings(&by_po).await,
-        expected_strings(&quads, |i| i % 15 == 1)
+        expected_strings(quads, |i| i % 15 == 1)
     );
 
-    // A residual graph constraint leaves a mask scan to run — which already
-    // gathers the rows — so the serve plan is dropped (it would save
-    // nothing), and the result still comes out right.
+    // A residual graph constraint on top of the resolved predicate.
     let p2 = NamedNode::new("http://example.org/p2").unwrap();
     let by_pg = store
         .match_pattern(None, Some(&p2), None, Some(&graphs[0]))
         .await
         .unwrap();
-    assert!(!by_pg.debug_has_serve_plan());
-    // The residual scan needed the ids, so nothing is left pending either.
-    assert!(!by_pg.debug_selection_pending());
+    assert_eq!(by_pg.debug_has_serve_plan(), expect.residual_graph_served);
+    assert_eq!(
+        by_pg.debug_selection_pending(),
+        expect.residual_graph_served && expect.served_pending
+    );
+    assert_eq!(by_pg.size().await.unwrap(), 5);
     assert_eq!(
         view_strings(&by_pg).await,
-        expected_strings(&quads, |i| i % 3 == 2 && i % 2 == 0)
+        expected_strings(quads, |i| i % 3 == 2 && i % 2 == 0)
     );
 
     // Chaining narrows the first view's row ids — materializing them — so
-    // its serve plan drops.
+    // its serve plan drops (its filter no longer selects exactly the rows).
     let chained = by_p
         .match_pattern(None, None, Some(&o1), None)
         .await
@@ -629,11 +712,55 @@ async fn test_in_memory_copy_index_serving() {
     assert!(!chained.debug_selection_pending());
     assert_eq!(
         view_strings(&chained).await,
-        expected_strings(&quads, |i| i % 3 == 1 && i % 5 == 1)
+        expected_strings(quads, |i| i % 3 == 1 && i % 5 == 1)
     );
 
-    // A tombstoned row vanishes from served streams too: the slice reads
-    // copy rows, so the delete reaches it through the rid column.
+    // A term the store has never seen short-circuits to empty.
+    let missing = NamedNode::new("http://example.org/nope").unwrap();
+    let none = store
+        .match_pattern(None, Some(&missing), None, None)
+        .await
+        .unwrap();
+    assert_eq!(none.size().await.unwrap(), 0);
+
+    // A term the store knows — but never as a predicate — probes the index
+    // child and finds nothing.
+    let subject_as_p = NamedNode::new("http://example.org/s00").unwrap();
+    let zero = store
+        .match_pattern(None, Some(&subject_as_p), None, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        zero.debug_selection_pending(),
+        expect.never_predicate_pending
+    );
+    assert_eq!(view_strings(&zero).await, Vec::<String>::new());
+    assert_eq!(zero.size().await.unwrap(), 0);
+
+    // An appended quad rides the tail beside the served base run: the
+    // served predicate match still engages for the base and the tail row
+    // joins its rows, on a view that keeps the index.
+    let appended = make_quad(
+        "http://example.org/s99",
+        "http://example.org/p1",
+        "o1",
+        graphs[0].clone(),
+    );
+    let tailed = store.add_quad(appended.clone()).await.unwrap();
+    assert_eq!(tailed.indexes(), &[IndexType::SecondaryByCopy]);
+    let by_p_tailed = tailed
+        .match_pattern(None, Some(&p1), None, None)
+        .await
+        .unwrap();
+    assert!(by_p_tailed.debug_has_serve_plan());
+    assert_eq!(by_p_tailed.size().await.unwrap(), 11);
+    let mut want = expected_strings(quads, |i| i % 3 == 1);
+    want.push(appended.to_string());
+    want.sort();
+    assert_eq!(view_strings(&by_p_tailed).await, want);
+
+    // A tombstoned row vanishes from served streams too: the read takes copy
+    // rows, so the delete reaches it through the family's rid column.
     let deleted = store.delete_quad(&quads[4]).await.unwrap();
     let by_p_after = deleted
         .match_pattern(None, Some(&p1), None, None)
@@ -643,11 +770,11 @@ async fn test_in_memory_copy_index_serving() {
     assert_eq!(by_p_after.size().await.unwrap(), 9);
     assert_eq!(
         view_strings(&by_p_after).await,
-        expected_strings(&quads, |i| i % 3 == 1 && i != 4)
+        expected_strings(quads, |i| i % 3 == 1 && i != 4)
     );
 
-    // Deleting by a served pattern: the matcher's doomed view carries pending
-    // ids, which the delete materializes into tombstones.
+    // Deleting by a served pattern: the matcher's doomed view carries the
+    // resolution's ids, which the delete materializes into tombstones.
     let wiped = deleted
         .delete_matching(None, Some(&p1), None, None)
         .await
@@ -659,6 +786,35 @@ async fn test_in_memory_copy_index_serving() {
         .unwrap();
     assert_eq!(by_p_wiped.size().await.unwrap(), 0);
     assert_eq!(view_strings(&by_p_wiped).await, Vec::<String>::new());
+}
+
+/// The serving script over an in-memory store: every served run answers
+/// from a slice of the base with its ids pending, a residual graph
+/// constraint drops the plan for a mask scan that gathers the rows itself,
+/// and a known-but-never-predicate term is proven empty by the in-memory
+/// probe at match time.
+#[tokio::test]
+async fn test_in_memory_copy_index_serving() {
+    let (quads, graphs) = copy_index_script_dataset();
+    let arr = build_array::<SortedInMemoryBuilder>(
+        quad_stream(quads.clone()),
+        LayoutStrategy::Default,
+        vec![IndexType::SecondaryByCopy],
+    )
+    .await
+    .unwrap();
+    let store = VortexRdfStore::from_built(arr).unwrap();
+    run_copy_index_serving_script(
+        store,
+        &quads,
+        &graphs,
+        ServeExpectations {
+            served_pending: true,
+            residual_graph_served: false,
+            never_predicate_pending: false,
+        },
+    )
+    .await;
 }
 
 // ─── Resident form and code reads over indexes ─────────────────────────

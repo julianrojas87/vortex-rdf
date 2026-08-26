@@ -22,7 +22,7 @@ mod rows;
 mod serialize;
 mod streaming;
 #[cfg(test)]
-mod test_hooks;
+pub(crate) mod test_hooks;
 
 pub use builders::{
     BuiltArray, BuiltStream, ChunkStream, SortedInMemoryBuilder, VortexArrayBuilder,

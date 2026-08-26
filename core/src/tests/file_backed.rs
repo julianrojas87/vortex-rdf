@@ -200,6 +200,33 @@ async fn test_file_backed_subject_metadata_range_for_missing_subject() {
     );
 }
 
+/// A file view's `size()` counts its pending filter's rows minus the
+/// tombstones over them, so it agrees with the rows the view streams.
+#[tokio::test]
+async fn test_file_backed_filtered_size_skips_tombstones() {
+    let quads = modular_quads(12, 3, 4);
+    let (_dir, path) = write_store_file(quads.clone(), LayoutStrategy::Default, vec![]).await;
+    let store = VortexRdfStore::from_file(&path).await.unwrap();
+
+    // Row 3: s03 p0 "object 3".
+    let deleted = store.delete_quad(&quads[3]).await.unwrap();
+    let p0 = NamedNode::new("http://example.org/p0").unwrap();
+    let matched = deleted
+        .match_pattern(None, Some(&p0), None, None)
+        .await
+        .unwrap();
+    // p0 is on rows 0, 3, 6, 9; row 3 is gone.
+    assert_eq!(matched.size().await.unwrap(), 3);
+    assert_eq!(
+        matched.size().await.unwrap(),
+        matched.quads().unwrap().count().await
+    );
+    assert_eq!(
+        view_strings(&matched).await,
+        expected_strings(&quads, |i| i % 3 == 0 && i != 3)
+    );
+}
+
 // ─── Subject chunk probe ───────────────────────────────────────────────
 
 /// Sorted Dictionary quads with 3-quad subject runs — the shape the encoded
