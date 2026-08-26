@@ -2,7 +2,9 @@
 //! the one open path every target has, runtime handle or not. The fixtures
 //! hold [`dictionary_test_quads`]: `store-default.vortex` under the Default
 //! layout with no indexes, `store-dictionary-both-indexes.vortex` under the
-//! Dictionary layout with both index families.
+//! Dictionary layout with both index families. Setting
+//! `VORTEX_RDF_REGEN_FIXTURES` makes `test_fixtures_match_regenerated_stores`
+//! rewrite both files from the current writer before comparing.
 
 use super::*;
 
@@ -82,10 +84,16 @@ async fn test_dictionary_fixture_adopts() {
 #[tokio::test]
 async fn test_fixtures_match_regenerated_stores() {
     let quads = dictionary_test_quads();
-    for (fixture, layout, indexes) in [
-        (DEFAULT_FIXTURE, LayoutStrategy::Default, vec![]),
+    for (fixture, name, layout, indexes) in [
+        (
+            DEFAULT_FIXTURE,
+            "store-default.vortex",
+            LayoutStrategy::Default,
+            vec![],
+        ),
         (
             DICTIONARY_FIXTURE,
+            "store-dictionary-both-indexes.vortex",
             LayoutStrategy::Dictionary,
             vec![IndexType::SecondaryByCopy, IndexType::SecondaryByReference],
         ),
@@ -95,6 +103,12 @@ async fn test_fixtures_match_regenerated_stores() {
             .unwrap();
         let regenerated = VortexRdfStore::from_built(arr).unwrap();
         let bytes = regenerated.to_bytes().await.unwrap();
+        if std::env::var_os("VORTEX_RDF_REGEN_FIXTURES").is_some() {
+            let path =
+                std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/src/tests/fixtures/"))
+                    .join(name);
+            std::fs::write(&path, &bytes).unwrap();
+        }
         let reread = VortexRdfStore::from_bytes(&bytes).await.unwrap();
         let checked_in = VortexRdfStore::from_bytes(fixture).await.unwrap();
         assert_eq!(checked_in.layout(), reread.layout(), "{layout:?}");

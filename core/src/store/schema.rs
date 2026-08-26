@@ -3,12 +3,12 @@
 //! These are contract, not policy: a name change here changes what a written
 //! file means, so they live in one place. Column names owned by a single
 //! subsystem live with that subsystem instead: each index child's column
-//! names in its index module ([`secondary_by_copy::Family`],
+//! names in its index module ([`secondary_by_copy::CopyFamily`],
 //! [`secondary_by_reference`]), the dictionary child's `_dict_term` in
 //! [`term_dict`](crate::store::layouts::dictionary::term_dict), and the
 //! TypedObject layout's split object columns in [`typed_object`].
 //!
-//! [`secondary_by_copy::Family`]: crate::store::indexes::secondary_by_copy::Family
+//! [`secondary_by_copy::CopyFamily`]: crate::store::indexes::secondary_by_copy::CopyFamily
 //! [`secondary_by_reference`]: crate::store::indexes::secondary_by_reference
 //! [`typed_object`]: crate::store::layouts::typed_object
 

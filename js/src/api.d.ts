@@ -167,4 +167,4 @@ export function serializeRdf(input: string, format: RdfFormatName, options?: Bui
  * One-shot deserialization: native-container bytes in, RDF text out
  * (`VortexRdfStore.fromBytes(...).toRdf(format)` without holding a store).
  */
-export function deserializeRdf(vortex_bytes: Uint8Array, format: RdfFormatName): Promise<string>;
+export function deserializeRdf(bytes: Uint8Array, format: RdfFormatName): Promise<string>;

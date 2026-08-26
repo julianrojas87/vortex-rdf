@@ -26,7 +26,11 @@ use oxrdf::NamedOrBlankNode;
 impl VortexRdfStore {
     /// Whether this view carries an index serving plan for `quads()`.
     pub(crate) fn debug_has_serve_plan(&self) -> bool {
-        self.quads.serve_plan_attached()
+        match &self.quads {
+            QuadsSource::InMemory { serve, .. } => serve.is_some(),
+            #[cfg(feature = "file-io")]
+            QuadsSource::File { serve, .. } => serve.is_some(),
+        }
     }
 
     /// Whether this view's base selection is still pending — a served match
@@ -56,7 +60,7 @@ impl VortexRdfStore {
 
     /// The append tail's physical rows, `None` when nothing has been
     /// appended.
-    pub(crate) fn tail_rows(&self) -> Option<&ArrayRef> {
+    pub(crate) fn debug_tail_rows(&self) -> Option<&ArrayRef> {
         self.tail.as_ref().map(|tail| &tail.rows)
     }
 

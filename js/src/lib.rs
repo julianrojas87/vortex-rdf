@@ -43,8 +43,8 @@ pub async fn serialize_rdf(
 /// One-shot conversion: native-container bytes in, RDF text out. `Vec<u8>`
 /// for the same one-copy reason as [`VortexRdfStore::from_bytes`].
 #[wasm_bindgen(js_name = deserializeRdf, skip_typescript)]
-pub async fn deserialize_rdf(vortex_bytes: Vec<u8>, format_name: &str) -> Result<String, JsValue> {
-    VortexRdfStore::from_bytes(vortex_bytes)
+pub async fn deserialize_rdf(bytes: Vec<u8>, format_name: &str) -> Result<String, JsValue> {
+    VortexRdfStore::from_bytes(bytes)
         .await?
         .to_rdf(format_name)
         .await

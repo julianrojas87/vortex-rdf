@@ -96,7 +96,7 @@ export interface StoreAdapter<H = unknown> {
     dispose?(h: H): void;
 }
 
-// Disposal alone isn't enough for the pure-JS adapters (rdf-stores): a 2M-quad store
+// Disposal alone isn't enough for the pure-JS adapters (rdf-stores): a full-size store
 // there is a large, long-lived Map-of-Maps graph, and merely dropping the reference
 // only makes it *eligible* for GC — V8's generational collector has no obligation to
 // actually reclaim it before the next multi-hundred-MB allocation piles on top. Run

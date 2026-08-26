@@ -167,15 +167,20 @@ impl<T: Spillable> Run<T> {
 
     /// Pull up to `n` items off the run (fewer at the end of the data).
     pub(crate) fn next_batch(&mut self, n: usize) -> Result<Vec<T>> {
-        let mut batch = Vec::with_capacity(n.min(4096));
-        while batch.len() < n {
-            match self.next()? {
-                Some(item) => batch.push(item),
-                None => break,
-            }
-        }
-        Ok(batch)
+        pull_batch(n, || self.next())
     }
+}
+
+/// Pull up to `n` items off `next` (fewer once it yields `None`).
+fn pull_batch<T>(n: usize, mut next: impl FnMut() -> Result<Option<T>>) -> Result<Vec<T>> {
+    let mut batch = Vec::with_capacity(n.min(4096));
+    while batch.len() < n {
+        match next()? {
+            Some(item) => batch.push(item),
+            None => break,
+        }
+    }
+    Ok(batch)
 }
 
 /// Sequential rkyv reader over a spill file.
@@ -364,14 +369,7 @@ impl<T: Ord + Spillable> RunMerger<T> {
 
     /// Pull up to `n` items off the merge (fewer at the end of the data).
     pub(crate) fn next_batch(&mut self, n: usize) -> Result<Vec<T>> {
-        let mut batch = Vec::with_capacity(n.min(4096));
-        while batch.len() < n {
-            match self.next()? {
-                Some(item) => batch.push(item),
-                None => break,
-            }
-        }
-        Ok(batch)
+        pull_batch(n, || self.next())
     }
 }
 
@@ -399,57 +397,6 @@ impl<T: Ord> Ord for MinHeapItem<T> {
 impl<T: Ord> PartialOrd for MinHeapItem<T> {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
-    }
-}
-
-/// A `(value, row ID)` index entry, sorted by value then row ID.
-#[derive(
-    Clone, Debug, Eq, PartialEq, Ord, PartialOrd, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
-)]
-struct PairRecord<V> {
-    value: V,
-    rid: u32,
-}
-
-/// External sort of `(value, row ID)` pairs — the machinery behind globally
-/// sorted secondary-index columns in out-of-core builds: the row IDs are only
-/// known during the quad merge, so the index order is derived by a second
-/// sort after it.
-pub(crate) struct PairRunSpiller<V>(RunSpiller<PairRecord<V>>);
-
-impl<V> PairRunSpiller<V>
-where
-    V: Ord + Spillable,
-{
-    pub(crate) fn new(dir: &Path, name: &'static str, capacity: usize) -> Self {
-        Self(RunSpiller::new(dir, name, capacity))
-    }
-
-    pub(crate) fn push(&mut self, value: V, rid: u32) -> Result<()> {
-        self.0.push(PairRecord { value, rid })
-    }
-
-    /// Flush the tail run and set up the K-way merge over all runs.
-    pub(crate) fn into_merger(self) -> Result<PairMerger<V>> {
-        self.0.into_merger().map(PairMerger)
-    }
-}
-
-/// Streams `(value, row ID)` pairs in global sorted order.
-pub(crate) struct PairMerger<V>(RunMerger<PairRecord<V>>);
-
-impl<V> PairMerger<V>
-where
-    V: Ord + Spillable,
-{
-    /// Pull up to `n` pairs off the merge (fewer at the end of the data).
-    pub(crate) fn next_batch(&mut self, n: usize) -> Result<Vec<(V, u32)>> {
-        Ok(self
-            .0
-            .next_batch(n)?
-            .into_iter()
-            .map(|pair| (pair.value, pair.rid))
-            .collect())
     }
 }
 
@@ -494,14 +441,11 @@ mod tests {
         std::fs::remove_dir_all(&base).unwrap();
     }
 
-    fn string_records() -> Vec<PairRecord<String>> {
+    fn string_records() -> Vec<(String, u32)> {
         // Variable-length records exercise the reused write/read buffers
         // growing and shrinking across pushes.
         (0..64u32)
-            .map(|i| PairRecord {
-                value: "x".repeat((i as usize * 7) % 41),
-                rid: i,
-            })
+            .map(|i| ("x".repeat((i as usize * 7) % 41), i))
             .collect()
     }
 
@@ -511,7 +455,7 @@ mod tests {
         let path = guard.path().join("run.bin");
         let records = string_records();
         write_run(&path, &records).unwrap();
-        let mut run: Run<PairRecord<String>> = Run::file(&path).unwrap();
+        let mut run: Run<(String, u32)> = Run::file(&path).unwrap();
         for expected in &records {
             assert_eq!(run.next().unwrap().as_ref(), Some(expected));
         }
@@ -537,7 +481,7 @@ mod tests {
             ("mid-payload", second_start + 4 + second_len / 2),
         ] {
             std::fs::write(&path, &full[..keep]).unwrap();
-            let mut merger: RunMerger<PairRecord<String>> =
+            let mut merger: RunMerger<(String, u32)> =
                 RunMerger::new(vec![Run::file(&path).unwrap()]).unwrap();
             assert_eq!(
                 merger.next().unwrap().as_ref(),

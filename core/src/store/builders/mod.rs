@@ -32,7 +32,9 @@
 
 use crate::error::{Result, VortexRdfError};
 use crate::store::RawQuad;
-use crate::store::array::{chunked_or_single, stamp_is_sorted};
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+use crate::store::array::chunked_or_single;
+use crate::store::array::stamp_is_sorted;
 use crate::store::indexes::{
     IndexComponent, IndexType, Indexes, secondary_by_copy, secondary_by_reference, unique_indexes,
 };
@@ -298,9 +300,7 @@ pub(crate) fn build_parts_from_raws(
 /// Assemble a builder's per-chunk StructArrays into a single ArrayRef. Every
 /// build emits at least one (possibly empty) chunk, so `chunks` carries the
 /// schema; an empty list is a caller bug.
-// Read only by the out-of-core builder, which is compiled out on
-// wasm32-unknown-unknown.
-#[cfg_attr(all(target_arch = "wasm32", target_os = "unknown"), allow(dead_code))]
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub(crate) fn assemble_chunks(chunks: Vec<ArrayRef>) -> Result<ArrayRef> {
     let dtype = chunks
         .first()

@@ -458,7 +458,7 @@ fn sorted_probe_run(
 /// window-only, exactly like the slice-then-search path. String-valued
 /// components (whose probe scalars are not integers) and probe-declined
 /// encodings fall back to the per-call search.
-pub(crate) fn component_probe_run(
+fn component_probe_run(
     component: &IndexComponent,
     column: &'static str,
     native: &Scalar,

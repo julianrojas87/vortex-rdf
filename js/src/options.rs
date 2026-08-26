@@ -56,7 +56,9 @@ pub(crate) async fn build_array(
 }
 
 /// Resolve the optional JS build options. Accepts `undefined`/`null` (all
-/// defaults) or a `BuildOptions` object.
+/// defaults) or a `BuildOptions` object. The strategy vocabularies live on
+/// core's `FromStr` impls (the canonical kebab-case names shared by every
+/// frontend); parse failures become JS exceptions.
 pub(crate) fn parse_build_options(options: JsValue) -> Result<BuildConfig, JsValue> {
     if options.is_null() || options.is_undefined() {
         return Ok(BuildConfig::default());
@@ -64,7 +66,7 @@ pub(crate) fn parse_build_options(options: JsValue) -> Result<BuildConfig, JsVal
 
     let mut config = BuildConfig::default();
     if let Some(name) = get_string_option(&options, "layout")? {
-        config.layout = parse_layout(&name)?;
+        config.layout = name.parse().map_err(js_err)?;
     }
     let indexes = Reflect::get(&options, &"indexes".into())
         .map_err(|_| js_err("Could not read the 'indexes' option"))?;
@@ -75,7 +77,7 @@ pub(crate) fn parse_build_options(options: JsValue) -> Result<BuildConfig, JsVal
         config.indexes = js_sys::Array::from(&indexes)
             .iter()
             .map(|value| match value.as_string() {
-                Some(name) => parse_index(&name),
+                Some(name) => name.parse::<IndexType>().map_err(js_err),
                 None => Err(js_err("Option 'indexes' must contain strings")),
             })
             .collect::<Result<Indexes, JsValue>>()?;
@@ -94,16 +96,4 @@ fn get_string_option(options: &JsValue, key: &str) -> Result<Option<String>, JsV
         Some(name) => Ok(Some(name)),
         None => Err(js_err(format!("Option '{}' must be a string", key))),
     }
-}
-
-// The strategy vocabularies live on core's `FromStr` impls — the canonical
-// kebab-case names shared by every frontend, and nothing else. These wrappers
-// only shape the failure into a JS exception.
-
-fn parse_layout(name: &str) -> Result<LayoutStrategy, JsValue> {
-    name.parse().map_err(js_err)
-}
-
-fn parse_index(name: &str) -> Result<IndexType, JsValue> {
-    name.parse().map_err(js_err)
 }

@@ -293,7 +293,7 @@ impl VortexRdfStore {
     /// array-returning counterpart of [`match`](Self::match_pattern).
     ///
     /// Returns synchronously: no wasm read path performs I/O, so there is
-    /// nothing to await (see [`resolve_now`]). The quads still decode their
+    /// nothing to await (see `resolve_now`). The quads still decode their
     /// term strings lazily on access.
     #[wasm_bindgen(js_name = getQuads, skip_typescript)]
     pub fn get_quads(
@@ -339,11 +339,8 @@ impl VortexRdfStore {
         object: JsValue,
         graph: JsValue,
     ) -> Result<JsValue, JsValue> {
-        // Codes are only meaningful against the store's cached dictionary.
-        // Core's `code_read_snapshot` is the one gate for that (Dictionary
-        // layout, no append tail — appends re-encode against a fresh
-        // dictionary — and a resident snapshot); short of it, codes would not
-        // resolve via `termDict`, so report the code read model unavailable.
+        // Same gate as `code_path_dict`: without a code-read snapshot the codes
+        // would not resolve via `termDict`.
         if self.inner.code_read_snapshot().is_none() {
             return Ok(JsValue::NULL);
         }

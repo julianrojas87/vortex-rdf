@@ -61,30 +61,7 @@ async fn run_chunk_boundary_builders(
 }
 
 #[tokio::test]
-async fn test_streaming_chunk_boundaries() {
-    let quads: Vec<Quad> = (0..10)
-        .map(|i| {
-            make_quad(
-                &format!("http://example.org/s{}", i),
-                "http://example.org/p",
-                "o",
-                GraphName::DefaultGraph,
-            )
-        })
-        .collect();
-
-    for (name, chunks, _) in run_chunk_boundary_builders(LayoutStrategy::Default, &quads).await {
-        if let vortex_array::dtype::DType::Struct(fields, _) = chunks[0].dtype() {
-            let names: Vec<&str> = fields.names().iter().map(|n| n.as_ref()).collect();
-            assert_eq!(names, ["s", "p", "o", "g"], "{name}");
-        } else {
-            panic!("{name}: expected struct dtype");
-        }
-    }
-}
-
-#[tokio::test]
-async fn test_sorted_streaming_chunk_boundaries() {
+async fn test_default_streaming_chunk_boundaries() {
     // Quads fed in REVERSE subject order; both sorted builders must emit
     // globally sorted output across chunk boundaries.
     let quads: Vec<Quad> = (0..10)
@@ -110,6 +87,12 @@ async fn test_sorted_streaming_chunk_boundaries() {
         sorted.sort();
         assert_eq!(subjects, sorted, "{name}: output not globally sorted");
         assert_eq!(subjects.len(), 10, "{name}: wrong quad count");
+        if let vortex_array::dtype::DType::Struct(fields, _) = chunks[0].dtype() {
+            let names: Vec<&str> = fields.names().iter().map(|n| n.as_ref()).collect();
+            assert_eq!(names, ["s", "p", "o", "g"], "{name}");
+        } else {
+            panic!("{name}: expected struct dtype");
+        }
     }
 }
 

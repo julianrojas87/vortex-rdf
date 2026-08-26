@@ -116,7 +116,7 @@ compressed. The figures are refreshed with each Vortex minor bump.
 Reproduce with:
 
 ```console
-cargo bench -p vortex-rdf-encoded-search --all-features
+cargo bench -p vortex-rdf-encoded-search --bench probe
 ```
 
 ## Compatibility

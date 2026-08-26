@@ -77,9 +77,9 @@ impl VortexArrayBuilder for SortedInMemoryBuilder {
         Ok(built)
     }
 
-    /// The sort holds the whole dataset as `RawQuad`s; column chunks are
-    /// built lazily as the writer polls, so only one chunk's Vortex arrays
-    /// exist at a time.
+    /// The sort holds the whole dataset (as `RawQuad`s, or as interned codes
+    /// under the Dictionary layout); column chunks are built lazily as the
+    /// writer polls, so only one chunk's Vortex arrays exist at a time.
     async fn build_vortex_stream(
         quad_stream: Box<dyn Stream<Item = Result<RawQuad>> + Unpin + Send + 'static>,
         layout: LayoutStrategy,

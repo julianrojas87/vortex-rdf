@@ -31,8 +31,7 @@ enum Action {
 
 #[derive(Args)]
 struct SerializeArgs {
-    /// Column layout strategy (defaults to dictionary, the shared default
-    /// across every frontend)
+    /// Column layout strategy
     #[arg(long, value_enum, default_value = "dictionary")]
     layout: LayoutStrategy,
 

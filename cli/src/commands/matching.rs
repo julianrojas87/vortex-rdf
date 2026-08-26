@@ -79,7 +79,7 @@ pub async fn run(args: MatchArgs) -> Result<()> {
 
         let built = SortedStreamBuilder::build_vortex_array(
             Box::new(quads_stream),
-            LayoutStrategy::Default,
+            LayoutStrategy::Dictionary,
             vec![],
         )
         .await?;

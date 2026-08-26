@@ -181,22 +181,9 @@ pub(crate) fn search_sorted_bounds(
 ) -> Result<(usize, usize)> {
     use vortex_array::search_sorted::{SearchResult, SearchSorted, SearchSortedSide};
 
-    // Typed fast path: a canonical non-nullable u32 column (the Dictionary
-    // layout's term codes). `partition_point` over the raw slice costs a few
-    // dozen loads, where the generic kernel below builds a fresh
-    // `ExecutionCtx` and materializes a `Scalar` per probe.
-    if let Some(prim) = canonical_u32(arr)
-        && let Ok(code) = u32::try_from(probe)
-    {
-        let codes = prim.as_slice::<u32>();
-        let lo = codes.partition_point(|&v| v < code);
-        let hi = codes.partition_point(|&v| v <= code);
-        return Ok((lo, hi));
-    }
-
-    // Encoded fast path: probe the compressed representation directly. Covers
-    // wire-encoded columns (`from_bytes` adoption, sliced index runs) without
-    // decoding them; declines fall through to the generic kernel.
+    // Encoded fast path: probe the column's representation directly, canonical
+    // or wire-encoded (`from_bytes` adoption, sliced index runs), without
+    // decoding it; declines fall through to the generic kernel.
     if arr.dtype().is_unsigned_int()
         && !arr.dtype().is_nullable()
         && let Ok(needle) = u64::try_from(probe)

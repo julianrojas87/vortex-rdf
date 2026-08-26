@@ -8,8 +8,7 @@ use crate::store::QuadsSource;
 use crate::store::RawQuad;
 use crate::store::builders::{DEFAULT_CHUNK_ROWS, build_parts_from_raws};
 use crate::store::indexes::{Indexes, unique_indexes};
-use crate::store::layouts::DictAccess;
-use crate::store::layouts::{LayoutStrategy, ResolvedLayout};
+use crate::store::layouts::LayoutStrategy;
 
 use super::VortexRdfStore;
 
@@ -151,13 +150,7 @@ impl VortexRdfStore {
         sorted: bool,
     ) -> Result<Self> {
         let (base, components, dict) = build_parts_from_raws(raws, strategy, &indexes, sorted)?;
-        let layout = match (strategy, dict) {
-            (LayoutStrategy::Dictionary, Some(dict)) => {
-                ResolvedLayout::Dictionary(DictAccess::Resident(dict))
-            }
-            (LayoutStrategy::TypedObject, _) => ResolvedLayout::TypedObject,
-            _ => ResolvedLayout::Default,
-        };
+        let layout = super::resolved_layout(dict, base.dtype())?;
         // Compress like every other construction — a compacted store carries
         // the same resident form a freshly built one does.
         let (base, components) = super::compress_built_parts(base, components)?;

@@ -350,7 +350,7 @@ async fn test_locally_sorted_children_from_bytes_match_correctly() {
     // chunk only: the concatenated child is not globally sorted, so its
     // descriptor must say so — the shape a chunked foreign writer could
     // produce and a reader must not binary-search.
-    use crate::store::indexes::secondary_by_copy::Family;
+    use crate::store::indexes::secondary_by_copy::CopyFamily;
     use crate::store::indexes::secondary_by_copy::out_of_core::{CopyKey, copy_child_chunk};
     let mut quad_chunks = Vec::new();
     let mut child_chunks: Vec<Vec<vortex_array::ArrayRef>> = vec![Vec::new(), Vec::new()];
@@ -359,15 +359,15 @@ async fn test_locally_sorted_children_from_bytes_match_correctly() {
             crate::store::builders::build_struct_array(rows, LayoutStrategy::Default, false)
                 .unwrap(),
         );
-        for (family_ix, family) in [Family::Posg, Family::Ospg].into_iter().enumerate() {
+        for (family_ix, family) in [CopyFamily::Posg, CopyFamily::Ospg].into_iter().enumerate() {
             let mut keys: Vec<(CopyKey<String>, u32)> = rows
                 .iter()
                 .enumerate()
                 .map(|(i, q)| {
                     let spog = [q.s.clone(), q.p.clone(), q.o.clone(), q.g.clone()];
                     let key = match family {
-                        Family::Posg => CopyKey::posg(&spog),
-                        Family::Ospg => CopyKey::ospg(spog),
+                        CopyFamily::Posg => CopyKey::posg(&spog),
+                        CopyFamily::Ospg => CopyKey::ospg(spog),
                     };
                     (key, (n * 4 + i) as u32)
                 })
@@ -376,7 +376,7 @@ async fn test_locally_sorted_children_from_bytes_match_correctly() {
             child_chunks[family_ix].push(copy_child_chunk(family, &keys).unwrap());
         }
     }
-    let components: Vec<container::NativeComponentWrite> = [Family::Posg, Family::Ospg]
+    let components: Vec<container::NativeComponentWrite> = [CopyFamily::Posg, CopyFamily::Ospg]
         .into_iter()
         .zip(child_chunks)
         .map(|(family, chunks)| {
@@ -587,7 +587,12 @@ async fn test_tailed_serialization_restores_sorted_order() {
         LayoutStrategy::TypedObject,
         LayoutStrategy::Dictionary,
     ] {
-        for indexes in [vec![], vec![IndexType::SecondaryByCopy]] {
+        for indexes in [
+            vec![],
+            vec![IndexType::SecondaryByReference],
+            vec![IndexType::SecondaryByCopy],
+            vec![IndexType::SecondaryByCopy, IndexType::SecondaryByReference],
+        ] {
             let arr = build_array::<SortedInMemoryBuilder>(
                 quad_stream(modular_quads(12, 3, 4)),
                 layout,
@@ -619,6 +624,7 @@ async fn test_tailed_serialization_restores_sorted_order() {
 
             let reread = VortexRdfStore::from_bytes(&bytes).await.unwrap();
             assert_eq!(reread.size().await.unwrap(), 13);
+            assert_eq!(reread.indexes(), indexes.as_slice(), "{layout:?}");
             let subjects: Vec<String> = reread
                 .quads()
                 .unwrap()

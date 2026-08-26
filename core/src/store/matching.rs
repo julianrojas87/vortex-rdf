@@ -84,11 +84,7 @@ impl VortexRdfStore {
         graph: Option<&GraphName>,
     ) -> Result<Tail> {
         let t = debug::timer();
-        let carry = |selection: RowSelection| Tail {
-            rows: tail.rows.clone(),
-            selection,
-            deleted: tail.deleted.clone(),
-        };
+        let carry = |selection: RowSelection| tail.with_selection(selection);
         if tail.selection.is_empty(tail.rows.len()) {
             return Ok(carry(tail.selection.clone()));
         }

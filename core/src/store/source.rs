@@ -112,14 +112,15 @@ impl QuadsSource {
         }
     }
 
-    /// Whether this source carries an index serving plan for its reads.
-    #[cfg(test)]
-    pub(crate) fn serve_plan_attached(&self) -> bool {
-        match self {
-            QuadsSource::InMemory { serve, .. } => serve.is_some(),
+    /// Whether this source still covers every base row: no pushed-down
+    /// filter and an all-rows selection.
+    pub(crate) fn is_unrefined(&self) -> bool {
+        let unfiltered = match self {
+            QuadsSource::InMemory { .. } => true,
             #[cfg(feature = "file-io")]
-            QuadsSource::File { serve, .. } => serve.is_some(),
-        }
+            QuadsSource::File { filter, .. } => filter.is_none(),
+        };
+        unfiltered && self.view_selection().is_all()
     }
 }
 
@@ -157,6 +158,15 @@ pub(crate) struct Tail {
 }
 
 impl Tail {
+    /// The same rows and tombstones under a different `selection`.
+    pub(crate) fn with_selection(&self, selection: RowSelection) -> Tail {
+        Tail {
+            rows: self.rows.clone(),
+            selection,
+            deleted: self.deleted.clone(),
+        }
+    }
+
     /// The tail rows visible through this store, tombstones dropped, in tail
     /// order.
     pub(crate) fn live_rows(&self) -> Result<ArrayRef> {

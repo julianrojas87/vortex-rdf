@@ -36,7 +36,7 @@ async fn test_file_backed_delete_keeps_indexes() {
         &vec![IndexType::SecondaryByReference],
         "tombstoning a file row must not invalidate its index"
     );
-    // The file on disk is unchanged — the source store still sees all 12.
+    // The source view is untouched — it still sees all 12.
     assert_eq!(store.size().await.unwrap(), 12);
 
     // The index still routes the lookup after the delete, and the

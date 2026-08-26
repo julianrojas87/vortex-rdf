@@ -79,8 +79,6 @@ def test_stub_class_methods_match_runtime(name):
 
 
 _NO_DEFAULT = inspect.Parameter.empty
-
-
 _KEYWORD_ONLY = inspect.Parameter.KEYWORD_ONLY
 
 

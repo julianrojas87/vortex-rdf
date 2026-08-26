@@ -314,10 +314,10 @@ def main() -> int:
 def meminfo_mb() -> dict[str, int]:
     """Total and available system memory at the start of the run.
 
-    Recorded because a library whose peak RSS approaches what the machine had
-    free was measured under swap pressure, and its *timings* are then a
-    property of this machine rather than of the library. The dashboard compares
-    each peak against these figures and labels the machine-bound ones.
+    Recorded so the dashboard can compare each library's peak RSS against the
+    memory the machine had free at the start: a peak close to that figure means
+    the run was under swap pressure, and its timings describe this machine, not
+    the library. Such cells are labelled machine-bound.
     """
     out = {}
     try:

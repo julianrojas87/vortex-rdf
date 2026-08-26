@@ -93,8 +93,8 @@ class LazyDict {
     }
 }
 
-export function makeDictView(dict) { 
-    return new LazyDict(dict); 
+export function makeDictView(dict) {
+    return new LazyDict(dict);
 }
 
 // ── A single column's backing: code+dict, or packed term bytes ───────────────
@@ -106,10 +106,10 @@ function ntAt(col, i) {
 }
 
 class LazyTerm {
-    constructor(col, i) { 
-        this.$col = col; 
-        this.$i = i; 
-        this.$p = undefined; 
+    constructor(col, i) {
+        this.$col = col;
+        this.$i = i;
+        this.$p = undefined;
     }
     get $parsed() { return this.$p ?? (this.$p = parseNt(ntAt(this.$col, this.$i))); }
     get termType() { return this.$parsed.termType; }

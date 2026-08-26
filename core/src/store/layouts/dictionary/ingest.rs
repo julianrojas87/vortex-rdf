@@ -220,8 +220,8 @@ impl InterningQuadBuilder {
 
         // provisional code → sorted rank == dictionary code.
         let mut rank_of = vec![0u32; entries.len()];
-        for (rank, (_, pid)) in entries.iter().enumerate() {
-            rank_of[*pid as usize] = rank as u32;
+        for (rank, (_, provisional)) in entries.iter().enumerate() {
+            rank_of[*provisional as usize] = rank as u32;
         }
 
         // Freeze by *consuming* the boxes: each term is freed as it is copied
@@ -234,8 +234,8 @@ impl InterningQuadBuilder {
 
         let remap_start = debug::timer();
         for quad in &mut self.quads {
-            for id in quad.iter_mut() {
-                *id = rank_of[*id as usize];
+            for code in quad.iter_mut() {
+                *code = rank_of[*code as usize];
             }
         }
         self.quads.sort_unstable();

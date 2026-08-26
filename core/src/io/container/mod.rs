@@ -66,6 +66,7 @@ mod tests {
     use super::wire::{decode_store_metadata, encode_store_metadata};
     use super::*;
     use crate::session::VORTEX_SESSION;
+    use crate::store::layouts::dictionary::term_dict::COL_DICT_TERM;
     use vortex_array::IntoArray;
     use vortex_array::arrays::{StructArray, VarBinViewArray};
     use vortex_array::dtype::{DType, Nullability};
@@ -89,7 +90,7 @@ mod tests {
 
     fn dict_chunk(terms: &[&str]) -> vortex_array::ArrayRef {
         StructArray::from_fields(&[(
-            "_dict_term",
+            COL_DICT_TERM,
             VarBinViewArray::from_iter_str(terms.iter().copied()).into_array(),
         )])
         .unwrap()
@@ -98,9 +99,9 @@ mod tests {
 
     fn dict_descriptor(dtype: DType) -> StoreComponentDescriptor {
         StoreComponentDescriptor {
-            name: "dictionary".into(),
+            name: DICT_COMPONENT_NAME.into(),
             role: StoreComponentRole::Dictionary,
-            implementation: "sorted-terms-fsst-v1".into(),
+            implementation: DICT_IMPLEMENTATION.into(),
             version: 1,
             required: true,
             sorted: true,

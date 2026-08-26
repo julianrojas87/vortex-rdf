@@ -1,3 +1,7 @@
+//! The two quad shapes the store exchanges with builders and readers:
+//! [`RawQuad`] (owned N-Triples strings, the builders' input) and
+//! [`SharedQuad`] (`Arc<str>` terms, the shared-string read output).
+
 use std::sync::Arc;
 
 use oxrdf::Quad;

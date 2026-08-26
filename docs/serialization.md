@@ -50,11 +50,11 @@ A builder hands these back in one of two shapes
 
 | Surface | Call | Pipeline | Produces |
 |---|---|---|---|
-| CLI | `vortex-rdf-cli serialize -i in.ttl -o out.vortex [--layout <default\|typed-object\|dictionary>] [--indexes secondary-by-copy] [--indexes secondary-by-reference] [-f <format>]` (`--layout` defaults to `dictionary`; [`main.rs`](../cli/src/main.rs#L33)) | out-of-core | file |
+| CLI | `vortex-rdf-cli serialize -i in.ttl -o out.vortex [--layout <default\|typed-object\|dictionary>] [--indexes secondary-by-copy] [--indexes secondary-by-reference] [-f <format>]` (`--layout` defaults to `dictionary`; [`main.rs`](../cli/src/main.rs#L36)) | out-of-core | file |
 | Rust | [`io::quads_stream_to_vortex_file`](../core/src/io/ser.rs#L155) / [`quads_stream_to_vortex_writer`](../core/src/io/ser.rs#L95) | out-of-core | file / any `VortexWrite` |
-| Rust | [`SortedStreamBuilder::build_vortex_array`](../core/src/store/builders/sorted_stream.rs#L52) or [`SortedInMemoryBuilder::build_vortex_array`](../core/src/store/builders/sorted_in_memory.rs#L36), then [`VortexRdfStore::from_built`](../core/src/store/mod.rs#L199) | either | in-memory store |
-| Rust | [`VortexRdfStore::to_bytes`](../core/src/store/serialize.rs#L152) | — (re-serializes a store) | bytes |
-| Rust | [`to_serializable_parts`](../core/src/store/serialize.rs#L131) → [`from_parts`](../core/src/store/mod.rs#L184) | — | in-memory round trip |
+| Rust | [`SortedStreamBuilder::build_vortex_array`](../core/src/store/builders/sorted_stream.rs#L50) or [`SortedInMemoryBuilder::build_vortex_array`](../core/src/store/builders/sorted_in_memory.rs#L36), then [`VortexRdfStore::from_built`](../core/src/store/mod.rs#L201) | either | in-memory store |
+| Rust | [`VortexRdfStore::to_bytes`](../core/src/store/serialize.rs#L146) | — (re-serializes a store) | bytes |
+| Rust | [`to_serializable_parts`](../core/src/store/serialize.rs#L125) → [`from_parts`](../core/src/store/mod.rs#L186) | — | in-memory round trip |
 | Python | `serialize_rdf(input_path, output_path, *, format=None, layout="dictionary", indexes=[])` ([`serialize.rs`](../python/src/serialize.rs#L33)) | out-of-core | file |
 | Python | `VortexRdfStore(path, in_memory=True)` | — (opens, then lifts through `to_serializable_parts` → `from_parts`) | in-memory store |
 | Python | `store.to_bytes()` / `VortexRdfStore.from_bytes(data)` | — | bytes |
@@ -71,7 +71,7 @@ the same kebab-case names, which `LayoutStrategy`/`IndexType` parse and print.
 ## 3. The ingest currency: `RawQuad`
 
 Every builder consumes one thing: a stream of
-[`RawQuad`](../core/src/common/quad.rs#L52)s, four owned strings in the exact
+[`RawQuad`](../core/src/common/quad.rs#L56)s, four owned strings in the exact
 form the columns store.
 
 | Field | Spelling | Example |
@@ -153,7 +153,7 @@ flowchart TD
 
 **String layouts.** The stream is drained into a `Vec<RawQuad>`, sorted, and
 built into one struct of primary columns through
-[`build_struct_array`](../core/src/store/builders/mod.rs#L165); the requested
+[`build_struct_array`](../core/src/store/builders/mod.rs#L167); the requested
 index families are sorted over that same vector ([§8](#8-secondary-indexes-at-build-time)).
 
 **Dictionary layout.** Terms are interned as they arrive
@@ -170,7 +170,7 @@ time (the wasm array path).
 
 **Streaming variant.** `build_vortex_stream` still sorts the whole dataset in
 memory but emits the primary columns as windows of
-[`DEFAULT_CHUNK_ROWS`](../core/src/store/builders/mod.rs#L50) rows (100,000)
+[`DEFAULT_CHUNK_ROWS`](../core/src/store/builders/mod.rs#L52) rows (100,000)
 only as the writer polls; the components are complete arrays riding beside the
 stream as replayable sources.
 
@@ -213,13 +213,13 @@ dataset's lifetime.
 yields the globally next quad in `(s, p, o, g)` order.
 
 **Phase 3 — emission.** Without indexes the merge is lazy
-([`build_chunk_stream`](../core/src/store/builders/sorted_stream.rs#L152)):
+([`build_chunk_stream`](../core/src/store/builders/sorted_stream.rs#L150)):
 every poll of the chunk stream pulls up to a chunk's worth of quads off the
 heap and builds one struct
-([`build_struct_array`](../core/src/store/builders/mod.rs#L165), or
+([`build_struct_array`](../core/src/store/builders/mod.rs#L167), or
 [`dictionary::build_chunk`](../core/src/store/layouts/dictionary/mod.rs#L142)
 encoding each term through the term→code map). With indexes the merge runs to
-completion first ([`merge_quads_feeding_indexes`](../core/src/store/builders/sorted_stream.rs#L327)):
+completion first ([`merge_quads_feeding_indexes`](../core/src/store/builders/sorted_stream.rs#L326)):
 row ids are only known as the merge assigns them, and an index child is a
 *globally* sorted table over those ids, so it needs a second external sort.
 Each merged quad's terms (strings, or codes under Dictionary) are pushed into
@@ -277,15 +277,15 @@ is the sorted set of every distinct term of the dataset — subjects, predicates
 objects and graph names in one namespace, the default graph's `""` included. A
 term's code is its position, so code order equals string order and a bound
 term resolves to its code by binary search. The frozen column is
-FSST-compressed at the source ([`compress`](../core/src/store/layouts/dictionary/term_dict.rs#L268)):
+FSST-compressed at the source ([`compress`](../core/src/store/layouts/dictionary/term_dict.rs#L244)):
 one symbol table is trained on the whole column and the terms are compressed in
-independent windows of [`DICT_CHUNK_ROWS`](../core/src/store/layouts/dictionary/term_dict.rs#L47)
+independent windows of [`DICT_CHUNK_ROWS`](../core/src/store/layouts/dictionary/term_dict.rs#L46)
 (65,536) terms, each window a self-contained FSST array. The term count must
 fit an `i32`.
 
 Which pipeline built the dictionary decides how its term→code map is held during
 encoding: borrowed from the live quads in memory
-([`from_quads_with_map`](../core/src/store/layouts/dictionary/term_dict.rs#L354)),
+([`from_quads_with_map`](../core/src/store/layouts/dictionary/term_dict.rs#L330)),
 owned when the quads were spilled and cannot be borrowed from
 ([`TermDictionaryBuilder::finish`](../core/src/store/layouts/dictionary/ingest.rs#L64)).
 Either way the map exists only for the build; stores keep the columnar
@@ -310,9 +310,9 @@ Term columns use the layout's encoding — strings under `Default` and
 for the index), `u32` codes under `Dictionary` — and `rid` is always the `u32`
 position of the quad in the sorted primary rows.
 
-**In memory** ([`build_components`](../core/src/store/builders/mod.rs#L232)) each
+**In memory** ([`build_components`](../core/src/store/builders/mod.rs#L234)) each
 family is a permutation of the complete sorted dataset: sort the row ids by the
-family's comparator ([`Family::cmp_quads`](../core/src/store/indexes/secondary_by_copy.rs#L141),
+family's comparator ([`CopyFamily::cmp_quads`](../core/src/store/indexes/secondary_by_copy.rs#L145),
 or the code tuple under Dictionary), then gather the columns through that
 permutation — the permutation itself is the `rid` column. The lead sort column
 is stamped `IsSorted`.
@@ -380,15 +380,15 @@ container.
 ## 10. Adopting a build in memory
 
 A build that is queried in place, without a file, skips the writer:
-[`from_built`](../core/src/store/mod.rs#L199) turns a `BuiltArray` into the
+[`from_built`](../core/src/store/mod.rs#L201) turns a `BuiltArray` into the
 store's *compressed-resident* form
-([`compress_built_parts`](../core/src/store/mod.rs#L150)):
+([`compress_built_parts`](../core/src/store/mod.rs#L152)):
 
 - every non-nullable `u32` child of the base and of each component is
   re-encoded from the bounds the build already knows —
   `Constant` for a single-valued column, `RunEnd` for a sorted column with few
   runs, bit-packed at the observed width otherwise
-  ([`with_compressed_int_children`](../core/src/store/array.rs#L311)); the
+  ([`with_compressed_int_children`](../core/src/store/array.rs#L298)); the
   `IsSorted` stamps carry across;
 - the base's compressed columns are wrapped in a `vortex.shared` node, so the
   match fast paths probe the compressed source while the code-column payload
@@ -397,7 +397,7 @@ store's *compressed-resident* form
   ([`StructProbes::warm`](../core/src/store/probes.rs#L43)), so no query pays the
   encoding-tree walk.
 
-The other in-memory constructor, [`from_parts`](../core/src/store/mod.rs#L184),
+The other in-memory constructor, [`from_parts`](../core/src/store/mod.rs#L186),
 adopts a store's split parts (the bindings' round trip): it keeps each integer
 child's existing encoding wherever a probe binds it and decodes only the ones
 that decline. Opening serialized bytes in memory is
@@ -432,15 +432,15 @@ artifact therefore always claims `quads_sorted` truthfully.
 ### 11.2 Compaction
 
 [`compact`](../core/src/store/compaction.rs#L30) /
-[`compact_with_indexes`](../core/src/store/compaction.rs#L58) gather every live
+[`compact_with_indexes`](../core/src/store/compaction.rs#L57) gather every live
 quad, sort, and rebuild:
 
-- **A file-backed owner stays file-backed** ([`stream_compacted_to_file`](../core/src/store/compaction.rs#L100)):
+- **A file-backed owner stays file-backed** ([`stream_compacted_to_file`](../core/src/store/compaction.rs#L99)):
   the sorted rows are streamed through `SortedStreamBuilder` — spilling beside
   the store file, not in the OS temp dir — into a sibling temp file
   `<store>.compact-<uuid>.tmp`, which is atomically renamed over the original;
   the store is then reopened with the residency budget it was opened with.
-- **An in-memory store** rebuilds through [`from_raw_quads`](../core/src/store/compaction.rs#L147)
+- **An in-memory store** rebuilds through [`from_raw_quads`](../core/src/store/compaction.rs#L146)
   (a fresh dictionary under Dictionary, components over the whole set) and
   adopts the result exactly as `from_built` does.
 
@@ -474,9 +474,9 @@ every other format decodes to `oxrdf` terms and drives the `oxrdfio` serializer.
 |---|---|---|---|
 | `--layout` / `layout` | every surface | `dictionary` | column layout ([§7](#7-columns-per-layout)) |
 | `--indexes` / `indexes` | every surface | none | which index families to build ([§8](#8-secondary-indexes-at-build-time)) |
-| `DEFAULT_CHUNK_ROWS` | [`builders/mod.rs`](../core/src/store/builders/mod.rs#L50) | 100,000 rows | run size, emitted chunk size, spiller capacity, auto-compaction cap |
+| `DEFAULT_CHUNK_ROWS` | [`builders/mod.rs`](../core/src/store/builders/mod.rs#L52) | 100,000 rows | run size, emitted chunk size, spiller capacity, auto-compaction cap |
 | `VORTEX_RDF_SPILL_DIR` | environment | unset (caller base, else OS temp) | where spill runs live |
-| `DICT_CHUNK_ROWS` | [`term_dict.rs`](../core/src/store/layouts/dictionary/term_dict.rs#L48) | 65,536 terms | FSST window = dictionary child leaf |
+| `DICT_CHUNK_ROWS` | [`term_dict.rs`](../core/src/store/layouts/dictionary/term_dict.rs#L46) | 65,536 terms | FSST window = dictionary child leaf |
 | row block / segment target | Vortex default write strategy | 8,192 rows / ~1 MiB | zone-map granularity and segment size of every written child |
 | `VORTEX_RDF_DICT_MAX_RESIDENT_BYTES`, `max_resident_bytes` | environment / Python / `from_file_with_dict_residency` | 512 MiB | not a build knob — decides, at open, whether the dictionary child is lifted resident ([file-format.md §5](file-format.md#5-the-dictionary-child)) |
 

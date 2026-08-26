@@ -37,3 +37,26 @@ describe('api.d.ts covers the wasm exports', () => {
         });
     }
 });
+
+// The three entries must re-export the same names from the generated module.
+function reexports(source: string): string[] {
+    const names: string[] = [];
+    for (const m of source.matchAll(/export\s*\{([^}]*)\}\s*from\s*'\.\.\/pkg\/web\/vortex_rdf\.js'/g)) {
+        for (const raw of m[1].split(',')) {
+            const name = raw.trim();
+            if (name) names.push(name);
+        }
+    }
+    return names.sort();
+}
+
+describe('the entries re-export the same names', () => {
+    test('entry/node.js, entry/browser.js and entry/types.d.ts agree', () => {
+        const node = reexports(read('../entry/node.js'));
+        const browser = reexports(read('../entry/browser.js'));
+        const types = reexports(read('../entry/types.d.ts'));
+        expect(node.length).toBeGreaterThan(0);
+        expect(browser).toEqual(node);
+        expect(types).toEqual(node);
+    });
+});

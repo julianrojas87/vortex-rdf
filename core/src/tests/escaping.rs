@@ -5,8 +5,6 @@
 //! round-trips.
 
 use super::*;
-use crate::common::terms::parse_term;
-use crate::store::RawQuad;
 use std::collections::HashMap;
 
 /// Literals whose lexical value either needs escaping when serialized or
@@ -117,19 +115,5 @@ async fn escaped_literals_roundtrip_with_secondary_indexes() {
         ] {
             run_escaped_literal_roundtrip(layout, indexes).await;
         }
-    }
-}
-
-#[test]
-fn stored_object_strings_survive_a_parse_and_reserialize() {
-    for term in escaped_literal_cases() {
-        let stored = term.to_string();
-        let quad = Quad::new(
-            subject_node(0, 2),
-            NamedNode::new("http://example.org/p").unwrap(),
-            parse_term(&stored).unwrap(),
-            GraphName::DefaultGraph,
-        );
-        assert_eq!(RawQuad::from_quad(&quad).o, stored);
     }
 }

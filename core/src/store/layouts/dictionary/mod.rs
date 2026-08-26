@@ -342,13 +342,13 @@ impl<T: Clone> TermMemo<T> {
 /// Decode a chunk's code columns into quads, reading each distinct code's
 /// term at most once per role (see [`TermMemo`]).
 fn decode_codes(
-    s_ids: &[u32],
-    p_ids: &[u32],
-    o_ids: &[u32],
-    g_ids: &[u32],
+    s_codes: &[u32],
+    p_codes: &[u32],
+    o_codes: &[u32],
+    g_codes: &[u32],
     src: &mut impl TermSource,
 ) -> Vec<Result<Quad>> {
-    let n = s_ids.len();
+    let n = s_codes.len();
     let (mut sm, mut pm, mut om, mut gm) = (
         TermMemo::new(n),
         TermMemo::new(n),
@@ -358,12 +358,14 @@ fn decode_codes(
 
     (0..n)
         .map(|i| {
-            let subject = sm.get_or_insert(s_ids[i], || parse_subject(src.str_at(0, s_ids[i])?))?;
+            let subject =
+                sm.get_or_insert(s_codes[i], || parse_subject(src.str_at(0, s_codes[i])?))?;
             let predicate =
-                pm.get_or_insert(p_ids[i], || parse_named_node(src.str_at(1, p_ids[i])?))?;
-            let object = om.get_or_insert(o_ids[i], || parse_object(src.str_at(2, o_ids[i])?))?;
+                pm.get_or_insert(p_codes[i], || parse_named_node(src.str_at(1, p_codes[i])?))?;
+            let object =
+                om.get_or_insert(o_codes[i], || parse_object(src.str_at(2, o_codes[i])?))?;
             let graph =
-                gm.get_or_insert(g_ids[i], || parse_graph_name(src.str_at(3, g_ids[i])?))?;
+                gm.get_or_insert(g_codes[i], || parse_graph_name(src.str_at(3, g_codes[i])?))?;
             Ok(Quad::new(subject, predicate, object, graph))
         })
         .collect()
@@ -459,6 +461,19 @@ pub(crate) fn unique_codes(chunk: &ArrayRef) -> Result<Vec<u32>> {
     codes.sort_unstable();
     codes.dedup();
     Ok(codes)
+}
+
+/// Resolve a chunk's distinct codes to terms with one scan of a file-backed
+/// dictionary, keyed for [`decode_chunk_mapped`] and
+/// [`decode_chunk_mapped_shared`].
+#[cfg(feature = "file-io")]
+pub(crate) async fn resolve_chunk_terms(
+    fb: &FileBackedDict,
+    chunk: &ArrayRef,
+) -> Result<HashMap<u32, Arc<str>>> {
+    let codes = unique_codes(chunk)?;
+    let terms = fb.decode_many(&codes).await?;
+    Ok(codes.into_iter().zip(terms).collect())
 }
 
 /// [`decode_chunk`] against a pre-resolved code→term map instead of a

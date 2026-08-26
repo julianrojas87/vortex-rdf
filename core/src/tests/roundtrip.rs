@@ -175,7 +175,7 @@ fn drop_graph_column(chunk: &vortex_array::ArrayRef) -> vortex_array::ArrayRef {
 /// A chunk that cannot be read as the layout's columns at all decodes to a
 /// single `Err`, whatever its row count.
 #[test]
-fn decode_chunk_reports_chunk_failure_as_single_err() {
+fn test_decode_chunk_reports_chunk_failure_as_single_err() {
     let raws: Vec<crate::store::RawQuad> = modular_quads(3, 3, 4)
         .iter()
         .map(crate::store::RawQuad::from_quad)
@@ -197,7 +197,7 @@ fn decode_chunk_reports_chunk_failure_as_single_err() {
 /// layouts that store the object spelling, an unknown `o_kind` under the
 /// typed layout.
 #[test]
-fn decode_chunk_reports_bad_row_at_its_position() {
+fn test_decode_chunk_reports_bad_row_at_its_position() {
     use vortex_array::IntoArray as _;
     use vortex_array::arrays::PrimitiveArray;
 
@@ -420,6 +420,71 @@ async fn test_export_nquads_fast_path_file_backed() {
 
         let store = VortexRdfStore::from_file(&path).await.unwrap();
         let stored: Vec<Quad> = store.quads().unwrap().try_collect().await.unwrap();
+        let mut exported = Vec::new();
+        crate::export_rdf(store, &mut exported, oxrdfio::RdfFormat::NQuads)
+            .await
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(exported).unwrap(),
+            oxrdf_reference(&stored, oxrdfio::RdfFormat::NQuads),
+            "{layout:?}"
+        );
+    }
+}
+
+/// `store` with one base quad tombstoned and one quad appended to the tail.
+async fn tombstoned_and_tailed(store: VortexRdfStore) -> VortexRdfStore {
+    let quads = export_test_quads();
+    let appended = make_quad(
+        "http://example.org/s9",
+        "http://example.org/p",
+        "appended",
+        GraphName::DefaultGraph,
+    );
+    store
+        .delete_quad(&quads[1])
+        .await
+        .unwrap()
+        .add_quad(appended)
+        .await
+        .unwrap()
+}
+
+/// The export over a store with a tombstoned base row and an append tail
+/// skips the deleted row and includes the tail row, under every layout's
+/// raw chunk decoding.
+#[tokio::test]
+async fn test_export_skips_tombstones_and_includes_tail() {
+    let quads = export_test_quads();
+    for layout in EXPORT_LAYOUTS {
+        let arr = build_array::<SortedInMemoryBuilder>(quad_stream(quads.clone()), layout, vec![])
+            .await
+            .unwrap();
+        let store = tombstoned_and_tailed(VortexRdfStore::from_built(arr).unwrap()).await;
+        let stored = store.quads_vec().await.unwrap();
+        assert_eq!(stored.len(), quads.len(), "{layout:?}");
+        let mut exported = Vec::new();
+        crate::export_rdf(store, &mut exported, oxrdfio::RdfFormat::NQuads)
+            .await
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(exported).unwrap(),
+            oxrdf_reference(&stored, oxrdfio::RdfFormat::NQuads),
+            "{layout:?}"
+        );
+    }
+}
+
+/// The file arm of the same: tombstone and tail over a file-backed store.
+#[cfg(feature = "file-io")]
+#[tokio::test]
+async fn test_export_skips_tombstones_and_includes_tail_file_backed() {
+    let quads = export_test_quads();
+    for layout in EXPORT_LAYOUTS {
+        let (_dir, path) = write_store_file(quads.clone(), layout, vec![]).await;
+        let store = tombstoned_and_tailed(VortexRdfStore::from_file(&path).await.unwrap()).await;
+        let stored = store.quads_vec().await.unwrap();
+        assert_eq!(stored.len(), quads.len(), "{layout:?}");
         let mut exported = Vec::new();
         crate::export_rdf(store, &mut exported, oxrdfio::RdfFormat::NQuads)
             .await

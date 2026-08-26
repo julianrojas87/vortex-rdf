@@ -13,9 +13,7 @@ publish = false
 [lib]
 crate-type = ["cdylib", "rlib"]
 
-# wasm-opt's default `-O` only shrinks the file and costs many minutes on this module
-# without further optimization. -O1 builds ~20x faster, gzips comparably, 
-# and is indistinguishable at runtime.
+# Cap wasm-opt at -O1: the size-only passes; the module's hot paths are already optimized by rustc.
 [package.metadata.wasm-pack.profile.release]
 wasm-opt = ['-O1']
 

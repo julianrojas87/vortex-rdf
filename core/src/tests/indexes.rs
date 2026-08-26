@@ -12,15 +12,11 @@ use super::*;
 /// single `o` column each child's `val` column shares its dtype.
 #[tokio::test]
 async fn test_duplicate_index_requests_are_deduplicated() {
-    let layouts: [(LayoutStrategy, &[&str]); 3] = [
-        (LayoutStrategy::Default, &["s", "p", "o", "g"]),
-        (
-            LayoutStrategy::TypedObject,
-            &["s", "p", "o_kind", "o_value", "o_datatype", "o_lang", "g"],
-        ),
-        (LayoutStrategy::Dictionary, &["s", "p", "o", "g"]),
-    ];
-    for (layout, primary_columns) in layouts {
+    for layout in [
+        LayoutStrategy::Default,
+        LayoutStrategy::TypedObject,
+        LayoutStrategy::Dictionary,
+    ] {
         let arr = build_array::<SortedInMemoryBuilder>(
             quad_stream(two_quads()),
             layout,
@@ -36,7 +32,7 @@ async fn test_duplicate_index_requests_are_deduplicated() {
             panic!("{layout:?}: expected StructArray dtype");
         };
         let names: Vec<&str> = fields.names().iter().map(|n| n.as_ref()).collect();
-        assert_eq!(names, primary_columns, "{layout:?}");
+        assert_eq!(names, primary_columns(layout), "{layout:?}");
         assert_eq!(
             component_names(&arr),
             ["index:ref-o", "index:ref-p"],
@@ -446,9 +442,10 @@ async fn run_index_matrix_cell<B: VortexArrayBuilder>(
         let names: Vec<&str> = fields.names().iter().map(|n| n.as_ref()).collect();
         // Whatever the builder or layout, index data never rides in the quad
         // rows: those carry the layout's primary columns and nothing else.
-        assert!(
-            names.iter().all(|n| !n.starts_with("_idx")),
-            "index columns leaked into the quad rows for builder={builder_name} layout={layout_name} indexes={index_name}",
+        assert_eq!(
+            names,
+            primary_columns(layout),
+            "builder={builder_name} layout={layout_name} indexes={index_name}",
         );
         let expect_ref = indexes.contains(&IndexType::SecondaryByReference);
         let expect_copy = indexes.contains(&IndexType::SecondaryByCopy);

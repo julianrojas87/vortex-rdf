@@ -378,11 +378,6 @@ pub(crate) async fn file_point_rows(
     selection: &RowSelection,
     deleted: Option<&Mask>,
 ) -> Result<Option<ArrayRef>> {
-    use vortex_array::IntoArray;
-    use vortex_array::arrays::StructArray;
-    use vortex_array::dtype::FieldName;
-    use vortex_array::validity::Validity;
-
     let Some(rows) = selection.point_sized_live_rows(deleted) else {
         return Ok(None);
     };
@@ -427,15 +422,38 @@ pub(crate) async fn file_point_rows(
         }
     }
 
+    point_read_struct(file, &handles, columns, &live, |col| {
+        eqs.iter().find(|(c, _)| c == col).map(|(_, v)| *v)
+    })
+    .await
+}
+
+/// Read `columns` at `rows` point-by-point through their chunk-probe
+/// `handles` into one canonical struct chunk. A column `constant` answers is
+/// filled with that value instead of being read. `Ok(None)` declines — an
+/// unprobeable chunk or a column type the canonical child cannot hold.
+async fn point_read_struct(
+    file: &NativeStoreFile,
+    handles: &[Arc<vortex_rdf_encoded_search::ColumnChunks>],
+    columns: &[&str],
+    rows: &[u64],
+    constant: impl Fn(&str) -> Option<u64>,
+) -> Result<Option<ArrayRef>> {
+    use vortex_array::IntoArray;
+    use vortex_array::arrays::StructArray;
+    use vortex_array::dtype::FieldName;
+    use vortex_array::validity::Validity;
+
+    let source = file.segment_source();
+    let session = file.session();
     let mut children = Vec::with_capacity(columns.len());
-    for (idx, col) in columns.iter().enumerate() {
-        let eq = eqs.iter().find(|(c, _)| c == col).map(|(_, v)| *v);
-        let mut values = Vec::with_capacity(live.len());
-        match eq {
-            Some(v) => values.extend(std::iter::repeat_n(v, live.len())),
+    for (handle, col) in handles.iter().zip(columns) {
+        let mut values = Vec::with_capacity(rows.len());
+        match constant(col) {
+            Some(v) => values.extend(std::iter::repeat_n(v, rows.len())),
             None => {
-                for &row in &live {
-                    match handles[idx]
+                for &row in rows {
+                    match handle
                         .value_at(row, &source, session)
                         .await
                         .map_err(VortexRdfError::Vortex)?
@@ -446,19 +464,18 @@ pub(crate) async fn file_point_rows(
                 }
             }
         }
-        let Some(child) =
-            primitive_from_u64_reads(handles[idx].dtype().as_ptype(), values.into_iter())
+        let Some(child) = primitive_from_u64_reads(handle.dtype().as_ptype(), values.into_iter())
         else {
             return Ok(None);
         };
         children.push(child);
     }
     let names: Vec<FieldName> = columns.iter().map(|c| FieldName::from(*c)).collect();
-    let rows_struct =
-        StructArray::try_new(names.into(), children, live.len(), Validity::NonNullable)
+    Ok(Some(
+        StructArray::try_new(names.into(), children, rows.len(), Validity::NonNullable)
             .map_err(VortexRdfError::Vortex)?
-            .into_array();
-    Ok(Some(rows_struct))
+            .into_array(),
+    ))
 }
 
 /// A located serve run's projected component columns, read point-by-point
@@ -472,11 +489,6 @@ pub(crate) async fn component_point_chunk(
     columns: &[&'static str],
     range: Range<u64>,
 ) -> Result<Option<ArrayRef>> {
-    use vortex_array::IntoArray;
-    use vortex_array::arrays::StructArray;
-    use vortex_array::dtype::FieldName;
-    use vortex_array::validity::Validity;
-
     let Some(handles) = columns
         .iter()
         .map(|c| file.component_column_chunks(component, c))
@@ -484,34 +496,8 @@ pub(crate) async fn component_point_chunk(
     else {
         return Ok(None);
     };
-    let source = file.segment_source();
-    let session = file.session();
-    let len = (range.end - range.start) as usize;
-    let mut children = Vec::with_capacity(columns.len());
-    for handle in &handles {
-        let mut values = Vec::with_capacity(len);
-        for row in range.clone() {
-            match handle
-                .value_at(row, &source, session)
-                .await
-                .map_err(VortexRdfError::Vortex)?
-            {
-                Some(v) => values.push(v),
-                None => return Ok(None),
-            }
-        }
-        let Some(child) = primitive_from_u64_reads(handle.dtype().as_ptype(), values.into_iter())
-        else {
-            return Ok(None);
-        };
-        children.push(child);
-    }
-    let names: Vec<FieldName> = columns.iter().map(|c| FieldName::from(*c)).collect();
-    Ok(Some(
-        StructArray::try_new(names.into(), children, len, Validity::NonNullable)
-            .map_err(VortexRdfError::Vortex)?
-            .into_array(),
-    ))
+    let rows: Vec<u64> = range.collect();
+    point_read_struct(file, &handles, columns, &rows, |_| None).await
 }
 
 /// The `(column, code)` pairs of a filter built by [`build_file_filter`] —

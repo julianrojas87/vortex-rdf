@@ -17,7 +17,7 @@ use crate::error::{Result, VortexRdfError};
 use crate::store::array::chunked_or_single;
 
 /// The host's available parallelism, read once; 1 on targets that cannot
-/// answer (wasm). Read by [`collect_scan`] for its in-flight split count and
+/// answer (wasm). Read by [`collect_chunks`] for its in-flight split count and
 /// exposed through [`available_parallelism`] to the store's scan and serve
 /// split loops.
 static AVAILABLE_PARALLELISM: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
@@ -33,13 +33,14 @@ pub(crate) fn available_parallelism() -> usize {
     *AVAILABLE_PARALLELISM
 }
 
-/// Drive a scan's per-split futures inline and assemble the chunks into one
-/// array — the shared tail of [`scan_all`] and [`scan_all_reader`].
+/// Drive a scan's per-split futures inline and collect the chunks in split
+/// (row) order — the shared tail of [`scan_all`], [`scan_all_reader`] and
+/// [`scan_reader_chunks`].
 ///
 /// The futures are polled through a `buffered` window — several in flight on
 /// this same task, still no runtime handle — so one split's I/O overlaps
-/// another's decode, while the chunks arrive in split (row) order.
-async fn collect_scan<F>(dtype: vortex_array::dtype::DType, tasks: Vec<F>) -> Result<ArrayRef>
+/// another's decode.
+async fn collect_chunks<F>(tasks: Vec<F>) -> Result<Vec<ArrayRef>>
 where
     F: Future<Output = VortexResult<Option<ArrayRef>>>,
 {
@@ -50,7 +51,15 @@ where
             chunks.push(chunk);
         }
     }
-    chunked_or_single(chunks, dtype)
+    Ok(chunks)
+}
+
+/// [`collect_chunks`] assembled into one array of `dtype`.
+async fn collect_scan<F>(dtype: vortex_array::dtype::DType, tasks: Vec<F>) -> Result<ArrayRef>
+where
+    F: Future<Output = VortexResult<Option<ArrayRef>>>,
+{
+    chunked_or_single(collect_chunks(tasks).await?, dtype)
 }
 
 /// Materialize a whole file by driving its scan's per-split futures inline.
@@ -71,12 +80,20 @@ pub(crate) async fn scan_all(file: &vortex_file::VortexFile) -> Result<ArrayRef>
 /// buffer-backed file on every target, runtime handle included or not.
 pub(crate) async fn scan_all_reader(reader: vortex_layout::LayoutReaderRef) -> Result<ArrayRef> {
     let dtype = reader.dtype().clone();
+    chunked_or_single(scan_reader_chunks(reader).await?, dtype)
+}
+
+/// [`scan_all_reader`] before assembly: the reader's scan chunks in split
+/// (row) order, each in its stored encoding.
+pub(crate) async fn scan_reader_chunks(
+    reader: vortex_layout::LayoutReaderRef,
+) -> Result<Vec<ArrayRef>> {
     let scan = vortex_layout::scan::scan_builder::ScanBuilder::new(
         crate::session::VORTEX_SESSION.clone(),
         reader,
     );
     let tasks = scan.build().map_err(VortexRdfError::Vortex)?;
-    collect_scan(dtype, tasks).await
+    collect_chunks(tasks).await
 }
 
 /// The actionable error for a file whose root is not the native store layout.
@@ -89,7 +106,7 @@ pub(crate) fn unsupported_file_error(file: &vortex_file::VortexFile) -> VortexRd
 }
 
 /// Open a Vortex file lazily — no data is read until the returned `VortexFile`
-/// is scanned. This is the core entrypoint for our zero-copy, memory-efficient lazy store.
+/// is scanned.
 ///
 /// The layout reader is cached on the file handle: every scan and pruning
 /// evaluation over the store shares one reader tree, so zone-map stats tables

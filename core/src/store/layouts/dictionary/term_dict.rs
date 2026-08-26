@@ -16,9 +16,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use vortex_array::arrays::struct_::{StructArray, StructArrayExt};
-use vortex_array::arrays::{ChunkedArray, PrimitiveArray, VarBinViewArray};
-use vortex_array::dtype::DType;
-use vortex_array::expr::{root, select};
+use vortex_array::arrays::{PrimitiveArray, VarBinViewArray};
 use vortex_array::match_each_integer_ptype;
 #[cfg(any(feature = "file-io", target_arch = "wasm32"))]
 use vortex_array::validity::Validity;
@@ -26,6 +24,7 @@ use vortex_array::{ArrayRef, IntoArray, VortexSessionExecute};
 use vortex_fsst::{FSST, FSSTArray, FSSTArraySlotsExt as _, fsst_compress, fsst_train_compressor};
 
 use crate::error::{Result, VortexRdfError};
+use crate::io::read::scan_reader_chunks;
 use crate::session::VORTEX_SESSION;
 use crate::store::RawQuad;
 use crate::store::array::{StrColReader, buf_as_str};
@@ -195,32 +194,9 @@ impl TermDictionary {
         Self::compress(plain)
     }
 
-    /// Adopt a term column as read back from a file or IPC stream.
-    ///
-    /// Already-FSST terms are kept compressed — decoding them here would cost
-    /// a full plaintext copy of the dictionary at open. Any other encoding is
-    /// canonicalized: the write path compresses, but nothing in the format
-    /// obliges a producer to have done so.
-    fn from_terms_array(elements: ArrayRef, ctx: &mut vortex_array::ExecutionCtx) -> Result<Self> {
-        // Flatten `Chunked` containers into their chunks: the dictionary
-        // child's writer splits large dictionaries into several chunks, each
-        // independently FSST-compressed, and canonicalizing them into one
-        // array would decompress the dictionary on open — exactly the copy
-        // holding it compressed exists to avoid.
-        use vortex_array::arrays::chunked::ChunkedArrayExt as _;
-        let mut queue = vec![elements];
-        let mut flat = Vec::new();
-        while let Some(cur) = queue.pop() {
-            match cur.try_downcast::<vortex_array::arrays::Chunked>() {
-                // Reverse so the pop order preserves chunk order.
-                Ok(chunked) => queue.extend(chunked.chunks().iter().rev().cloned()),
-                Err(other) => flat.push(other),
-            }
-        }
-        Self::from_term_chunks(flat, ctx)
-    }
-
-    /// Adopt a term column's chunks through [`TermChunk::from_wire`].
+    /// Adopt a term column's chunks through [`TermChunk::from_wire`]:
+    /// already-FSST chunks are kept compressed, any other encoding is
+    /// canonicalized.
     fn from_term_chunks(
         chunks: Vec<ArrayRef>,
         ctx: &mut vortex_array::ExecutionCtx,
@@ -717,47 +693,28 @@ impl TermDictionary {
     /// dictionary, keeping each chunk's stored encoding (FSST where the
     /// writer compressed).
     ///
-    /// Drives the scan's per-split futures inline and overlapped (`join_all`,
-    /// no runtime handle), so it serves the file-backed open, the buffered
-    /// `open_buffer` open, and the wasm read path alike.
+    /// Scans the child through [`scan_reader_chunks`] (inline, no runtime
+    /// handle), so it serves the file-backed open, the buffered `open_buffer`
+    /// open, and the wasm read path alike; each scan chunk's term column is
+    /// adopted as one dictionary chunk.
     pub(crate) async fn from_child_reader(reader: vortex_layout::LayoutReaderRef) -> Result<Self> {
         if reader.row_count() == 0 {
             return Ok(Self::empty());
         }
-        let projection = select([COL_DICT_TERM], root())
-            .bind(reader.dtype())
-            .map_err(VortexRdfError::Vortex)?;
-        let scan =
-            vortex_layout::scan::scan_builder::ScanBuilder::new(VORTEX_SESSION.clone(), reader)
-                .with_projection(projection);
         let mut ctx = VORTEX_SESSION.create_execution_ctx();
-        let tasks = scan.build().map_err(VortexRdfError::Vortex)?;
         let mut chunks = Vec::new();
-        for res in futures::future::join_all(tasks).await {
-            if let Some(chunk) = res.map_err(VortexRdfError::Vortex)? {
-                let struct_arr = chunk
-                    .execute::<StructArray>(&mut ctx)
-                    .map_err(VortexRdfError::Vortex)?;
-                chunks.push(
-                    struct_arr
-                        .unmasked_field_by_name(COL_DICT_TERM)
-                        .map_err(VortexRdfError::Vortex)?
-                        .clone(),
-                );
-            }
+        for chunk in scan_reader_chunks(reader).await? {
+            let struct_arr = chunk
+                .execute::<StructArray>(&mut ctx)
+                .map_err(VortexRdfError::Vortex)?;
+            chunks.push(
+                struct_arr
+                    .unmasked_field_by_name(COL_DICT_TERM)
+                    .map_err(VortexRdfError::Vortex)?
+                    .clone(),
+            );
         }
-        Self::from_terms_array(
-            match chunks.len() {
-                1 => chunks.pop().expect("length checked above"),
-                _ => {
-                    let dtype = DType::Utf8(vortex_array::dtype::Nullability::NonNullable);
-                    ChunkedArray::try_new(chunks, dtype)
-                        .map_err(VortexRdfError::Vortex)?
-                        .into_array()
-                }
-            },
-            &mut ctx,
-        )
+        Self::from_term_chunks(chunks, &mut ctx)
     }
 }
 
@@ -929,20 +886,18 @@ mod tests {
         let mut ctx = VORTEX_SESSION.create_execution_ctx();
 
         let single =
-            TermDictionary::from_terms_array(plain.clone().into_array(), &mut ctx).unwrap();
+            TermDictionary::from_term_chunks(vec![plain.clone().into_array()], &mut ctx).unwrap();
         assert!(matches!(
             single.terms,
             TermStore::Single(TermChunk::Canonical(_))
         ));
 
         let column = plain.into_array();
-        let dtype = column.dtype().clone();
         let pieces = vec![
             column.slice(0..120).unwrap(),
             column.slice(120..300).unwrap(),
         ];
-        let chunked = ChunkedArray::try_new(pieces, dtype).unwrap().into_array();
-        let chunked = TermDictionary::from_terms_array(chunked, &mut ctx).unwrap();
+        let chunked = TermDictionary::from_term_chunks(pieces, &mut ctx).unwrap();
         match &chunked.terms {
             TermStore::Chunked(c) => {
                 assert_eq!(c.chunks.len(), 2);

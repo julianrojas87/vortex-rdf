@@ -74,17 +74,11 @@ impl VortexRdfStore {
     /// components.
     async fn selected_parts(&self) -> Result<SelectedParts> {
         let base = self.base_selected_rows().await?;
-        let (owner_shaped, tombstoned) = match &self.quads {
-            QuadsSource::InMemory {
-                selection, deleted, ..
-            } => (selection.is_all(), deleted.is_some()),
+        let owner_shaped = self.quads.is_unrefined();
+        let tombstoned = match &self.quads {
+            QuadsSource::InMemory { deleted, .. } => deleted.is_some(),
             #[cfg(feature = "file-io")]
-            QuadsSource::File {
-                filter,
-                selection,
-                deleted,
-                ..
-            } => (filter.is_none() && selection.is_all(), deleted.is_some()),
+            QuadsSource::File { deleted, .. } => deleted.is_some(),
         };
         let rebuild =
             self.tail.is_some() || (owner_shaped && tombstoned && !self.indexes.is_empty());

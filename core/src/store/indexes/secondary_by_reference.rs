@@ -41,9 +41,9 @@ use crate::store::layouts::dictionary::QuadCodes;
 use crate::store::layouts::{PatternCodes, QuadPattern, TermRef};
 
 /// Column names inside a reference component's persisted child.
-const CHILD_COLUMNS: [&str; 2] = ["val", "rid"];
 const COL_VAL: &str = "val";
 const COL_RID: &str = "rid";
+const CHILD_COLUMNS: [&str; 2] = [COL_VAL, COL_RID];
 
 /// This index's persisted-child identity table — one `{val, rid}` table per
 /// covered family — feeding every generic loop in the hub (the slug registry

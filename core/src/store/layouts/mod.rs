@@ -51,6 +51,8 @@ use crate::store::schema::{COL_G, COL_O, COL_P, COL_S};
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
 #[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
 pub enum LayoutStrategy {
+    /// All four quad fields as opaque N-Triples strings.
+    ///
     /// ### `LayoutStrategy::Default` column schema
     ///
     /// All four quad fields stored as opaque UTF-8 strings in N-Triples
@@ -71,8 +73,10 @@ pub enum LayoutStrategy {
     /// [`IndexType`]: crate::store::indexes::IndexType
     Default,
 
+    /// Object column split into typed sub-columns (kind, value, datatype, lang).
+    ///
     /// ### `LayoutStrategy::TypedObject` column schema
-    /// Object column decomposed into typed sub-columns (kind, value, datatype, lang).
+    ///
     /// Same as `Default` for `s`, `p`, `g`. The `o` column is decomposed into typed fields
     /// so that Vortex can apply datatype-appropriate encodings (delta, RLE, dictionary).
     ///
@@ -93,7 +97,10 @@ pub enum LayoutStrategy {
     /// [`IndexType`]: crate::store::indexes::IndexType
     TypedObject,
 
+    /// All four quad fields as u32 codes into one shared term dictionary.
+    ///
     /// ### `LayoutStrategy::Dictionary` column schema
+    ///
     /// All four quad fields stored as u32 codes into a single global term
     /// dictionary. In memory the dictionary lives beside the columns (see
     /// `dictionary::term_dict`); a serialized
@@ -572,7 +579,7 @@ impl PatternCodes {
                     ($opt:expr, $ctor:expr, $field:expr) => {
                         if let Some(term) = $opt {
                             match self.code($ctor(term))? {
-                                Some(id) => eqs.push(($field, Scalar::from(id))),
+                                Some(code) => eqs.push(($field, Scalar::from(code))),
                                 None => return Ok(Constraints::AlwaysFalse),
                             }
                         }
@@ -641,13 +648,8 @@ impl ResolvedLayout {
     #[cfg(feature = "file-io")]
     pub(crate) async fn decode_chunk_async(&self, chunk: &ArrayRef) -> Vec<Result<Quad>> {
         if let ResolvedLayout::Dictionary(DictAccess::FileBacked(fb)) = self {
-            let codes = match dictionary::unique_codes(chunk) {
-                Ok(codes) => codes,
-                Err(e) => return vec![Err(e)],
-            };
-            let terms: std::collections::HashMap<u32, Arc<str>> = match fb.decode_many(&codes).await
-            {
-                Ok(terms) => codes.into_iter().zip(terms).collect(),
+            let terms = match dictionary::resolve_chunk_terms(fb, chunk).await {
+                Ok(terms) => terms,
                 Err(e) => return vec![Err(e)],
             };
             return dictionary::decode_chunk_mapped(chunk, &terms);
@@ -659,7 +661,6 @@ impl ResolvedLayout {
     /// shared N-Triples strings, decoded once per distinct code under the
     /// Dictionary layout; the string layouts read their columns as
     /// [`raw_quads`](Self::raw_quads) does, one string per row.
-    ///
     pub(crate) fn decode_chunk_shared(&self, chunk: &ArrayRef) -> Vec<Result<SharedQuad>> {
         match self {
             ResolvedLayout::Default | ResolvedLayout::TypedObject => match self.raw_quads(chunk) {
@@ -690,13 +691,8 @@ impl ResolvedLayout {
         chunk: &ArrayRef,
     ) -> Vec<Result<SharedQuad>> {
         if let ResolvedLayout::Dictionary(DictAccess::FileBacked(fb)) = self {
-            let codes = match dictionary::unique_codes(chunk) {
-                Ok(codes) => codes,
-                Err(e) => return vec![Err(e)],
-            };
-            let terms: std::collections::HashMap<u32, Arc<str>> = match fb.decode_many(&codes).await
-            {
-                Ok(terms) => codes.into_iter().zip(terms).collect(),
+            let terms = match dictionary::resolve_chunk_terms(fb, chunk).await {
+                Ok(terms) => terms,
                 Err(e) => return vec![Err(e)],
             };
             return dictionary::decode_chunk_mapped_shared(chunk, &terms);

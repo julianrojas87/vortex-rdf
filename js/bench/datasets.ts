@@ -191,7 +191,12 @@ export function datasetProbes(n: number, opts: DatasetOpts = {}): {
     const s0 = subjectTerm(0);
     const p0 = predicateTerm(0);
     const o0 = objectTerm(0, o.literalFrac);
-    const g0 = m.nGraph === 1 ? df.defaultGraph() : graphTerm(0);
+    // A single-graph dataset has no graph term to bind, which would quietly
+    // turn `G` into a second full scan and `SPOG` into `SPO` -- two probes
+    // measuring something other than what their names claim. Return no quad
+    // probes instead, so a caller that forgot to pass the quads options gets
+    // nothing rather than plausible-looking wrong rows.
+    const g0 = m.nGraph === 1 ? null : graphTerm(0);
     return {
         triples: [
             { name: 'S', s: s0, p: null, o: null, g: null },
@@ -201,7 +206,7 @@ export function datasetProbes(n: number, opts: DatasetOpts = {}): {
             { name: 'PO', s: null, p: p0, o: o0, g: null },
             { name: 'SPO', s: s0, p: p0, o: o0, g: null },
         ],
-        quads: [
+        quads: g0 === null ? [] : [
             { name: 'G', s: null, p: null, o: null, g: g0 },
             { name: 'SPOG', s: s0, p: p0, o: o0, g: g0 },
         ],

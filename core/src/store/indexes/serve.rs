@@ -484,7 +484,7 @@ impl FileServePlan {
 
     /// A scan over the serving index child — where [`Self::projection`] and
     /// the plan's bound filter apply.
-    pub(crate) fn child_scan(&self) -> vortex_layout::scan::scan_builder::ScanBuilder<ArrayRef> {
+    fn child_scan(&self) -> vortex_layout::scan::scan_builder::ScanBuilder<ArrayRef> {
         vortex_layout::scan::scan_builder::ScanBuilder::new(
             VORTEX_SESSION.clone(),
             self.reader.clone(),

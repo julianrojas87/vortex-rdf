@@ -45,14 +45,12 @@ describe('bench dataset parity', () => {
         expect(o0.value).toBe('descriptive object value number 000000000');
     });
 
-    test('quad probes bind graph 0; a single-graph dataset binds the default graph', () => {
-        // The Python generator returns no quad probes at graphs=1; this one
-        // binds `G`/`SPOG` to the default graph instead.
+    test('quad probes bind graph 0; a single-graph dataset has no quad probes', () => {
+        // Same as the Python generator: no graph term to bind at graphs=1.
         const named = datasetProbes(32768, { graphs: 8 }).quads;
         expect(named.map((p) => p.name)).toEqual(['G', 'SPOG']);
         expect(named[0].g?.termType).toBe('NamedNode');
         expect(named[0].g?.value).toBe(`${BASE}/graph/2026/named/000000`);
-        const single = datasetProbes(32768, { graphs: 1 }).quads;
-        expect(single.map((p) => p.g?.termType)).toEqual(['DefaultGraph', 'DefaultGraph']);
+        expect(datasetProbes(32768, { graphs: 1 }).quads).toEqual([]);
     });
 });

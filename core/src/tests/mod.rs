@@ -115,6 +115,17 @@ async fn build_array<B: VortexArrayBuilder>(
     B::build_vortex_array(Box::new(quads), layout, indexes).await
 }
 
+/// The quad-row column names `layout` builds — what a schema assertion
+/// expects the primary struct to carry and nothing else.
+fn primary_columns(layout: LayoutStrategy) -> &'static [&'static str] {
+    match layout {
+        LayoutStrategy::Default | LayoutStrategy::Dictionary => &["s", "p", "o", "g"],
+        LayoutStrategy::TypedObject => {
+            &["s", "p", "o_kind", "o_value", "o_datatype", "o_lang", "g"]
+        }
+    }
+}
+
 /// The names of a build's index children, in emission order — what a schema
 /// assertion checks, since index data never rides in the quad rows.
 fn component_names(built: &BuiltArray) -> Vec<&'static str> {

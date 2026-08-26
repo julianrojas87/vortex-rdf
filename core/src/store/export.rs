@@ -80,7 +80,6 @@ async fn write_structured<W: Write>(
     format: RdfFormat,
 ) -> error::Result<()> {
     let decode_start = debug::timer();
-    // Retrieve the quad stream (either in-memory or lazy file-backed stream).
     let mut quads_stream = store.quads()?;
     log::debug!(
         "[export_rdf] Quad stream setup took {:?}",
@@ -88,10 +87,8 @@ async fn write_structured<W: Write>(
     );
 
     let write_start = debug::timer();
-    // Construct the oxrdf serialization helper for streaming output.
     let mut rdf_serializer = RdfSerializer::from_format(format).for_writer(writer);
 
-    // Dynamically iterate over each quad and push it to the output writer.
     while let Some(quad_res) = quads_stream.next().await {
         let quad = quad_res?;
         rdf_serializer
@@ -99,7 +96,6 @@ async fn write_structured<W: Write>(
             .map_err(|e| VortexRdfError::Serialization(e.to_string()))?;
     }
 
-    // Finalize the serialization output (e.g. closing syntax blocks).
     rdf_serializer
         .finish()
         .map_err(|e| VortexRdfError::Serialization(e.to_string()))?;

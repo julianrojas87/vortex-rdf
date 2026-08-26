@@ -206,7 +206,7 @@ fn tail_chunks(store: &VortexRdfStore) -> Option<Vec<vortex_array::ArrayRef>> {
     use vortex_array::arrays::Chunked;
     use vortex_array::arrays::chunked::ChunkedArrayExt as _;
     store
-        .tail_rows()
+        .debug_tail_rows()
         .expect("a tail")
         .clone()
         .try_downcast::<Chunked>()
@@ -229,7 +229,7 @@ async fn test_tail_accretion_flattens_at_chunk_bound() {
     .await
     .unwrap();
     let mut store = VortexRdfStore::from_built(arr).unwrap();
-    assert!(store.tail_rows().is_none());
+    assert!(store.debug_tail_rows().is_none());
 
     for i in 0..TAIL_MAX_CHUNKS {
         store = store.add_quad(tail_quad(i)).await.unwrap();

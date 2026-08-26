@@ -4,8 +4,8 @@ A deliberate port of `js/bench/datasets.ts`, kept algorithmically identical --
 same moduli, same term spellings, same probe selection -- so a row on the
 Python dashboard tab measures the *same data* as the corresponding row on the
 JavaScript tab. Any drift here silently makes the two tabs incomparable, so the
-uniqueness argument and the cardinality defaults are reproduced verbatim rather
-than re-derived.
+uniqueness argument and the cardinality defaults are identical to the JS
+generator's.
 
 Two things differ from the JS original, both forced by what the Python
 libraries accept:
@@ -14,9 +14,9 @@ libraries accept:
     objects. Every library under test ingests from a file (`serialize_rdf`,
     `bulk_load`, `rdf2cottas`, `Graph.parse`), and lightrdf has no store at all
     -- a file is the only input all five share.
-  * Generation streams to disk. Materializing 2M quads as Python objects first
-    would cost more memory than any store under test, and this module runs in
-    the same process as the adapter whose peak RSS is being attributed.
+  * Generation streams to disk. Materializing the dataset as Python objects
+    first would cost more memory than any store under test, and this module
+    runs in the same process as the adapter whose peak RSS is being attributed.
 
 PURITY CONTRACT: standard library only. This module is imported by every
 adapter's isolated virtualenv, which by construction does not have the other

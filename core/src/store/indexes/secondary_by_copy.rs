@@ -64,7 +64,7 @@ use vortex_array::scalar::Scalar;
 /// sort order. Each family owns five columns: the four quad components plus
 /// the primary row id each copy row came from.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub(crate) enum Family {
+pub(crate) enum CopyFamily {
     /// Quads sorted by (p, o, s, g).
     Posg,
     /// Quads sorted by (o, s, p, g).
@@ -74,79 +74,83 @@ pub(crate) enum Family {
 /// Column names inside a copy family's persisted child: the plain primaries
 /// plus the primary row id. Both families use the same names — the child's
 /// identity is what says which sort order the rows are in.
-const CHILD_COLUMNS: [&str; 5] = ["s", "p", "o", "g", "rid"];
+const COL_S: &str = "s";
+const COL_P: &str = "p";
+const COL_O: &str = "o";
+const COL_G: &str = "g";
+const COL_RID: &str = "rid";
+const CHILD_COLUMNS: [&str; 5] = [COL_S, COL_P, COL_O, COL_G, COL_RID];
 /// The child columns sourcing the primary `(s, p, o, g)` components, in that
 /// order — what both serve plans project.
-pub(crate) const CHILD_PRIMARY: [&str; 4] = ["s", "p", "o", "g"];
-const COL_RID: &str = "rid";
+const CHILD_PRIMARY: [&str; 4] = [COL_S, COL_P, COL_O, COL_G];
 
 /// This index's persisted-child identity table — one differently-sorted quad
 /// table per family — feeding every generic loop in the hub (the slug
 /// registry and the roster it builds); see
 /// [`IndexType::component_identities`](super::IndexType::component_identities). Built
-/// from the [`Family`] accessors so each name keeps exactly one spelling.
+/// from the [`CopyFamily`] accessors so each name keeps exactly one spelling.
 pub(crate) const IDENTITIES: [super::ComponentIdentity; 2] = [
     super::ComponentIdentity {
-        name: Family::Posg.component_name(),
-        slug: Family::Posg.component_slug(),
+        name: CopyFamily::Posg.component_name(),
+        slug: CopyFamily::Posg.component_slug(),
     },
     super::ComponentIdentity {
-        name: Family::Ospg.component_name(),
-        slug: Family::Ospg.component_slug(),
+        name: CopyFamily::Ospg.component_name(),
+        slug: CopyFamily::Ospg.component_slug(),
     },
 ];
 
-impl Family {
+impl CopyFamily {
     /// The persisted child's component name.
     pub(crate) const fn component_name(self) -> &'static str {
         match self {
-            Family::Posg => "index:posg",
-            Family::Ospg => "index:ospg",
+            CopyFamily::Posg => "index:posg",
+            CopyFamily::Ospg => "index:ospg",
         }
     }
 
     /// The persisted child's implementation slug.
     pub(crate) const fn component_slug(self) -> &'static str {
         match self {
-            Family::Posg => "secondary-by-copy/posg",
-            Family::Ospg => "secondary-by-copy/ospg",
+            CopyFamily::Posg => "secondary-by-copy/posg",
+            CopyFamily::Ospg => "secondary-by-copy/ospg",
         }
     }
 
     /// The leading sort-key column inside the persisted child (plain names).
     fn child_lead_col(self) -> &'static str {
         match self {
-            Family::Posg => "p",
-            Family::Ospg => "o",
+            CopyFamily::Posg => COL_P,
+            CopyFamily::Ospg => COL_O,
         }
     }
 
     /// The second sort-key column inside the persisted child.
     fn child_second_col(self) -> &'static str {
         match self {
-            Family::Posg => "o",
-            Family::Ospg => "s",
+            CopyFamily::Posg => COL_O,
+            CopyFamily::Ospg => COL_S,
         }
     }
 
     /// Index of the lead value column within [`CHILD_COLUMNS`] order.
     fn lead_ix(self) -> usize {
         match self {
-            Family::Posg => 1,
-            Family::Ospg => 2,
+            CopyFamily::Posg => 1,
+            CopyFamily::Ospg => 2,
         }
     }
 
     /// This family's quad comparator over term strings.
     fn cmp_quads(self, a: &RawQuad, b: &RawQuad) -> Ordering {
         match self {
-            Family::Posg => {
+            CopyFamily::Posg => {
                 a.p.cmp(&b.p)
                     .then_with(|| a.o.cmp(&b.o))
                     .then_with(|| a.s.cmp(&b.s))
                     .then_with(|| a.g.cmp(&b.g))
             }
-            Family::Ospg => {
+            CopyFamily::Ospg => {
                 a.o.cmp(&b.o)
                     .then_with(|| a.s.cmp(&b.s))
                     .then_with(|| a.p.cmp(&b.p))
@@ -160,8 +164,8 @@ impl Family {
     /// ranks.
     fn code_key(self, codes: &QuadCodes, i: usize) -> [u32; 4] {
         match self {
-            Family::Posg => [codes.p[i], codes.o[i], codes.s[i], codes.g[i]],
-            Family::Ospg => [codes.o[i], codes.s[i], codes.p[i], codes.g[i]],
+            CopyFamily::Posg => [codes.p[i], codes.o[i], codes.s[i], codes.g[i]],
+            CopyFamily::Ospg => [codes.o[i], codes.s[i], codes.p[i], codes.g[i]],
         }
     }
 }
@@ -175,7 +179,7 @@ impl Family {
 /// object take the POSG family's (p, o) prefix, resolving both components in
 /// one probe. `None` when nothing this index covers is bound.
 struct CopyProbe<'a> {
-    family: Family,
+    family: CopyFamily,
     lead: TermRef<'a>,
     second: Option<TermRef<'a>>,
     resolves: ResolvedRoles,
@@ -187,19 +191,19 @@ fn choose<'a>(pattern: QuadPattern<'a>) -> Option<CopyProbe<'a>> {
     }
     match (pattern.predicate, pattern.object) {
         (Some(predicate), Some(object)) => Some(CopyProbe {
-            family: Family::Posg,
+            family: CopyFamily::Posg,
             lead: TermRef::Predicate(predicate),
             second: Some(TermRef::Object(object)),
             resolves: ResolvedRoles::PredicateObject,
         }),
         (Some(predicate), None) => Some(CopyProbe {
-            family: Family::Posg,
+            family: CopyFamily::Posg,
             lead: TermRef::Predicate(predicate),
             second: None,
             resolves: ResolvedRoles::Predicate,
         }),
         (None, Some(object)) => Some(CopyProbe {
-            family: Family::Ospg,
+            family: CopyFamily::Ospg,
             lead: TermRef::Object(object),
             second: None,
             resolves: ResolvedRoles::Object,
@@ -414,7 +418,8 @@ pub(crate) async fn resolve_file(
     match build_serve_plan(
         reader.clone(),
         layout,
-        pattern,
+        pattern.graph,
+        &constraints,
         codes,
         name,
         located,
@@ -446,47 +451,41 @@ pub(crate) async fn resolve_file(
 }
 
 /// Build the [`FileServePlan`] letting the store stream a resolved pattern's
-/// quads from this index's own copy columns, or `None` when a bound residual
-/// term has no dictionary code (the pattern matches nothing — a case
-/// `match_pattern` already short-circuits before resolving, so this is only a
-/// safety fallback to the row-id path).
+/// quads from this index's own copy columns, or `None` when a bound graph has
+/// no dictionary code (the pattern matches nothing — a case `match_pattern`
+/// already short-circuits before resolving, so this is only a safety fallback
+/// to the row-id path).
 ///
-/// Every bound non-subject component (predicate, object, graph) becomes a term
-/// equality on the family's matching column: the copies store each component as
-/// one full term, so — unlike the primary layout's split TypedObject columns —
-/// even the object probes as a single equality. The copy index declines
-/// subject-bound patterns, so the subject never appears here.
+/// `constraints` are the probe's term equalities on the family's sort-key
+/// columns (predicate and/or object); a bound graph adds one more on the `g`
+/// column. The copies store each component as one full term, so — unlike the
+/// primary layout's split TypedObject columns — even the object probes as a
+/// single equality. The copy index declines subject-bound patterns, so the
+/// subject never appears here.
 #[cfg(feature = "file-io")]
+#[allow(clippy::too_many_arguments)]
 fn build_serve_plan(
     reader: vortex_layout::LayoutReaderRef,
     layout: &ResolvedLayout,
-    pattern: QuadPattern<'_>,
+    graph: Option<&oxrdf::GraphName>,
+    constraints: &[(&'static str, Scalar)],
     codes: &mut PatternCodes,
     component: &'static str,
     row_range: Option<std::ops::Range<u64>>,
     memo: &std::sync::Arc<crate::store::native_file::BoundExprMemo>,
 ) -> Result<Option<FileServePlan>> {
-    let mut constraints: Vec<(&'static str, Scalar)> = Vec::new();
-    for (column, term) in [
-        ("p", pattern.predicate.map(TermRef::Predicate)),
-        ("o", pattern.object.map(TermRef::Object)),
-        ("g", pattern.graph.map(TermRef::Graph)),
-    ] {
-        let Some(term) = term else { continue };
-        let Some(scalar) = codes.probe_scalar(term)? else {
+    let mut constraints = constraints.to_vec();
+    if let Some(graph) = graph {
+        let Some(scalar) = codes.probe_scalar(TermRef::Graph(graph))? else {
             return Ok(None);
         };
-        constraints.push((column, scalar));
+        constraints.push((COL_G, scalar));
     }
     // A located range is exactly the constrained rows only when the probes
     // covered every constraint: the location searched the sort keys (lead,
     // then second), so a bound graph — never a sort key here — demotes the
     // range back to the filter scan.
-    let row_range = if pattern.graph.is_none() {
-        row_range
-    } else {
-        None
-    };
+    let row_range = if graph.is_none() { row_range } else { None };
     Ok(Some(FileServePlan::new(
         CHILD_PRIMARY,
         COL_RID,
@@ -510,7 +509,7 @@ pub(crate) mod out_of_core {
     use vortex_array::{ArrayRef, IntoArray};
 
     use super::super::components::{child_struct, child_struct_dtype};
-    use super::{CHILD_COLUMNS, Family, TermColumn};
+    use super::{CHILD_COLUMNS, CopyFamily, TermColumn};
     use crate::error::Result;
     use crate::store::array::stamp_is_sorted;
 
@@ -540,7 +539,7 @@ pub(crate) mod out_of_core {
     /// `V` is the term encoding: `String`, or `u32` codes under the Dictionary
     /// layout.
     pub(crate) fn copy_child_chunk<V: TermColumn>(
-        family: Family,
+        family: CopyFamily,
         keys: &[(CopyKey<V>, u32)],
     ) -> Result<ArrayRef> {
         let [s_ix, p_ix, o_ix, g_ix] = family.key_positions();
@@ -556,13 +555,13 @@ pub(crate) mod out_of_core {
         child_struct(&CHILD_COLUMNS, columns, keys.len()).map(|a| a.into_array())
     }
 
-    impl Family {
+    impl CopyFamily {
         /// Where each quad component (s, p, o, g) sits inside this family's
         /// [`CopyKey`] tuple, which stores the components in sort-key order.
         pub(super) fn key_positions(self) -> [usize; 4] {
             match self {
-                Family::Posg => [2, 0, 1, 3],
-                Family::Ospg => [1, 2, 0, 3],
+                CopyFamily::Posg => [2, 0, 1, 3],
+                CopyFamily::Ospg => [1, 2, 0, 3],
             }
         }
     }
@@ -573,7 +572,7 @@ pub(crate) mod out_of_core {
     /// under the Dictionary layout.
     ///
     /// Built via [`Self::posg`] / [`Self::ospg`] from an `[s, p, o, g]` tuple;
-    /// [`Family::key_positions`](super::Family::key_positions) maps the components back out when the sorted
+    /// [`CopyFamily::key_positions`](super::CopyFamily::key_positions) maps the components back out when the sorted
     /// keys are turned into columns.
     #[derive(
         Clone,
@@ -632,14 +631,14 @@ impl TermColumn for u32 {
 // ── build side ───────────────────────────────────────────────────────────────
 
 /// The permutation putting `quads` in `family` order.
-fn string_perm(quads: &[RawQuad], family: Family) -> Vec<u32> {
+fn string_perm(quads: &[RawQuad], family: CopyFamily) -> Vec<u32> {
     let mut perm: Vec<u32> = (0..quads.len() as u32).collect();
     perm.sort_unstable_by(|&a, &b| family.cmp_quads(&quads[a as usize], &quads[b as usize]));
     perm
 }
 
 /// The permutation putting the encoded dataset in `family` order.
-fn code_perm(codes: &QuadCodes, family: Family) -> Vec<u32> {
+fn code_perm(codes: &QuadCodes, family: CopyFamily) -> Vec<u32> {
     let mut perm: Vec<u32> = (0..codes.s.len() as u32).collect();
     perm.sort_unstable_by_key(|&i| family.code_key(codes, i as usize));
     perm
@@ -700,18 +699,18 @@ impl GlobalCopyArrays {
     /// `term_of` reads row `i`'s `(s, p, o, g)` terms; each family's lead
     /// column is stamped sorted.
     fn build<'a, V: TermColumn + 'a>(
-        perm_by: impl Fn(Family) -> Vec<u32>,
+        perm_by: impl Fn(CopyFamily) -> Vec<u32>,
         term_of: [&dyn Fn(usize) -> &'a V; 4],
     ) -> Self {
-        let build = |family: Family| {
+        let build = |family: CopyFamily| {
             let perm = perm_by(family);
             let columns = family_columns(&perm, term_of);
             stamp_is_sorted(&columns[family.lead_ix()]);
             columns
         };
         Self {
-            posg: build(Family::Posg),
-            ospg: build(Family::Ospg),
+            posg: build(CopyFamily::Posg),
+            ospg: build(CopyFamily::Ospg),
         }
     }
 
@@ -720,7 +719,7 @@ impl GlobalCopyArrays {
     /// provenance.
     pub(crate) fn into_components(self) -> Result<Vec<super::IndexComponent>> {
         let Self { posg, ospg } = self;
-        [(Family::Posg, posg), (Family::Ospg, ospg)]
+        [(CopyFamily::Posg, posg), (CopyFamily::Ospg, ospg)]
             .into_iter()
             .map(|(family, columns)| {
                 let len = columns[0].len();
@@ -763,20 +762,20 @@ mod tests {
         // Predicate and object bound: (p, o) prefix probe on the POSG family,
         // resolving both components.
         let probe = choose(QuadPattern::new(None, Some(&p), Some(&o), None)).unwrap();
-        assert_eq!(probe.family, Family::Posg);
+        assert_eq!(probe.family, CopyFamily::Posg);
         assert_eq!(probe.resolves, ResolvedRoles::PredicateObject);
         assert_eq!(probe.lead.to_string(), p.to_string());
         assert_eq!(probe.second.map(|t| t.to_string()), Some(o.to_string()));
 
         // Predicate-only patterns probe the POSG lead alone.
         let probe = choose(QuadPattern::new(None, Some(&p), None, None)).unwrap();
-        assert_eq!(probe.family, Family::Posg);
+        assert_eq!(probe.family, CopyFamily::Posg);
         assert_eq!(probe.resolves, ResolvedRoles::Predicate);
         assert!(probe.second.is_none());
 
         // Object-only patterns probe the OSPG lead.
         let probe = choose(QuadPattern::new(None, None, Some(&o), None)).unwrap();
-        assert_eq!(probe.family, Family::Ospg);
+        assert_eq!(probe.family, CopyFamily::Ospg);
         assert_eq!(probe.resolves, ResolvedRoles::Object);
         assert!(probe.second.is_none());
 
@@ -793,9 +792,9 @@ mod tests {
             raw("s1", "p1", "o0", ""), // 2
         ];
         // (p, o, s, g): (p1,o0) < (p1,o2) < (p2,o0) → rows 2, 0, 1.
-        assert_eq!(string_perm(&quads, Family::Posg), vec![2, 0, 1]);
+        assert_eq!(string_perm(&quads, CopyFamily::Posg), vec![2, 0, 1]);
         // (o, s, p, g): (o0,s0) < (o0,s1) < (o2,s2) → rows 1, 2, 0.
-        assert_eq!(string_perm(&quads, Family::Ospg), vec![1, 2, 0]);
+        assert_eq!(string_perm(&quads, CopyFamily::Ospg), vec![1, 2, 0]);
 
         // The code comparator agrees with the string one when codes are
         // lexicographic ranks of the terms.
@@ -805,8 +804,8 @@ mod tests {
             o: vec![1, 0, 0],
             g: vec![0, 0, 0],
         };
-        assert_eq!(code_perm(&codes, Family::Posg), vec![2, 0, 1]);
-        assert_eq!(code_perm(&codes, Family::Ospg), vec![1, 2, 0]);
+        assert_eq!(code_perm(&codes, CopyFamily::Posg), vec![2, 0, 1]);
+        assert_eq!(code_perm(&codes, CopyFamily::Ospg), vec![1, 2, 0]);
     }
 
     #[test]
@@ -824,14 +823,14 @@ mod tests {
         ];
 
         let posg = CopyKey::posg(&spog);
-        let [s_ix, p_ix, o_ix, g_ix] = Family::Posg.key_positions();
+        let [s_ix, p_ix, o_ix, g_ix] = CopyFamily::Posg.key_positions();
         assert_eq!(
             [&posg.0[s_ix], &posg.0[p_ix], &posg.0[o_ix], &posg.0[g_ix]],
             [&spog[0], &spog[1], &spog[2], &spog[3]]
         );
 
         let ospg = CopyKey::ospg(spog.clone());
-        let [s_ix, p_ix, o_ix, g_ix] = Family::Ospg.key_positions();
+        let [s_ix, p_ix, o_ix, g_ix] = CopyFamily::Ospg.key_positions();
         assert_eq!(
             [&ospg.0[s_ix], &ospg.0[p_ix], &ospg.0[o_ix], &ospg.0[g_ix]],
             [&spog[0], &spog[1], &spog[2], &spog[3]]

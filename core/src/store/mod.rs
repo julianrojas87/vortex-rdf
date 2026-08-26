@@ -43,6 +43,8 @@ pub use crate::common::quad::{RawQuad, SharedQuad};
 
 pub(crate) use source::{QuadsSource, Tail};
 
+use indexes::IndexComponent;
+
 use crate::error::{Result, VortexRdfError};
 use layouts::dictionary::TermDictionary;
 use layouts::{DictAccess, ResolvedLayout};
@@ -104,7 +106,7 @@ pub struct VortexRdfStore {
 /// [`VortexRdfStore::from_parts`] (the bindings' in-memory round-trip).
 pub struct StoreParts {
     pub(crate) array: ArrayRef,
-    pub(crate) components: Vec<crate::store::indexes::IndexComponent>,
+    pub(crate) components: Vec<IndexComponent>,
     pub(crate) dict: Option<Arc<TermDictionary>>,
     /// Whether `array`'s rows are in global `(s, p, o, g)` order; written as
     /// the root's `quads_sorted` (see `WireMetadata::quads_sorted`).
@@ -116,10 +118,10 @@ pub struct StoreParts {
 }
 
 /// The layout an in-memory construction (`from_parts`, `from_built`,
-/// `from_bytes`) resolves to: a dictionary held beside the rows makes it
-/// Dictionary-resident, otherwise the array's own dtype decides. A dict-less
-/// Dictionary-layout array is rejected: bare code columns carry no way back
-/// to their terms.
+/// `from_bytes`, compaction's `from_raw_quads`) resolves to: a dictionary
+/// held beside the rows makes it Dictionary-resident, otherwise the array's
+/// own dtype decides. A dict-less Dictionary-layout array is rejected: bare
+/// code columns carry no way back to their terms.
 fn resolved_layout(
     dict: Option<Arc<TermDictionary>>,
     dtype: &vortex_array::dtype::DType,
@@ -149,12 +151,12 @@ fn resolved_layout(
 /// places canonical built columns become a store.
 fn compress_built_parts(
     base: ArrayRef,
-    components: Vec<crate::store::indexes::IndexComponent>,
-) -> Result<(ArrayRef, Vec<crate::store::indexes::IndexComponent>)> {
+    components: Vec<IndexComponent>,
+) -> Result<(ArrayRef, Vec<IndexComponent>)> {
     let base = array::with_compressed_int_children(base, true)?;
     let components = components
         .into_iter()
-        .map(crate::store::indexes::IndexComponent::into_compressed)
+        .map(IndexComponent::into_compressed)
         .collect::<Result<Vec<_>>>()?;
     Ok((base, components))
 }
@@ -187,7 +189,7 @@ impl VortexRdfStore {
         let components = parts
             .components
             .into_iter()
-            .map(crate::store::indexes::IndexComponent::into_searchable)
+            .map(IndexComponent::into_searchable)
             .collect::<Result<Vec<_>>>()?;
         Self::assemble_resident(base, components, layout)
     }
@@ -212,10 +214,10 @@ impl VortexRdfStore {
     /// this assembler transforms nothing.
     fn assemble_resident(
         base: ArrayRef,
-        components: Vec<crate::store::indexes::IndexComponent>,
+        components: Vec<IndexComponent>,
         layout: ResolvedLayout,
     ) -> Result<Self> {
-        let components: Arc<[crate::store::indexes::IndexComponent]> = components.into();
+        let components: Arc<[IndexComponent]> = components.into();
         // The queryable index set follows the component roster, exactly as
         // the file path follows its child roster.
         let indexes = crate::store::indexes::indexes_from_components(&components);
@@ -312,11 +314,10 @@ impl VortexRdfStore {
                 serve: None,
             },
         };
-        let tail = self.tail.as_ref().map(|tail| Tail {
-            rows: tail.rows.clone(),
-            selection: RowSelection::empty(),
-            deleted: tail.deleted.clone(),
-        });
+        let tail = self
+            .tail
+            .as_ref()
+            .map(|tail| tail.with_selection(RowSelection::empty()));
         Self {
             layout: self.layout.clone(),
             indexes: vec![],
@@ -387,12 +388,7 @@ impl VortexRdfStore {
             .tail
             .as_ref()
             .is_none_or(|tail| matches!(tail.selection, RowSelection::All));
-        let unfiltered = match &self.quads {
-            QuadsSource::InMemory { .. } => true,
-            #[cfg(feature = "file-io")]
-            QuadsSource::File { filter, .. } => filter.is_none(),
-        };
-        tail_owned && unfiltered && self.quads.view_selection().is_all()
+        tail_owned && self.quads.is_unrefined()
     }
 
     /// Err unless this store owns its rows — the gate every mutation takes;
