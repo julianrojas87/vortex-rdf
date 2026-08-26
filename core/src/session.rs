@@ -1,6 +1,6 @@
-//! Crate-wide Vortex session infrastructure. Lives at the crate root,
-//! executing *any* Vortex kernel — an in-memory decode as much as a
-//! file scan — needs the session's registries.
+//! Crate-wide Vortex session infrastructure. Lives at the crate root because
+//! executing *any* Vortex kernel — an in-memory decode as much as a file scan
+//! — needs the session's registries.
 
 use std::sync::LazyLock;
 
@@ -16,15 +16,12 @@ use vortex_session::VortexSession;
 ))]
 use vortex_io::session::RuntimeSessionExt;
 
-/// The one Vortex session: arrays, layouts, scalar kernels, and a runtime.
-///
-/// Every target reads and writes Vortex *files* (the wasm bindings exchange
-/// file bytes via `open_buffer`/`to_bytes`), so every target needs the same
-/// registries — a single session keeps the encoding registry from diverging
-/// between targets. The runtime handle is the only per-target piece: tokio
-/// natively, the microtask-queue `WasmRuntime` on wasm (required by the file
-/// writer's task spawning), and none for native no-file-io builds, whose code
-/// paths are all handle-free.
+/// The one Vortex session: array, layout, scalar-fn and runtime registries,
+/// with the store's container layout registered and the store edition
+/// enabled. The runtime handle is the only per-target piece: tokio on native
+/// file-io builds; the microtask-queue `WasmRuntime` on
+/// wasm32-unknown-unknown, where the file writer spawns tasks; none on native
+/// no-file-io builds, whose code paths are all handle-free.
 pub(crate) static VORTEX_SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
     let session = VortexSession::empty()
         .with::<ArraySession>()
@@ -41,31 +38,37 @@ pub(crate) static VORTEX_SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
     session
 });
 
-/// Enroll every registered array encoding, layout and extension dtype, plus
-/// the zone-map aggregates the file writer emits, in one enabled edition. The
-/// file writer refuses components outside the session's enabled editions
-/// (reading is covered by registration alone), and this store's wire
-/// contract is "whatever the registered compressor emits" — not a vortex
-/// edition boundary — so the edition spans the full registries.
+/// The edition every registered component and [`ZONE_AGGREGATES`] entry is
+/// declared in and that the session enables for writing.
+const STORE_EDITION: vortex_edition::EditionId =
+    vortex_edition::EditionId::new("vortexrdf", 2026, 8, 0);
+
+/// The zone-map aggregate ids the vortex file writer emits by default
+/// (bounded min/max for string columns, min/max otherwise, nan and null
+/// counts). The aggregate registry cannot be enumerated, so this list is
+/// mirrored by hand: an id the writer emits that is missing here makes every
+/// file write fail with an edition error. The inline test below checks it
+/// against the writer's per-dtype defaults for the schema's column types.
+const ZONE_AGGREGATES: [&str; 6] = [
+    "vortex.bounded_max",
+    "vortex.bounded_min",
+    "vortex.max",
+    "vortex.min",
+    "vortex.nan_count",
+    "vortex.null_count",
+];
+
+/// Declare and enable one edition ([`STORE_EDITION`]) containing every
+/// registered array encoding, layout and extension dtype plus
+/// [`ZONE_AGGREGATES`]. The file writer only emits components from an enabled
+/// edition (reading needs registration alone); the edition is a writer
+/// allow-list, so it spans the full registries.
 fn enable_store_edition(session: &VortexSession) {
     use vortex_array::dtype::session::DTypeSessionExt as _;
     use vortex_array::session::ArraySessionExt as _;
-    use vortex_edition::{
-        ComponentKind, Edition, EditionId, EditionInclusion, EditionSessionExt as _,
-    };
+    use vortex_edition::{ComponentKind, Edition, EditionInclusion, EditionSessionExt as _};
     use vortex_error::{VortexExpect as _, vortex_err};
     use vortex_layout::session::LayoutSessionExt as _;
-
-    const STORE_EDITION: EditionId = EditionId::new("vortexrdf", 2026, 8, 0);
-    /// The default zone-map aggregates written by the vortex file writer.
-    const ZONE_AGGREGATES: [&str; 6] = [
-        "vortex.bounded_max",
-        "vortex.bounded_min",
-        "vortex.max",
-        "vortex.min",
-        "vortex.nan_count",
-        "vortex.null_count",
-    ];
 
     let editions = session.editions();
     editions
@@ -119,4 +122,48 @@ fn enable_store_edition(session: &VortexSession) {
         .enable_edition(STORE_EDITION)
         .map_err(|error| vortex_err!("{error}"))
         .vortex_expect("the store edition was just declared");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use vortex_array::aggregate_fn::session::AggregateFnSessionExt as _;
+    use vortex_array::dtype::{DType, Nullability, PType};
+    use vortex_edition::{ComponentKind, EditionSessionExt as _};
+
+    /// Every zone-map aggregate the file writer emits for the schema's column
+    /// dtypes (utf8 strings and unsigned integer codes) is in the enabled
+    /// edition, so no column type the store writes can fail the writer's
+    /// edition check.
+    #[test]
+    fn store_edition_covers_writer_zone_aggregates() {
+        let enabled: Vec<String> = VORTEX_SESSION
+            .enabled_component_ids(ComponentKind::Aggregate)
+            .iter()
+            .map(|id| id.to_string())
+            .collect();
+        let dtypes = [
+            DType::Utf8(Nullability::NonNullable),
+            DType::Primitive(PType::U8, Nullability::NonNullable),
+            DType::Primitive(PType::U16, Nullability::NonNullable),
+            DType::Primitive(PType::U32, Nullability::NonNullable),
+            DType::Primitive(PType::U64, Nullability::NonNullable),
+        ];
+        let mut wanted: Vec<String> = ZONE_AGGREGATES.iter().map(|id| id.to_string()).collect();
+        for dtype in &dtypes {
+            wanted.extend(
+                VORTEX_SESSION
+                    .aggregate_fns()
+                    .zone_stat_defaults(dtype)
+                    .iter()
+                    .map(|f| f.id().to_string()),
+            );
+        }
+        for id in wanted {
+            assert!(
+                enabled.contains(&id),
+                "zone aggregate {id} is not in the store edition"
+            );
+        }
+    }
 }

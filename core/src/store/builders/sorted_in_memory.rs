@@ -166,9 +166,8 @@ pub(crate) async fn build_chunk_stream(
 
 /// The built children as writable components. They are already materialized
 /// (this builder holds the dataset), so each is a replayable single-chunk
-/// source rather than something the writer has to pull. A build with no
-/// serializer compiled in has nothing to hand them to, and says so with an
-/// empty roster rather than by dropping the stream path.
+/// source. A build with no serializer compiled in has nothing to hand them
+/// to, and says so with an empty roster.
 fn component_writes(
     components: Vec<crate::store::indexes::IndexComponent>,
 ) -> Result<Vec<crate::io::container::NativeComponentWrite>> {

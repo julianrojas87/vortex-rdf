@@ -158,8 +158,7 @@ impl DictionaryQuadSink {
 /// [`TermDictionary`], and remaps every quad's provisional codes to its terms'
 /// sorted ranks — the dictionary codes, since codes are lexicographic ranks.
 /// It then sorts the coded quads directly: `[u32; 4]` lexicographic order
-/// equals (s, p, o, g) term order because codes are sorted ranks, so the
-/// sort moves 16-byte rows rather than four-String structs.
+/// equals (s, p, o, g) term order because codes are sorted ranks.
 pub(crate) struct InterningQuadBuilder {
     /// term → provisional code, owning each distinct term exactly once.
     codes: HashMap<Box<str>, u32>,

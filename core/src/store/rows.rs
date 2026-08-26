@@ -191,16 +191,16 @@ impl VortexRdfStore {
     /// pays a first-touch decode instead of losing the buffer-sharing fast
     /// path.
     ///
-    /// This is the payload path behind the JS bindings' `match`/`getQuads`:
-    /// serving codes off the base's buffers skips the per-call
-    /// slice-gather-canonicalize pipeline those calls otherwise pay.
-    pub fn code_columns(&self) -> Option<[Buffer<u32>; 4]> {
+    /// Serving codes off the base's buffers skips the slice-gather-canonicalize
+    /// pipeline that [`code_columns_gathered`](Self::code_columns_gathered) —
+    /// the bindings' entry point — otherwise runs; that method tries this fast
+    /// path first.
+    pub(crate) fn code_columns(&self) -> Option<[Buffer<u32>; 4]> {
         use vortex_array::arrays::Struct;
         if self.layout.strategy() != LayoutStrategy::Dictionary || self.tail_len() != 0 {
             return None;
         }
-        // Without `file-io` the InMemory variant is the only one, making this
-        // pattern irrefutable — which is fine, not a bug.
+        // Without `file-io`, InMemory is the only variant.
         #[allow(irrefutable_let_patterns)]
         let QuadsSource::InMemory {
             base,
@@ -279,7 +279,7 @@ impl VortexRdfStore {
     }
 
     /// The rows this view selects as four `u32` term-code columns, gathering
-    /// them when [`code_columns`](Self::code_columns)' zero-copy fast path
+    /// them when `code_columns`' zero-copy fast path
     /// does not apply.
     ///
     /// The fallback is the full read pipeline —

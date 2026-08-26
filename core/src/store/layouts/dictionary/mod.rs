@@ -212,8 +212,8 @@ pub(crate) fn empty_struct() -> Result<ArrayRef> {
 }
 
 /// The four primary code columns of a chunk, as arrays whose `u32` slices the
-/// decoders read. Returned rather than borrowed from a temporary: the slices
-/// borrow these arrays, so they must outlive the decode.
+/// decoders read. Returned by value: the slices borrow these arrays, so they
+/// must outlive the decode.
 fn code_columns(
     chunk: &ArrayRef,
 ) -> Result<(

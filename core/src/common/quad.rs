@@ -8,7 +8,7 @@ use crate::error::Result;
 /// A quad whose terms are shared N-Triples strings: a decoder produces one
 /// `Arc<str>` per distinct term of a chunk and hands it to every row that
 /// repeats the term by reference count, so materializing a wide result costs
-/// a refcount bump per term rather than an allocation. `g` is `""` for the
+/// one refcount bump per term. `g` is `""` for the
 /// default graph, as the columns store it.
 ///
 /// Pointer identity between equal terms is an optimization the decoders

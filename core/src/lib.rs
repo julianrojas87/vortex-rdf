@@ -66,8 +66,8 @@ pub use store::{
     LayoutStrategy, RawQuad, SharedQuad, SortedInMemoryBuilder, StoreParts, VortexArrayBuilder,
     VortexRdfStore, export_rdf,
 };
-// Compiled out on wasm along with the rest of the external-sort pipeline
-// (see the module gate in `store::builders`).
+// Compiled out on wasm along with the rest of the sorted-stream builder's
+// out-of-core merge (see the module gate in `store::builders`).
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub use store::SortedStreamBuilder;
 

@@ -16,7 +16,7 @@
 //! A view's selection field wraps this in [`ViewSelection`], which adds one
 //! more state: *pending* — an index-served match whose exact ids are a
 //! deferred computation, run by the first consumer that needs the selection
-//! rather than at match time (serving reads never do).
+//! (serving reads never do).
 //!
 //! [`VortexRdfStore`]: crate::store::VortexRdfStore
 
@@ -231,10 +231,10 @@ impl RowSelection {
     /// of `self.apply(base)`, in that order, ready to filter the gathered rows
     /// or to be counted.
     ///
-    /// Deletions live in a base-wide mask rather than being folded into the
-    /// selection, so that tombstoning a single row of a large store costs a bit
-    /// per row instead of an explicit id per surviving row. The price is that
-    /// every read path has to apply this.
+    /// The tombstone contract: deletions live in a base-wide mask, never
+    /// folded into the selection, so tombstoning one row of a large store
+    /// costs a bit per base row — and every read path applies this mask
+    /// before handing rows out.
     pub(crate) fn live_mask(&self, deleted: &Mask, base_len: usize) -> Mask {
         match self {
             RowSelection::All => !deleted,
@@ -331,8 +331,7 @@ fn intersect_sorted_ids(left: &[u64], right: &[u64]) -> Buffer<u64> {
 /// [`gather_by_point_reads`](crate::store::scan::gather::gather_by_point_reads)).
 /// The pipeline's cost is fixed per column
 /// (optimizer pass, execution context, canonicalization) whatever the row
-/// count, while point reads cost per row per column, so the crossover sits in
-/// the hundreds of rows and this threshold stays under it. The file-backed
+/// count, while point reads cost per row per column. The file-backed
 /// dictionary makes the same trade: `FileBackedDict::decode_many`
 /// point-reads batches of up to this many codes through the chunk leaves and
 /// scans wider ones.

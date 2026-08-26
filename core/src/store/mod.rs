@@ -28,8 +28,8 @@ pub use builders::{
     BuiltArray, BuiltStream, ChunkStream, SortedInMemoryBuilder, VortexArrayBuilder,
 };
 pub use export::export_rdf;
-// Compiled out on wasm along with the rest of the external-sort pipeline
-// (see the module gate in `builders`).
+// Compiled out on wasm along with the rest of the sorted-stream builder's
+// out-of-core merge (see the module gate in `builders`).
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub use builders::SortedStreamBuilder;
 pub use indexes::{IndexType, Indexes};
@@ -56,10 +56,11 @@ use vortex_array::dtype::FieldNames;
 use vortex_array::validity::Validity;
 use vortex_array::{ArrayRef, IntoArray};
 
-/// Columnar RDF quad storage backed by Vortex.
-///
-/// Stores quad terms according to the chosen layout strategy.
-/// And applies indexes as chosen at build time.
+/// An RDF quad store over a Vortex array or file. A store is a base (in
+/// memory or a file) plus a view over it — a row selection, tombstones, and an
+/// append tail — and the layout and secondary indexes the base was built
+/// with; [`match_pattern`](Self::match_pattern) derives narrower views that
+/// share the base, and mutation is owner-only ([`owned`](Self::owned)).
 #[derive(Clone)]
 pub struct VortexRdfStore {
     /// The store's backing quad data, either an in-memory array or a lazily
@@ -77,12 +78,11 @@ pub struct VortexRdfStore {
     /// plans index lookups against this set.
     ///
     /// Views derived through `match_pattern` keep their indexes: a view narrows
-    /// a [`RowSelection`] over the base rather than rewriting rows, so the
+    /// a [`RowSelection`] over the base and never rewrites rows, so the
     /// components' `rid` columns still address the base the ids were built
     /// against. Only physically gathering the rows — which renumbers them from
     /// zero, as [`compact_with_indexes`] does — invalidates those ids; it
-    /// rebuilds the index set over the new order rather than carrying the old
-    /// one across.
+    /// rebuilds the index set over the new order.
     ///
     /// [`compact_with_indexes`]: Self::compact_with_indexes
     indexes: Indexes,
@@ -358,10 +358,9 @@ impl VortexRdfStore {
     /// cannot be mutated in place. This turns such a view into an owner by
     /// compacting, rebuilding its declared indexes
     /// ([`compact_with_indexes`]) so mutating a match result yields an
-    /// independent store that is still indexed rather than one degraded to full
-    /// scans. An owner is returned as a cheap clone, preserving its tombstones
-    /// and indexes, so repeated in-place deletes stay cheap and keep their
-    /// indexes.
+    /// independent store that is still indexed. An owner is returned as a
+    /// cheap clone, preserving its tombstones and indexes, so repeated
+    /// in-place deletes stay cheap and keep their indexes.
     ///
     /// [`compact_with_indexes`]: Self::compact_with_indexes
     pub async fn owned(&self) -> Result<Self> {
@@ -372,7 +371,7 @@ impl VortexRdfStore {
         }
     }
 
-    /// Whether this store owns its rows, rather than being a window onto
+    /// Whether this store owns its rows, as opposed to being a window onto
     /// someone else's.
     ///
     /// Only an owner may be mutated: a narrowed view's rows are a subset of a
@@ -417,9 +416,10 @@ impl VortexRdfStore {
         &self.indexes
     }
 
+    /// The layout strategy this store's rows are stored in (the build-time
+    /// tag, independent of whether the Dictionary layout's dictionary is
+    /// resident or file-backed).
     pub fn layout(&self) -> LayoutStrategy {
-        // Report the build-time strategy tag regardless of whether extra
-        // state (like the Dictionary layout's term dictionary) is attached.
         self.layout.strategy()
     }
 
@@ -444,7 +444,7 @@ impl VortexRdfStore {
     /// it — the one public dictionary accessor, and the one implementation of
     /// the code-read invariant, for every frontend that pairs a code-typed
     /// read
-    /// ([`code_columns`](Self::code_columns)/[`code_columns_gathered`](Self::code_columns_gathered))
+    /// (`code_columns`/[`code_columns_gathered`](Self::code_columns_gathered))
     /// with a decode handle. Taking a snapshot is O(1) and retains only the
     /// dictionary — not the store, nor its quad columns. Hand it to any
     /// consumer that holds term codes: see [`DictSnapshot`] for why the store
@@ -461,8 +461,7 @@ impl VortexRdfStore {
     ///   to hand out.
     ///
     /// Decoding codes against anything less than all three yields silently
-    /// wrong terms, which is why bindings must take this gate rather than
-    /// re-derive parts of it.
+    /// wrong terms, so bindings take this gate as a whole.
     pub fn code_read_snapshot(&self) -> Option<DictSnapshot> {
         if self.tail_len() != 0 {
             return None;

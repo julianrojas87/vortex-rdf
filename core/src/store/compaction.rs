@@ -112,8 +112,7 @@ impl VortexRdfStore {
         // The sorted builder spills merge runs to disk, and compaction rewrites
         // the whole store, so those runs can reach dataset size. Point them at
         // the store file's own directory — the one volume known to fit the
-        // data, the same placement thinking as the sibling temp file above —
-        // rather than the OS temp dir (commonly a size-capped tmpfs). The
+        // data, the same placement as the sibling temp file above. The
         // `VORTEX_RDF_SPILL_DIR` override still outranks this default.
         let write = async {
             let built = crate::store::builders::sorted_stream::build_chunk_stream(
@@ -187,10 +186,10 @@ impl VortexRdfStore {
 const AUTO_COMPACT_TAIL_FLOOR: usize = 4_096;
 
 /// Auto-compaction ratio: compact when the tail reaches this fraction of the
-/// base (tail ≥ base/10). A ratio — rather than a fixed size — is what keeps
-/// the rebuild cost amortized-constant per appended row, the dynamic-array
-/// growth argument; 10% trades roughly seven whole-store rewrites per doubling
-/// for a tail that stays small relative to the base.
+/// base (tail ≥ base/10). A ratio keeps the rebuild cost amortized-constant
+/// per appended row (the dynamic-array growth argument); 10% trades roughly
+/// seven whole-store rewrites per doubling for a tail that stays small
+/// relative to the base.
 const AUTO_COMPACT_BASE_RATIO: usize = 10;
 
 /// Auto-compaction cap: compact once the tail could fill a builder chunk,

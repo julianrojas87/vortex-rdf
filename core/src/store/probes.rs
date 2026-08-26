@@ -1,11 +1,7 @@
-//! Per-store cache of resolved encoded-search probes over the base's
-//! columns.
-//!
-//! Resolving a probe walks the column's encoding tree (per-chunk on a
-//! chunked base) — the fixed cost of a point read on a compressed-resident
-//! store, when paid per call. The base is immutable for a store's lifetime —
-//! mutation constructs a new source — so its column probes are resolved once
-//! and shared by every derived view.
+//! Per-base cache of resolved encoded-search probes over a struct array's
+//! children. A base is immutable for a store's lifetime (mutation constructs
+//! a new source), so probes are resolved once per base and shared by every
+//! derived view.
 
 use std::sync::{Arc, OnceLock};
 
@@ -13,13 +9,12 @@ use vortex_array::ArrayRef;
 use vortex_array::dtype::FieldName;
 use vortex_rdf_encoded_search::OwnedSortedProbe;
 
-/// Lazily-resolved probes for one base array's struct children, shared
-/// across the views over that base (`Arc` in `QuadsSource::InMemory`).
+/// Lazily-resolved probes for one struct array's children, shared across the
+/// views over that base (`Arc` in `QuadsSource::InMemory`) and by the index
+/// components and serve plans keyed on their own struct arrays.
 ///
-/// The cells record which array they were resolved for; a lookup against a
-/// different base declines rather than answering with the wrong probes, so
-/// a construction site that wrongly carries the cache across a base swap
-/// degrades to the uncached path instead of corrupting reads.
+/// The cells are keyed by the address of the array they were resolved for;
+/// every lookup against a different base returns `None` (the uncached path).
 #[derive(Default)]
 pub(crate) struct StructProbes {
     cells: OnceLock<(usize, ProbeCells)>,
@@ -29,6 +24,8 @@ pub(crate) struct StructProbes {
 type ProbeCells = Vec<(FieldName, Option<Arc<OwnedSortedProbe>>)>;
 
 impl StructProbes {
+    /// A fresh, unresolved cache, shared (`Arc`) because every
+    /// `QuadsSource::InMemory` and index component holds one by `Arc`.
     pub(crate) fn new() -> Arc<Self> {
         Arc::new(Self::default())
     }
@@ -40,13 +37,9 @@ impl StructProbes {
         Some(&self.cells(base)?.get(idx)?.1).and_then(Option::as_ref)
     }
 
-    /// Resolve `base`'s children now rather than on the first query.
-    ///
-    /// The walk is proportional to the encoding tree, so on a compressed
-    /// chunked base it is per-chunk per-column work that would otherwise land
-    /// entirely on whichever query happens to be first. Every in-memory
-    /// construction pays it up front instead, alongside the encoding pass it
-    /// follows.
+    /// Resolve `base`'s children now; later lookups against the same base
+    /// are cache hits. Called by every in-memory construction after its
+    /// encoding pass.
     pub(crate) fn warm(&self, base: &ArrayRef) {
         let _ = self.cells(base);
     }

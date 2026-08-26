@@ -15,11 +15,11 @@ use oxrdfio::{RdfFormat, RdfParser};
 ///
 /// **Trusted-input decode path.** Every caller reconstructs a term from the
 /// store's *own* serialized columns (see [`crate::store::layouts`]), whose
-/// IRIs were validated by oxrdf's constructors at ingestion — so this uses
-/// [`NamedNode::new_unchecked`] rather than re-running `oxiri::Iri::parse` on
-/// every decoded row. `.vortex` files are likewise trusted to have been checked
-/// when written. The `Result` is kept so the decode call sites (which `?` on
-/// genuinely fallible neighbours like `buf_as_str`) stay uniform.
+/// IRIs were validated by oxrdf's constructors at ingestion, so the node is
+/// built with [`NamedNode::new_unchecked`] and no IRI is re-parsed on decode.
+/// `.vortex` files are likewise trusted to have been checked when written.
+/// The `Result` is kept so the decode call sites (which `?` on genuinely
+/// fallible neighbours like `buf_as_str`) stay uniform.
 pub(crate) fn parse_named_node(s: &str) -> Result<NamedNode> {
     let s = s.trim_matches(|c| c == '<' || c == '>');
     Ok(NamedNode::new_unchecked(s))
@@ -53,9 +53,9 @@ enum LiteralForm<'a> {
 /// `None` if `s` does not start with `"` or is unterminated.
 ///
 /// A quote terminates the literal only when the run of backslashes directly
-/// before it has even length; an odd run means the last one escapes it. This
-/// jumps quote to quote rather than scanning byte by byte, because `str::find`
-/// is memchr-accelerated and a hand-rolled loop is not.
+/// before it has even length; an odd run means the last one escapes it. The
+/// scan jumps quote to quote with the memchr-accelerated `str::find` and
+/// counts the backslash run behind each candidate.
 fn closing_quote(s: &str) -> Option<usize> {
     let b = s.as_bytes();
     if b.first() != Some(&b'"') {

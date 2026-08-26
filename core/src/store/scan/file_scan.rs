@@ -1,8 +1,8 @@
-//! Filter evaluation over a native store file's splits: the scan-side
-//! machinery behind the store's file-backed counting, deletion, and pruning
-//! paths, plus the translation of a [`RowSelection`] onto vortex's scan
-//! knobs. Everything here is a pure function of a [`NativeStoreFile`] and a
-//! filter expression — no store state.
+//! The file-backed half of the scan tier: per-split filter evaluation,
+//! statistics-only pruning envelopes, pushed-down filter construction, row
+//! and component point reads through the file's cached chunk probes, and
+//! [`RowSelection::restrict_scan`]. Pure functions of a [`NativeStoreFile`]
+//! and a filter expression — no store state.
 
 use std::future::Future;
 use std::ops::{BitAnd, Range};
@@ -67,9 +67,9 @@ impl RowSelection {
     /// `IncludeByIndex` selection. `All` leaves the scan's full row range in
     /// place (every file row is a quad row).
     ///
-    /// Tombstoned rows are dropped inside the scan rather than by post-filtering
-    /// its output, so this composes with a pushed-down filter (whose output
-    /// carries no row ids to re-align against). They ride the same `Selection`
+    /// Tombstoned rows are dropped inside the scan, so this composes with a
+    /// pushed-down filter (whose output carries no row ids to re-align
+    /// against). They ride the same `Selection`
     /// knob as an id list, so the one case where both would claim it — a sparse
     /// `Ids` selection with deletes — is resolved by subtracting the tombstones
     /// from the id list up front; `All`/`Range` leave that knob free for an
@@ -321,23 +321,15 @@ pub(crate) async fn matching_file_rows(
     Ok(Mask::from_indices(row_count as usize, matched))
 }
 
-/// Convert a quad pattern into a Vortex filter expression that can be
-/// applied to a file-backed array during scanning. This allows the file
-/// reader to push filters down and avoid reading unnecessary data. `codes`
-/// is the match's prepared witness, which carries the layout's term →
-/// constraint mapping.
+/// The pushed-down filter for a pattern under `codes`' layout: `AND` of
+/// `column == code` per compiled constraint, `lit(false)` for an unmatchable
+/// pattern, `None` when nothing is bound.
 pub(crate) fn build_file_filter(
     pattern: QuadPattern<'_>,
     codes: &mut PatternCodes,
 ) -> Result<Option<Expression>> {
     Ok(match codes.constraints(pattern)? {
-        // If the layout determines that no rows can possibly match (e.g.,
-        // asking for a term that doesn't exist in a dictionary layout),
-        // return a filter that matches nothing (always evaluates to false).
         Constraints::AlwaysFalse => Some(lit(false)),
-
-        // Equality constraints (column, value) become one AND-conjunction;
-        // an empty set is no filter at all.
         Constraints::Eq(eqs) => crate::store::indexes::row_ids::eq_conjunction(eqs),
     })
 }
@@ -568,8 +560,8 @@ pub(crate) async fn row_range_from_pruning(
     filter: &Expression,
 ) -> Result<Option<Range<u64>>> {
     let row_count = file.row_count();
-    // A row count that doesn't fit in usize can't back a Mask; bail out to
-    // "no envelope known" rather than fail the whole match.
+    // A row count that doesn't fit in usize can't back a Mask; such a file
+    // is answered as "no envelope known" and the match goes on.
     let Ok(len) = usize::try_from(row_count) else {
         return Ok(None);
     };

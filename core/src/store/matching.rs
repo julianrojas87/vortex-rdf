@@ -41,6 +41,14 @@ use super::VortexRdfStore;
 impl VortexRdfStore {
     // ── pattern matching ──────────────────────────────────────────────────────
 
+    /// Derive a view of this store narrowed to the quads matching the pattern
+    /// (`None` = free). No quads are decoded: the base and the tail are
+    /// matched independently and the resulting restrictions compose with
+    /// this view's own — a prefix binary search over the sorted base, a
+    /// secondary index's row ids (on a file store also a pushed-down filter
+    /// or a pruned row range), then a column-wise scan of whatever remains.
+    /// The derived view shares the base, so matches chain; tombstoned rows
+    /// are excluded by every read of the result.
     pub async fn match_pattern(
         &self,
         subject: Option<&NamedOrBlankNode>,
@@ -90,14 +98,9 @@ impl VortexRdfStore {
         let pattern = QuadPattern::new(subject, predicate, object, graph);
         let mut codes = layout.prepare_pattern(pattern).await?;
         let eqs = match codes.constraints(pattern)? {
-            // A term the tail's layout can prove absent matches nothing.
-            Constraints::AlwaysFalse => {
-                log::debug!(
-                    "[match_pattern] Tail proved the pattern unmatchable at {:?}",
-                    debug::elapsed(t)
-                );
-                return Ok(carry(RowSelection::empty()));
-            }
+            // The tail's string layouts never compile to AlwaysFalse (see
+            // `tail_layout`); the arm stays for totality.
+            Constraints::AlwaysFalse => return Ok(carry(RowSelection::empty())),
             Constraints::Eq(eqs) => eqs,
         };
         if eqs.is_empty() {
@@ -182,7 +185,7 @@ impl VortexRdfStore {
     /// Those ids are computed here, except for the one case that does not
     /// need them — a serving index's resolution that is the view's sole
     /// restriction leaves them pending (`LazyRowIds`), for the first consumer
-    /// that reads through the selection rather than the plan.
+    /// that reads through the selection and not the plan.
     ///
     /// Tombstones are deliberately not consulted here: they are applied by
     /// every read path instead, so matching may name deleted rows without the
@@ -198,8 +201,7 @@ impl VortexRdfStore {
         codes: &mut PatternCodes,
         t: Option<Instant>,
     ) -> Result<Self> {
-        // Without `file-io` the InMemory variant is the only one, making this
-        // pattern irrefutable — which is fine, not a bug.
+        // Without `file-io`, InMemory is the only variant.
         #[allow(irrefutable_let_patterns)]
         let QuadsSource::InMemory {
             base,
@@ -217,9 +219,10 @@ impl VortexRdfStore {
         // the base and yields base row ids, which are then intersected
         // into this view's selection — so a chained match narrows the
         // same coordinate space instead of rebasing onto a new array.
-        // Bases adopted through the split are already canonical
-        // structs, so the common case is a plain downcast — no
-        // per-match canonicalization.
+        // Every in-memory construction (`from_built`, `from_parts`) hands
+        // the base over as a struct array, so the common case is a plain
+        // downcast; the execute arm of `into_struct_array` is a fallback
+        // for a non-struct base.
         let struct_arr = into_struct_array(base.clone())?;
 
         // A chained match folds this pattern's restrictions into the

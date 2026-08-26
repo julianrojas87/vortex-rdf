@@ -218,9 +218,9 @@ impl TermChunks {
     }
 }
 
-/// A term dictionary left in its layout child: term → code probes and
-/// code → term decodes read the sorted `_dict_term` column on demand instead of holding
-/// all terms resident.
+/// A term dictionary left in its layout child, with no term held resident:
+/// term → code probes and code → term decodes read the sorted `_dict_term`
+/// column on demand.
 ///
 /// `reader` is the dictionary child's layout reader (the native store root's
 /// `dictionary` component), so a term's code is its child row. Probes and

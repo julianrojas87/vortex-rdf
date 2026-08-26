@@ -127,7 +127,7 @@ impl VortexRdfStore {
     /// file-backed dictionary is lifted resident transiently for the write.
     ///
     /// A view that rebuilds (tailed, or tombstoned with indexes) emits its
-    /// rows in `(s, p, o, g)` order rather than in the order it holds them.
+    /// rows in `(s, p, o, g)` order, not in the order it holds them.
     pub async fn to_serializable_parts(&self) -> Result<StoreParts> {
         let (array, components, fresh, quads_sorted) = self.selected_parts().await?;
         let dict = match (&self.layout, fresh) {

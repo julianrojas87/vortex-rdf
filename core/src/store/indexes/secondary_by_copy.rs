@@ -238,8 +238,8 @@ pub(crate) fn resolve_in_memory(
     };
     // Translate the term to the value columns' native probe value (a string,
     // or a dictionary code). Absent from the dictionary ⇒ nothing can match.
-    // The probe terms are the pattern's own predicate/object, so this shares
-    // the match's resolution cache rather than searching the dictionary again.
+    // The probe terms are the pattern's own predicate/object, so this reads
+    // the match's resolution cache (no second dictionary search).
     let Some(lead_native) = codes.probe_scalar(probe.lead)? else {
         return Ok(IndexResolution::Empty);
     };

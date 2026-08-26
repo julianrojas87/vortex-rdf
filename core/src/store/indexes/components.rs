@@ -386,8 +386,8 @@ impl IndexComponent {
         Arc::clone(&self.probes)
     }
 
-    /// Resolve this component's probes now rather than on the first query —
-    /// the component half of the eager resolution every in-memory
+    /// Resolve this component's probes at construction, ahead of the first
+    /// query — the component half of the eager resolution every in-memory
     /// construction does (see [`StructProbes::warm`]). A *deferred* component
     /// is left alone: materializing it here would undo the deferral that
     /// `from_bytes` adoption exists for.

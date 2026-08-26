@@ -363,9 +363,9 @@ enum CodeResolver {
 /// dictionary may perform I/O during a match — and every synchronous probe of
 /// the match core is a method on the witness
 /// ([`probe_scalar`](Self::probe_scalar), [`constraints`](Self::constraints)).
-/// Holding one is therefore proof the prelude ran: "prelude skipped" is
-/// unrepresentable rather than a defended runtime invariant, which is what
-/// lets a file-backed dictionary confine its I/O to the prelude.
+/// Holding one is therefore proof the prelude ran — "prelude skipped" is
+/// unrepresentable — which is what lets a file-backed dictionary confine
+/// its I/O to the prelude.
 ///
 /// The role cache also serves memoization: `match_base` derives the same
 /// term → code mapping in several stages — the unmatchable-pattern gate, the
@@ -373,9 +373,9 @@ enum CodeResolver {
 /// caching per role keeps a fully-bound pattern to one dictionary search and
 /// one render per bound term instead of one per stage.
 ///
-/// The render goes into `scratch` rather than a fresh `String` per probe: a
-/// term's N-Triples form is only needed long enough to search the dictionary
-/// with it, so one buffer serves all four roles and every stage.
+/// The render goes into `scratch`: a term's N-Triples form is only needed
+/// long enough to search the dictionary with it, so one buffer serves all
+/// four roles and every stage.
 ///
 /// Scoped to a single `match_base`: the tail is matched under a *different*
 /// layout (it stores terms as strings precisely so a term the base's dictionary
@@ -436,8 +436,7 @@ impl PatternCodes {
     }
 
     /// `term`'s N-Triples form in the shared scratch buffer — for the layouts
-    /// that probe with the string itself rather than a dictionary code, which
-    /// have nothing to cache but still benefit from not allocating.
+    /// that probe with the string itself (no dictionary code to cache).
     fn render(&mut self, term: TermRef<'_>) -> &str {
         term.write_nt(&mut self.scratch);
         &self.scratch

@@ -273,7 +273,8 @@ impl VortexRdfStore {
         }
     }
 
-    /// The raw-text counterpart of [`quad_chunks`](Self::quad_chunks): each
+    /// The raw-text counterpart of
+    /// [`shared_quad_chunks`](Self::shared_quad_chunks): each
     /// item is one chunk of this view's quads decoded to [`RawQuad`]s — every
     /// term in the exact N-Triples string form the columns store. The
     /// N-Triples/N-Quads export fast path streams these and writes the
@@ -381,7 +382,7 @@ impl VortexRdfStore {
 
 /// One chunk decoded to raw quads through `layout`, a chunk-level decode
 /// error carried as a one-element error chunk (the same convention as
-/// [`VortexRdfStore::quad_chunks`]).
+/// `VortexRdfStore::decoded_chunks`).
 fn raw_chunk(layout: &ResolvedLayout, rows: &ArrayRef) -> Vec<Result<RawQuad>> {
     match layout.raw_quads(rows) {
         Ok(raws) => raws.into_iter().map(Ok).collect(),
@@ -390,7 +391,7 @@ fn raw_chunk(layout: &ResolvedLayout, rows: &ArrayRef) -> Vec<Result<RawQuad>> {
 }
 
 /// The boxed, error-mapped, tail-chained stream every file pipeline in
-/// [`VortexRdfStore::quad_chunks`] (and its raw twin) returns. `decode` runs
+/// `VortexRdfStore::decoded_chunks` (and its raw twin) returns. `decode` runs
 /// inside the scan's spawned split tasks (via the scan's map function), so
 /// decoding runs concurrently across the runtime's workers instead of
 /// serially at the stream consumer. Each polled item is one decoded chunk; a
@@ -416,8 +417,8 @@ fn scan_chunk_stream<T: Send + 'static>(
 
 /// The async-decode counterpart of [`scan_chunk_stream`], for reads whose
 /// decode must itself await — a file-backed dictionary resolves each chunk's
-/// codes with a scan of its own, so the decode necessarily runs after the
-/// chunk stream rather than inside the scan's sync map function.
+/// codes with a scan of its own, so the decode runs after the chunk stream,
+/// not inside the scan's sync map function.
 #[cfg(feature = "file-io")]
 fn scan_chunk_stream_async<T: Send + 'static>(
     scan: ScanBuilder<ArrayRef>,

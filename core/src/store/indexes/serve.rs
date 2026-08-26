@@ -4,7 +4,7 @@
 //!
 //! An index builds a serve plan during resolution; the store executes it
 //! without knowing which index produced it, so serving stays a uniform
-//! capability rather than one index's special case. It is the generic form of
+//! capability of the store. It is the generic form of
 //! what a permutation index (whole quads in a query-friendly order, e.g.
 //! `IndexType::SecondaryByCopy`) can provide and a back-reference index (only
 //! `(value, row-id)` pairs, e.g. `IndexType::SecondaryByReference`) cannot.

@@ -6,8 +6,7 @@
 //! string comparisons and term → code lookup is a binary search — no HashMap
 //! is needed on the query side, and the terms stay in their compact columnar
 //! form (see [`TermStore`]: FSST-compressed windows as built and written,
-//! plaintext `VarBinViewArray` when a producer wrote them that way) rather
-//! than as owned `String`s.
+//! plaintext `VarBinViewArray` when a producer wrote them that way).
 //!
 //! [`LayoutStrategy::Dictionary`]: crate::store::layouts::LayoutStrategy::Dictionary
 
@@ -62,9 +61,8 @@ enum TermStore {
     Single(TermChunk),
     /// A multi-chunk term column (compressed in windows, or read back from a
     /// serialized dictionary child), each chunk kept in the encoding it was
-    /// written in. Holding the chunks (instead of canonicalizing them into
-    /// one array) is what keeps a large dictionary FSST-compressed through
-    /// the resident lift.
+    /// written in, so a large dictionary stays FSST-compressed through the
+    /// resident lift.
     Chunked(ResidentChunks),
 }
 
@@ -450,8 +448,8 @@ impl TermDictionary {
     }
 }
 
-/// Slots in a dictionary's [`ProbeCache`]. A power of two, so the slot index is
-/// a mask rather than a modulo.
+/// Slots in a dictionary's [`ProbeCache`]. A power of two: the slot index is
+/// the hash masked to this width.
 ///
 /// Sized for the working set of a query workload — the bound terms of the
 /// patterns currently being asked — not for the dictionary.
@@ -565,8 +563,7 @@ impl FsstTerms {
             .execute::<PrimitiveArray>(&mut ctx)
             .map_err(VortexRdfError::Vortex)?;
         // Width is whatever the writer's scheme selection produced — a small
-        // dictionary's offsets fit in a u8 — so accept every integer type
-        // rather than the couple a given dataset happens to yield.
+        // dictionary's offsets fit in a u8 — so accept every integer type.
         // The u32 arm of the macro casts u32 -> u32; that is the price of one
         // arm covering every width.
         #[allow(clippy::unnecessary_cast)]

@@ -140,10 +140,9 @@ impl<'a> TypedEq<'a> {
         Some(cols)
     }
 
-    /// The mixed/cold row compare. The per-row `as_slice` on the Code arm is
-    /// deliberate: mixed code+string constraint sets do not occur in practice
-    /// (Dictionary bases are all-code, tails and Default bases all-string),
-    /// and the hot all-code case takes [`TypedEq::code_views`] instead.
+    /// Row compare over the mixed enum. Sets whose every constraint is
+    /// slice-bound (`TypedEq::Code`) are served by [`TypedEq::code_views`]
+    /// instead and never reach here.
     #[inline]
     fn matches(&self, i: usize) -> bool {
         match self {
@@ -169,16 +168,10 @@ impl<'a> TypedEq<'a> {
     }
 }
 
-/// Selection size below which a *single* residual equality is better served by
-/// the typed row-at-a-time loop than the vectorized mask pipeline (see
-/// [`typed_residual_ids`]).
-///
-/// Above it the mask scan's SIMD comparison outruns the typed loop by enough to
-/// repay slicing and canonicalizing the base; below it the query is nothing but
-/// that fixed cost. The crossover moves with how many columns the store
-/// carries (the fixed cost is paid per column), so this sits an order of
-/// magnitude under the narrowest crossover rather than at it.
-const TYPED_SINGLE_EQ_MAX_ROWS: usize = 4_096;
+/// Selection size above which the typed row loop declines to the vectorized
+/// mask scan: always for a lone constraint, and for any set that binds a
+/// column through an encoded-search probe (see [`typed_residual_ids`]).
+const TYPED_EQ_MAX_ROWS: usize = 4_096;
 
 /// Typed residual filter over a store's base: when every residual equality
 /// constraint targets a typed-comparable canonical column (see [`TypedEq`]),
@@ -194,43 +187,24 @@ pub(crate) fn typed_residual_ids(
     base_len: usize,
     eqs: &[(&'static str, Scalar)],
 ) -> Option<vortex_buffer::Buffer<u64>> {
-    // With ≥2 slice-bound columns the typed residual wins outright: it
-    // short-circuits the conjunction per row, which the vectorized pipeline
-    // cannot.
-    //
-    // With a lone constraint there is nothing to short-circuit, and the
-    // row-at-a-time `views()` access (an erased-array deref per row) loses
-    // to SIMD `compare_views_constant` — but only while the scan is what
-    // dominates. The mask pipeline's arguments cost the same whatever the
-    // selection: `selection.apply` pushes a slice through the array
-    // optimizer and `mask_for` canonicalizes the struct, over *every* column
-    // the base carries. Once a fast path has already narrowed the view to a
-    // handful of rows — a bound subject's binary search leaving one residual
-    // term, the `SP` shape — that fixed cost is the entire query, and it
-    // scales with the store's width.
-    //
-    // So the rule is about selection size, not column count: keep the mask
-    // scan while there are enough rows for SIMD to pay for the setup, take
-    // the typed loop below that.
+    // A lone constraint has no conjunction to short-circuit per row, so over
+    // a wide selection it goes to the mask scan; two or more slice-bound
+    // constraints take the typed loop at any width.
     let needles = Needle::extract(eqs)?;
     let selected = selection.len(base_len);
-    let wide = selected > TYPED_SINGLE_EQ_MAX_ROWS;
+    let wide = selected > TYPED_EQ_MAX_ROWS;
     if eqs.len() < 2 && wide {
         return None;
     }
-    // Reading a compressed column row-at-a-time costs a point read where a
-    // canonical one costs a load, and materializing the payload wrapper's
-    // canonical form costs one pass over the whole column. Take that pass
-    // when this scan alone already reads as many values as the pass decodes:
-    // it repays within the call, and the wrapper's cache — shared by every
-    // view and clone of the base — makes every later scan a slice loop. A
-    // narrow selection stays on point reads, so a store queried only through
-    // its fast paths never materializes a second copy of its columns.
+    // Materialize a payload wrapper's canonical form only when this scan
+    // reads at least as many values as the pass decodes; the wrapper caches
+    // it for every later view/clone of the base, and a narrow selection stays
+    // on point reads so a store queried only through its fast paths never
+    // holds a second copy of its columns.
     let canonicalize = selected.saturating_mul(eqs.len()) >= base_len;
     let cols = TypedEq::bind(struct_arr, eqs, &needles, canonicalize)?;
-    // What still binds through a probe is an encoding with no canonical form
-    // to reach for — a wire-encoded adoption. Its per-row point read never
-    // outruns the vectorized compare over a wide selection.
+    // A probe-bound column (no canonical form to reach for) is read per row,
+    // so a wide selection over one goes to the mask scan.
     if cols.iter().any(|c| matches!(c, TypedEq::CodeProbe(..))) && wide {
         return None;
     }
@@ -389,7 +363,7 @@ mod tests {
     /// second constraint beside it: wide selections decline to the mask scan.
     #[test]
     fn probe_bound_column_declines_wide_selection() {
-        let n = (TYPED_SINGLE_EQ_MAX_ROWS as u32) * 2;
+        let n = (TYPED_EQ_MAX_ROWS as u32) * 2;
         let sa = mixed_struct(n);
         let eqs = eqs(&[("p", 3), ("o", 10)]);
         assert!(typed_residual_ids(&sa, &RowSelection::All, n as usize, &eqs).is_none());
@@ -404,7 +378,7 @@ mod tests {
     /// declined to the mask pipeline.
     #[test]
     fn wrapped_column_materializes_for_wide_scan() {
-        let n = (TYPED_SINGLE_EQ_MAX_ROWS as u32) * 2;
+        let n = (TYPED_EQ_MAX_ROWS as u32) * 2;
         let sa = wrapped_struct(n);
         let o = sa.unmasked_field_by_name("o").unwrap().clone();
         assert!(crate::store::array::cached_u32_primitive(&o).is_none());
@@ -422,7 +396,7 @@ mod tests {
     /// on point reads, leaving the wrapper holding only its compressed form.
     #[test]
     fn wrapped_column_stays_compressed_for_narrow_scan() {
-        let n = (TYPED_SINGLE_EQ_MAX_ROWS as u32) * 2;
+        let n = (TYPED_EQ_MAX_ROWS as u32) * 2;
         let sa = wrapped_struct(n);
         let o = sa.unmasked_field_by_name("o").unwrap().clone();
 

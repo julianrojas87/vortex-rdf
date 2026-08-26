@@ -129,7 +129,7 @@ impl VortexRdfStore {
 
     /// Remove every quad matching the pattern — the counterpart to
     /// [`match_pattern`], for when the rows a pattern selects should be dropped
-    /// rather than read.
+    /// instead of read.
     ///
     /// The matched rows are tombstoned in place: the base's row ids — and
     /// with them its secondary indexes — stay valid, and the tombstones are

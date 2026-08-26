@@ -12,8 +12,10 @@
 //! [`secondary_by_reference`]: crate::store::indexes::secondary_by_reference
 //! [`typed_object`]: crate::store::layouts::typed_object
 
-/// The subject column — first in every layout, globally sorted by the sorted
-/// builders (which stamp `IsSorted` on it for the binary-search fast path).
+/// The subject column — first in every layout. Whether its rows are globally
+/// sorted is per-store provenance
+/// ([`quads_sorted`](crate::io::container::layout::quads_sorted)), not a
+/// property of the name.
 pub(crate) const COL_S: &str = "s";
 /// The predicate column.
 pub(crate) const COL_P: &str = "p";
