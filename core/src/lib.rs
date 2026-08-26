@@ -57,6 +57,7 @@ pub mod debug;
 pub mod error;
 pub mod io;
 mod session;
+/// The quad store: builders, layouts, indexes, matching and mutation.
 pub mod store;
 
 pub use error::{Result, VortexRdfError};

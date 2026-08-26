@@ -236,8 +236,8 @@ class PyoxigraphAdapter(Adapter):
 
     has_distinct_open is False: an in-memory Store has no artifact to reopen,
     so a fresh process must bulk_load the source file again -- which is what
-    the Build column already measures, so Open is left blank rather than
-    ranking a re-parse against a file-backed format's footer read.
+    the Build column already measures, so Open is left blank (a re-parse is
+    not comparable with a file-backed format's footer read).
     """
 
     slug, label = "pyoxigraph", "pyoxigraph"

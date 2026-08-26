@@ -16,9 +16,13 @@ use crate::error::Result;
 /// contract.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct SharedQuad {
+    /// Subject term.
     pub s: Arc<str>,
+    /// Predicate term.
     pub p: Arc<str>,
+    /// Object term.
     pub o: Arc<str>,
+    /// Graph term; `""` for the default graph.
     pub g: Arc<str>,
 }
 
@@ -46,9 +50,13 @@ impl From<RawQuad> for SharedQuad {
 /// writing to Vortex arrays.
 #[derive(Clone, Hash, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct RawQuad {
+    /// Subject term.
     pub s: String,
+    /// Predicate term.
     pub p: String,
+    /// Object term.
     pub o: String,
+    /// Graph term; `""` for the default graph.
     pub g: String,
 }
 
@@ -69,6 +77,7 @@ impl PartialOrd for RawQuad {
 }
 
 impl RawQuad {
+    /// Render an oxrdf [`Quad`]'s four terms in N-Triples form.
     pub fn from_quad(q: &Quad) -> Self {
         RawQuad {
             s: match &q.subject {

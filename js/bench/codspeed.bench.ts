@@ -12,8 +12,7 @@
 // action, so `npm run bench:codspeed` locally just produces wall-clock numbers.
 //
 // The whole JS→WASM boundary (promise machinery, quad packing, the lazy read
-// model) is measured for real, rather than approximated by timing the Rust-side
-// stages in isolation, and the flamegraph attributes the cost.
+// model) is measured end to end, and the flamegraph attributes the cost.
 //
 // Single process by design: CodSpeed measures each task deterministically, and
 // there are no competing libraries to isolate — so none of compare.bench.ts's
@@ -51,8 +50,7 @@ import {
 // per-distinct-term decode invisible.
 // The defaults are the size all three CodSpeed suites share — 32³ = 32,768,
 // which `core/benches/support/mod.rs` takes as its BENCH_SIZE default — so one
-// shared-core regression lands in all three tabs at comparable magnitude
-// instead of showing up in one and hiding in another. It is also 4 zones of
+// shared-core regression lands in all three tabs at comparable magnitude. It is also 4 zones of
 // 8,192 rows, the smallest round size at which zone pruning has anything to
 // prune.
 const DIM = Number(process.env.CODSPEED_BENCH_DIM ?? 32); // triples: DIM³ rows

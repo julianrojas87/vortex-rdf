@@ -1,8 +1,8 @@
 """Measure ONE adapter, in its own process and its own virtualenv.
 
 Run by `run.py`, never directly in a full run. One adapter per process buys
-two things: peak RSS is attributable to a single library rather than to
-whichever ran first, and no library's garbage or import-time allocation taints
+two things: peak RSS is attributable to a single library, not to whichever
+ran first, and no library's garbage or import-time allocation taints
 another's timings. It also lets each adapter keep an incompatible dependency
 set -- see the pyoxigraph pin note in `run.py`.
 
@@ -299,8 +299,8 @@ def run_query(adapter: Adapter, args: argparse.Namespace) -> dict:
     # --- match: the same patterns, COLD ---
     # Each iteration answers the FIRST query on a freshly opened handle. The
     # open runs in `setup`, which is outside the timed region, so this isolates
-    # what a query costs against empty caches rather than reporting that plus
-    # the open -- which is measured on its own as `open::<slug>` above.
+    # what a query costs against empty caches, excluding the open -- which is
+    # measured on its own as `open::<slug>` above.
     #
     # Gated on `has_distinct_open`: for a store that lives only in memory,
     # opening IS re-parsing the source, so its cold cell would be tens of

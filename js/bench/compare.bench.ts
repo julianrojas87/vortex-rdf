@@ -63,7 +63,7 @@ interface MemoryRow {
 /** One adapter, one role, one process. A worker that cannot finish is skipped:
  *  the remaining adapters still run and still produce their rows. The caller
  *  records a failure for a null return, so the missing rows stay attributed on
- *  the page instead of reading as benchmarks nobody ran. */
+ *  the page as failures, not as benchmarks nobody ran. */
 function runWorker(slug: string, role: 'query' | 'querycold' | 'fullscan' | 'mutate'): WorkerOutput | null {
     return runWorkerProcess<WorkerOutput>(workerPath, [slug, role], `${slug}/${role}`);
 }
@@ -78,13 +78,13 @@ async function main(): Promise<void> {
     const matched: Record<string, number> = {};
     // Phases an adapter could not complete. Recorded so a missing row on the
     // dashboard is visibly attributed to a store that could not do the work,
-    // rather than looking like a benchmark nobody ran.
+    // not read as a benchmark nobody ran.
     const failures: { slug: string; label: string; role: string; phase: string; error: string }[] = [];
 
     // Every adapter queries the same dataset with the same probes, so their match
     // counts must agree. A disagreement is a correctness bug in one of them, not a
-    // benchmarking detail — surface it rather than silently keeping whichever
-    // adapter reported last. Applied to every role that counts anything: the full
+    // benchmarking detail — surface it; the first adapter's count is kept as
+    // the reference. Applied to every role that counts anything: the full
     // scan reports from its own process, and it is the strongest check of the set.
     const countWarnings: string[] = [];
     // A worker that never produced output — crash or the WORKER_TIMEOUT_MS
@@ -102,7 +102,7 @@ async function main(): Promise<void> {
             else if (matched[pat] !== n) {
                 // Into the results file, not just the console: the dashboard
                 // renders these, so a disagreement is visible where the numbers
-                // are read rather than only where the run happened to scroll by.
+                // are read, not only in the console output.
                 const msg = `${label} matched ${n} rows for '${pat}', an earlier adapter matched ${matched[pat]}`;
                 countWarnings.push(msg);
                 console.error(`  !! ${msg}`);
@@ -148,7 +148,7 @@ async function main(): Promise<void> {
     // The full scan gets its own process per adapter, for the same reason each
     // adapter gets one: it is heavy enough that a store's retained memory makes
     // it order-dependent, so sharing a process with the query and ingest phases
-    // measures the residue of those rather than the scan. See runFullScan.
+    // measures the residue of those on top of the scan. See runFullScan.
     for (const a of ADAPTERS) {
         const out = runWorker(a.slug, 'fullscan');
         if (!out) { workerLost(a, 'fullscan'); continue; }
@@ -174,7 +174,7 @@ async function main(): Promise<void> {
 
     // A library whose model rules mutation out entirely (hdt: the file is
     // immutable once built) is not in MUT_ADAPTERS, but its cells should still
-    // say why rather than read as benchmarks nobody ran.
+    // say why, so they read as unsupported, not as benchmarks nobody ran.
     for (const a of ADAPTERS) {
         if (!a.mutationUnsupported) continue;
         for (const id of ['add', 'add_batch', 'delete']) {

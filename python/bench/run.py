@@ -146,7 +146,7 @@ def check_count_agreement(counts_by_slug: dict[str, dict[str, int]]) -> list[str
     term spellings are being asked the same question; if two disagree on how
     many rows a pattern matches, at least one is being queried wrongly and its
     timing measures the wrong work. Disagreements are reported into the
-    dashboard's provenance rather than silently averaged over.
+    dashboard's provenance.
     """
     warnings: list[str] = []
     patterns: set[str] = set()
@@ -175,7 +175,7 @@ def main() -> int:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
     # Sampled before any adapter runs, so it describes the headroom the whole
-    # run had rather than whatever the last library left behind.
+    # run had, not whatever the last library left behind.
     mem = meminfo_mb()
 
     opts = dataset_opts(graphs=GRAPHS)

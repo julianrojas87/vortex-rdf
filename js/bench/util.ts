@@ -6,8 +6,8 @@
 // No store library (oxigraph, rdf-stores, or the Vortex wasm module) may be
 // reachable from here — codspeed.bench.ts imports it and runs under CodSpeed's
 // Valgrind instrumentation, where loading a foreign multi-MB wasm module would
-// pollute every measurement. That constraint is why this module exists at all
-// instead of these helpers living in shared.ts, which does import all three.
+// pollute every measurement. shared.ts imports all three, so these helpers
+// live here.
 
 import { spawnSync } from 'node:child_process';
 import { readFileSync, rmSync } from 'node:fs';
@@ -140,7 +140,7 @@ const WORKER_TIMEOUT_MS = Number(process.env.WORKER_TIMEOUT_MS ?? 30 * 60_000);
  *
  * The worker receives `args` followed by the path it must write its JSON to;
  * that file is this function's to name and to remove. A non-zero exit is
- * reported and skipped rather than thrown, so one failed point never costs the
+ * reported and skipped, not thrown, so one failed point never costs the
  * whole run. A worker that outlives `WORKER_TIMEOUT_MS` is killed the same way
  * — SIGKILL, because a wasm-bound death march does not answer SIGTERM.
  *

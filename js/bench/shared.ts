@@ -6,7 +6,7 @@
 // PURITY CONTRACT: each of those runs in its own child process and imports this
 // file independently, so it must be pure/deterministic given the same env vars —
 // no shared in-memory state crosses the process boundary, and every knob is an
-// env var read here rather than a value passed between processes.
+// env var read here, never a value passed between processes.
 //
 // codspeed.bench.ts deliberately does NOT import this file: the store libraries
 // loaded below would put a foreign multi-MB wasm module into its Valgrind-
@@ -154,8 +154,8 @@ function newRdfStore(kind: 'default' | 'single'): RdfStore {
     // `createDefault` is rdf-stores's only factory and always wires in quoted-triple
     // (RDF-star) support (RdfStoreIndexNestedMapQuoted / TermDictionaryQuotedIndexed) —
     // there's no leaner non-quoted construction path in the library, so mirroring that
-    // exact choice here (rather than substituting a plain, non-quoted index) is what
-    // keeps this an apples-to-apples comparison with what real rdf-stores callers get.
+    // exact choice here keeps this an apples-to-apples comparison with what real
+    // rdf-stores callers get.
     // Pin <number> (as createDefault does) so Q resolves to Quad, not BaseQuad.
     return new RdfStore<number>({
         indexCombinations: [['graph', 'subject', 'predicate', 'object']],

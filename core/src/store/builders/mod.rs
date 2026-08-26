@@ -73,6 +73,7 @@ fn into_vortex_error(e: VortexRdfError) -> vortex_error::VortexError {
 /// — which consumes it — more than once.
 #[derive(Clone)]
 pub struct BuiltArray {
+    /// The quad rows as one struct array (in the layout's column schema).
     pub array: ArrayRef,
     /// The requested indexes' children, built beside the quad rows — the
     /// store's adoption currency
@@ -87,7 +88,9 @@ pub struct BuiltArray {
 /// writable components, and the dictionary the serializer writes as the
 /// `dictionary` child.
 pub struct BuiltStream {
+    /// The schema dtype shared by every chunk.
     pub dtype: DType,
+    /// The lazy stream of primary-only quad chunks.
     pub chunks: ChunkStream,
     /// The index children riding beside the rows as writable components.
     pub(crate) components: Vec<crate::io::container::NativeComponentWrite>,

@@ -197,7 +197,7 @@ later stages see an empty selection and skip.
 ## 5. Stage C — backend dispatch
 
 Here it is decided **where the base rows live**. `match_base` reads
-the store's [`QuadsSource`](../core/src/store/source.rs#L28) and hands the prelude's witness to the matching backend. `InMemory` holds the
+the store's [`QuadsSource`](../core/src/store/source.rs#L35) and hands the prelude's witness to the matching backend. `InMemory` holds the
 base array (and any index components) resident (i.e., loaded into RAM), so its stages narrow a
 `RowSelection` directly and run synchronously. `File` leaves the rows on disk,
 so its stages can only *define* a filter and a selection for the next scan
@@ -215,7 +215,7 @@ flowchart LR
 
 ## 6. The in-memory path
 
-[`match_base_in_memory`](../core/src/store/matching.rs#L193) runs four stages
+[`match_base_in_memory`](../core/src/store/matching.rs#L195) runs four stages
 over the base `StructArray`. Each one asks the same two questions — *can I answer
 part of this pattern cheaply?* and *which rows survive?* — narrowing the shared
 `RowSelection` and clearing whatever pattern components it answered, so the next
@@ -223,7 +223,7 @@ stage only sees what is left.
 
 Only the *struct* is canonical. Its columns stay in the compressed encodings
 every in-memory construction gives them
-([`compress_built_parts`](../core/src/store/mod.rs)), and the stages below
+([`compress_built_parts`](../core/src/store/mod.rs#L150)), and the stages below
 search them in place through the cached encoded-search probes. No stage
 decompresses a column; a match decodes nothing but the rows a mask scan has to
 compare ([§6.3](#63-residual-column-filtering)).
@@ -258,11 +258,11 @@ Each stage in the code, and where the details are below:
 
 | Stage | Code | Details |
 |---|---|---|
-| Prelude | [`matching.rs:224-252`](../core/src/store/matching.rs#L224-L252) | — |
-| 1 · prefix probe | [`matching.rs:254-337`](../core/src/store/matching.rs#L254-L337), [`search_sorted_bounds`](../core/src/store/array.rs#L103) | [§6.1](#61-prefix-probe) |
-| 2 · secondary-index routing | [`matching.rs:339-409`](../core/src/store/matching.rs#L339-L409), [`resolve_indexes_in_memory`](../core/src/store/indexes/mod.rs#L706) | [§6.2](#62-secondary-index-routing) |
-| 3 · residual column filtering | [`matching.rs:411-452`](../core/src/store/matching.rs#L411-L452), [`typed_residual_ids`](../core/src/store/scan/typed_eq.rs#L191), [`mask_for`](../core/src/store/matching.rs#L761) | [§6.3](#63-residual-column-filtering) |
-| 4 · finalize | [`matching.rs:454-468`](../core/src/store/matching.rs#L454-L468) | [§6.4](#64-keeping-or-dropping-the-serve-plan) |
+| Prelude | [`matching.rs:217-246`](../core/src/store/matching.rs#L217-L246) | — |
+| 1 · prefix probe | [`matching.rs:248-331`](../core/src/store/matching.rs#L248-L331), [`search_sorted_bounds`](../core/src/store/array.rs#L178) | [§6.1](#61-prefix-probe) |
+| 2 · secondary-index routing | [`matching.rs:333-403`](../core/src/store/matching.rs#L333-L403), [`resolve_indexes_in_memory`](../core/src/store/indexes/mod.rs#L485) | [§6.2](#62-secondary-index-routing) |
+| 3 · residual column filtering | [`matching.rs:405-446`](../core/src/store/matching.rs#L405-L446), [`typed_residual_ids`](../core/src/store/scan/typed_eq.rs#L184), [`mask_for`](../core/src/store/matching.rs#L739) | [§6.3](#63-residual-column-filtering) |
+| 4 · finalize | [`matching.rs:448-462`](../core/src/store/matching.rs#L448-L462) | [§6.4](#64-keeping-or-dropping-the-serve-plan) |
 
 ### 6.1 Prefix probe
 
@@ -274,7 +274,7 @@ rebuild that merges an append tail re-establishes it
 ([`order_for_rebuild`](../core/src/store/serialize.rs)). So the stage is skipped
 only for rows that arrived without the provenance — a foreign or older writer's
 file, whose `quads_sorted: false` keeps
-[`with_subject_stamp`](../core/src/store/rows.rs#L474) from inventing a stamp
+[`with_subject_stamp`](../core/src/store/array.rs#L124) from inventing a stamp
 those rows never earned. Compacting such a store restores the fast path.
 
 When it engages, the **subject** resolves to its exact `[lo, hi)` run in
@@ -284,7 +284,7 @@ When it engages, the **subject** resolves to its exact `[lo, hi)` run in
   (`probes.by_name(base, "s")`) when the column resolves one and the probe value
   is an integer — the Dictionary layout's code column;
 - otherwise through the per-call
-  [`search_sorted_bounds`](../core/src/store/array.rs), which also handles the
+  [`search_sorted_bounds`](../core/src/store/array.rs#L178), which also handles the
   string layouts' `VarBinView` subject columns.
 
 Then the **roles behind it narrow the run in sort order** — `p` inside the
@@ -481,7 +481,7 @@ longer starts `All` ([§11](#11-chained-matches)).
 
 ## 7. The file path
 
-[`match_base_file`](../core/src/store/matching.rs#L495) composes the same
+[`match_base_file`](../core/src/store/matching.rs#L489) composes the same
 restrictions as the in-memory path, but **nothing is read**: each stage decides
 what the *next* scan will do, and the result is a filter expression plus a row
 selection.
@@ -522,11 +522,11 @@ Each stage in the code, and where the details are below:
 
 | Stage | Code | Details |
 |---|---|---|
-| Prelude | [`matching.rs:504-515`](../core/src/store/matching.rs#L504-L515) | — |
-| 1 · subject chunk probe | [`matching.rs:524-542`](../core/src/store/matching.rs#L524-L542), [`sorted_subject_chunks`](../core/src/store/native_file.rs#L161) | [§7.1](#71-subject-chunk-probe) |
-| 2 · secondary-index routing | [`matching.rs:543-559`](../core/src/store/matching.rs#L543-L559), [`resolve_indexes_file`](../core/src/store/indexes/mod.rs#L730) | [§8](#8-the-index-resolvers) |
-| 3 · pushed-down filter | [`matching.rs:572-671`](../core/src/store/matching.rs#L572-L671), [`build_file_filter`](../core/src/store/scan/file_scan.rs#L309) | [§7.3](#73-what-ends-up-on-the-view) |
-| 4 · selection and serve plan | [`matching.rs:565-566`](../core/src/store/matching.rs#L565-L566) and [`673-714`](../core/src/store/matching.rs#L673-L714), [`row_range_from_pruning`](../core/src/store/scan/file_scan.rs#L553) | [§7.2](#72-zone-map-pruning), [§7.3](#73-what-ends-up-on-the-view) |
+| Prelude | [`matching.rs:498-509`](../core/src/store/matching.rs#L498-L509) | — |
+| 1 · subject chunk probe | [`matching.rs:510-528`](../core/src/store/matching.rs#L510-L528), [`locate_subject_run`](../core/src/store/scan/file_scan.rs#L342) | [§7.1](#71-subject-chunk-probe) |
+| 2 · secondary-index routing | [`matching.rs:529-545`](../core/src/store/matching.rs#L529-L545), [`resolve_indexes_file`](../core/src/store/indexes/mod.rs#L509) | [§8](#8-the-index-resolvers) |
+| 3 · pushed-down filter | [`matching.rs:558-642`](../core/src/store/matching.rs#L558-L642), [`build_file_filter`](../core/src/store/scan/file_scan.rs#L327) | [§7.3](#73-what-ends-up-on-the-view) |
+| 4 · selection and serve plan | [`matching.rs:551-552`](../core/src/store/matching.rs#L551-L552) and [`matching.rs:643-692`](../core/src/store/matching.rs#L643-L692), [`row_range_from_pruning`](../core/src/store/scan/file_scan.rs#L558) | [§7.2](#72-zone-map-pruning), [§7.3](#73-what-ends-up-on-the-view) |
 
 The two paths differ in what a stage produces, not in what it asks. In memory a
 stage narrows a `RowSelection` directly; here stage 3 can only *describe* the
@@ -535,9 +535,10 @@ scan can honour without reading data.
 
 ### 7.1 Subject chunk probe
 
-The file mirror of the in-memory subject binary search: it binary-searches the
-subject column's **encoded chunks** through cached chunk probes, reading only the
-chunks the bisection touches. It requires `u64::try_from(&probe)` to succeed, so
+The file mirror of the in-memory subject binary search
+([`locate_subject_run`](../core/src/store/scan/file_scan.rs#L342)): it
+binary-searches the subject column's **encoded chunks** through cached chunk
+probes, reading only the chunks the bisection touches. It requires `u64::try_from(&probe)` to succeed, so
 it engages **only under the Dictionary layout** — a string-subject file falls
 through to zone-map pruning.
 
@@ -564,7 +565,7 @@ freshly opened file, which fetches the chunks it bisects, ≈ 0.75 ms.
 ### 7.2 Zone-map pruning
 
 When no index resolved anything and no subject range was found,
-[`row_range_from_pruning`](../core/src/store/scan/file_scan.rs) runs one
+[`row_range_from_pruning`](../core/src/store/scan/file_scan.rs#L558) runs one
 `pruning_evaluation` per filter conjunct over the whole file — statistics only,
 no row data — and collapses the surviving mask to its enclosing contiguous
 range. Interior gaps are kept (the scan's own per-split pruning skips them from
@@ -666,12 +667,13 @@ comparator makes the second column sorted inside each lead run). It returns:
   re-sorted only on demand) and **always a serve plan** over the matched run.
 
 **On file:** locates the run by binary-searching the child's cached chunk probes
-(lead, then a windowed second-key search), integers only. Then:
+([`locate_component_run`](../core/src/store/indexes/row_ids.rs#L49): lead,
+then a windowed second-key search), integers only. Then:
 
 | Located run | Row ids |
 |---|---|
 | empty | `IndexResolution::Empty` |
-| ≤ 256 rows (`POINT_GATHER_MAX_ROWS`) | **Eager**, via `rid_point_reads` |
+| ≤ 256 rows (`POINT_GATHER_MAX_ROWS`) | **Eager**, via [`rid_point_reads`](../core/src/store/indexes/row_ids.rs#L84) |
 | wider, or unlocated | **Lazy** — a deferred rid-only pushed-down scan |
 
 The serve plan is built from *every* bound non-subject component (p, o, **g**).
@@ -701,10 +703,8 @@ plan is what differs: in memory the 31,776-row `P` is served in ≈ 8.8 ms
 against ≈ 13 ms gathered from a by-reference resolution and ≈ 15 ms after a
 scan; on file the served range scan of that run, split across the workers,
 reads it in ≈ 2.4 ms against ≈ 4.2–4.6 ms for the filtered scan of the
-primaries a by-reference or filter-only match reads through (the three
-re-measured together on 2026-08-25, after the split landed; served through
-the child's single leaf-chunk split it had cost ≈ 2.3× the primary scan),
-while narrow runs (`O`, `PO`) are point-read in ≈ 40 µs.
+primaries a by-reference or filter-only match reads through, while narrow
+runs (`O`, `PO`) are point-read in ≈ 40 µs.
 
 ### 8.3 `SecondaryByReference` — sorted `{val, rid}` pairs
 
@@ -715,11 +715,12 @@ supplies a serve plan** and its row ids are **always eager**.
 run, `sorted_row_ids` puts them back in base row order. Declines when the
 component is absent, unsorted, or probe-incompatible.
 
-**On file:** `locate_run` binary-searches the value column's chunk probes
+**On file:** [`locate_component_run`](../core/src/store/indexes/row_ids.rs#L49)
+binary-searches the value column's chunk probes
 (sorted child + integer probe required). A located run ≤ 256 rows uses
 `rid_point_reads`; a wider one uses a rid-only scan restricted to the range —
 neither pays filter evaluation. Anything the probes decline falls back to
-`scan_index_row_ids`, a pushed-down `val == probe` scan that answers whatever the
+[`scan_index_row_ids`](../core/src/store/indexes/row_ids.rs#L160), a pushed-down `val == probe` scan that answers whatever the
 order.
 
 **Example.** For the running example `index:ref-o` holds
@@ -742,7 +743,7 @@ size: `{val, rid}` pairs are a fraction of a second sorted copy of every quad.
 
 | | `InMemoryServePlan` | `FileServePlan` |
 |---|---|---|
-| Acquisition | slice the component's `[start, end)` run, or point-read it through cached probes when ≤ 256 rows | a located run: `component_point_chunk` point reads when ≤ 256 rows, else a projected scan of exactly its row range, split by row count across the workers (`located_run_scan`); unlocated: the pushed-down projected+filtered scan of the index child |
+| Acquisition | slice the component's `[start, end)` run, or point-read it through cached probes when ≤ 256 rows | a located run: [`component_point_chunk`](../core/src/store/scan/file_scan.rs#L469) point reads when ≤ 256 rows, else a projected scan of exactly its row range, split by row count across the workers ([`located_run_scan`](../core/src/store/indexes/serve.rs#L521)); unlocated: the pushed-down projected+filtered scan of the index child |
 | Constraints | implicit in the run's bounds (lead ± second key) | explicit `p`/`o`/`g` term equalities, bound lazily on first read |
 | Dropped when | anything else narrowed the view (including a bound graph, which forces a residual scan) | an earlier filter/selection exists, or a subject range applies |
 | Tombstones | applied through the plan's `rid` column | applied through the plan's `rid` column |
@@ -840,7 +841,7 @@ and the object of a `TypedObject` store expands into 2–4 residual equalities.
 | `?POG` | as above; plan carries `g` too, but its `row_range` is dropped | ref-o ids; filter keeps `p ∧ g` | filter `p ∧ o ∧ g` |
 | `SP??` … `SPOG` | subject range; index routing skipped when the range is < 4096 rows; residual becomes the pushed filter | same | subject range (or pruning envelope) + residual filter |
 
-Under the string layouts the subject chunk probe and both indexes' `locate_run`
+Under the string layouts the subject chunk probe and both indexes' `locate_component_run`
 decline (they need integer probes), so a file match reduces to *pushed-down
 filter + zone-map pruning* — plus, for `SecondaryByCopy`, a filtered index-child
 scan that still supplies a serve plan.
@@ -852,7 +853,7 @@ scan that still supplies a serve plan.
 `match_pattern` on an already-derived view composes rather than rebases:
 
 - In memory, a still-`Pending` selection **materializes** at the top of
-  `match_base_in_memory` (`selection.materialized_sync()`) — chaining is one of
+  `match_base_in_memory` (`selection.materialized()`) — chaining is one of
   the consumers the deferral exists for. `unrefined` is then false, so no serve
   plan can be kept.
 - On file, `existing_filter` is ANDed with the new one and `existing_selection`
@@ -885,7 +886,7 @@ The match's decisions show up here
 
 | Consumer | With a serve plan | Without |
 |---|---|---|
-| `quads()` / `quads_vec()` | decode the plan's run (in memory: slice or point reads; file: point reads ≤ 256 rows, else projected+filtered scan) — the pending ids are never touched | gather the selection from the primaries, or run the restricted file scan |
+| `quads()` / `quads_vec()` | decode the plan's run (in memory: slice or point reads; file: point reads ≤ 256 rows, else a range scan of the located run (`located_run_scan`); a projected+filtered scan of the child only when the run was not located) — the pending ids are never touched | gather the selection from the primaries, or run the restricted file scan |
 | `shared_quads_vec()` / `shared_quad_chunks()` | as `quads()`, through the plan's shared-term decode twins — one `Arc<str>` per distinct term of a chunk, handed to every row repeating it | the same gather or restricted scan, decoded to shared terms |
 | `size()` | in memory a lazy component run knows its width without decoding; on file a located plan's run width answers outright when no filter or tombstones apply, otherwise the ids materialize (then filter masks are counted if a filter is pending) | selection length, or `count_matching_rows` over the filter |
 | `code_columns()` / `code_columns_gathered()` | read the four `u32` columns straight off the index's own columns | materialize the selection, then slice/gather the base's buffers — `code_columns_gathered` runs the full read pipeline where the zero-copy path declines (file-backed or non-canonical views) |
@@ -932,9 +933,9 @@ located by-copy run and a rid scan of the run otherwise.
 
 | Constant | Value | Defined in | Meaning |
 |---|---|---|---|
-| `INDEX_ROUTING_MIN_ROWS` | 4096 | [`matching.rs`](../core/src/store/matching.rs) | an already-narrowed view below this skips index routing |
-| `POINT_GATHER_MAX_ROWS` | 256 | [`selection.rs`](../core/src/store/selection.rs) | runs/selections at or below this are read point-by-point through cached probes |
-| `TYPED_SINGLE_EQ_MAX_ROWS` | 4096 | [`typed_eq.rs`](../core/src/store/scan/typed_eq.rs) | above this, a lone residual equality goes to the vectorized mask scan |
+| `INDEX_ROUTING_MIN_ROWS` | 4096 | [`matching.rs`](../core/src/store/matching.rs#L801) | an already-narrowed view below this skips index routing |
+| `POINT_GATHER_MAX_ROWS` | 256 | [`selection.rs`](../core/src/store/selection.rs#L338) | runs/selections at or below this are read point-by-point through cached probes (`gather_by_point_reads`, the located-run reads); the file-backed dictionary point-reads a batch of at most this many codes through its chunk leaves and scans a wider one |
+| `TYPED_EQ_MAX_ROWS` | 4096 | [`typed_eq.rs`](../core/src/store/scan/typed_eq.rs#L174) | selection size above which the typed row loop declines to the vectorized mask scan: always for a lone residual equality, and for any set that binds a column through an encoded-search probe |
 
 ---
 
@@ -951,7 +952,7 @@ IRIs, not the running example's — where an example above says `s0`, `p0` or
 (`<http://data.example.org/ontology/2026/property/0000>` and the like), which
 no prefixed name abbreviates. Warm regime (one store,
 caches primed by an untimed first query), fastest of ten samples, one machine,
-2026-08-24. Read the figures as orders of magnitude and ratios: the dashboard
+2026-08-24/25. Read the figures as orders of magnitude and ratios: the dashboard
 `scripts/refresh.sh` renders carries the current ones, and
 `BENCH_SIZE=1048576 cargo bench --bench match_lazy` reproduces the match
 column.
@@ -983,7 +984,7 @@ Dictionary layout unless stated; the file's chunk cache is warm.
 | Path | Shape | match | + read | What the numbers say |
 |---|---|---|---|---|
 | stage 1 · subject chunk probe | `S` / `SP` / `SPOG` | 4.8 / 5.4 / 8.0 µs | 30 / 31 / 37 µs | residual roles ride as filter conjuncts; the read point-reads the run |
-| stage 2 · `SecondaryByCopy`, located run | `P` / `O` / `PO` | 3.5 / 3.3 / 9.5 µs | 2.4 ms / 37 µs / 38 µs | `P`'s 31,776-row run defers its ids and is served by a row-count-split scan of the run (the 2.4 ms is a 2026-08-25 re-measurement after the split landed, in a run where the by-reference and no-index `P` reads below took 4.6 / 4.2 ms; the stamped run's single-split serve had cost 19 ms); `O` and `PO` (≤ 256 rows) point-read rids and quads |
+| stage 2 · `SecondaryByCopy`, located run | `P` / `O` / `PO` | 3.5 / 3.3 / 9.5 µs | 2.4 ms / 37 µs / 38 µs | `P`'s 31,776-row run defers its ids and is served by a row-count-split scan of the run; `O` and `PO` (≤ 256 rows) point-read rids and quads |
 | stage 2 · `SecondaryByReference`, located run | `P` / `O` / `PO` | 0.76 ms / 3.2 µs / 4.2 µs | 8.6 ms / 13 µs / 17 µs | a wide run pays a rid-only scan of the run now; narrow runs point-read |
 | stages 3–4 · pushed-down filter + pruning | `P` / `O` / `G`, no index | 2.6 / 2.0 / 2.4 µs | 8.1 ms / 1.6 ms / 13 ms | the match only builds the filter (the envelope is memoized); the read is a filtered scan — pruning keeps only the zones that can hold `o0`, while `p0` occurs in every zone and its read decodes 31,776 rows |
 | string-layout file | `S` / `P`, `Default`, no index | 2.6 / 2.6 µs | 0.86 / 11 ms | no chunk probe for a string subject: pruning envelope, then a filtered scan |
@@ -999,12 +1000,10 @@ Dictionary layout unless stated; the file's chunk cache is warm.
   unindexed `P` differ by ≈ 450× at match time in memory.
 - **By-reference pays at match time, by-copy at read time — and by-copy reads
   faster in memory.** `P`: 29 µs then 13 ms gathered, against 2 µs then 8.8 ms
-  served. On file too, now that a located run's scan is split by row count
+  served. On file too, since a located run's scan is split by row count
   across the workers: `P` served in ≈ 2.4 ms against ≈ 4.2–4.6 ms through the
-  filtered primary scan a by-reference or filter-only match reads through
-  (re-measured together, 2026-08-25). Served through the child's own single
-  leaf-chunk split, the same read had decoded on one worker and cost ≈ 2.3×
-  the primary scan; narrow runs are point-read either way.
+  filtered primary scan a by-reference or filter-only match reads through;
+  narrow runs are point-read either way.
 - **Wide reads are decode-bound**: ≈ 0.28 µs per row served, ≈ 0.4–0.45 µs
   per row gathered and decoded. A ≤ 256-row point read is ≈ 10–15 µs in
   memory and ≈ 30 µs on file.
@@ -1086,8 +1085,10 @@ unrestricted ([§11](#11-chained-matches)).
 | `match_pattern`, `match_base`, both backends, `match_tail`, `mask_for`, `contains` | [`core/src/store/matching.rs`](../core/src/store/matching.rs) |
 | Layouts, `QuadPattern`, `PatternCodes`, `Constraints`, `prepare_pattern` | [`core/src/store/layouts/mod.rs`](../core/src/store/layouts/mod.rs) |
 | Dictionary residency and the async prelude | [`core/src/store/layouts/dictionary/access.rs`](../core/src/store/layouts/dictionary/access.rs) |
-| `RowSelection` / `ViewSelection`, gathering, point reads | [`core/src/store/selection.rs`](../core/src/store/selection.rs) |
+| `RowSelection` / `ViewSelection`, `POINT_GATHER_MAX_ROWS` | [`core/src/store/selection.rs`](../core/src/store/selection.rs) |
+| Gathering selected rows, point reads through cached probes | [`core/src/store/scan/gather.rs`](../core/src/store/scan/gather.rs) |
 | `IndexResolution`, `ResolvedRowIds`, `LazyRowIds`, planners | [`core/src/store/indexes/mod.rs`](../core/src/store/indexes/mod.rs) |
+| Locating index runs on file, rid point reads and scans, `eq_conjunction` | [`core/src/store/indexes/row_ids.rs`](../core/src/store/indexes/row_ids.rs) |
 | Sorted quad copies (POSG / OSPG) | [`core/src/store/indexes/secondary_by_copy.rs`](../core/src/store/indexes/secondary_by_copy.rs) |
 | Sorted `{val, rid}` pairs | [`core/src/store/indexes/secondary_by_reference.rs`](../core/src/store/indexes/secondary_by_reference.rs) |
 | Serve plans and the shared decode tail | [`core/src/store/indexes/serve.rs`](../core/src/store/indexes/serve.rs) |

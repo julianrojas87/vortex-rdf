@@ -53,8 +53,8 @@ async function bench(
  *  its match count. */
 const matched: Record<string, number> = {};
 
-/** A phase whose single execution already exceeds this runs ONCE rather than
- *  the full repetition count; `0` disables the rule.
+/** A phase whose single execution already exceeds this runs ONCE, not the
+ *  full repetition count; `0` disables the rule.
  *
  *  Repetitions exist to average out noise that is small relative to the
  *  measurement — on a cell that takes tens of seconds, the noise the extra
@@ -96,7 +96,7 @@ const storeFootprint: Record<string, number | null> = {};
 
 /** `wasm` is Vortex's linear memory specifically — oxigraph has its own module
  *  this cannot see, and rdf-stores has none — so it is only read for Vortex
- *  adapters and reported as null elsewhere rather than as a misleading 0. */
+ *  adapters and reported as null elsewhere (a 0 would misreport it). */
 async function memSnapshot(isVortex: boolean): Promise<{ rss: number | null; js: number; wasm: number | null }> {
     // jsHeapMb forces a collection first, so the RSS read after it is post-GC too.
     const js = jsHeapMb();
@@ -107,8 +107,7 @@ const delta = (a: number | null, b: number | null) => (a === null || b === null 
 
 /** Count every probe once (the cross-adapter agreement check), timing each —
  *  the timings drive [`splitBySpeed`]. A probe that cannot be counted is
- *  recorded as a failure and excluded from the benches instead of aborting the
- *  whole worker: this pre-pass runs the same consume the benches run, so it is
+ *  recorded as a failure and excluded from the benches; the worker carries on: this pre-pass runs the same consume the benches run, so it is
  *  also where a consume-budget breach surfaces first. */
 async function countAll(a: StoreAdapter, h: unknown, pats: Pat[]): Promise<Record<string, number>> {
     const costMs: Record<string, number> = {};
@@ -190,8 +189,8 @@ async function runQuery(a: StoreAdapter): Promise<Row[]> {
     th = null;
 
     if (a.quadsUnsupported) {
-        // No graph in the model at all — say so per probe rather than leaving
-        // cells that read as benchmarks nobody ran. This store answered the
+        // No graph in the model at all — say so per probe, so the cells
+        // read as unsupported, not as benchmarks nobody ran. This store answered the
         // triple patterns above, on the projection of the same rows.
         for (const p of qProbes.quads) {
             for (const id of [`${a.slug}::${p.name}`, `${a.slug}::${p.name}::count`]) {
@@ -207,8 +206,8 @@ async function runQuery(a: StoreAdapter): Promise<Row[]> {
     } else {
         console.log(`[${a.label}] ingest…`);
         await bench('ingest', rows, HEAVY_OPTS, (b) => {
-            // Dispose in `afterEach` (untimed) rather than inside the timed function, so
-            // freeing the previous store never pollutes the measured ingest cost.
+            // Dispose in `afterEach` (untimed), so freeing the previous store
+            // never pollutes the measured ingest cost.
             let h: unknown;
             b.add(`ingest::${a.slug}`, async () => { h = await a.build(triples); }, {
                 afterEach: () => { reclaim(a, h); h = undefined; },
@@ -225,8 +224,8 @@ async function runQuery(a: StoreAdapter): Promise<Row[]> {
  *
  * Each iteration answers the FIRST query on a freshly adopted store. The adopt
  * happens in tinybench's `beforeEach`, which is untimed, so the column isolates
- * what a query costs against empty caches rather than reporting that plus the
- * cost of building a store. Opening is measured separately as `open::<slug>`,
+ * what a query costs against empty caches, excluding the cost of building a
+ * store. Opening is measured separately as `open::<slug>`,
  * mirroring the Python tab, so the two are attributable on their own.
  *
  * The process isolation is not stylistic. The first query on an adopted store
@@ -240,8 +239,8 @@ async function runQueryCold(a: StoreAdapter): Promise<Row[]> {
     const rows: Row[] = [];
     if (!a.snapshot || !a.open) {
         // No persistent form: nothing to reopen, so no cold rows — and no open
-        // either. Say so in the cell rather than leaving a bare dash, which
-        // reads as a measurement nobody took. Getting this store queryable in a
+        // either. Say so in the cell; a bare dash would read as a measurement
+        // nobody took. Getting this store queryable in a
         // fresh process is a rebuild from quads, which the Ingest column reports.
         rows.push(unsupportedRow(
             `open::${a.slug}`,
@@ -328,7 +327,7 @@ async function runFullScan(a: StoreAdapter): Promise<Row[]> {
     //
     // Guarded: this pre-pass runs the same consume the benches below run, so a
     // store that cannot scan at all — a trap, or the consume budget — fails
-    // HERE, once, and the benches are skipped rather than left to fail three
+    // HERE, once, and the benches are skipped; they would otherwise fail three
     // more times. Its timing also picks the repetition plan.
     let preMs: number | null = null;
     try {

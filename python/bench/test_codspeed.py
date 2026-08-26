@@ -65,8 +65,7 @@ from vortex_rdf import VortexRdfStore, serialize_rdf  # noqa: E402
 #
 # The defaults are the size all three CodSpeed suites share -- 32**3 = 32,768,
 # which core/benches/support/mod.rs takes as its BENCH_SIZE default -- so one
-# shared-core regression lands in all three tabs at comparable magnitude
-# instead of showing up in one and hiding in another. It is also 4 zones of
+# shared-core regression lands in all three tabs at comparable magnitude. It is also 4 zones of
 # 8,192 rows, the smallest round size at which zone pruning has anything to
 # prune.
 DIM = int(os.environ.get("CODSPEED_BENCH_DIM", 32))  # triples: DIM**3 rows
@@ -163,8 +162,8 @@ def stores(store_paths) -> dict[str, VortexRdfStore]:
 def test_build(benchmark, tmp_path_factory, data, variant):
     """Parse an RDF file and write the `.vortex` store, per star variant.
 
-    `dict` runs over the cardinality-realistic dataset rather than the
-    cube, as in the JS suite: it is the guard on dictionary construction, and on
+    `dict` runs over the cardinality-realistic dataset, not the cube, as in
+    the JS suite: it is the guard on dictionary construction, and on
     the cube the dictionary is a few dozen terms and its build cost invisible.
     Its number is therefore NOT comparable with the cube variants beside it.
     """
@@ -209,7 +208,7 @@ def _cold_query(benchmark, path: str, pattern: Pat) -> None:
     `match_cold_*` groups and the JS suite's `query_cold_*` tasks.
 
     The open is outside the measured callable, so this isolates the query
-    against empty caches rather than reporting that plus the open; opening is
+    against empty caches, excluding the open; opening is
     its own task (`test_open`). That works because instrumentation measures a
     single invocation — which is genuinely the store's first query. Under a
     harness that called the function repeatedly the later calls would be warm,
