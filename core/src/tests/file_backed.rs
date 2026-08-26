@@ -1,79 +1,9 @@
+//! File-backed stores: zone-map pruning, the bound-subject chunk probe,
+//! open validation, and the per-layout matching matrix over files.
+
 use super::*;
-use std::sync::OnceLock;
 
-// ─── 6) File-backed edge behavior ──────────────────────────────────────
-
-#[tokio::test]
-async fn test_file_backed_filtered_size() {
-    // 20 quads alternating between two predicates (10 each).
-    let quads: Vec<Quad> = (0..20)
-        .map(|i| {
-            make_quad(
-                &format!("http://example.org/s{}", i),
-                &format!("http://example.org/p{}", i % 2),
-                "o",
-                GraphName::DefaultGraph,
-            )
-        })
-        .collect();
-
-    let (_dir, path) = write_store_file(quads, LayoutStrategy::Default, vec![]).await;
-
-    let store = VortexRdfStore::from_file(&path).await.unwrap();
-    assert_eq!(store.size().await.unwrap(), 20);
-
-    // size() on a filtered file-backed store must report the *filtered*
-    // count, not file.row_count().
-    let p0 = NamedNode::new("http://example.org/p0").unwrap();
-    let filtered = store
-        .match_pattern(None, Some(&p0), None, None)
-        .await
-        .unwrap();
-    assert_eq!(filtered.size().await.unwrap(), 10);
-}
-
-#[tokio::test]
-async fn test_file_backed_secondary_index_object_predicate() {
-    let quads: Vec<Quad> = (0..30)
-        .map(|i| {
-            make_quad(
-                &format!("http://example.org/s{}", i),
-                &format!("http://example.org/p{}", i % 3),
-                &format!("o{}", i % 5),
-                GraphName::DefaultGraph,
-            )
-        })
-        .collect();
-
-    let (_dir, path) = write_store_file(
-        quads,
-        LayoutStrategy::Default,
-        vec![IndexType::SecondaryByReference],
-    )
-    .await;
-
-    let store = VortexRdfStore::from_file(&path).await.unwrap();
-
-    let o1 = Term::Literal(Literal::new_simple_literal("o1"));
-    let by_object = store
-        .match_pattern(None, None, Some(&o1), None)
-        .await
-        .unwrap();
-    assert_eq!(by_object.size().await.unwrap(), 6);
-
-    let p2 = NamedNode::new("http://example.org/p2").unwrap();
-    let by_predicate = store
-        .match_pattern(None, Some(&p2), None, None)
-        .await
-        .unwrap();
-    assert_eq!(by_predicate.size().await.unwrap(), 10);
-
-    let by_both = store
-        .match_pattern(None, Some(&p2), Some(&o1), None)
-        .await
-        .unwrap();
-    assert_eq!(by_both.size().await.unwrap(), 2);
-}
+// ─── Zone-map pruning ──────────────────────────────────────────────────
 
 /// Predicate matches whose zone-map hits are NOT contiguous (clusters at both
 /// ends of an s-sorted file, with a middle zone whose stats exclude the
@@ -88,8 +18,7 @@ async fn test_file_backed_non_contiguous_predicate_matches() {
     const N: usize = 3 * 8192;
     const CLUSTER: usize = 64;
 
-    // The serialize of the 24,576-row fixture dominates this test's
-    // runtime, so its bytes are built once per process.
+    // Serialized once per process (see `cached_store_bytes`).
     static BYTES: OnceLock<Vec<u8>> = OnceLock::new();
     let bytes = cached_store_bytes(&BYTES, || async {
         let quads: Vec<Quad> = (0..N)
@@ -154,9 +83,9 @@ async fn test_file_backed_non_contiguous_predicate_matches() {
 async fn test_file_backed_chained_subject_then_object_index() {
     const N: usize = 3 * 8192;
 
-    // Built once per process, like the non-contiguous fixture above — the
-    // two shapes differ (this one needs the reference index and modular
-    // predicates), so they cannot share one file.
+    // Serialized once per process (see `cached_store_bytes`); this shape
+    // (reference index, modular predicates) cannot share the non-contiguous
+    // fixture's file.
     static BYTES: OnceLock<Vec<u8>> = OnceLock::new();
     let bytes = cached_store_bytes(&BYTES, || async {
         let quads: Vec<Quad> = (0..N)
@@ -249,9 +178,7 @@ async fn test_file_backed_chained_subject_then_object_index() {
 
 #[tokio::test]
 async fn test_file_backed_subject_metadata_range_for_missing_subject() {
-    let mut quads = modular_quads(25, 1, 1);
-    quads.reverse();
-
+    let quads = modular_quads(25, 1, 1);
     let (_dir, path) = write_store_file(quads, LayoutStrategy::Default, vec![]).await;
 
     let store = VortexRdfStore::from_file(&path).await.unwrap();
@@ -273,7 +200,7 @@ async fn test_file_backed_subject_metadata_range_for_missing_subject() {
     );
 }
 
-// ─── Bound-subject chunk-probe fast path ───────────────────────────────
+// ─── Subject chunk probe ───────────────────────────────────────────────
 
 /// Sorted Dictionary quads with 3-quad subject runs — the shape the encoded
 /// chunk-probe fast path serves.
@@ -290,16 +217,12 @@ fn probe_path_quads(n_subjects: usize) -> Vec<Quad> {
         .collect()
 }
 
-fn subject(i: usize) -> NamedOrBlankNode {
-    NamedOrBlankNode::NamedNode(NamedNode::new(format!("http://example.org/s{i:04}")).unwrap())
-}
-
 /// The fast path engages on a sorted Dictionary file — the debug hook
 /// reports the exact run — and every subject-bound shape answers exactly
 /// like the in-memory store over the same quads: first/mid/last subjects,
 /// absent subjects, and [S]/[SP]/[SPO]/[SG] residual composition.
 #[tokio::test]
-async fn test_file_subject_probe_matches_memory() {
+async fn test_file_backed_subject_chunk_probe_matches_memory() {
     let quads = probe_path_quads(2000);
     let (_dir, path) = write_store_file(
         quads.clone(),
@@ -318,14 +241,18 @@ async fn test_file_subject_probe_matches_memory() {
     let memory = VortexRdfStore::from_built(arr).unwrap();
 
     // Engagement, pinned directly: the exact 3-row run for a mid subject.
-    let mid = subject(777);
+    let mid = subject_node(777, 4);
     let range = store.debug_subject_chunk_probe_range(&mid).await.unwrap();
     assert_eq!(range, Some(777 * 3..777 * 3 + 3), "fast path must engage");
 
     let p = NamedNode::new("http://example.org/p1").unwrap();
     let o = Term::Literal(Literal::new_simple_literal("object 3"));
     let g = GraphName::DefaultGraph;
-    for s in [subject(0), subject(777), subject(1999)] {
+    for s in [
+        subject_node(0, 4),
+        subject_node(777, 4),
+        subject_node(1999, 4),
+    ] {
         for (pp, po, pg) in [
             (None, None, None),
             (Some(&p), None, None),
@@ -354,12 +281,12 @@ async fn test_file_subject_probe_matches_memory() {
 /// Tombstones and tails compose with the probed range: a deleted quad
 /// leaves the run, an added quad joins it through the tail.
 #[tokio::test]
-async fn test_file_subject_probe_with_mutation() {
+async fn test_file_backed_subject_chunk_probe_with_mutation() {
     let quads = probe_path_quads(100);
     let (_dir, path) = write_store_file(quads.clone(), LayoutStrategy::Dictionary, vec![]).await;
     let store = VortexRdfStore::from_file(&path).await.unwrap();
 
-    let s50 = subject(50);
+    let s50 = subject_node(50, 4);
     let doomed = quads[50 * 3].clone();
     let store = store.delete_quad(&doomed).await.unwrap();
     let matched = store
@@ -394,7 +321,7 @@ async fn test_file_subject_probe_with_mutation() {
 /// must equal the in-memory result — and the second match must not attach a
 /// serve plan (the view already carries a restriction).
 #[tokio::test]
-async fn test_file_subject_probe_chained() {
+async fn test_file_backed_subject_chunk_probe_chained() {
     let quads = probe_path_quads(500);
     let (_dir, path) = write_store_file(
         quads.clone(),
@@ -413,7 +340,7 @@ async fn test_file_subject_probe_chained() {
     let memory = VortexRdfStore::from_built(arr).unwrap();
 
     let p = NamedNode::new("http://example.org/p2").unwrap();
-    let s = subject(444);
+    let s = subject_node(444, 4);
     let got_first = store
         .match_pattern(None, Some(&p), None, None)
         .await
@@ -435,14 +362,11 @@ async fn test_file_subject_probe_chained() {
 
 /// A file whose rows are not globally sorted must NOT engage the fast path —
 /// no sortedness, no binary search — while subject matches stay correct
-/// through the scan path.
-///
-/// No writer of ours emits such a file any more — every build sorts, and a
-/// tailed store's serialization re-sorts the merged rows — so the rows are
-/// encoded and written directly here, rotated out of order and unstamped, the
-/// way a foreign (or older) writer's file arrives.
+/// through the scan path. The rows are encoded and written directly, rotated
+/// out of order and without the sorted stamp — the shape a foreign writer's
+/// file arrives in.
 #[tokio::test]
-async fn test_file_subject_probe_requires_sorted() {
+async fn test_file_backed_subject_chunk_probe_requires_sorted() {
     use crate::store::layouts::dictionary::{self, TermDictionary};
 
     let mut raws: Vec<crate::store::RawQuad> = probe_path_quads(50)
@@ -468,7 +392,7 @@ async fn test_file_subject_probe_requires_sorted() {
     std::fs::write(&path, &bytes).unwrap();
 
     let store = VortexRdfStore::from_file(&path).await.unwrap();
-    let s = subject(10);
+    let s = subject_node(10, 4);
     assert_eq!(
         store.debug_subject_chunk_probe_range(&s).await.unwrap(),
         None
@@ -478,4 +402,97 @@ async fn test_file_subject_probe_requires_sorted() {
         .await
         .unwrap();
     assert_eq!(matched.size().await.unwrap(), 3);
+}
+
+// ─── Open validation ───────────────────────────────────────────────────
+
+/// A file written by a generic Vortex writer — a valid Vortex file, but not a
+/// native store — fails at open with an actionable error naming the expected
+/// root layout, rather than a scan-time surprise.
+#[tokio::test]
+async fn test_from_file_rejects_foreign_vortex_file() {
+    use vortex_file::WriteOptionsSessionExt as _;
+
+    // A bare u32 code schema, written by the raw Vortex writer under a
+    // plain root layout.
+    let array = bare_code_quad_array(&[1, 2, 3]);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("bare.vortex");
+    let dtype = array.dtype().clone();
+    let stream = vortex_array::stream::ArrayStreamAdapter::new(
+        dtype,
+        Box::pin(futures::stream::once(async move { Ok(array) })),
+    );
+    let mut writer = tokio::fs::File::create(&path).await.unwrap();
+    crate::session::VORTEX_SESSION
+        .write_options()
+        .write(&mut writer, stream)
+        .await
+        .unwrap();
+
+    let err = VortexRdfStore::from_file(&path)
+        .await
+        .err()
+        .expect("open should fail");
+    assert!(
+        err.to_string().contains("not a vortex-rdf store file"),
+        "unexpected error: {err}"
+    );
+}
+
+// ─── File-backed matching, by layout ───────────────────────────────────
+
+/// One cell of the 3-layout matrix: write the layout's dataset to a file,
+/// open it, and hand the store to the layout's `probe` — the probes each
+/// bind the term family their layout represents differently on disk.
+async fn run_match_pattern_file_test<F, Fut>(layout: LayoutStrategy, quads: Vec<Quad>, probe: F)
+where
+    F: FnOnce(VortexRdfStore) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    let (_dir, path) = write_store_file(quads, layout, vec![]).await;
+    let store = VortexRdfStore::from_file(&path).await.unwrap();
+    probe(store).await;
+}
+
+/// Dictionary layout (over `dictionary_test_quads`): a pushed-down integer
+/// filter on the code columns, and a term absent from the dictionary.
+async fn probe_dictionary(store: VortexRdfStore) {
+    let p0 = NamedNode::new("http://example.org/p0").unwrap();
+    let filtered = store
+        .match_pattern(None, Some(&p0), None, None)
+        .await
+        .unwrap();
+    assert_eq!(filtered.size().await.unwrap(), 4);
+    let results: Vec<Quad> = filtered.quads().unwrap().try_collect().await.unwrap();
+    assert!(
+        results
+            .iter()
+            .all(|q| q.predicate == "http://example.org/p0")
+    );
+
+    let missing_p = NamedNode::new("http://example.org/nope").unwrap();
+    let empty = store
+        .match_pattern(None, Some(&missing_p), None, None)
+        .await
+        .unwrap();
+    assert_eq!(empty.size().await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn test_match_file_default() {
+    run_match_pattern_file_test(LayoutStrategy::Default, two_quads(), probe_default).await;
+}
+#[tokio::test]
+async fn test_match_file_typed_object() {
+    run_match_pattern_file_test(LayoutStrategy::TypedObject, two_quads(), probe_typed_object).await;
+}
+#[tokio::test]
+async fn test_match_file_dictionary() {
+    run_match_pattern_file_test(
+        LayoutStrategy::Dictionary,
+        dictionary_test_quads(),
+        probe_dictionary,
+    )
+    .await;
 }

@@ -25,18 +25,15 @@ fn canonical_names_round_trip() {
     }
 }
 
-/// Parsing is strict: only the canonical kebab-case names are accepted, so
-/// the retired binding spellings (PascalCase, underscores, short forms) must
-/// be rejected, not silently folded into a canonical arm.
+/// Parsing is strict: only the canonical kebab-case names are accepted;
+/// PascalCase, snake_case and short forms are rejected rather than folded
+/// into a canonical arm.
 #[test]
 fn non_canonical_spellings_are_rejected() {
-    // Retired JS PascalCase.
     assert!("TypedObject".parse::<LayoutStrategy>().is_err());
     assert!("Dictionary".parse::<LayoutStrategy>().is_err());
     assert!("SecondaryByCopy".parse::<IndexType>().is_err());
     assert!("SecondaryByReference".parse::<IndexType>().is_err());
-
-    // Retired Python underscore and short forms.
     assert!("typed_object".parse::<LayoutStrategy>().is_err());
 
     // The error names the canonical vocabulary.

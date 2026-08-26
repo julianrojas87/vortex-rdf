@@ -1,6 +1,9 @@
+//! Mutation: appends into the tail, tombstoning deletes, set semantics,
+//! auto-compaction thresholds, and the owner-only rule for views.
+
 use super::*;
 
-// ─── 5) Mutation behavior ───────────────────────────────────────────────
+// ─── Mutation ──────────────────────────────────────────────────────────
 
 async fn run_add_delete_test<B: VortexArrayBuilder>() {
     let q1 = make_quad(
@@ -450,6 +453,90 @@ async fn test_file_backed_add_auto_compacts_past_threshold() {
     );
 }
 
+/// Compacting a file-backed store rewrites the compacted rows back over its
+/// own source file and stays file-backed: an independent reopen of the path
+/// sees the folded-in, tombstone-free data, the rebuilt index survives, a
+/// later append is folded into the file too, and no sibling artifact (temp
+/// file, spill run) is left beside the store.
+#[cfg(feature = "file-io")]
+#[tokio::test]
+async fn test_file_backed_compaction_rewrites_source_file() {
+    let (_dir, path) = write_store_file(
+        modular_quads(12, 2, 3),
+        LayoutStrategy::Default,
+        vec![IndexType::SecondaryByReference],
+    )
+    .await;
+    let only_the_store_file = || {
+        let entries: Vec<std::path::PathBuf> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        assert_eq!(
+            entries,
+            std::slice::from_ref(&path),
+            "compaction must leave no sibling artifacts"
+        );
+    };
+
+    let store = VortexRdfStore::from_file(&path).await.unwrap();
+
+    // Delete "object 0" (i = 0, 3, 6, 9): 4 rows tombstoned, 8 live.
+    let object0 = Term::Literal(Literal::new_simple_literal("object 0"));
+    let after = store
+        .delete_matching(None, None, Some(&object0), None)
+        .await
+        .unwrap();
+    assert_eq!(after.size().await.unwrap(), 8);
+
+    // Compact, keeping the index set: tombstoned rows are reclaimed and the
+    // source file is rewritten in place.
+    let compacted = after.compact().await.unwrap();
+    only_the_store_file();
+    assert_eq!(compacted.size().await.unwrap(), 8);
+    assert_eq!(
+        compacted.indexes(),
+        &vec![IndexType::SecondaryByReference],
+        "compaction rebuilds the store's index set"
+    );
+    // The rebuilt index routes over the compacted rows: the deleted object
+    // is gone for good.
+    assert_eq!(
+        compacted
+            .match_pattern(None, None, Some(&object0), None)
+            .await
+            .unwrap()
+            .size()
+            .await
+            .unwrap(),
+        0,
+    );
+
+    // Proof the file itself was overwritten: an independent reopen of the
+    // path sees the compacted, tombstone-free data — not the original 12.
+    let reopened = VortexRdfStore::from_file(&path).await.unwrap();
+    assert_eq!(reopened.size().await.unwrap(), 8);
+    assert_eq!(reopened.indexes(), &vec![IndexType::SecondaryByReference]);
+
+    // A file-backed store keeps its tail until an explicit compact; that
+    // compaction folds the appended row into the file too.
+    let extra = make_quad(
+        "http://example.org/s99",
+        "http://example.org/p0",
+        "object 9",
+        GraphName::DefaultGraph,
+    );
+    let appended = reopened.add_quad(extra).await.unwrap();
+    assert_eq!(appended.tail_len(), 1);
+    let recompacted = appended.compact().await.unwrap();
+    only_the_store_file();
+    assert_eq!(recompacted.tail_len(), 0);
+    assert_eq!(recompacted.size().await.unwrap(), 9);
+    // The append now lives in the file on disk.
+    let reopened2 = VortexRdfStore::from_file(&path).await.unwrap();
+    assert_eq!(reopened2.size().await.unwrap(), 9);
+}
+
 /// Under the Dictionary layout the tail stores term strings (an appended
 /// term has no code in the sorted dictionary), and patterns probe the base
 /// by code and the tail by string — so a term the dictionary has never
@@ -667,9 +754,9 @@ async fn test_compaction_folds_tail_and_sorts() {
     assert_eq!(again.size().await.unwrap(), 8);
 }
 
-/// File-backed stores append the same way: the file stays immutable, the
-/// tail lives in memory beside it, and queries union the pushed-down scan
-/// with the tail scan.
+/// File-backed stores append the same way: the file is untouched by the
+/// append (the tail lives in memory beside it) and queries union the
+/// pushed-down scan with the tail scan.
 #[cfg(feature = "file-io")]
 #[tokio::test]
 async fn test_file_backed_add_quads() {
@@ -736,13 +823,24 @@ async fn test_file_backed_add_quads() {
     let deleted = added.delete_quad(&quads[0]).await.unwrap();
     assert_eq!(deleted.size().await.unwrap(), 13);
 
-    // Compaction folds file + tail into a sorted, indexed in-memory store.
+    // Compaction folds the tail into the source file (rewritten in place)
+    // and stays file-backed.
     let compacted = deleted
         .compact_with_indexes(vec![IndexType::SecondaryByReference])
         .await
         .unwrap();
     assert_eq!(compacted.size().await.unwrap(), 13);
     assert_eq!(compacted.indexes(), &[IndexType::SecondaryByReference]);
+    assert_eq!(
+        VortexRdfStore::from_file(&path)
+            .await
+            .unwrap()
+            .size()
+            .await
+            .unwrap(),
+        13,
+        "compaction rewrites the source file"
+    );
     assert_eq!(
         compacted
             .match_pattern(None, None, Some(&object9), None)

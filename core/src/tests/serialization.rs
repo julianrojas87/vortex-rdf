@@ -1,18 +1,18 @@
+//! The vortex-rdf.store.v1 wire contract. Every test here asserts the same
+//! contract from a different starting state (tailed, tombstoned,
+//! file-backed, dictionary, locally-sorted multi-chunk): `to_bytes` /
+//! `from_bytes` must carry the store's index components and its sortedness
+//! provenance faithfully — rebuilt where a mutation invalidated them, never
+//! silently dropped, never over-claimed.
+
 use super::*;
 use crate::io::container;
 use crate::store::schema;
 
-// ─── 8) The vortex-rdf.store.v1 wire contract ──────────────────────────
-//
-// Every test here asserts the same contract from a different starting
-// state (tailed, tombstoned, file-backed, dictionary, locally-sorted
-// multi-chunk): `to_bytes`/`from_bytes` must carry the store's index
-// components and its sortedness provenance faithfully — rebuilt where a
-// mutation invalidated them, never silently dropped, never over-claimed.
+// ─── Wire round-trips ──────────────────────────────────────────────────
 
-/// The tailed-serialization wart is fixed: a tailed store's `to_bytes`
-/// REBUILDS its index components over the merged rows instead of silently
-/// dropping them, so the round-tripped store keeps its index set — under the
+/// A tailed store's `to_bytes` rebuilds its index components over the
+/// merged rows, so the round-tripped store keeps its index set under the
 /// Dictionary layout (fresh dictionary, code components) and the string
 /// layouts alike.
 #[tokio::test]
@@ -235,8 +235,7 @@ async fn test_file_backed_to_bytes_keeps_quads_sorted() {
 }
 
 /// Serialization is deterministic: two `to_bytes` of the same store are
-/// byte-identical (the invariant the dictionary-child chunk memo will rely
-/// on when the pass-through strategy lands).
+/// byte-identical.
 #[tokio::test]
 async fn test_to_bytes_is_byte_stable() {
     let quads: Vec<Quad> = (0..500)
@@ -310,7 +309,6 @@ async fn test_locally_sorted_children_from_bytes_match_correctly() {
             child_chunks[family_ix].push(copy_child_chunk(family, &keys).unwrap());
         }
     }
-    let dtype = quad_chunks[0].dtype().clone();
     let components: Vec<container::NativeComponentWrite> = [Family::Posg, Family::Ospg]
         .into_iter()
         .zip(child_chunks)
@@ -334,20 +332,7 @@ async fn test_locally_sorted_children_from_bytes_match_correctly() {
             .unwrap()
         })
         .collect();
-    let mut bytes: Vec<u8> = Vec::new();
-    container::write_store(
-        &crate::session::VORTEX_SESSION,
-        &mut bytes,
-        vortex_array::stream::ArrayStreamAdapter::new(
-            dtype,
-            Box::pin(futures::stream::iter(quad_chunks.into_iter().map(Ok))),
-        ),
-        container::default_child_strategy(),
-        false,
-        components,
-    )
-    .await
-    .unwrap();
+    let bytes = unstamped_store_bytes(quad_chunks, components).await;
 
     let store = VortexRdfStore::from_bytes(&bytes).await.unwrap();
     assert_eq!(store.indexes(), &[IndexType::SecondaryByCopy]);
@@ -509,34 +494,14 @@ async fn test_from_parts_adopts_searchable_children() {
         1
     );
 
-    // Rows with no sorted provenance: adoption must not invent a stamp they
-    // never earned. No writer of ours emits such a store any more — every
-    // build sorts and every rebuild re-sorts — so the shape is written
-    // directly here, as a foreign (or older) writer's file would arrive.
-    let mut raws: Vec<crate::store::RawQuad> = quads
-        .iter()
-        .rev()
-        .map(crate::store::RawQuad::from_quad)
-        .collect();
-    raws.rotate_left(3);
-    let unsorted =
-        crate::store::builders::build_struct_array(&raws, LayoutStrategy::Default, false).unwrap();
-    let dtype = unsorted.dtype().clone();
-    let mut bytes: Vec<u8> = Vec::new();
-    container::write_store(
-        &crate::session::VORTEX_SESSION,
-        &mut bytes,
-        vortex_array::stream::ArrayStreamAdapter::new(
-            dtype,
-            Box::pin(futures::stream::once(async move { Ok(unsorted) })),
-        ),
-        container::default_child_strategy(),
-        false,
-        vec![],
-    )
-    .await
-    .unwrap();
-    let adopted = VortexRdfStore::from_bytes(&bytes).await.unwrap();
+    // Rows with no sorted provenance (reversed, rotated): adoption must not
+    // invent a stamp they never earned.
+    let quads_unsorted = {
+        let mut v: Vec<Quad> = quads.iter().rev().cloned().collect();
+        v.rotate_left(3);
+        v
+    };
+    let adopted = unstamped_store(&quads_unsorted);
     assert!(
         !VortexRdfStore::from_parts(adopted.to_serializable_parts().await.unwrap())
             .unwrap()
@@ -545,11 +510,9 @@ async fn test_from_parts_adopts_searchable_children() {
     );
 }
 
-/// Serializing a store that still carries an append tail re-establishes the
-/// sorted order the tail broke: the rebuild it already runs (fresh dictionary,
-/// re-sorted index children) now orders the primary rows too, so the artifact
-/// claims `quads_sorted` and every later reader keeps the subject fast path
-/// without having to compact first.
+/// Serializing a store that carries an append tail emits its rows in sorted
+/// order: the artifact claims `quads_sorted`, and a reader keeps the subject
+/// fast path without compacting first.
 #[tokio::test]
 async fn test_tailed_serialization_restores_sorted_order() {
     for layout in [
@@ -628,7 +591,7 @@ async fn test_tailed_serialization_restores_sorted_order() {
 /// it was serialized from, with its sorted columns bound by encoded search
 /// probes rather than the generic per-scalar kernel.
 #[tokio::test]
-async fn test_from_bytes_matches_equal_canonical_across_patterns() {
+async fn test_from_bytes_and_from_parts_answer_every_pattern_like_from_built() {
     // Repeated subjects (4 quads each) over enough rows that the sorted
     // subject column keeps a compressed wire form worth probing; object
     // cardinality high enough that code columns bit-pack rather than

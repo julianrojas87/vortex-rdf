@@ -469,39 +469,3 @@ impl VortexRdfStore {
         self.dictionary_snapshot()
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::{StoreParts, VortexRdfStore};
-    use vortex_array::IntoArray as _;
-    use vortex_array::arrays::struct_::StructArray;
-    use vortex_array::validity::Validity;
-    use vortex_buffer::Buffer;
-
-    /// A bare Dictionary-layout array cannot self-describe, and `from_parts`
-    /// says so.
-    #[test]
-    fn test_from_parts_rejects_bare_dictionary_array() {
-        let col = || Buffer::from_iter([1u32, 2, 3]).into_array();
-        let array = StructArray::try_new(
-            ["s", "p", "o", "g"].into(),
-            vec![col(), col(), col(), col()],
-            3,
-            Validity::NonNullable,
-        )
-        .unwrap()
-        .into_array();
-        let err = VortexRdfStore::from_parts(StoreParts {
-            array,
-            components: Vec::new(),
-            dict: None,
-            quads_sorted: false,
-        })
-        .err()
-        .expect("from_parts should fail");
-        assert!(
-            err.to_string().contains("from_built"),
-            "unexpected error: {err}"
-        );
-    }
-}

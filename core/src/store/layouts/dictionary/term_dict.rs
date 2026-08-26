@@ -106,7 +106,7 @@ impl TermChunk {
     }
 
     /// The held column as an array, in its stored encoding.
-    #[cfg(any(feature = "file-io", target_arch = "wasm32"))]
+    #[cfg(any(feature = "file-io", target_arch = "wasm32", test))]
     fn array(&self) -> ArrayRef {
         match self {
             TermChunk::Canonical(a) => a.clone().into_array(),
@@ -758,6 +758,17 @@ impl TermDictionary {
             },
             &mut ctx,
         )
+    }
+}
+
+#[cfg(test)]
+impl TermDictionary {
+    /// The held term chunks as arrays, each in its stored encoding.
+    pub(crate) fn term_chunks(&self) -> Vec<ArrayRef> {
+        match &self.terms {
+            TermStore::Single(c) => vec![c.array()],
+            TermStore::Chunked(c) => c.chunks.iter().map(TermChunk::array).collect(),
+        }
     }
 }
 

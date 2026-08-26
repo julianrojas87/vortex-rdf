@@ -35,17 +35,13 @@ pub(crate) fn escaped_literal_cases() -> Vec<Term> {
     ]
 }
 
-fn subject(i: usize) -> NamedOrBlankNode {
-    NamedOrBlankNode::NamedNode(NamedNode::new(format!("http://example.org/s{:02}", i)).unwrap())
-}
-
 fn escaped_literal_quads() -> Vec<Quad> {
     escaped_literal_cases()
         .into_iter()
         .enumerate()
         .map(|(i, o)| {
             Quad::new(
-                subject(i),
+                subject_node(i, 2),
                 NamedNode::new("http://example.org/p").unwrap(),
                 o,
                 GraphName::DefaultGraph,
@@ -128,7 +124,7 @@ fn stored_object_strings_survive_a_parse_and_reserialize() {
     for term in escaped_literal_cases() {
         let stored = term.to_string();
         let quad = Quad::new(
-            subject(0),
+            subject_node(0, 2),
             NamedNode::new("http://example.org/p").unwrap(),
             parse_term(&stored).unwrap(),
             GraphName::DefaultGraph,

@@ -1,9 +1,13 @@
+//! The Dictionary layout on files: the residency axis (a dictionary left in
+//! its serialized child, probed by point reads, versus lifted resident) and
+//! the native container round-trips of the dictionary child.
+
 use super::*;
-use crate::io::container::DICT_COMPONENT_NAME;
+use crate::io::container::{self, DICT_COMPONENT_NAME};
 use crate::store::layouts::dictionary::FileBackedDict;
 use crate::store::native_file::NativeStoreFile;
 
-// ─── 7b) File-backed dictionary ─────────────────────────────────────────
+// ─── File-backed dictionary ────────────────────────────────────────────
 
 /// Sorted string forms of a pattern match on `store`.
 async fn matched_strings(
@@ -55,10 +59,14 @@ async fn test_file_backed_dictionary_shared_quads_match_resident() {
 }
 
 /// A store opened with the dictionary forced file-backed must answer every
-/// pattern family identically to the resident open of the same file.
-async fn assert_file_backed_matches_resident(indexes: Indexes, tag: &str) {
+/// pattern family identically to the resident open of the same file. Hands
+/// back the temp dir guard with both opens for further probes.
+async fn assert_file_backed_matches_resident(
+    indexes: Indexes,
+    tag: &str,
+) -> (tempfile::TempDir, VortexRdfStore, VortexRdfStore) {
     let quads = dictionary_test_quads();
-    let (_dir, path) = write_store_file(quads.clone(), LayoutStrategy::Dictionary, indexes).await;
+    let (dir, path) = write_store_file(quads.clone(), LayoutStrategy::Dictionary, indexes).await;
 
     let resident = VortexRdfStore::from_file(&path).await.unwrap();
     let fb = VortexRdfStore::from_file_with_dict_residency(&path, 0)
@@ -136,6 +144,7 @@ async fn assert_file_backed_matches_resident(indexes: Indexes, tag: &str) {
     assert!(fb.contains(q0).await.unwrap(), "{tag}: contains");
     let empty = matched_strings(&fb, None, Some(&absent), None, None).await;
     assert!(empty.is_empty(), "{tag}: absent term matches nothing");
+    (dir, fb, resident)
 }
 
 #[tokio::test]
@@ -147,19 +156,11 @@ async fn test_file_backed_dictionary_matches_resident() {
 /// must stream through the async decode path and still agree with resident.
 #[tokio::test]
 async fn test_file_backed_dictionary_serves_from_copy_index() {
-    assert_file_backed_matches_resident(vec![IndexType::SecondaryByCopy], "copy_index").await;
+    let (_dir, fb, _resident) =
+        assert_file_backed_matches_resident(vec![IndexType::SecondaryByCopy], "copy_index").await;
 
     // And explicitly confirm the serving plan engages on the file-backed
     // store (the equality above would hold even off the fallback path).
-    let (_dir, path) = write_store_file(
-        dictionary_test_quads(),
-        LayoutStrategy::Dictionary,
-        vec![IndexType::SecondaryByCopy],
-    )
-    .await;
-    let fb = VortexRdfStore::from_file_with_dict_residency(&path, 0)
-        .await
-        .unwrap();
     let p0 = NamedNode::new("http://example.org/p0").unwrap();
     let matched = fb.match_pattern(None, Some(&p0), None, None).await.unwrap();
     assert!(matched.debug_has_serve_plan());
@@ -298,9 +299,8 @@ async fn test_tombstoned_indexed_codes_address_cached_dictionary() {
 async fn test_file_backed_dictionary_probe_parity() {
     // Enough unique terms to spread the dictionary across several chunk
     // leaves, so the probe's binary search genuinely crosses between them.
-    // The 20k-quad serialize dominates this test's runtime, so the fixture's
-    // bytes are built once per process.
-    static BYTES: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+    // Serialized once per process (see `cached_store_bytes`).
+    static BYTES: OnceLock<Vec<u8>> = OnceLock::new();
     let bytes = cached_store_bytes(&BYTES, || async {
         let quads: Vec<Quad> = (0..20_000)
             .map(|i| {
@@ -421,4 +421,142 @@ async fn test_file_backed_dictionary_rejects_below_first_term() {
     assert_eq!(fb.encode("!").await.unwrap(), None);
     // And row 0 itself still resolves.
     assert_eq!(fb.encode(&first_term).await.unwrap(), Some(0));
+}
+
+// ─── Dictionary child round-trips ──────────────────────────────────────
+
+/// The term column stays FSST-encoded through a to_bytes/from_bytes round
+/// trip — read back compressed, not canonicalized on open — and the terms
+/// still resolve through the compressed form.
+#[tokio::test]
+async fn test_dictionary_terms_stay_fsst_through_bytes() {
+    let arr = build_array::<SortedInMemoryBuilder>(
+        quad_stream(fsst_dictionary_quads()),
+        LayoutStrategy::Dictionary,
+        vec![],
+    )
+    .await
+    .unwrap();
+    let store = VortexRdfStore::from_built(arr).unwrap();
+
+    let bytes = store.to_bytes().await.unwrap();
+    let reread = VortexRdfStore::from_bytes(&bytes).await.unwrap();
+    assert_dictionary_terms_fsst(&reread, "reread");
+
+    // And the terms still resolve, through the compressed representation.
+    assert_eq!(reread.size().await.unwrap(), 2_000);
+    let p = NamedNode::new("http://example.org/predicate/3").unwrap();
+    let matched = reread
+        .match_pattern(None, Some(&p), None, None)
+        .await
+        .unwrap();
+    assert_eq!(matched.size().await.unwrap(), 125);
+}
+
+/// The native container end to end through the path-based writer: one
+/// self-contained file whose root carries the transparent quad-source child
+/// and the dictionary child, reopening with identical results.
+#[tokio::test]
+async fn test_dictionary_native_file_roundtrip() {
+    let quads = dictionary_test_quads();
+    let (_dir, path) = write_store_file(quads.clone(), LayoutStrategy::Dictionary, vec![]).await;
+
+    // One self-contained file: the native root with the quad-source child
+    // and the dictionary as an auxiliary child.
+    assert!(!path.with_extension("dict.vortex").exists());
+    let file = crate::io::read::open_vortex_file(&path).await.unwrap();
+    assert!(container::is_native_file(&file));
+    let names: Vec<_> = file.footer().layout().child_names().collect();
+    assert_eq!(names.first().map(|n| n.as_ref()), Some("quad-source"));
+    assert!(names.iter().any(|n| n.as_ref() == "dictionary"));
+
+    let store = VortexRdfStore::from_file(&path).await.unwrap();
+    assert_eq!(store.layout(), LayoutStrategy::Dictionary);
+    assert_eq!(store.size().await.unwrap(), quads.len());
+
+    let p0 = NamedNode::new("http://example.org/p0").unwrap();
+    let matched = store
+        .match_pattern(None, Some(&p0), None, None)
+        .await
+        .unwrap();
+    assert_eq!(matched.size().await.unwrap(), 4);
+    let decoded: Vec<Quad> = store.quads().unwrap().try_collect().await.unwrap();
+    assert_eq!(quad_strings(&decoded), quad_strings(&quads));
+}
+
+/// An empty Dictionary store still writes (and reopens through) the
+/// dictionary segment — the key's presence is unconditional for the layout.
+#[tokio::test]
+async fn test_dictionary_empty_store_roundtrip() {
+    let (_dir, path) = write_store_file(Vec::new(), LayoutStrategy::Dictionary, vec![]).await;
+
+    let store = VortexRdfStore::from_file(&path).await.unwrap();
+    assert_eq!(store.layout(), LayoutStrategy::Dictionary);
+    assert_eq!(store.size().await.unwrap(), 0);
+}
+
+/// A dictionary big enough that the writer splits its child into several
+/// chunks must survive the resident lift still FSST-compressed, chunk by
+/// chunk, with probe parity — the multi-chunk arm of the term store.
+#[tokio::test]
+async fn test_large_dictionary_child_lift_keeps_fsst() {
+    use crate::store::RawQuad;
+    use crate::store::layouts::dictionary::{TermDictionary, TermDictionaryBuilder};
+    use vortex_buffer::ByteBuffer;
+    use vortex_file::OpenOptionsSessionExt as _;
+
+    // ~200k unique terms → several independent FSST windows, so the child is
+    // written (verbatim, through the pass-through strategy) as several flat
+    // leaves and splits back into several chunks.
+    let mut builder = TermDictionaryBuilder::new();
+    for i in 0..50_000u32 {
+        builder.insert_quad(&RawQuad {
+            s: format!("<http://example.org/subject/{i:07}>"),
+            p: format!("<http://example.org/predicate/{i:07}>"),
+            o: format!("\"object value number {i:07}\""),
+            g: format!("<http://example.org/graph/{i:07}>"),
+        });
+    }
+    let (dict, _code_map) = builder.finish().unwrap();
+    let len = dict.len() as u64;
+
+    let bytes = write_dict_only_store(&dict).await;
+    assert!(bytes.len() > 1 << 20, "file too small to force chunking");
+
+    let file = crate::session::VORTEX_SESSION
+        .open_options()
+        .open_buffer(ByteBuffer::from(bytes))
+        .unwrap();
+    let typed = file
+        .footer()
+        .layout()
+        .as_::<container::RdfStoreLayoutVTable>();
+    let (_, child) = container::store_component(typed, container::DICT_COMPONENT_NAME)
+        .unwrap()
+        .unwrap();
+    assert_eq!(child.row_count(), len);
+    let reader = child
+        .new_reader(
+            container::DICT_COMPONENT_NAME.into(),
+            file.segment_source(),
+            file.session(),
+            &Default::default(),
+        )
+        .unwrap();
+    let lifted = TermDictionary::from_child_reader(reader).await.unwrap();
+
+    // Multi-chunk, and every chunk still FSST.
+    let chunks = lifted.term_chunks();
+    assert!(chunks.len() > 1, "large dictionary should lift multi-chunk");
+    for chunk in &chunks {
+        assert_eq!(chunk.encoding_id().to_string(), "vortex.fsst");
+    }
+
+    // Probe parity across chunk boundaries, both directions.
+    for code in (0..len as u32).step_by(7919) {
+        let term = dict.decode(code).unwrap();
+        assert_eq!(lifted.encode(&term), Some(code), "{term}");
+        assert_eq!(lifted.decode(code).as_deref(), Some(term.as_str()));
+    }
+    assert_eq!(lifted.encode("\u{10FFFF}"), None);
 }

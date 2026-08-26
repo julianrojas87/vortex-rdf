@@ -368,8 +368,6 @@ impl FileBackedDict {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use vortex_array::IntoArray;
-    use vortex_array::validity::Validity;
 
     /// The compression windows survive serialization as the child's chunk
     /// leaves: a windowed dictionary's written child resolves one leaf per
@@ -377,8 +375,6 @@ mod tests {
     /// them.
     #[tokio::test]
     async fn windowed_dict_child_chunk_leaves() {
-        use crate::io::container;
-        use vortex_array::stream::ArrayStreamAdapter;
         use vortex_buffer::ByteBuffer;
         use vortex_file::OpenOptionsSessionExt as _;
 
@@ -387,34 +383,7 @@ mod tests {
             .collect();
         let plain = VarBinViewArray::from_iter_str(terms.iter().map(String::as_str));
         let d = TermDictionary::compress_windowed(plain, 100).unwrap();
-
-        // A minimal native file: a one-row quad child plus the dictionary.
-        let quads = StructArray::try_new(
-            ["s", "p", "o", "g"].into(),
-            (0..4)
-                .map(|_| vortex_buffer::Buffer::from_iter([0u32]).into_array())
-                .collect::<Vec<_>>(),
-            1,
-            Validity::NonNullable,
-        )
-        .unwrap()
-        .into_array();
-        let dtype = quads.dtype().clone();
-        let stream = ArrayStreamAdapter::new(
-            dtype,
-            Box::pin(futures::stream::once(async move { Ok(quads) })),
-        );
-        let mut bytes: Vec<u8> = Vec::new();
-        container::write_store(
-            &VORTEX_SESSION,
-            &mut bytes,
-            stream,
-            container::default_child_strategy(),
-            false,
-            vec![d.to_write().unwrap()],
-        )
-        .await
-        .unwrap();
+        let bytes = crate::tests::write_dict_only_store(&d).await;
 
         let file = VORTEX_SESSION
             .open_options()
