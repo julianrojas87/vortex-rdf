@@ -93,3 +93,7 @@ required-features = ["file-io"]
 name = "compare"
 harness = false
 required-features = ["file-io"]
+
+[[test]]
+name = "bench_dataset"
+required-features = ["file-io"]

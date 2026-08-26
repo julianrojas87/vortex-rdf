@@ -25,10 +25,8 @@
 // adapter a trustworthy, uncontaminated peak-RSS reading (see shared.ts's
 // `peakRssMb`).
 //
-// Uses tinybench + @codspeed/tinybench-plugin — the same harness rdf-stores.js uses.
-// `withCodSpeed` is a no-op when not run under the CodSpeed action, so this produces
-// plain wall-clock results and is NEVER uploaded to CodSpeed (no JS CodSpeed workflow
-// exists; this is never run via CodSpeedHQ/action). CodSpeed stays Rust-only.
+// Uses tinybench. `withCodSpeed` is not applied here: this suite is wall-clock
+// and never uploaded — the instrumented, uploaded JS suite is codspeed.bench.ts.
 
 import { createRequire } from 'node:module';
 import { cpus } from 'node:os';
@@ -37,10 +35,15 @@ import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
 
 import {
-    ADAPTERS, MUT_ADAPTERS, N_TRIPLES, N_QUADS, GRAPHS, MUT_BATCH,
-    QUERY_OPTS, HEAVY_OPTS, FULL_SCAN_OPTS, moduli, unsupportedRow, type Row,
+    ADAPTERS, MUT_ADAPTERS, N_TRIPLES, GRAPHS, MUT_BATCH,
+    QUERY_OPTS, HEAVY_OPTS, FULL_SCAN_OPTS, moduli, unsupportedRow,
+    type Row, type WorkerOutput,
 } from './shared.js';
 import { runWorkerProcess } from './util.js';
+
+/** The run's dataset shape: term cardinality per role, from which every
+ *  probe's selectivity follows. */
+const SHAPE = moduli(N_TRIPLES, { graphs: GRAPHS });
 
 const require = createRequire(import.meta.url);
 const here = dirname(fileURLToPath(import.meta.url));
@@ -53,17 +56,8 @@ interface MemoryRow {
     /** Whole-process high-water mark: the only figure comparable across a wasm
      *  store and a pure-JS one. This is the headline memory number. */
     peakRssMb: number | null;
-    /** What building the store cost over and above the shared input `Quad[]`.
-     *  `wasmHeapMb` is Vortex/oxigraph-only and is null for pure-JS adapters. */
-    storeFootprint?: Record<string, number | null>;
-}
-interface WorkerOutput {
-    rows: Row[];
-    peakRssMb: number | null;
-    storeFootprint?: Record<string, number | null>;
-    matched?: Record<string, number>;
-    cardinality?: Record<string, unknown>;
-    failures?: { phase: string; error: string }[];
+    /** See `WorkerOutput.storeFootprint` in shared.ts. */
+    storeFootprint?: WorkerOutput['storeFootprint'];
 }
 
 /** One adapter, one role, one process. A worker that cannot finish is skipped:
@@ -75,10 +69,9 @@ function runWorker(slug: string, role: 'query' | 'querycold' | 'fullscan' | 'mut
 }
 
 async function main(): Promise<void> {
-    const qm = moduli(N_QUADS, { graphs: GRAPHS });
     console.log(
-        `Dataset shape: ${N_QUADS.toLocaleString()} quads over ${qm.nGraph} named graphs ` +
-        `(${qm.terms.toLocaleString()} distinct terms)…`);
+        `Dataset shape: ${N_TRIPLES.toLocaleString()} quads over ${SHAPE.nGraph} named graphs ` +
+        `(${SHAPE.terms.toLocaleString()} distinct terms)…`);
 
     const results: Row[] = [];
     const memory: MemoryRow[] = [];
@@ -104,7 +97,7 @@ async function main(): Promise<void> {
         });
     };
     const mergeMatched = (label: string, out: WorkerOutput): void => {
-        for (const [pat, n] of Object.entries(out.matched ?? {})) {
+        for (const [pat, n] of Object.entries(out.matched)) {
             if (matched[pat] === undefined) matched[pat] = n;
             else if (matched[pat] !== n) {
                 // Into the results file, not just the console: the dashboard
@@ -125,7 +118,7 @@ async function main(): Promise<void> {
             slug: a.slug, label: a.label, role: 'query',
             peakRssMb: out.peakRssMb, storeFootprint: out.storeFootprint,
         });
-        for (const f of out.failures ?? []) {
+        for (const f of out.failures) {
             failures.push({ slug: a.slug, label: a.label, role: 'query', ...f });
             console.error(`  !! ${a.label} could not complete '${f.phase}': ${f.error}`);
         }
@@ -146,7 +139,7 @@ async function main(): Promise<void> {
         const out = runWorker(a.slug, 'querycold');
         if (!out) { workerLost(a, 'querycold'); continue; }
         results.push(...out.rows);
-        for (const f of out.failures ?? []) {
+        for (const f of out.failures) {
             failures.push({ slug: a.slug, label: a.label, role: 'querycold', ...f });
             console.error(`  !! ${a.label} could not complete '${f.phase}': ${f.error}`);
         }
@@ -161,7 +154,7 @@ async function main(): Promise<void> {
         if (!out) { workerLost(a, 'fullscan'); continue; }
         results.push(...out.rows);
         mergeMatched(a.label, out);
-        for (const f of out.failures ?? []) {
+        for (const f of out.failures) {
             failures.push({ slug: a.slug, label: a.label, role: 'fullscan', ...f });
             console.error(`  !! ${a.label} could not complete '${f.phase}': ${f.error}`);
         }
@@ -172,7 +165,7 @@ async function main(): Promise<void> {
         if (!out) { workerLost(a, 'mutate'); continue; }
         results.push(...out.rows);
         memory.push({ slug: a.slug, label: a.label, role: 'mutate', peakRssMb: out.peakRssMb });
-        for (const f of out.failures ?? []) {
+        for (const f of out.failures) {
             failures.push({ slug: a.slug, label: a.label, role: 'mutate', ...f });
             console.error(`  !! ${a.label} could not complete '${f.phase}': ${f.error}`);
         }
@@ -191,11 +184,10 @@ async function main(): Promise<void> {
 
     const config = {
         triplesCount: N_TRIPLES,
-        quadsCount: N_QUADS,
         // Term cardinality is an explicit property of the dataset, and
         // selectivity follows from it — record it so a timing can be read
         // against the number of rows it actually touched.
-        cardinality: moduli(N_QUADS, { graphs: GRAPHS }),
+        cardinality: SHAPE,
         matchedRows: matched,
         countWarnings,
         mutBatch: MUT_BATCH,
@@ -228,8 +220,8 @@ function provenance(): string {
     const cpu = cpus()[0]?.model ?? 'unknown CPU';
     return (
         `Measured ${measured} · node ${process.version} · ${cpu}, ${cpus().length} threads · ` +
-        `${N_QUADS.toLocaleString()} quads over ${moduli(N_QUADS, { graphs: GRAPHS }).nGraph} named graphs ` +
-        `(${moduli(N_QUADS, { graphs: GRAPHS }).terms.toLocaleString()} terms; hdt reads their triples projection), ` +
+        `${N_TRIPLES.toLocaleString()} quads over ${SHAPE.nGraph} named graphs ` +
+        `(${SHAPE.terms.toLocaleString()} terms; hdt reads their triples projection), ` +
         `MUT_BATCH=${MUT_BATCH.toLocaleString()} · tinybench ${depVersion('tinybench')}, wall-clock · ` +
         `vortex-rdf-store ${require('../package.json').version}, rdf-stores ${depVersion('rdf-stores')}, oxigraph ${depVersion('oxigraph')}, hdt 0.7 (wasm, read-only) · ` +
         `one adapter per process, isolated`

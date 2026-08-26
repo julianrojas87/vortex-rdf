@@ -4,7 +4,7 @@ Run by `run.py`, never directly in a full run. One adapter per process buys
 two things: peak RSS is attributable to a single library rather than to
 whichever ran first, and no library's garbage or import-time allocation taints
 another's timings. It also lets each adapter keep an incompatible dependency
-set -- see the pyoxigraph pin note in `adapters.py`.
+set -- see the pyoxigraph pin note in `run.py`.
 
 Results go to stdout as one JSON object; progress goes to stderr, so the
 orchestrator can stream progress to the terminal while parsing the result.
@@ -20,10 +20,16 @@ import re
 import statistics
 import sys
 import time
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
-from adapters import build_adapter
-from datasets import DatasetOpts, dataset_prefix, dataset_probes, fresh_quads
+from adapters import Adapter, build_adapter
+from datasets import (
+    FULL_SCAN_PATTERN,
+    dataset_opts,
+    dataset_prefix,
+    dataset_probes,
+    fresh_quads,
+)
 
 # ─── Timing ─────────────────────────────────────────────────────────────────
 #
@@ -38,11 +44,10 @@ FULL_SCAN_ITERS = int(os.environ.get("PY_BENCH_FULL_SCAN_ITERS", 3))
 
 #: A phase whose single execution already exceeds this stops after one sample
 #: (and skips any remaining warmup); ``0`` disables the rule. Repetition exists
-#: to average out noise that is small relative to the reading -- on a
-#: 40-second deterministic bulk parse the extra runs cost minutes to remove
-#: noise three orders of magnitude below the number. The reduced count is
-#: reported honestly through the row's ``samples`` field, which the dashboard
-#: displays. Same knob and default as the JS worker and ``compare.rs``.
+#: to average out noise that is small relative to the reading, which a
+#: multi-ten-second phase does not need. The reduced count is reported through
+#: the row's ``samples`` field, which the dashboard displays. Same knob and
+#: default as the JS worker and ``compare.rs``.
 SLOW_PHASE_NS = float(os.environ.get("BENCH_SLOW_PHASE_MS", 30_000)) * 1e6
 
 
@@ -59,31 +64,28 @@ def fmt_ns(ns: float) -> str:
 
 def measure(
     ident: str,
-    fn: Callable[[], object],
+    fn: Callable[[Any], object],
     rows: list,
     iters: int,
     warmup: int = 0,
-    setup: Optional[Callable[[], None]] = None,
-    teardown: Optional[Callable[[object], None]] = None,
+    setup: Optional[Callable[[], Any]] = None,
+    teardown: Optional[Callable[[Any, object], None]] = None,
     regime: Optional[str] = None,
 ) -> None:
     """Time `fn` and append one dashboard-shaped row.
 
-    `setup`/`teardown` run outside the timed region -- a build phase must
-    dispose the store it just made before the next iteration, or the process
-    accumulates one full store per iteration and the peak RSS attributed to
-    this adapter becomes a multiple of what it actually needs.
+    `setup`/`teardown` run outside the timed region. `setup` returns the
+    iteration's state (`None` when absent), `fn` receives it, and `teardown`
+    receives the state and `fn`'s result -- a build phase must dispose the
+    store it just made before the next iteration, or the process accumulates
+    one full store per iteration and the peak RSS attributed to this adapter
+    becomes a multiple of what it actually needs.
 
-    Everything already alive is frozen into the permanent generation before
-    the loop, so the per-iteration collection walks only what an iteration
-    itself created. A full collection traverses the interpreter's entire
-    object graph; that traversal evicts the CPU caches and leaves the next
-    timed call running cold, a near-constant per-sample cost that swamps a
-    microsecond-scale query and, being constant, compresses the ratios
-    between fast and slow adapters. Freezing is scoped to this measurement:
-    objects the collector ignores are still reclaimed by reference counting,
-    but leaving them frozen would exempt later cyclic garbage for the rest of
-    the process.
+    Everything already alive is frozen (`gc.freeze`) for the duration, so the
+    per-iteration `gc.collect()` walks only what an iteration itself created
+    instead of the interpreter's whole object graph. `gc.unfreeze` runs
+    afterwards: leaving objects frozen would exempt later cyclic garbage for
+    the rest of the process.
     """
     samples: list[float] = []
     gc.collect()
@@ -91,18 +93,16 @@ def measure(
     try:
         remaining_warmup = warmup
         while len(samples) < iters:
-            if setup:
-                setup()
+            state = setup() if setup else None
             # Keeps an automatic collection from firing inside a timed call.
             # Cheap now: the frozen objects are out of the collector's reach.
             gc.collect()
             t0 = time.perf_counter_ns()
-            out = fn()
+            out = fn(state)
             elapsed = time.perf_counter_ns() - t0
             if teardown:
-                teardown(out)
-            else:
-                del out
+                teardown(state, out)
+            del state, out
             if remaining_warmup > 0:
                 remaining_warmup -= 1
                 # A warmup run this long says the phase needs no more warming:
@@ -188,10 +188,14 @@ def peak_rss_mb() -> Optional[int]:
 # ─── Phases ─────────────────────────────────────────────────────────────────
 
 
-def run_query(a, args) -> dict:
+def log(label: str, msg: str) -> None:
+    print(f"  [{label}] {msg}", file=sys.stderr, flush=True)
+
+
+def run_query(adapter: Adapter, args: argparse.Namespace) -> dict:
+    a = adapter
     rows: list = []
     counts: dict[str, int] = {}
-    log = lambda msg: print(f"  [{a.label}] {msg}", file=sys.stderr, flush=True)
 
     workdir = args.workdir
     # One dataset for the whole run. A library whose model has graphs builds
@@ -203,20 +207,13 @@ def run_query(a, args) -> dict:
     artifact = a.artifact_path(workdir, src)
 
     # --- build (ingest) ---
-    log("build…")
-    handle_box: list = []
-
-    def do_build():
-        h = a.build(src, artifact)
-        handle_box.append(h)
-        return h
-
+    log(a.label, "build…")
     measure(
         f"ingest::{a.slug}",
-        do_build,
+        lambda _: a.build(src, artifact),
         rows,
         HEAVY_ITERS,
-        teardown=lambda h: (a.dispose(h), handle_box.clear()),
+        teardown=lambda _, h: a.dispose(h),
     )
 
     artifact_bytes = a.artifact_bytes(artifact)
@@ -229,14 +226,14 @@ def run_query(a, args) -> dict:
     # operation. The cost is real and it is Build's to report; this column stays
     # about opening an artifact.
     if a.has_distinct_open:
-        log("open…")
+        log(a.label, "open…")
         measure(
             f"open::{a.slug}",
-            lambda: a.open(artifact, src),
+            lambda _: a.open(artifact, src),
             rows,
             QUERY_ITERS,
             warmup=QUERY_WARMUP,
-            teardown=lambda h: a.dispose(h),
+            teardown=lambda _, h: a.dispose(h),
         )
     else:
         rows.append(
@@ -249,7 +246,7 @@ def run_query(a, args) -> dict:
 
     # --- match: triple patterns + full scan ---
     handle = a.open(artifact, src)
-    probes = dataset_probes(args.n, DatasetOpts(graphs=args.graphs))
+    probes = dataset_probes(args.n, dataset_opts(graphs=args.graphs))
     # The graph probes are part of the one pattern set now, not a second
     # dataset's; a library without graphs in its model reports them unsupported.
     pattern_set = list(probes["triples"])
@@ -269,19 +266,22 @@ def run_query(a, args) -> dict:
                         )
                         | {"regime": regime}
                     )
+    # Term parsing happens once per pattern, outside every timed region.
+    prepared = {pat.name: a.prepare(pat) for pat in pattern_set}
     for pat in pattern_set:
-        log(f"match {pat.name}…")
-        counts[pat.name] = a.count(handle, pat)
+        log(a.label, f"match {pat.name}…")
+        query = prepared[pat.name]
+        counts[pat.name] = a.count(handle, query)
         # A count path that resolves differently must fail loudly here, not
         # time the wrong work below.
-        n_count = a.count_only(handle, pat)
+        n_count = a.count_only(handle, query)
         if n_count != counts[pat.name]:
             raise RuntimeError(
                 f"count_only disagrees for {pat.name}: {n_count} != {counts[pat.name]}"
             )
         measure(
             f"{a.slug}::{pat.name}",
-            lambda p=pat: a.count(handle, p),
+            lambda _, q=query: a.count(handle, q),
             rows,
             QUERY_ITERS,
             QUERY_WARMUP,
@@ -289,7 +289,7 @@ def run_query(a, args) -> dict:
         )
         measure(
             f"{a.slug}::{pat.name}::count",
-            lambda p=pat: a.count_only(handle, p),
+            lambda _, q=query: a.count_only(handle, q),
             rows,
             QUERY_ITERS,
             QUERY_WARMUP,
@@ -306,22 +306,19 @@ def run_query(a, args) -> dict:
     # opening IS re-parsing the source, so its cold cell would be tens of
     # seconds of ingest sitting in a microsecond column. Those adapters simply
     # have no cold rows, and the dashboard leaves the cells blank.
+    def open_cold():
+        return a.open(artifact, src)
+
+    def drop_cold(h, _result):
+        a.dispose(h)
+
     if a.has_distinct_open:
-        # `setup` takes no arguments and `teardown` sees the timed call's
-        # return value, so the handle travels between them in a one-slot box.
-        box: list = []
-
-        def open_cold():
-            box.append(a.open(artifact, src))
-
-        def drop_cold(_result):
-            a.dispose(box.pop())
-
         for pat in pattern_set:
-            log(f"match {pat.name} (cold)…")
+            log(a.label, f"match {pat.name} (cold)…")
+            query = prepared[pat.name]
             measure(
                 f"{a.slug}::{pat.name}",
-                lambda p=pat: a.count(box[-1], p),
+                lambda h, q=query: a.count(h, q),
                 rows,
                 QUERY_ITERS,
                 QUERY_WARMUP,
@@ -331,7 +328,7 @@ def run_query(a, args) -> dict:
             )
             measure(
                 f"{a.slug}::{pat.name}::count",
-                lambda p=pat: a.count_only(box[-1], p),
+                lambda h, q=query: a.count_only(h, q),
                 rows,
                 QUERY_ITERS,
                 QUERY_WARMUP,
@@ -340,26 +337,26 @@ def run_query(a, args) -> dict:
                 regime="cold",
             )
 
-    log("match full…")
-    full = probes["full"][0]
+    log(a.label, "match full…")
+    full = a.prepare(FULL_SCAN_PATTERN)
     counts["full"] = a.count(handle, full)
     n_count = a.count_only(handle, full)
     if n_count != counts["full"]:
         raise RuntimeError(f"count_only disagrees for full: {n_count} != {counts['full']}")
-    measure(f"{a.slug}::full", lambda: a.count(handle, full), rows, FULL_SCAN_ITERS, regime="warm")
+    measure(f"{a.slug}::full", lambda _: a.count(handle, full), rows, FULL_SCAN_ITERS, regime="warm")
     measure(
         f"{a.slug}::full::count",
-        lambda: a.count_only(handle, full),
+        lambda _: a.count_only(handle, full),
         rows,
         FULL_SCAN_ITERS,
         regime="warm",
     )
 
     if a.has_distinct_open:
-        log("match full (cold)…")
+        log(a.label, "match full (cold)…")
         measure(
             f"{a.slug}::full",
-            lambda: a.count(box[-1], full),
+            lambda h: a.count(h, full),
             rows,
             FULL_SCAN_ITERS,
             setup=open_cold,
@@ -368,7 +365,7 @@ def run_query(a, args) -> dict:
         )
         measure(
             f"{a.slug}::full::count",
-            lambda: a.count_only(box[-1], full),
+            lambda h: a.count_only(h, full),
             rows,
             FULL_SCAN_ITERS,
             setup=open_cold,
@@ -396,16 +393,12 @@ def run_query(a, args) -> dict:
     }
 
 
-def run_mutate(a, args) -> dict:
+def run_mutate(adapter: Adapter, args: argparse.Namespace) -> dict:
+    a = adapter
     rows: list = []
-    log = lambda msg: print(f"  [{a.label}] {msg}", file=sys.stderr, flush=True)
 
-    if not a.supports_mutation:
-        reason = {
-            "vortex": "the Python bindings expose no add/delete API",
-            "pycottas": "COTTASStore raises: 'The COTTAS store is read only!'",
-            "lightrdf": "a streaming parser, with no store to mutate",
-        }.get(a.slug.split("_")[0], "not supported by this library")
+    if a.mutation_unsupported:
+        reason = a.mutation_unsupported
         rows.append(unsupported_row(f"add::{a.slug}", reason))
         rows.append(unsupported_row(f"delete::{a.slug}", reason))
         # No memory reading: this process did nothing but start an interpreter,
@@ -415,44 +408,32 @@ def run_mutate(a, args) -> dict:
 
     src = args.quads if a.supports_quads else args.triples
     fresh = fresh_quads(args.mut_batch)
-    del_slice = dataset_prefix(args.n, args.mut_batch, DatasetOpts(graphs=args.graphs))
+    del_slice = dataset_prefix(args.n, args.mut_batch, dataset_opts(graphs=args.graphs))
 
     # add: into an empty store, so the measurement is the insert path and not a
     # lookup against however many rows the dataset happens to hold.
-    log(f"add ({args.mut_batch})…")
+    log(a.label, f"add ({args.mut_batch})…")
     empty_src = os.path.join(args.workdir, "empty.nt")
     if not os.path.exists(empty_src):
         open(empty_src, "w").close()
-    holder: list = []
-
-    def setup_empty():
-        holder.clear()
-        holder.append(a.build(empty_src, a.artifact_path(args.workdir, empty_src)))
-
     measure(
         f"add::{a.slug}",
-        lambda: a.add(holder[0], fresh),
+        lambda h: a.add(h, fresh),
         rows,
         HEAVY_ITERS,
-        setup=setup_empty,
-        teardown=lambda _: (a.dispose(holder[0]), holder.clear()),
+        setup=lambda: a.build(empty_src, a.artifact_path(args.workdir, empty_src)),
+        teardown=lambda h, _: a.dispose(h),
     )
 
     # delete: from a store that actually contains the batch.
-    log(f"delete ({args.mut_batch})…")
-    dholder: list = []
-
-    def setup_loaded():
-        dholder.clear()
-        dholder.append(a.build(src, a.artifact_path(args.workdir, src)))
-
+    log(a.label, f"delete ({args.mut_batch})…")
     measure(
         f"delete::{a.slug}",
-        lambda: a.delete(dholder[0], del_slice),
+        lambda h: a.delete(h, del_slice),
         rows,
         HEAVY_ITERS,
-        setup=setup_loaded,
-        teardown=lambda _: (a.dispose(dholder[0]), dholder.clear()),
+        setup=lambda: a.build(src, a.artifact_path(args.workdir, src)),
+        teardown=lambda h, _: a.dispose(h),
     )
 
     return {"rows": rows, "counts": {}, "artifact_bytes": None, "peak_rss_mb": peak_rss_mb()}
@@ -470,9 +451,9 @@ def main() -> int:
     ap.add_argument("--mut-batch", type=int, default=10_000)
     args = ap.parse_args()
 
-    a = build_adapter(args.slug)
-    result = run_query(a, args) if args.role == "query" else run_mutate(a, args)
-    result.update({"slug": a.slug, "label": a.label, "role": args.role})
+    adapter = build_adapter(args.slug)
+    result = run_query(adapter, args) if args.role == "query" else run_mutate(adapter, args)
+    result.update({"slug": adapter.slug, "label": adapter.label, "role": args.role})
     print(json.dumps(result))
     return 0
 

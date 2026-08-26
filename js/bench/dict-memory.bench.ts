@@ -21,8 +21,7 @@
 //   DICT_MEM_SLUGS=vortex_dict,vortex_default \
 //   npm run bench:dict-memory
 //
-// Fits per-term cost. Needs >= 2 points, and is what produced the bytes/term
-// numbers in the first place.
+// Fits per-term cost; needs >= 2 points.
 //
 // Method — two nested differentials, because nothing can be read directly.
 //
@@ -30,7 +29,7 @@
 // memory is read after each, so the slope against store count gives the RETAINED
 // cost of one store. A single store tells you nothing — the ingest transient
 // sets the high-water mark and the store is allocated inside the space it
-// freed. See the worker's header for the measurement that established this.
+// freed.
 //
 // Outer (here, sweep mode only): hold rows fixed, sweep term cardinality, and fit
 //
@@ -53,15 +52,15 @@ import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
 
 import { runWorkerProcess } from './util.js';
+import type { DictMemoryPoint as Point } from './shared.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const workerPath = resolve(here, 'dict-memory.worker.ts');
 const OUT = resolve(here, process.env.DICT_MEM_OUT ?? 'dict-memory.json');
 
-/** Rows held fixed across the sweep — only term cardinality varies.
- *
- *  200k is the scale every committed figure was taken at. Keeping it as the
- *  default is what makes a fresh run comparable to REFERENCE. */
+/** Rows held fixed across the sweep — only term cardinality varies. 200k is
+ *  REFERENCE's scale; keeping it as the default is what makes a fresh run
+ *  comparable to REFERENCE. */
 const N = Number(process.env.DICT_MEM_N ?? 200_000);
 
 /** Which build variants to run. Dictionary layout is the subject. Add
@@ -88,20 +87,6 @@ const RATIOS = (process.env.DICT_MEM_RATIOS ?? '1.0').split(',').map(Number);
  *  fragmentation noise between runs with identical store content; the
  *  high-water figures are the stable ones. */
 const REFERENCE = { retainedPerStoreMb: 15.0, firstStoreMb: 51, lastStoreMb: 97, stores: 4 };
-
-interface Point {
-    slug: string; n: number; terms: number; stores: number;
-    wasmPerStore: (number | null)[];
-    wasmAfterInit: number | null; wasmAfterGen: number | null;
-    wasmAfterFirstQuery: number | null; wasmAfterFullScan: number | null;
-    wasmAfterRebuild: number | null; wasmAfterFree: number | null;
-    jsAfterInit: number; jsAfterBuild: number; jsAfterFirstQuery: number;
-    jsAfterFullScan: number; jsAfterRebuild: number;
-    rssAfterBuild: number | null; peakRssMb: number | null;
-    scanMs: number; decodeMs: number; mutateQueryMs: number;
-    fullRows: number; firstQueryRows: number; decodedChars: number;
-    [k: string]: unknown;
-}
 
 /** Retained MB per store: the slope of linear memory against live store count. */
 function retainedPerStore(p: Point): number | null {
@@ -132,14 +117,14 @@ function atReferenceConfig(points: Point[]): points is [Point] {
         && points[0].stores === REFERENCE.stores;
 }
 
-/** The regression view: today's numbers beside the ones FSST landed with. */
+/** The regression view: today's numbers beside REFERENCE. */
 function reportAgainstReference(p: Point): void {
     const show = (now: number | null | undefined, then: number): string => {
         if (now === null || now === undefined) return '?';
         const d = now - then;
         return `${now.toFixed(1)} MB  (${d >= 0 ? '+' : ''}${d.toFixed(1)} vs ${then.toFixed(1)})`;
     };
-    console.log('\n─── vs. the FSST reference run ─────────────────────────────');
+    console.log('\n─── vs. REFERENCE ──────────────────────────────────────────');
     console.log(`  retained/store   ${show(retainedPerStore(p), REFERENCE.retainedPerStoreMb)}`);
     console.log(`  1 store          ${show(p.wasmPerStore[0], REFERENCE.firstStoreMb)}`);
     console.log(`  ${REFERENCE.stores} stores         ${show(p.wasmPerStore.at(-1), REFERENCE.lastStoreMb)}`);
@@ -175,7 +160,7 @@ function main(): void {
             points.push(p);
             const per = retainedPerStore(p);
             console.log(
-                `   terms=${p.terms.toLocaleString()}  retained/store=${per === null ? '?' : per.toFixed(1)} MB  ` +
+                `   terms=${p.cardinality.terms.toLocaleString()}  retained/store=${per === null ? '?' : per.toFixed(1)} MB  ` +
                 `wasm: [${p.wasmPerStore.join(',')}] query=${p.wasmAfterFirstQuery} ` +
                 `scan=${p.wasmAfterFullScan} rebuild=${p.wasmAfterRebuild} MB  ` +
                 `scan=${p.scanMs.toFixed(0)}ms decode=${p.decodeMs.toFixed(0)}ms ` +
@@ -188,27 +173,27 @@ function main(): void {
     for (const slug of SLUGS) {
         const ps = points.filter((p) => p.slug === slug && retainedPerStore(p) !== null);
         if (ps.length < 2) continue;
-        const f = fit(ps.map((p) => p.terms), ps.map((p) => retainedPerStore(p) as number));
+        const f = fit(ps.map((p) => p.cardinality.terms), ps.map((p) => retainedPerStore(p) as number));
         analysis[slug] = {
             bytesPerTerm: Math.round(f.slope * 1048576),
             interceptMb: Number(f.intercept.toFixed(1)),
             // The control: four u32 columns are 16 bytes/row regardless of terms.
             expectedQuadColumnsMb: Number(((N * 16) / 1048576).toFixed(1)),
             retainedPerStoreMb: ps.map((p) => ({
-                terms: p.terms, mb: Number((retainedPerStore(p) as number).toFixed(1)),
+                terms: p.cardinality.terms, mb: Number((retainedPerStore(p) as number).toFixed(1)),
             })),
             firstQueryDeltaMb: ps.map((p) => ({
-                terms: p.terms,
+                terms: p.cardinality.terms,
                 wasm: (p.wasmAfterFirstQuery ?? 0) - (p.wasmPerStore.at(-1) ?? 0)!,
                 js: p.jsAfterFirstQuery - p.jsAfterBuild,
             })),
             rebuildGrowthMb: ps.map((p) => ({
-                terms: p.terms,
+                terms: p.cardinality.terms,
                 growth: (p.wasmAfterRebuild ?? 0) - (p.wasmAfterFullScan ?? 0),
                 mutateQueryMs: Math.round(p.mutateQueryMs),
             })),
             fullScan: ps.map((p) => ({
-                terms: p.terms, rows: p.fullRows,
+                terms: p.cardinality.terms, rows: p.fullRows,
                 scanMs: Math.round(p.scanMs), decodeMs: Math.round(p.decodeMs),
                 jsHeapDeltaMb: p.jsAfterFullScan - p.jsAfterFirstQuery,
             })),

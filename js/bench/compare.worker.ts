@@ -3,32 +3,21 @@
 // can't take down the whole run, and each adapter gets a clean, uncontaminated
 // peak-memory reading (see shared.ts's `peakRssMb`) instead of one polluted by
 // whatever every earlier adapter left resident.
-import { Bench } from 'tinybench';
-import { withCodSpeed } from '@codspeed/tinybench-plugin';
+import { Bench, type BenchOptions } from 'tinybench';
 import { writeFileSync } from 'node:fs';
 
 import {
-    ADAPTERS, MUT_ADAPTERS, N_TRIPLES, N_QUADS, GRAPHS, MUT_BATCH,
+    ADAPTERS, MUT_ADAPTERS, N_TRIPLES, GRAPHS, MUT_BATCH,
     genDataset, genFresh, genDatasetPrefix, datasetProbes, moduli,
     FULL_SCAN_PATTERN, QUERY_OPTS, COLD_QUERY_OPTS, HEAVY_OPTS, FULL_SCAN_OPTS,
     reclaim, collect, unsupportedRow, peakRssMb, rssMb, jsHeapMb, wasmHeapMb,
-    type Row, type Pat, type StoreAdapter,
+    type Row, type Pat, type StoreAdapter, type WorkerOutput,
 } from './shared.js';
 
 const [, , slug, role, outFile] = process.argv;
 if (!slug || !role || !outFile) {
     console.error('usage: compare.worker.ts <slug> <query|querycold|fullscan|mutate> <out-file>');
     process.exit(1);
-}
-
-async function runBench(
-    rows: Row[], opts: typeof QUERY_OPTS, add: (b: Bench) => void,
-    regime?: 'cold' | 'warm',
-): Promise<void> {
-    const bench = withCodSpeed(new Bench(opts));
-    add(bench);
-    await bench.run();
-    collect(bench, rows, regime);
 }
 
 /** Phases that could not be measured, and why. */
@@ -44,11 +33,14 @@ const failures: { phase: string; error: string }[] = [];
  * a benchmark that was never run.
  */
 async function bench(
-    phase: string, rows: Row[], opts: typeof QUERY_OPTS, add: (b: Bench) => void,
+    phase: string, rows: Row[], opts: BenchOptions, add: (b: Bench) => void,
     regime?: 'cold' | 'warm',
 ): Promise<void> {
     try {
-        await runBench(rows, opts, add, regime);
+        const b = new Bench(opts);
+        add(b);
+        await b.run();
+        collect(b, rows, regime);
     } catch (e) {
         const error = e instanceof Error ? e.message : String(e);
         console.error(`  !! phase '${phase}' failed: ${error}`);
@@ -56,9 +48,9 @@ async function bench(
     }
 }
 
-/** Rows each probe actually matches. Recorded alongside the timings because
- *  selectivity is now a property of the dataset's term cardinality rather than a
- *  fixed D², so a timing is only interpretable next to its match count. */
+/** Rows each probe matches, recorded beside the timings: selectivity follows
+ *  the dataset's term cardinality, so a timing is only interpretable next to
+ *  its match count. */
 const matched: Record<string, number> = {};
 
 /** A phase whose single execution already exceeds this runs ONCE rather than
@@ -75,7 +67,7 @@ const SLOW_PHASE_MS = Number(process.env.BENCH_SLOW_PHASE_MS ?? 30_000);
 /** The repetition plan for a slow phase: one measured run, no warmup. Warmup
  *  is not lost — every pattern measured this way already executed once in the
  *  count pre-pass, so its caches are as warm as one run makes them. */
-const ONE_SHOT: typeof QUERY_OPTS = {
+const ONE_SHOT: BenchOptions = {
     time: 0, iterations: 1, warmup: false, warmupIterations: 0, throws: true,
 };
 
@@ -150,15 +142,15 @@ function datasetOptsFor(a: StoreAdapter) {
 
 /** Every pattern a store answers: the triple probes always, the graph probes
  *  where its model has graphs. */
-function patternsFor(a: StoreAdapter) {
+function probesFor(a: StoreAdapter): Pat[] {
     const probes = datasetProbes(N_TRIPLES, datasetOptsFor(a));
     return a.quadsUnsupported ? probes.triples : [...probes.triples, ...probes.quads];
 }
 
 async function runQuery(a: StoreAdapter): Promise<Row[]> {
     const rows: Row[] = [];
-    const tProbes = { triples: patternsFor(a) };
-    const qProbes = datasetProbes(N_QUADS, { graphs: GRAPHS });
+    const pats = probesFor(a);
+    const qProbes = datasetProbes(N_TRIPLES, { graphs: GRAPHS });
 
     console.log(`[${a.label}] query…`);
     const triples = genDataset(N_TRIPLES, datasetOptsFor(a));
@@ -176,8 +168,8 @@ async function runQuery(a: StoreAdapter): Promise<Row[]> {
         wasmHeapMb: delta(after.wasm, before.wasm),
     });
 
-    const tCost = await countAll(a, th, tProbes.triples);
-    const tSplit = splitBySpeed(tProbes.triples, tCost);
+    const tCost = await countAll(a, th, pats);
+    const tSplit = splitBySpeed(pats, tCost);
     if (tSplit.fast.length) {
         await bench('query_triples', rows, QUERY_OPTS, (b) => {
             for (const p of tSplit.fast) {
@@ -227,20 +219,6 @@ async function runQuery(a: StoreAdapter): Promise<Row[]> {
     return rows;
 }
 
-/**
- * The full scan, in its own process — the same isolation argument this file
- * already makes for adapters, one level down.
- *
- * Materializing every row of a multi-million-quad dataset with realistic term
- * cardinality is by far the heaviest phase, and a store's own retention makes it
- * order-dependent: a store can hold hundreds of megabytes per full scan without
- * reclaiming them within its lifetime, and wasm linear memory never shrinks back
- * to the engine. Sharing a process with the query and ingest phases can therefore
- * leave a module too grown to scan at all — trapping on a freshly built store,
- * and reporting "this store cannot full-scan the dataset" when a clean process
- * does it comfortably. Measuring it here reports the scan rather than the residue
- * of everything that ran before it.
- */
 /**
  * The cold query regime, plus the open it deliberately excludes — in a process
  * of its own.
@@ -294,7 +272,7 @@ async function runQueryCold(a: StoreAdapter): Promise<Row[]> {
 
     console.log(`[${a.label}] query cold…`);
     const triples = genDataset(N_TRIPLES, datasetOptsFor(a));
-    const tProbes = { triples: patternsFor(a) };
+    const pats = probesFor(a);
     let th: unknown = await a.build(triples);
     const tSnap = await a.snapshot(th);
     reclaim(a, th);
@@ -311,10 +289,10 @@ async function runQueryCold(a: StoreAdapter): Promise<Row[]> {
         });
     });
 
-    await coldPass('query_cold', tSnap, tProbes.triples);
+    await coldPass('query_cold', tSnap, pats);
 
     if (a.quadsUnsupported) {
-        for (const p of datasetProbes(N_QUADS, { graphs: GRAPHS }).quads) {
+        for (const p of datasetProbes(N_TRIPLES, { graphs: GRAPHS }).quads) {
             for (const id of [`${a.slug}::${p.name}`, `${a.slug}::${p.name}::count`]) {
                 const r = unsupportedRow(id, a.quadsUnsupported);
                 r.regime = 'cold';
@@ -326,6 +304,20 @@ async function runQueryCold(a: StoreAdapter): Promise<Row[]> {
     return rows;
 }
 
+/**
+ * The full scan, in its own process — the same isolation argument this file
+ * already makes for adapters, one level down.
+ *
+ * Materializing every row of a multi-million-quad dataset with realistic term
+ * cardinality is by far the heaviest phase, and a store's own retention makes it
+ * order-dependent: a store can hold hundreds of megabytes per full scan without
+ * reclaiming them within its lifetime, and wasm linear memory never shrinks back
+ * to the engine. Sharing a process with the query and ingest phases can therefore
+ * leave a module too grown to scan at all — trapping on a freshly built store,
+ * and reporting "this store cannot full-scan the dataset" when a clean process
+ * does it comfortably. Measuring it here reports the scan, not the residue of
+ * everything that ran before it.
+ */
 async function runFullScan(a: StoreAdapter): Promise<Row[]> {
     const rows: Row[] = [];
     console.log(`[${a.label}] full scan…`);
@@ -429,14 +421,15 @@ async function main(): Promise<void> {
         : role === 'querycold' ? await runQueryCold(a)
             : role === 'fullscan' ? await runFullScan(a)
                 : await runMutate(a);
-    writeFileSync(outFile, JSON.stringify({
+    const out: WorkerOutput = {
         rows,
         peakRssMb: peakRssMb(),
         storeFootprint,
         matched,
         failures,
-        cardinality: role === 'query' ? moduli(N_QUADS, { graphs: GRAPHS }) : undefined,
-    }));
+        cardinality: role === 'query' ? moduli(N_TRIPLES, { graphs: GRAPHS }) : undefined,
+    };
+    writeFileSync(outFile, JSON.stringify(out));
 }
 
 main().catch((e) => {

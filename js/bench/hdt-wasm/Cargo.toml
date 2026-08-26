@@ -14,7 +14,6 @@ crate-type = ["cdylib"]
 # the two tabs' hdt rows measure the same implementation.
 hdt = "0.7"
 wasm-bindgen = "0.2"
-console_error_panic_hook = "0.1"
 # Transitive dependency of hdt; on wasm32 it must be told its randomness source
 # explicitly. Enabling the feature here unifies it into the whole build.
 uuid = { version = "1", features = ["js"] }

@@ -100,7 +100,8 @@ BUILD_VARIANTS = {
 }
 
 #: Query (read) path: the two representative configs the JS suite uses — the
-#: unindexed default and the fully-indexed fast path.
+#: unindexed Dictionary baseline and the fully-indexed (secondary-by-copy)
+#: fast path.
 QUERY_VARIANTS = ("dict", "dict_bycopy")
 
 
@@ -289,7 +290,7 @@ def test_readpath_full_decoded_literals(benchmark, stores):
 
 # ─── decode::<shape> (Python-only) ──────────────────────────────────────────
 #
-# No JavaScript counterpart: these guard `TermDict::decode_owned`'s sharing of
+# No JavaScript counterpart: these guard `TermDict::decode_slice`'s sharing of
 # one Python string across repeats of a code. The three shapes are not
 # variations on one workload — each is a different way a column can repeat, and
 # the sharing covers them unequally:
@@ -384,6 +385,10 @@ def test_readback_from_bytes(benchmark, stores):
 @pytest.mark.benchmark
 def test_readback_open(benchmark, tmp_path_factory, data):
     """Opening an already-built file — the operation with no JS counterpart,
-    since the wasm bindings have no file-backed store."""
+    since the wasm bindings have no file-backed store.
+
+    Measures the same operation as `test_open[dict_bycopy]` on a file built
+    inside the task; both ids are tracked on CodSpeed and kept for continuity.
+    """
     out = _build(data["cube"], tmp_path_factory.mktemp("open") / "out.vortex", "dict_bycopy")
     benchmark(lambda: VortexRdfStore(out))

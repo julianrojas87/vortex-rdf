@@ -7,28 +7,18 @@
 // run in one process would report every config at the high-water mark of the
 // largest one before it.
 //
-// ── Why this measures RETAINED memory by building several stores ─────────────
-//
-// The obvious instrument — build one store, read `memory.buffer.byteLength` —
-// does not work. Ingest allocates a large transient (the packed quad buffer
-// crossing the boundary, plus the owned `RawQuad` strings) whose size tracks
-// *rows*, not distinct terms. That transient sets the module's high-water
-// mark; the dictionary is then allocated inside the space it freed, so linear
-// memory does not grow and the dictionary is invisible however much term
-// cardinality varies.
-//
-// So instead: build `STORES` stores of the same config, keeping them all alive,
-// and read memory after each. The transient is reused across builds, but each
-// *retained* store must add to the module. The slope of memory against store
-// count is the retained per-store cost — which is what we actually want to
-// attribute.
+// Retained memory is read as a slope: `STORES` stores of one config are built
+// and kept alive, linear memory read after each. The ingest transient (packed
+// quad buffer + owned strings) sets the module's high-water mark and scales
+// with rows, so a single store's footprint is hidden inside it; only the
+// per-store increment isolates what a store retains.
 
 import { writeFileSync } from 'node:fs';
 
 import {
     VORTEX_VARIANTS, vortexAdapter, genDataset, datasetProbes, moduli,
     reclaim, peakRssMb, rssMb, jsHeapMb, wasmHeapMb,
-    type DatasetOpts,
+    type DatasetOpts, type DictMemoryPoint,
 } from './shared.js';
 import { decodeAll } from './util.js';
 import type { VortexRdfStore } from '../entry/node.js';
@@ -117,12 +107,11 @@ async function main(): Promise<void> {
     live.length = 0;
     const wasmAfterFree = await wasmHeapMb();
 
-    writeFileSync(outFile, JSON.stringify({
+    const point: DictMemoryPoint = {
         slug: slugArg,
         n,
         subjectRatio: opts.subjectRatio,
         objectRatio: opts.objectRatio,
-        terms: m.terms,
         cardinality: m,
         stores: STORES,
         wasmPerStore,
@@ -146,7 +135,8 @@ async function main(): Promise<void> {
         jsAfterRebuild,
         rssAfterBuild,
         peakRssMb: peakRssMb(),
-    }));
+    };
+    writeFileSync(outFile, JSON.stringify(point));
 }
 
 main().catch((e) => {

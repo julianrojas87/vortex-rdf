@@ -1,12 +1,10 @@
 """The dashboard harness's Vortex adapters, run over the fixture dataset.
 
 `bench/run.py` runs each adapter in its own virtualenv and keeps going when one
-fails, so an adapter that raises drops out of the dashboard silently -- a full
-run just writes fewer rows. That is how a `serialize_rdf(builder=...)` call
-outlived the argument. Nothing else in the suite imports `bench/`, and the
-harness itself is far too slow to run in CI, so this exercises the one thing
-that goes stale -- the binding call in each adapter's build/open/count path --
-over five triples instead of the dashboard's millions.
+fails, so an adapter whose binding call no longer matches the bindings'
+signature drops out of the dashboard silently. Nothing else imports `bench/`
+and the harness is too slow for CI, so this exercises each Vortex adapter's
+build/open/count path over five triples instead of the dashboard's millions.
 
 Only the Vortex adapters: the others' libraries are deliberately absent from
 this environment (see `bench/adapters.py` on why each gets its own virtualenv).
@@ -22,10 +20,8 @@ import pytest
 BENCH_DIR = Path(__file__).resolve().parents[1] / "bench"
 sys.path.insert(0, str(BENCH_DIR))
 
-from adapters import VORTEX_VARIANTS, build_adapter  # noqa: E402
+from adapters import VORTEX_SLUGS, build_adapter, split_term  # noqa: E402
 from datasets import FULL_SCAN_PATTERN, Pat  # noqa: E402
-
-VORTEX_SLUGS = [v[0] for v in VORTEX_VARIANTS]
 
 #: The fixture holds two `foaf:name` triples on IRI subjects plus one on a
 #: blank node; a bound predicate is the pattern that routes through a secondary
@@ -41,14 +37,41 @@ def test_vortex_adapter_round_trip(slug, fixture_nt_path, tmp_path):
     src = str(fixture_nt_path)
     artifact = adapter.artifact_path(str(tmp_path), src)
     handle = adapter.build(src, artifact)
-    assert adapter.count(handle, FULL_SCAN_PATTERN) == 5
-    assert adapter.count(handle, NAME_PATTERN) == 3
+    full, name = adapter.prepare(FULL_SCAN_PATTERN), adapter.prepare(NAME_PATTERN)
+    assert adapter.count(handle, full) == 5
+    assert adapter.count_only(handle, full) == 5
+    assert adapter.count(handle, name) == 3
+    assert adapter.count_only(handle, name) == 3
     adapter.dispose(handle)
 
     # The Open column of the dashboard: a second process reads the artifact the
     # build wrote, so the two paths must agree on the same file.
     reopened = adapter.open(artifact, src)
-    assert adapter.count(reopened, FULL_SCAN_PATTERN) == 5
+    assert adapter.count(reopened, full) == 5
+    assert adapter.count_only(reopened, full) == 5
     adapter.dispose(reopened)
 
     assert adapter.artifact_bytes(artifact) > 0
+
+
+@pytest.mark.parametrize(
+    "term, parts",
+    [
+        ("<http://example.org/s>", ("iri", "http://example.org/s", None, None)),
+        ('"plain"', ("literal", "plain", None, None)),
+        ('"hello"@en', ("literal", "hello", "en", None)),
+        (
+            '"42"^^<http://www.w3.org/2001/XMLSchema#integer>',
+            ("literal", "42", None, "http://www.w3.org/2001/XMLSchema#integer"),
+        ),
+        ("_:b0", ("blank", "b0", None, None)),
+    ],
+)
+def test_split_term(term, parts):
+    assert split_term(term) == parts
+
+
+@pytest.mark.parametrize("garbage", ["", "http://no.brackets", '"unterminated', '"x"y', "nonsense"])
+def test_split_term_rejects_garbage(garbage):
+    with pytest.raises(ValueError):
+        split_term(garbage)

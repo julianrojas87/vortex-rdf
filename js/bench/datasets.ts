@@ -51,24 +51,11 @@ export interface DatasetOpts {
     graphs?: number;
 }
 
-/** Distinct subjects per row, i.e. the reciprocal of how many triples describe
- *  each resource. 0.1 is ten triples per subject.
- *
- *  This is the knob that decides how much of the dataset is *terms*: the
- *  dictionary holds `subjectRatio + objectRatio` terms per quad, so the two
- *  ratios alone say whether there are more distinct terms than rows.
- *
- *  A ratio of 1.0 — a distinct subject for every row — is not how RDF looks: a
- *  resource is normally described by several properties, so its subject recurs
- *  across that many triples. It also makes `S` match exactly one row, and with
- *  `PO`/`SPO`/`SPOG` matching one apiece, five of the seven probes return two
- *  rows or fewer, so the comparison measures query *setup* almost to the
- *  exclusion of decoding, on a dictionary half again the size of the dataset.
- *
- *  Set `BENCH_SUBJ_RATIO=1.0` to ask for it deliberately: it is a reasonable
- *  dictionary-stress configuration, and `bench:dict-memory` asks for it
- *  explicitly for exactly that reason. It is a poor default. */
-export const SUBJECT_RATIO_DEFAULT = 0.1;
+/** Distinct subjects per row — the reciprocal of triples per subject; 0.1 is
+ *  ten triples per subject. With `objectRatio` it fixes how many distinct terms
+ *  the dictionary holds per quad. Override with `BENCH_SUBJ_RATIO` (1.0 is the
+ *  dictionary-stress setting bench:dict-memory uses). */
+const SUBJECT_RATIO_DEFAULT = 0.1;
 
 /** Env-overridable defaults, so a sweep can vary cardinality without new code. */
 export function datasetOpts(o: DatasetOpts = {}): Required<DatasetOpts> {
@@ -180,16 +167,10 @@ export function genFresh(n: number): Quad[] {
 
 // ─── Query patterns (probe terms fixed at index 0, so they always hit rows) ──
 export type Pat = { name: string; s: Term | null; p: Term | null; o: Term | null; g: Term | null };
-// 'full' (every variable unbound) is measured separately from the selective patterns,
-// under FULL_SCAN_OPTS's much lower repetition count (see shared.ts): repeating a
-// full-table materialization (every row — 1,048,576 at the default scale) ~15x (QUERY_OPTS's
-// 5 warmup + 10 timed) reproducibly trips an internal `unreachable` trap in oxigraph's
-// wasm build around the 5th repetition on the same store — confirmed in isolation with
-// nothing else in the process, so it's not a cross-adapter memory issue. No other
-// adapter under test showed any problem with that many repetitions, but a full-table
-// dump repeated many times is a heavy op for any store (closer in spirit to `ingest`
-// than to a selective query), so the lower budget applies to every adapter uniformly
-// rather than singling out the one library that happens to crash on it.
+// Measured under FULL_SCAN_OPTS (shared.ts), not QUERY_OPTS: a full-table
+// materialization is closer to ingest than to a selective query, and repeating
+// it QUERY_OPTS' 15 times exhausts some stores' wasm memory. The lower budget
+// applies to every adapter.
 export const FULL_SCAN_PATTERN: Pat = { name: 'full', s: null, p: null, o: null, g: null };
 
 /**
@@ -197,8 +178,8 @@ export const FULL_SCAN_PATTERN: Pat = { name: 'full', s: null, p: null, o: null,
  * every one matches row 0 at minimum — no pattern can silently measure a
  * zero-row query.
  *
- * Selectivity follows the data: at the defaults `S` matches ~1 row (subjects
- * are near-unique), `P` ~n/32, `O` ~2, and the conjunctions narrow to a
+ * Selectivity follows the data: at the defaults `S` matches ~10 rows (ten
+ * triples per subject), `P` ~n/32, `O` ~2, and the conjunctions narrow to a
  * handful. The workers record each pattern's matched-row count alongside its
  * timing, so the figures stay interpretable whatever the cardinality knobs.
  */
@@ -237,7 +218,7 @@ export function datasetProbes(n: number, opts: DatasetOpts = {}): {
 // tasks must use `genDataset` instead; the cube is for tasks where routing,
 // not term volume, is the object of measurement.
 
-export const EX = 'http://example.org/#';
+const EX = 'http://example.org/#';
 export const nn = (n: number | string) => df.namedNode(EX + n);
 
 /** d³ triples in the default graph: quad(ex#s, ex#p, ex#o). */

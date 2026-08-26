@@ -17,6 +17,24 @@ import { fileURLToPath } from 'node:url';
 
 import type { Quad } from '@rdfjs/types';
 
+/** The quad shape every consume helper reads: the three mandatory term slots
+ *  plus an optional graph, so rdf-stores, oxigraph and Vortex results all fit. */
+type TermQuad = {
+    subject: { value: string }; predicate: { value: string };
+    object: { value: string }; graph?: { value: string };
+};
+
+/** Read every term value of `quads[from, to)`; returns the characters read. */
+function readTerms(quads: ArrayLike<TermQuad>, from: number, to: number): number {
+    let chars = 0;
+    for (let i = from; i < to; i++) {
+        const q = quads[i];
+        chars += q.subject.value.length + q.predicate.value.length
+            + q.object.value.length + (q.graph?.value.length ?? 0);
+    }
+    return chars;
+}
+
 /** Force every term of every quad to be materialized.
  *
  * Counting rows (or taking `.length`) never decodes a single term under the
@@ -25,12 +43,7 @@ import type { Quad } from '@rdfjs/types';
  * path, and the per-distinct-term boundary crossing the on-demand dictionary
  * makes, is invisible to any instrument here. */
 export function decodeAll(quads: readonly Quad[]): number {
-    let chars = 0;
-    for (const q of quads) {
-        chars += q.subject.value.length + q.predicate.value.length
-            + q.object.value.length + q.graph.value.length;
-    }
-    return chars;
+    return readTerms(quads, 0, quads.length);
 }
 
 /** Human-readable duration from nanoseconds. */
@@ -41,16 +54,70 @@ export function fmtNs(ns: number): string {
     return (ns / 1e9).toPrecision(3) + ' s';
 }
 
-/** Deterministically drop a wasm-bindgen value's Rust-side allocation.
+// ─── Consuming a result set ──────────────────────────────────────────────────
+
+/** Wall-clock budget for one consume loop, ms. `0` disables the check.
  *
- * Vortex's and oxigraph's public `.d.ts` are hand-curated and deliberately omit
- * `free()` — ordinary consumers are meant to lean on the FinalizationRegistry.
- * A benchmark is not an ordinary consumer: V8 has no visibility into wasm
- * linear-memory pressure and can defer finalizers arbitrarily long, so every
- * store must be disposed as soon as its measurement is done. Hence the reach
- * past the curated type, rather than widening what real consumers see. */
-export function freeWasm(h: unknown): void {
-    (h as { free(): void }).free();
+ *  A store that cannot materialize a result set does not fail fast — it
+ *  death-marches, ballooning the heap towards the V8 cap (GC falls out of
+ *  concurrent mode into back-to-back full collections) until its wasm module
+ *  traps. The consume loop is where that time is spent, so this is where it
+ *  can be cut short: the throw surfaces through the worker's per-phase catch
+ *  as an ordinary `failures` entry and renders as a "failed" cell.
+ *
+ *  The default is orders of magnitude above any *successful* consume. */
+const CONSUME_BUDGET_MS = Number(process.env.CONSUME_BUDGET_MS ?? 120_000);
+
+/** Where every consume loop's reads escape to, so the JIT cannot drop them. */
+let consumeSink = 0;
+
+/** Thrown when a consume loop exceeds [`CONSUME_BUDGET_MS`]. The message is what
+ *  lands in the run's `failures` list, so it says how far the loop got. */
+class ConsumeBudgetExceeded extends Error {
+    constructor(done: number, total: number, ms: number) {
+        super(
+            `consume budget exceeded after ${(ms / 1000).toFixed(0)}s ` +
+            `(${done.toLocaleString()} of ${total.toLocaleString()} quads; ` +
+            `raise CONSUME_BUDGET_MS to wait longer)`,
+        );
+        this.name = 'ConsumeBudgetExceeded';
+    }
+}
+
+/** Rows per budget check: the budget is checked between windows, never per
+ *  quad, so the timer stays out of the measured loop. Result sets below one
+ *  window are never checked — a death march needs a large result set. */
+const CONSUME_WINDOW = 65_536;
+
+/** Count a result set by consuming it: read every term of every quad.
+ *
+ *  The stores return different amounts of *done* work: the pure-JS stores hold
+ *  eager term objects, while Vortex quads are lazy wasm-backed proxies whose
+ *  term values have not crossed the boundary yet. Counting `.length` alone lets
+ *  Vortex skip that crossing entirely, while the Rust and Python tabs both
+ *  materialize (quads_vec / N-Triples strings). Reading all four term values
+ *  makes materialization part of the measured work everywhere, and puts the
+ *  wasm boundary cost on the page. */
+export function consumeQuads(quads: ArrayLike<TermQuad>): number {
+    let acc = 0;
+    const t0 = CONSUME_BUDGET_MS > 0 ? performance.now() : 0;
+    for (let off = 0; off < quads.length; off += CONSUME_WINDOW) {
+        if (CONSUME_BUDGET_MS > 0 && off > 0) {
+            const ms = performance.now() - t0;
+            if (ms > CONSUME_BUDGET_MS) throw new ConsumeBudgetExceeded(off, quads.length, ms);
+        }
+        acc += readTerms(quads, off, Math.min(off + CONSUME_WINDOW, quads.length));
+    }
+    consumeSink += acc;
+    return quads.length;
+}
+
+/** [`consumeQuads`]'s contract for a store whose results are term strings
+ *  not quad objects (hdt): read every string, escape the reads. */
+export function consumeStrings(strings: string[]): void {
+    let acc = 0;
+    for (const s of strings) acc += s.length;
+    consumeSink += acc;
 }
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -64,8 +131,7 @@ const NODE_FLAGS = ['--expose-gc', '--max-old-space-size=8192'];
  *  The last line of defense behind `consumeQuads`' in-loop budget: that check
  *  can only fire while JavaScript is running, so a phase that stalls *inside* a
  *  single wasm call (or any future pathology outside our own loops) would hang
- *  the run indefinitely. The default is far above any legitimate worker — the
- *  slowest on record is oxigraph's query role at ~10 minutes. */
+ *  the run indefinitely. The default is far above any legitimate worker. */
 const WORKER_TIMEOUT_MS = Number(process.env.WORKER_TIMEOUT_MS ?? 30 * 60_000);
 
 /**

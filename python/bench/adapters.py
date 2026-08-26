@@ -1,11 +1,9 @@
 """One adapter per Python RDF library under comparison.
 
 Every import of a third-party library is deferred into the adapter that needs
-it. Each adapter runs in its own virtualenv (see `run.py`) precisely because
-their dependency sets conflict -- pycottas hard-pins `pyoxigraph==0.3.18`, so a
-shared environment would silently bench a pyoxigraph two minor versions behind
-the one the JavaScript tab compares against. A module-level import here would
-break that isolation on the first `import adapters`.
+it: each adapter runs in its own virtualenv (see `run.py` for why), and a
+module-level import here would break that isolation on the first
+`import adapters`.
 
 MEASURED UNIT. `count` consumes a pattern's results and returns how many there
 were: every matched term's lexical string is read in Python and its length
@@ -28,13 +26,15 @@ a term; the others walk their iterators or result lists unread.
 
 TERM SPELLING. The canonical form throughout the harness is N-Triples
 (`<iri>`, `"literal"`) -- what `datasets.py` writes and what the generated file
-contains. Adapters convert inward. Vortex and lightrdf accept that form
-directly; pyoxigraph, rdflib, and pycottas need parsed term objects.
+contains. Adapters convert inward through `prepare`, once per pattern and
+outside the timed region: Vortex and lightrdf accept that form directly;
+pyoxigraph, rdflib, and pycottas need parsed term objects.
 """
 
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass
 from typing import Any, Iterable, Optional
 
 from datasets import Pat
@@ -84,21 +84,32 @@ def split_term(t: str) -> tuple[str, str, Optional[str], Optional[str]]:
     raise ValueError(f"unrecognized N-Triples term: {t!r}")
 
 
+def rdflib_term(t: Optional[str]):
+    """An rdflib term for an N-Triples spelling; `None` stays a wildcard."""
+    if t is None:
+        return None
+    from rdflib.util import from_n3
+
+    return from_n3(t)
+
+
 # ─── Adapter base ───────────────────────────────────────────────────────────
 
 
 class Adapter:
     """A library under test.
 
-    `supports_quads` / `supports_mutation` drive the dashboard's "unsupported"
-    cells. They record a fact about the library's API, not a gap in the
-    harness, and each one is justified on the subclass.
+    `supports_quads` and `mutation_unsupported` drive the dashboard's
+    "unsupported" cells. They record a fact about the library's API, not a gap
+    in the harness, and each one is justified on the subclass.
     """
 
     slug: str = ""
     label: str = ""
     supports_quads: bool = True
-    supports_mutation: bool = True
+    #: The reason the library cannot add/delete, shown as the cell's tooltip;
+    #: `None` when it can.
+    mutation_unsupported: Optional[str] = None
     #: Whether opening the built artifact is a distinct operation from building
     #: it. False for stores that live only in memory and must re-parse the
     #: source file every process start; those get no Open measurement, because
@@ -116,13 +127,20 @@ class Adapter:
         """Get a queryable handle from an already-built artifact."""
         raise NotImplementedError
 
-    def count(self, handle: Any, pat: Pat) -> int:
+    def prepare(self, pat: Pat) -> Any:
+        """Convert a pattern into the form `count`/`count_only` take, so term
+        parsing happens once per pattern and outside the timed region."""
+        return pat
+
+    def count(self, handle: Any, query: Any) -> int:
+        """Consume every match of a prepared pattern (see the module doc's
+        MEASURED UNIT) and return how many there were."""
         raise NotImplementedError
 
-    def count_only(self, handle: Any, pat: Pat) -> int:
-        """Resolve the same pattern and return only the match count -- no term
-        is read. Each library's cheapest correct count path: the COUNT/ASK
-        shape of the workload."""
+    def count_only(self, handle: Any, query: Any) -> int:
+        """Resolve the same prepared pattern and return only the match count
+        -- no term is read. Each library's cheapest correct count path: the
+        COUNT/ASK shape of the workload."""
         raise NotImplementedError
 
     def add(self, handle: Any, quads: Iterable[tuple]) -> None:
@@ -154,12 +172,11 @@ class Adapter:
 class VortexAdapter(Adapter):
     """`serialize_rdf` to build a .vortex file, then open and match it.
 
-    supports_mutation is False: the Python bindings expose no add/delete at all
-    (`VortexRdfStore` is open / match / to_bytes). That is a real gap in the
-    bindings, not an omission here -- the JS bindings do have addQuad/addQuads.
+    mutation_unsupported: the Python bindings expose no add/delete API
+    (`VortexRdfStore` is open / match / to_bytes).
     """
 
-    supports_mutation = False
+    mutation_unsupported = "the Python bindings expose no add/delete API"
 
     def __init__(
         self,
@@ -184,25 +201,22 @@ class VortexAdapter(Adapter):
         return os.path.join(workdir, f"{self.slug}.{stem}.vortex")
 
     def build(self, src: str, artifact: str) -> Any:
-        from vortex_rdf import _native as native
+        from vortex_rdf import VortexRdfStore, serialize_rdf
 
         if os.path.exists(artifact):
             os.remove(artifact)
-        native.serialize_rdf(src, artifact, layout=self.layout, indexes=self.indexes)
-        return native.VortexRdfStore(artifact, in_memory=self.in_memory)
+        serialize_rdf(src, artifact, layout=self.layout, indexes=self.indexes)
+        return VortexRdfStore(artifact, in_memory=self.in_memory)
 
     def open(self, artifact: str, src: str) -> Any:
-        from vortex_rdf import _native as native
+        from vortex_rdf import VortexRdfStore
 
-        return native.VortexRdfStore(artifact, in_memory=self.in_memory)
+        return VortexRdfStore(artifact, in_memory=self.in_memory)
 
     def count(self, handle: Any, pat: Pat) -> int:
         # `get_quads` is the idiomatic read, and it materializes four terms per
         # row. On a triple pattern the libraries whose result is a triple build
         # three, so Vortex is doing strictly more work per row here, not less.
-        # Which path builds the strings follows the variant: the Dictionary
-        # builds read their matched term codes and decode each distinct code
-        # once, the Default build reads the store's shared-term rows.
         acc = rows = 0
         for s, p, o, g in handle.get_quads(pat.s, pat.p, pat.o, pat.g):
             acc += len(s) + len(p) + len(o) + len(g)
@@ -262,11 +276,12 @@ class PyoxigraphAdapter(Adapter):
     def open(self, artifact: str, src: str) -> Any:
         return self.build(src, artifact)
 
-    def count(self, handle: Any, pat: Pat) -> int:
+    def prepare(self, pat: Pat) -> tuple:
+        return (self._term(pat.s), self._term(pat.p), self._term(pat.o), self._term(pat.g))
+
+    def count(self, handle: Any, query: tuple) -> int:
         acc = rows = 0
-        for q in handle.quads_for_pattern(
-            self._term(pat.s), self._term(pat.p), self._term(pat.o), self._term(pat.g)
-        ):
+        for q in handle.quads_for_pattern(*query):
             acc += len(q.subject.value) + len(q.predicate.value) + len(q.object.value)
             gn = q.graph_name
             acc += len(gn.value) if hasattr(gn, "value") else 0
@@ -274,16 +289,10 @@ class PyoxigraphAdapter(Adapter):
         consume(acc)
         return rows
 
-    def count_only(self, handle: Any, pat: Pat) -> int:
+    def count_only(self, handle: Any, query: tuple) -> int:
         # No count API: the iterator still yields quad wrappers, which is this
         # store's floor for a count; their term strings stay unbuilt.
-        g = self._term(pat.g)
-        return sum(
-            1
-            for _ in handle.quads_for_pattern(
-                self._term(pat.s), self._term(pat.p), self._term(pat.o), g
-            )
-        )
+        return sum(1 for _ in handle.quads_for_pattern(*query))
 
     def _quad(self, q: tuple):
         import pyoxigraph as ox
@@ -307,20 +316,12 @@ class PyoxigraphAdapter(Adapter):
 class PycottasAdapter(Adapter):
     """`rdf2cottas` builds a Parquet-backed .cottas file; queries are DuckDB SQL.
 
-    supports_mutation is False on the library's own authority: every write
-    method on `pycottas.COTTASStore` raises
-    `TypeError('The COTTAS store is read only!')`.
+    mutation_unsupported on the library's own authority: every write method on
+    `pycottas.COTTASStore` raises `TypeError('The COTTAS store is read only!')`.
     """
 
     slug, label = "pycottas", "pycottas"
-    supports_mutation = False
-
-    def _term(self, t: Optional[str]):
-        if t is None:
-            return None
-        from rdflib.util import from_n3
-
-        return from_n3(t)
+    mutation_unsupported = "COTTASStore raises: 'The COTTAS store is read only!'"
 
     def artifact_path(self, workdir: str, src: str) -> str:
         stem = os.path.splitext(os.path.basename(src))[0]
@@ -339,25 +340,25 @@ class PycottasAdapter(Adapter):
 
         return pycottas.COTTASDocument(artifact)
 
-    def count(self, handle: Any, pat: Pat) -> int:
+    def prepare(self, pat: Pat) -> tuple:
+        terms = [rdflib_term(pat.s), rdflib_term(pat.p), rdflib_term(pat.o)]
+        if pat.g is not None:
+            terms.append(rdflib_term(pat.g))
+        return tuple(terms)
+
+    def count(self, handle: Any, query: tuple) -> int:
         acc = rows = 0
-        for row in handle.search(tuple(self._pattern(pat))):
+        for row in handle.search(query):
             for t in row:
                 acc += len(t)
             rows += 1
         consume(acc)
         return rows
 
-    def count_only(self, handle: Any, pat: Pat) -> int:
+    def count_only(self, handle: Any, query: tuple) -> int:
         # `search` builds its full result list either way -- pycottas's floor
         # for a count; the strings just go unread.
-        return len(handle.search(tuple(self._pattern(pat))))
-
-    def _pattern(self, pat: Pat) -> list:
-        terms = [self._term(pat.s), self._term(pat.p), self._term(pat.o)]
-        if pat.g is not None:
-            terms.append(self._term(pat.g))
-        return terms
+        return len(handle.search(query))
 
 
 # ─── lightrdf ───────────────────────────────────────────────────────────────
@@ -371,13 +372,13 @@ class LightrdfAdapter(Adapter):
     no-index baseline: what every pattern costs when nothing is precomputed.
 
     supports_quads is False: `search_triples(s, p, o)` takes no graph argument.
-    supports_mutation is False: there is nothing to mutate.
+    mutation_unsupported: there is nothing to mutate. Opening is distinct from
+    building: it wraps the path and parses nothing.
     """
 
     slug, label = "lightrdf", "lightrdf"
     supports_quads = False
-    supports_mutation = False
-    has_distinct_open = True  # opening is just wrapping the path -- near zero
+    mutation_unsupported = "a streaming parser, with no store to mutate"
 
     def artifact_path(self, workdir: str, src: str) -> str:
         return src  # its "artifact" is the source file itself
@@ -423,13 +424,6 @@ class RdflibAdapter(Adapter):
     slug, label = "rdflib", "rdflib"
     has_distinct_open = False
 
-    def _term(self, t: Optional[str]):
-        if t is None:
-            return None
-        from rdflib.util import from_n3
-
-        return from_n3(t)
-
     def artifact_path(self, workdir: str, src: str) -> str:
         return ""
 
@@ -447,8 +441,11 @@ class RdflibAdapter(Adapter):
     def open(self, artifact: str, src: str) -> Any:
         return self.build(src, artifact)
 
-    def count(self, handle: Any, pat: Pat) -> int:
-        s, p, o = self._term(pat.s), self._term(pat.p), self._term(pat.o)
+    def prepare(self, pat: Pat) -> tuple:
+        return (rdflib_term(pat.s), rdflib_term(pat.p), rdflib_term(pat.o), rdflib_term(pat.g))
+
+    def count(self, handle: Any, query: tuple) -> int:
+        s, p, o, g = query
         # `Dataset.triples` searches the default graph only, and every row of
         # the shared dataset sits in a named one -- so an unbound graph has to
         # go through `quads` with a `None` graph, which spans all of them.
@@ -456,7 +453,7 @@ class RdflibAdapter(Adapter):
 
         acc = rows = 0
         if isinstance(handle, Dataset):
-            for s2, p2, o2, g2 in handle.quads((s, p, o, self._term(pat.g))):
+            for s2, p2, o2, g2 in handle.quads((s, p, o, g)):
                 # rdflib terms subclass str; the graph position is a Graph
                 # whose identifier is the name.
                 gid = getattr(g2, "identifier", g2)
@@ -469,16 +466,16 @@ class RdflibAdapter(Adapter):
         consume(acc)
         return rows
 
-    def count_only(self, handle: Any, pat: Pat) -> int:
-        s, p, o = self._term(pat.s), self._term(pat.p), self._term(pat.o)
+    def count_only(self, handle: Any, query: tuple) -> int:
+        s, p, o, g = query
         from rdflib import Dataset
 
         if isinstance(handle, Dataset):
-            return sum(1 for _ in handle.quads((s, p, o, self._term(pat.g))))
+            return sum(1 for _ in handle.quads((s, p, o, g)))
         return sum(1 for _ in handle.triples((s, p, o)))
 
     def _rdflib_triple(self, q: tuple):
-        return (self._term(q[0]), self._term(q[1]), self._term(q[2]))
+        return (rdflib_term(q[0]), rdflib_term(q[1]), rdflib_term(q[2]))
 
     def add(self, handle: Any, quads: Iterable[tuple]) -> None:
         for q in quads:
@@ -491,31 +488,43 @@ class RdflibAdapter(Adapter):
 
 # ─── Registry ───────────────────────────────────────────────────────────────
 
-#: Vortex build variants, the same star design the Rust and JS tabs use:
-#: layout x secondary index x residency. Every one of them is a row
-#: in the cross-library panels.
-#:
-#: Residency and secondary indexes are crossed rather than varied one at a
-#: time: every Dictionary build appears file-backed and in-memory, so the
-#: index's effect can be read within a residency mode and residency's within
-#: an index configuration. The in-memory indexed cells are the ones that match
-#: how pyoxigraph and rdflib are configured.
+
+@dataclass(frozen=True)
+class VortexVariant:
+    slug: str
+    label: str
+    layout: str
+    indexes: tuple[str, ...]
+    in_memory: bool
+
+
+#: Vortex build variants: the same layout x secondary index x residency matrix
+#: as the Rust compare tab (core/benches/compare.rs), so the two tabs' Vortex
+#: rows line up one for one. The JS tab has no file residency and crosses
+#: Default with the indexes instead. Every variant is a row in the
+#: cross-library panels.
 VORTEX_VARIANTS = [
-    ("vortex_dict", "Vortex Dict", "dictionary", [], False),
-    ("vortex_dict_mem", "Vortex Dict (in-memory)", "dictionary", [], True),
-    ("vortex_default", "Vortex Default", "default", [], False),
-    ("vortex_dict_bycopy", "Vortex Dict+ByCopy", "dictionary", ["secondary-by-copy"], False),
-    ("vortex_dict_bycopy_mem", "Vortex Dict+ByCopy (in-memory)", "dictionary", ["secondary-by-copy"], True),
-    ("vortex_dict_byref", "Vortex Dict+ByRef", "dictionary", ["secondary-by-reference"], False),
-    ("vortex_dict_byref_mem", "Vortex Dict+ByRef (in-memory)", "dictionary", ["secondary-by-reference"], True),
+    VortexVariant("vortex_dict", "Vortex Dict", "dictionary", (), False),
+    VortexVariant("vortex_dict_mem", "Vortex Dict (in-memory)", "dictionary", (), True),
+    VortexVariant("vortex_default", "Vortex Default", "default", (), False),
+    VortexVariant("vortex_dict_bycopy", "Vortex Dict+ByCopy", "dictionary", ("secondary-by-copy",), False),
+    VortexVariant(
+        "vortex_dict_bycopy_mem", "Vortex Dict+ByCopy (in-memory)", "dictionary", ("secondary-by-copy",), True
+    ),
+    VortexVariant("vortex_dict_byref", "Vortex Dict+ByRef", "dictionary", ("secondary-by-reference",), False),
+    VortexVariant(
+        "vortex_dict_byref_mem", "Vortex Dict+ByRef (in-memory)", "dictionary", ("secondary-by-reference",), True
+    ),
 ]
+
+VORTEX_SLUGS = [v.slug for v in VORTEX_VARIANTS]
 
 
 def build_adapter(slug: str) -> Adapter:
     """Construct one adapter by slug, importing only that library."""
-    for vslug, label, layout, indexes, in_memory in VORTEX_VARIANTS:
-        if slug == vslug:
-            return VortexAdapter(vslug, label, layout, indexes, in_memory)
+    for v in VORTEX_VARIANTS:
+        if slug == v.slug:
+            return VortexAdapter(v.slug, v.label, v.layout, list(v.indexes), v.in_memory)
     if slug == "pyoxigraph":
         return PyoxigraphAdapter()
     if slug == "pycottas":
@@ -530,11 +539,11 @@ def build_adapter(slug: str) -> Adapter:
 #: Every adapter a full run measures, in dashboard row order: each Vortex
 #: variant is a row in the cross-library panels alongside the other libraries,
 #: not a footnote to them.
-ALL_SLUGS = [v[0] for v in VORTEX_VARIANTS] + ["pyoxigraph", "pycottas", "rdflib", "lightrdf"]
+ALL_SLUGS = VORTEX_SLUGS + ["pyoxigraph", "pycottas", "rdflib", "lightrdf"]
 
 #: Which virtualenv each adapter needs. Vortex variants share one.
 VENV_FOR = {
-    **{v[0]: "vortex" for v in VORTEX_VARIANTS},
+    **{slug: "vortex" for slug in VORTEX_SLUGS},
     "pyoxigraph": "pyoxigraph",
     "pycottas": "pycottas",
     "rdflib": "rdflib",

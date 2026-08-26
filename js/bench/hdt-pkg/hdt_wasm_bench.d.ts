@@ -20,40 +20,10 @@ export class Hdt {
     triple_ids_with_pattern(sp?: string | null, pp?: string | null, op?: string | null): Uint32Array;
 }
 
-export class HdtStore {
-    free(): void;
-    [Symbol.dispose](): void;
-    /**
-     * Translate a flat id array back to term strings, `[s1,p1,o1, …]`.
-     * Callers chunk large inputs: several million ids in one call is the
-     * documented OOM risk of this surface.
-     */
-    ids_to_strings(ids: Uint32Array): string[];
-    /**
-     * Parse an HDT file's bytes into a queryable store.
-     */
-    constructor(data: Uint8Array);
-    /**
-     * Total triples in the store — the harness's check that the pre-built
-     * artifact matches the dataset the other adapters generate in-process.
-     */
-    num_triples(): number;
-    /**
-     * Matching triples as a flat `Uint32Array` of ids `[s1,p1,o1, s2,p2,o2, …]`.
-     * Terms are in HDT dictionary spelling: IRIs bare, literals with quotes.
-     */
-    triple_ids_with_pattern(sp?: string | null, pp?: string | null, op?: string | null): Uint32Array;
-}
-
 export type InitInput = RequestInfo | URL | Response | BufferSource | WebAssembly.Module;
 
 export interface InitOutput {
     readonly memory: WebAssembly.Memory;
-    readonly __wbg_hdtstore_free: (a: number, b: number) => void;
-    readonly hdtstore_ids_to_strings: (a: number, b: number, c: number) => [number, number, number, number];
-    readonly hdtstore_new: (a: number, b: number) => [number, number, number];
-    readonly hdtstore_num_triples: (a: number) => number;
-    readonly hdtstore_triple_ids_with_pattern: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => [number, number];
     readonly __wbg_hdt_free: (a: number, b: number) => void;
     readonly hdt_ids_to_strings: (a: number, b: number, c: number) => [number, number, number, number];
     readonly hdt_new: (a: number, b: number) => [number, number, number];

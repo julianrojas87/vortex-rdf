@@ -33,7 +33,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from adapters import ALL_SLUGS, VENV_FOR  # noqa: E402
-from datasets import DatasetOpts, moduli, write_dataset  # noqa: E402
+from datasets import dataset_opts, moduli, write_dataset  # noqa: E402
 
 BENCH_DIR = Path(__file__).resolve().parent
 REPO_ROOT = BENCH_DIR.parent.parent
@@ -47,8 +47,7 @@ DATA_DIR = BENCH_DIR / ".data"
 _dim = int(os.environ.get("BENCH_DIM", 0))
 #: One dataset for the whole run: every library that has graphs in its model
 #: builds from it, and the ones that do not read its triples projection.
-N_QUADS = int(os.environ.get("BENCH_SIZE", 0)) or (_dim**3 if _dim else 1_048_576)
-N_TRIPLES = N_QUADS
+N_TRIPLES = int(os.environ.get("BENCH_SIZE", 0)) or (_dim**3 if _dim else 1_048_576)
 GRAPHS = int(os.environ.get("BENCH_GRAPHS_QUADS", 8))
 MUT_BATCH = int(os.environ.get("MUT_BATCH", 10_000))
 PYTHON_VERSION = os.environ.get("BENCH_PYTHON", "3.13")
@@ -122,7 +121,7 @@ def run_worker(slug: str, role: str, triples: Path, quads: Path) -> dict | None:
         "--slug", slug, "--role", role,
         "--triples", str(triples), "--quads", str(quads),
         "--workdir", str(workdir),
-        "--n", str(N_QUADS),
+        "--n", str(N_TRIPLES),
         "--graphs", str(GRAPHS), "--mut-batch", str(MUT_BATCH),
     ]
     log(f"\n[{slug}] {role}")
@@ -165,6 +164,9 @@ def check_count_agreement(counts_by_slug: dict[str, dict[str, int]]) -> list[str
 
 
 def main() -> int:
+    if any(arg in ("-h", "--help") for arg in sys.argv[1:]):
+        print(__doc__)
+        return 0
     if not shutil.which("uv"):
         log("uv is required to provision the per-adapter virtualenvs")
         return 1
@@ -176,17 +178,21 @@ def main() -> int:
     # run had rather than whatever the last library left behind.
     mem = meminfo_mb()
 
-    qm = moduli(N_QUADS, DatasetOpts(graphs=GRAPHS))
+    opts = dataset_opts(graphs=GRAPHS)
+    qm = moduli(N_TRIPLES, opts)
 
-    quads = DATA_DIR / f"quads_{N_QUADS}.nq"
-    triples = DATA_DIR / f"triples_{N_TRIPLES}.nt"
+    # Keyed on the resolved cardinality as well as the row count: the env knobs
+    # `dataset_opts` reads change the file's contents at the same row count.
+    key = f"{N_TRIPLES}_{qm.n_subj}x{qm.n_pred}x{qm.n_obj}x{qm.n_graph}_{opts.literal_frac:g}"
+    quads = DATA_DIR / f"quads_{key}.nq"
+    triples = DATA_DIR / f"triples_{key}.nt"
     for path, drop in ((quads, False), (triples, True)):
         if path.exists():
             log(f"reusing dataset {path.name} ({path.stat().st_size / 1e6:.1f} MB)")
         else:
-            log(f"generating {path.name} ({N_QUADS:,} rows)…")
+            log(f"generating {path.name} ({N_TRIPLES:,} rows)…")
             t0 = time.perf_counter()
-            write_dataset(str(path), N_QUADS, DatasetOpts(graphs=GRAPHS), drop_graph=drop)
+            write_dataset(str(path), N_TRIPLES, opts, drop_graph=drop)
             log(f"  wrote {path.stat().st_size / 1e6:.1f} MB in {time.perf_counter() - t0:.1f}s")
 
     rows: list = []
@@ -239,7 +245,7 @@ def main() -> int:
             versions.update(installed_versions(provision(name), pkgs))
     try:
         vortex_version = subprocess.run(
-            [str(provision("vortex")), "-c", "from vortex_rdf import _native as n; print(n.__version__)"],
+            [str(provision("vortex")), "-c", "import vortex_rdf; print(vortex_rdf.__version__)"],
             capture_output=True, text=True, check=True,
             env={**os.environ, "PYTHONPATH": str(REPO_ROOT / "python")},
         ).stdout.strip()
@@ -260,7 +266,7 @@ def main() -> int:
     measured = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     provenance = (
         f"Measured {measured} · Python {py_ver} · {cpu_model()}, {os.cpu_count()} threads · "
-        f"{N_QUADS:,} quads over {qm.n_graph} named graphs ({qm.terms:,} terms; "
+        f"{N_TRIPLES:,} quads over {qm.n_graph} named graphs ({qm.terms:,} terms; "
         f"lightrdf reads their triples projection), MUT_BATCH={MUT_BATCH:,} · "
         f"wall-clock (perf_counter_ns) · {lib_str} · one adapter per process and per virtualenv, isolated"
     )
@@ -276,7 +282,6 @@ def main() -> int:
         "sizes": sizes,
         "config": {
             "triplesCount": N_TRIPLES,
-            "quadsCount": N_QUADS,
             "cardinality": qm.__dict__,
             "matchedRows": matched,
             "mutBatch": MUT_BATCH,

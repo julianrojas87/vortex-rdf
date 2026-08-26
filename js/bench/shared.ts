@@ -22,8 +22,8 @@ import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
 
 import { VortexRdfStore, type BuildOptions } from '../entry/node.js';
-import { fmtNs, freeWasm } from './util.js';
-import { df, type Pat } from './datasets.js';
+import { fmtNs, consumeQuads, consumeStrings } from './util.js';
+import { df, moduli, type Pat } from './datasets.js';
 import {
     RdfStore,
     RdfStoreIndexNestedMapQuoted,
@@ -36,20 +36,14 @@ export * from './datasets.js';
 
 // ─── Config (env-tunable) ────────────────────────────────────────────────────
 //
-// Scale, as a row count: BENCH_SIZE — the same env name the Rust suites read, so
-// one knob sets every environment. BENCH_DIM remains as cube shorthand for quick
-// pilots (BENCH_DIM=16 → 4,096 rows) and loses to an explicit row count. The
-// default is the
-// dashboard's indicative-overview scale: 2^20 rows — the
-// benchmarks exist to show where vortex-rdf stands, not to be a stress test,
-// and this size keeps a full refresh under an hour while still exercising
-// term handling at ~630k distinct terms.
+// BENCH_SIZE sets the row count (default 2^20, ~630k distinct terms) — the same
+// env name the Rust suites read; BENCH_DIM=d is cube shorthand (d³ rows) for
+// quick pilots and loses to an explicit BENCH_SIZE.
 const dim = Number(process.env.BENCH_DIM ?? 0);
 /** One dataset for the whole run: every store whose model has graphs builds
  *  from it and answers every pattern on it, and one whose model does not (hdt)
  *  reads the same rows with the graph dropped. */
 export const N_TRIPLES = Number(process.env.BENCH_SIZE ?? 0) || (dim > 0 ? dim ** 3 : 1_048_576);
-export const N_QUADS = N_TRIPLES;
 /** Named graphs in that dataset, before the generator's coprimality nudge.
  *  Matches the Rust suite's `WANT_GRAPHS` and the Python suite's
  *  BENCH_GRAPHS_QUADS, so all three tabs describe the same shape. */
@@ -133,73 +127,9 @@ export const VORTEX_VARIANTS: { slug: string; label: string; options: BuildOptio
     { slug: 'vortex_default_bycopy', label: 'Vortex Default+ByCopy', options: { layout: 'default', indexes: ['secondary-by-copy'] } },
 ];
 
-/** Count a result set by consuming it: read every term of every quad.
- *
- *  The stores return different amounts of *done* work: the pure-JS stores hold
- *  eager term objects, while Vortex quads are lazy wasm-backed proxies whose
- *  term values have not crossed the boundary yet. Counting `.length` alone lets
- *  Vortex skip that crossing entirely — the JS tab then reads structurally
- *  faster than the same query on the same data on the Rust and Python tabs,
- *  which both materialize (quads_vec / N-Triples strings). Reading all four
- *  term values makes materialization part of the measured work everywhere, and
- *  puts the wasm boundary cost — the thing worth optimizing — on the page. */
-let consumeSink = 0;
-
-/** Thrown when a consume loop exceeds [`CONSUME_BUDGET_MS`]. The message is what
- *  lands in the run's `failures` list, so it says how far the loop got. */
-export class ConsumeBudgetExceeded extends Error {
-    constructor(done: number, total: number, ms: number) {
-        super(
-            `consume budget exceeded after ${(ms / 1000).toFixed(0)}s ` +
-            `(${done.toLocaleString()} of ${total.toLocaleString()} quads; ` +
-            `raise CONSUME_BUDGET_MS to wait longer)`,
-        );
-        this.name = 'ConsumeBudgetExceeded';
-    }
-}
-
-/** Wall-clock budget for one consume loop, ms. `0` disables the check.
- *
- *  The budget exists because a store that cannot materialize a result set does
- *  not fail fast — it death-marches, ballooning the heap towards the V8 cap
- *  (GC falls out of concurrent mode into back-to-back full collections) until
- *  its wasm module traps. The loop below is where that time is spent, so this
- *  is where it can be cut short: the throw surfaces through the worker's
- *  per-phase catch as an ordinary `failures` entry and renders as the same
- *  "failed" cell, delivered in minutes rather than tens of minutes.
- *
- *  The default is orders of magnitude above any *successful* consume. */
-const CONSUME_BUDGET_MS = Number(process.env.CONSUME_BUDGET_MS ?? 120_000);
-
-export function consumeQuads(
-    quads: ArrayLike<{ subject: { value: string }; predicate: { value: string };
-                       object: { value: string }; graph?: { value: string } }>,
-): number {
-    let acc = 0;
-    // Check the budget every 64Ki quads, not every iteration: a per-iteration
-    // `performance.now()` would add ~2M timer calls to a measured full scan.
-    // Result sets below 64Ki rows are never checked at all, which is fine —
-    // a death march needs a large result set to march over.
-    const t0 = CONSUME_BUDGET_MS > 0 ? performance.now() : 0;
-    for (let i = 0; i < quads.length; i++) {
-        if (CONSUME_BUDGET_MS > 0 && (i & 0xffff) === 0xffff) {
-            const ms = performance.now() - t0;
-            if (ms > CONSUME_BUDGET_MS) throw new ConsumeBudgetExceeded(i, quads.length, ms);
-        }
-        const q = quads[i];
-        acc += q.subject.value.length + q.predicate.value.length
-             + q.object.value.length + (q.graph?.value.length ?? 0);
-    }
-    consumeSink += acc; // the reads must escape, or the JIT may drop them
-    return quads.length;
-}
-/** [`consumeQuads`]'s contract for a store whose results are term strings
- *  rather than quad objects (hdt): read every string, escape the reads. */
-export function consumeStrings(strings: string[]): void {
-    let acc = 0;
-    for (const s of strings) acc += s.length;
-    consumeSink += acc;
-}
+// Result sets are counted by consuming them — `consumeQuads` / `consumeStrings`
+// in util.ts read every term value, so materialization is measured work on
+// every store.
 
 export function vortexAdapter(variant: { slug: string; label: string; options: BuildOptions }): StoreAdapter<VortexRdfStore> {
     return {
@@ -214,7 +144,7 @@ export function vortexAdapter(variant: { slug: string; label: string; options: B
         countOnly: (h, p) => h.countQuads(p.s, p.p, p.o, p.g),
         snapshot: (h) => h.toBytes(),
         open: (bytes) => VortexRdfStore.fromBytes(bytes as Uint8Array),
-        dispose: freeWasm,
+        dispose: (h) => h.free(),
     };
 }
 
@@ -260,7 +190,8 @@ export function oxigraphAdapter(): StoreAdapter<OxiStore> {
         // No count API: match() materializes its result array either way, so
         // walking its length is this store's floor for a count.
         countOnly: (h, p) => h.match(p.s as never, p.p as never, p.o as never, p.g as never).length,
-        dispose: freeWasm,
+        // oxigraph's shipped `.d.ts` does not declare the wasm-bindgen `free()`.
+        dispose: (h) => (h as unknown as { free(): void }).free(),
     };
 }
 
@@ -279,7 +210,7 @@ export const HDT_FILE = process.env.HDT_FILE
     ?? resolve(here, '../../target/bench_compare/hdt/data.hdt');
 
 type HdtModule = typeof import('./hdt-pkg/hdt_wasm_bench.js');
-type HdtStore = import('./hdt-pkg/hdt_wasm_bench.js').HdtStore;
+type Hdt = import('./hdt-pkg/hdt_wasm_bench.js').Hdt;
 let hdtModule: HdtModule | null = null;
 async function hdtMod(): Promise<HdtModule> {
     if (!hdtModule) {
@@ -304,7 +235,13 @@ function hdtTerm(t: { termType: string; value: string } | null): string | undefi
  *  that surface's documented OOM risk, so the full scan feeds it chunks. */
 const HDT_TRANSLATE_IDS = 300_000 * 3;
 
-export function hdtAdapter(): StoreAdapter<HdtStore> {
+/** Total triples in an HDT store: the harness's check that the pre-built
+ *  artifact matches the dataset the other adapters generate in-process. */
+function hdtNumTriples(h: Hdt): number {
+    return h.triple_ids_with_pattern(undefined, undefined, undefined).length / 3;
+}
+
+export function hdtAdapter(): StoreAdapter<Hdt> {
     return {
         slug: 'hdt',
         // Not "(file)": the wasm bindings parse the artifact's bytes into wasm
@@ -326,8 +263,8 @@ export function hdtAdapter(): StoreAdapter<HdtStore> {
                     + '(cargo bench --bench compare), or point HDT_FILE at one');
             }
             const mod = await hdtMod();
-            const h = new mod.HdtStore(readFileSync(HDT_FILE));
-            const n = h.num_triples();
+            const h = new mod.Hdt(readFileSync(HDT_FILE));
+            const n = hdtNumTriples(h);
             if (n !== quads.length) {
                 h.free();
                 throw new Error(
@@ -356,9 +293,9 @@ export function hdtAdapter(): StoreAdapter<HdtStore> {
         snapshot: async () => readFileSync(HDT_FILE),
         open: async (bytes) => {
             const mod = await hdtMod();
-            return new mod.HdtStore(bytes as Uint8Array);
+            return new mod.Hdt(bytes as Uint8Array);
         },
-        dispose: freeWasm,
+        dispose: (h) => h.free(),
     };
 }
 
@@ -393,6 +330,37 @@ export interface Row {
     unsupported?: boolean;
     /** Why, shown as the cell's tooltip. */
     reason?: string;
+}
+
+/** What compare.worker.ts writes for one adapter and role, and what
+ *  compare.bench.ts reads back. */
+export interface WorkerOutput {
+    rows: Row[];
+    peakRssMb: number | null;
+    /** What building the store cost over and above the shared input `Quad[]`.
+     *  `wasmHeapMb` is Vortex-only and null for the other adapters. */
+    storeFootprint: Record<string, number | null>;
+    /** Rows each probe matched, by pattern name. */
+    matched: Record<string, number>;
+    failures: { phase: string; error: string }[];
+    cardinality?: ReturnType<typeof moduli>;
+}
+
+/** What dict-memory.worker.ts writes for one cardinality point, and what
+ *  dict-memory.bench.ts reads back. */
+export interface DictMemoryPoint {
+    slug: string; n: number; subjectRatio?: number; objectRatio?: number;
+    cardinality: { terms: number; [k: string]: unknown };
+    stores: number; deletes: number;
+    wasmPerStore: (number | null)[];
+    wasmAfterInit: number | null; wasmAfterGen: number | null;
+    wasmAfterFirstQuery: number | null; wasmAfterFullScan: number | null;
+    wasmAfterRebuild: number | null; wasmAfterFree: number | null;
+    jsAfterInit: number; jsAfterBuild: number; jsAfterFirstQuery: number;
+    jsAfterFullScan: number; jsAfterRebuild: number;
+    rssAfterBuild: number | null; peakRssMb: number | null;
+    scanMs: number; decodeMs: number; mutateQueryMs: number;
+    fullRows: number; firstQueryRows: number; decodedChars: number;
 }
 
 /** A row the dashboard renders as 'unsupported' rather than as a missing cell.
@@ -467,32 +435,27 @@ export const FULL_SCAN_OPTS: BenchOptions = { time: 0, iterations: 3, warmup: fa
 // meaningless for rdf-stores and would understate oxigraph, which has its own
 // module. Never rank adapters by it.
 
-/** Linux-only: the kernel-tracked high-water mark, the true peak RSS for this
- * process's whole lifetime — unlike `process.memoryUsage().rss`, which is only a
- * point-in-time reading and can miss a spike between samples. */
-export function peakRssMb(): number | null {
+/** One field of Linux's `/proc/self/status`, in MB; null off Linux. */
+function procStatusMb(field: 'VmHWM' | 'VmRSS'): number | null {
     try {
         const status = readFileSync('/proc/self/status', 'utf8');
-        const m = status.match(/^VmHWM:\s+(\d+)\s+kB/m);
+        const m = status.match(new RegExp(`^${field}:\\s+(\\d+)\\s+kB`, 'm'));
         return m ? Math.round(Number(m[1]) / 1024) : null;
     } catch {
         return null;
     }
 }
 
+/** Linux-only: the kernel-tracked high-water mark, the true peak RSS for this
+ * process's whole lifetime — unlike `process.memoryUsage().rss`, which is only a
+ * point-in-time reading and can miss a spike between samples. */
+export const peakRssMb = (): number | null => procStatusMb('VmHWM');
+
 /** Current (not peak) RSS. Paired with dropping the input quads and forcing a
  * collection, this isolates what a store actually holds: the generated `Quad[]`
  * is well over a gigabyte of JS objects at the default scale, is identical for
  * every adapter, and otherwise swamps the differences between them in the peak. */
-export function rssMb(): number | null {
-    try {
-        const status = readFileSync('/proc/self/status', 'utf8');
-        const m = status.match(/^VmRSS:\s+(\d+)\s+kB/m);
-        return m ? Math.round(Number(m[1]) / 1024) : null;
-    } catch {
-        return null;
-    }
-}
+export const rssMb = (): number | null => procStatusMb('VmRSS');
 
 /** JS heap in use, after forcing a collection. Requires `--expose-gc` (every
  * worker spawn wires it in); without it this is a point-in-time reading that may

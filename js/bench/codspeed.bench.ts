@@ -32,7 +32,7 @@ import { VortexRdfStore, type BuildOptions } from '../entry/node.js';
 // ./datasets.js, the two with no store library behind them (see their purity
 // contracts); shared.ts loads oxigraph and rdf-stores at module scope, which
 // this instrumented process must never do.
-import { decodeAll, fmtNs, freeWasm } from './util.js';
+import { decodeAll, fmtNs } from './util.js';
 import {
     FULL_SCAN_PATTERN, genDataset, genFresh, genLiteralTriples, genQuads,
     genTriples, genTriplesPrefix, nn, type Pat,
@@ -152,17 +152,17 @@ async function benchBuild(triples: Quad[], realistic: Quad[], literals: Quad[]):
             const data = v.slug === 'dict' ? realistic : triples;
             let h: VortexRdfStore | undefined;
             b.add(`build::${v.slug}`, async () => { h = await VortexRdfStore.fromQuads(data, v.options); }, {
-                afterEach: () => { if (h) freeWasm(h); h = undefined; },
+                afterEach: () => { if (h) h.free(); h = undefined; },
             });
         }
         let hs: VortexRdfStore | undefined;
         b.add('build::fromString_nquads', async () => {
             hs = await VortexRdfStore.fromString(nquads, 'nquads', { layout: 'dictionary' });
-        }, { afterEach: () => { if (hs) freeWasm(hs); hs = undefined; } });
+        }, { afterEach: () => { if (hs) hs.free(); hs = undefined; } });
         let hl: VortexRdfStore | undefined;
         b.add('build::dict_literals', async () => {
             hl = await VortexRdfStore.fromQuads(literals, { layout: 'dictionary' });
-        }, { afterEach: () => { if (hl) freeWasm(hl); hl = undefined; } });
+        }, { afterEach: () => { if (hl) hl.free(); hl = undefined; } });
     });
 }
 
@@ -177,7 +177,7 @@ async function benchLiterals(literals: Quad[]): Promise<void> {
             decodeAll(await store.getQuads(null, null, null, null));
         });
     });
-    freeWasm(store);
+    store.free();
 }
 
 /** query_<config>::<pattern> — getQuads across every routing class, on each
@@ -198,23 +198,22 @@ async function benchQuery(triples: Quad[], quads: Quad[]): Promise<void> {
         // tinybench does not time (and which CodSpeed likewise excludes from
         // the measured invocation), so this isolates the query against empty
         // caches; adopting is measured on its own as `open::<config>` below.
-        // The handle is freed in `afterEach` rather than left to the GC: wasm
-        // linear memory never comes back.
+        // Freed in afterEach; see StoreAdapter.dispose in shared.ts.
         const tbytes = await th.toBytes();
         await runGroup(READ_OPTS, (b) => {
             let h: VortexRdfStore | undefined;
             b.add(`open::${v.slug}`, async () => { h = await VortexRdfStore.fromBytes(tbytes); }, {
-                afterEach: () => { if (h) freeWasm(h); h = undefined; },
+                afterEach: () => { if (h) h.free(); h = undefined; },
             });
             for (const p of TRIPLE_PATTERNS) {
                 let q: VortexRdfStore | undefined;
                 b.add(`query_cold_${v.slug}::${p.name}`, async () => { await q!.getQuads(p.s, p.p, p.o, p.g); }, {
                     beforeEach: async () => { q = await VortexRdfStore.fromBytes(tbytes); },
-                    afterEach: () => { if (q) freeWasm(q); q = undefined; },
+                    afterEach: () => { if (q) q.free(); q = undefined; },
                 });
             }
         });
-        freeWasm(th);
+        th.free();
 
         const qh = await VortexRdfStore.fromQuads(quads, v.options);
         await runGroup(READ_OPTS, (b) => {
@@ -227,11 +226,11 @@ async function benchQuery(triples: Quad[], quads: Quad[]): Promise<void> {
                 let q: VortexRdfStore | undefined;
                 b.add(`query_cold_${v.slug}::${p.name}`, async () => { await q!.getQuads(p.s, p.p, p.o, p.g); }, {
                     beforeEach: async () => { q = await VortexRdfStore.fromBytes(qbytes); },
-                    afterEach: () => { if (q) freeWasm(q); q = undefined; },
+                    afterEach: () => { if (q) q.free(); q = undefined; },
                 });
             }
         });
-        freeWasm(qh);
+        qh.free();
     }
 }
 
@@ -266,8 +265,8 @@ async function benchReadPath(triples: Quad[], realistic: Quad[]): Promise<void> 
             decodeAll(await storeReal.getQuads(f.s, f.p, f.o, f.g));
         });
     });
-    freeWasm(store);
-    freeWasm(storeReal);
+    store.free();
+    storeReal.free();
 }
 
 /** readback::<op> — serialize/deserialize the store across the boundary:
@@ -280,10 +279,10 @@ async function benchReadback(triples: Quad[]): Promise<void> {
         b.add('readback::toRdf_nquads', async () => { await store.toRdf('nquads'); });
         let h: VortexRdfStore | undefined;
         b.add('readback::fromBytes', async () => { h = await VortexRdfStore.fromBytes(bytes); }, {
-            afterEach: () => { if (h) freeWasm(h); h = undefined; },
+            afterEach: () => { if (h) h.free(); h = undefined; },
         });
     });
-    freeWasm(store);
+    store.free();
 }
 
 /** mutate::<op> — the mutation paths on the JS-default store: per-quad addQuad
@@ -298,20 +297,20 @@ async function benchMutate(): Promise<void> {
         b.add('mutate::addQuad_loop', async () => {
             h = VortexRdfStore.empty();
             for (const q of fresh) await h.addQuad(q);
-        }, { afterEach: () => { if (h) freeWasm(h); h = undefined; } });
+        }, { afterEach: () => { if (h) h.free(); h = undefined; } });
 
         let hb: VortexRdfStore | undefined;
         b.add('mutate::addQuads_batch', async () => {
             hb = VortexRdfStore.empty();
             await hb.addQuads(fresh);
-        }, { afterEach: () => { if (hb) freeWasm(hb); hb = undefined; } });
+        }, { afterEach: () => { if (hb) hb.free(); hb = undefined; } });
 
         let hd: VortexRdfStore | undefined;
         b.add('mutate::deleteQuad_loop', async () => {
             for (const q of delSlice) await hd!.deleteQuad(q);
         }, {
             beforeEach: async () => { hd = await VortexRdfStore.fromQuads(delSlice, opts); },
-            afterEach: () => { if (hd) freeWasm(hd); hd = undefined; },
+            afterEach: () => { if (hd) hd.free(); hd = undefined; },
         });
     });
 }
