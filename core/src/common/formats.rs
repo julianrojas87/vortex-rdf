@@ -1,49 +1,15 @@
+//! Resolving an [`RdfFormat`] from what a user supplies: a file path or a
+//! format name. The two entry points below are the only places a format is
+//! named rather than passed, so every binding's format argument funnels
+//! through them and accepts the same spellings.
+
 use oxrdfio::RdfFormat;
 
-#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, clap::ValueEnum, Debug)]
-pub enum Format {
-    /// N-Triples (.nt)
-    #[value(name = "nt")]
-    NTriples,
-    /// N-Quads (.nq)
-    #[value(name = "nq")]
-    NQuads,
-    /// Turtle (.ttl)
-    #[value(name = "ttl")]
-    Turtle,
-    /// TriG (.trig)
-    #[value(name = "trig")]
-    TriG,
-    /// RDF/XML (.rdf, .xml)
-    #[value(name = "rdf")]
-    RdfXml,
-    /// JSON-LD (.jsonld, .json)
-    #[value(name = "jsonld")]
-    JsonLd,
-    /// N3 (.n3)
-    #[value(name = "n3")]
-    N3,
-}
-
-impl From<Format> for RdfFormat {
-    fn from(f: Format) -> Self {
-        match f {
-            Format::NTriples => RdfFormat::NTriples,
-            Format::NQuads => RdfFormat::NQuads,
-            Format::Turtle => RdfFormat::Turtle,
-            Format::TriG => RdfFormat::TriG,
-            Format::RdfXml => RdfFormat::RdfXml,
-            Format::JsonLd => RdfFormat::JsonLd {
-                profile: Default::default(),
-            },
-            Format::N3 => RdfFormat::N3,
-        }
-    }
-}
-
-pub fn detect_format(path: &Option<std::path::PathBuf>) -> Option<RdfFormat> {
-    let path = path.as_ref()?;
-    let ext = path.extension()?.to_str()?;
+/// Infer the RDF format from a path's extension. `None` when there is no
+/// path, no extension, or the extension names no format oxrdfio knows — the
+/// caller then needs an explicit format.
+pub fn detect_format(path: Option<&std::path::Path>) -> Option<RdfFormat> {
+    let ext = path?.extension()?.to_str()?;
     RdfFormat::from_extension(ext)
 }
 
@@ -64,4 +30,50 @@ pub fn format_from_name(name: &str) -> Option<RdfFormat> {
         },
         _ => return None,
     })
+}
+
+/// Every name [`format_from_name`] accepts, long spelling before its aliases
+/// — the list "unsupported format" errors quote.
+pub fn supported_format_names() -> &'static [&'static str] {
+    &[
+        "ntriples", "nt", "nquads", "nq", "turtle", "ttl", "trig", "n3", "rdfxml", "rdf", "xml",
+        "jsonld",
+    ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // tests/names.rs asserts every supported_format_names() entry parses;
+    // this pins the extension mapping, case-insensitivity, and the None arms.
+    #[test]
+    fn detect_format_maps_extensions_and_declines_the_rest() {
+        let path = |p: &str| detect_format(Some(std::path::Path::new(p)));
+        assert_eq!(path("data.nt"), Some(RdfFormat::NTriples));
+        assert_eq!(path("data.nq"), Some(RdfFormat::NQuads));
+        assert_eq!(path("dir/data.ttl"), Some(RdfFormat::Turtle));
+        assert_eq!(path("data.trig"), Some(RdfFormat::TriG));
+        assert_eq!(path("data.rdf"), Some(RdfFormat::RdfXml));
+        // No path, no extension, or an extension naming no format: `None`,
+        // so the caller asks for an explicit format.
+        assert_eq!(detect_format(None), None);
+        assert_eq!(path("data"), None);
+        assert_eq!(path("data.parquet"), None);
+    }
+
+    #[test]
+    fn format_from_name_accepts_aliases_case_insensitively() {
+        assert_eq!(format_from_name("NTriples"), Some(RdfFormat::NTriples));
+        assert_eq!(format_from_name("nq"), Some(RdfFormat::NQuads));
+        assert_eq!(format_from_name("ttl"), Some(RdfFormat::Turtle));
+        assert_eq!(format_from_name("TRIG"), Some(RdfFormat::TriG));
+        assert_eq!(format_from_name("n3"), Some(RdfFormat::N3));
+        assert_eq!(format_from_name("xml"), Some(RdfFormat::RdfXml));
+        assert!(matches!(
+            format_from_name("jsonld"),
+            Some(RdfFormat::JsonLd { .. })
+        ));
+        assert_eq!(format_from_name("csv"), None);
+    }
 }

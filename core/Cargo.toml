@@ -12,19 +12,20 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
-# The format engine
 vortex.workspace = true
 vortex-array.workspace = true
 vortex-error.workspace = true
-vortex-ipc.workspace = true
 vortex-io.workspace = true
 vortex-session.workspace = true
 vortex-fsst.workspace = true
 vortex-mask.workspace = true
 vortex-layout.workspace = true
+vortex-edition.workspace = true
 vortex-file.workspace = true
 vortex-scan.workspace = true
 vortex-buffer.workspace = true
+# Encoding-aware bounds search over compressed columns (sibling workspace crate).
+vortex-rdf-encoded-search.workspace = true
 
 tokio.workspace = true
 
@@ -33,33 +34,49 @@ oxrdf.workspace = true
 oxrdfio.workspace = true
 
 # Utilities
-itertools.workspace = true
 thiserror.workspace = true
 uuid = { version = "1", features = ["v4"] }
 rkyv = { version = "0.8.17", features = ["std", "bytecheck"] }
 serde = { version = "1.0", features = ["derive"] }
-# Decoding IPC straight off an in-memory buffer (see `io::de::array_from_ipc_bytes`)
-# needs a `bytes::Buf` whose `copy_to_bytes` is zero-copy; vortex-ipc's decoder
-# is generic over `Buf`, so we name the same crate it does.
-bytes = "1.12"
+serde_json = "1.0"
 
 futures.workspace = true
+async-trait.workspace = true
 log = "0.4.33"
-clap.workspace = true
+clap = { workspace = true, optional = true }
 web-time = { workspace = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 mimalloc = { workspace = true, optional = true }
 
+# The microtask-queue `WasmRuntime` lives behind vortex-io's `wasm-bindgen`
+# feature; the wasm bindings already link wasm-bindgen, so this adds no size.
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+vortex-io = { workspace = true, features = ["wasm-bindgen"] }
+
 [features]
 default = ["file-io"]
-file-io = ["vortex-io/tokio", "vortex/zstd", "vortex/files", "vortex-file/tokio", "tokio/fs"]
+file-io = [
+    "vortex-io/tokio",
+    "vortex/files",
+    "vortex-file/tokio",
+    "tokio/fs",
+    "vortex-rdf-encoded-search/layout",
+]
 # Opt-in: let a binary that depends on this crate have it install mimalloc as
 # the process's global allocator, instead of picking one itself.
 mimalloc = ["dep:mimalloc"]
+# Opt-in: derive `clap::ValueEnum` on the builder/layout/index strategy enums,
+# so a CLI can take them as arguments. Off by default — the wasm and python
+# builds have no use for an argument parser.
+clap = ["dep:clap"]
 
 [dev-dependencies]
-divan = { version = "5.0.1", package = "codspeed-divan-compat" }
+divan = { workspace = true }
+oxigraph = { version = "0.5.9", default-features = false, features = ["rocksdb"] }
+sophia = "0.10"
+hdt = { version = "0.7", features = ["nt"] }
+tempfile = "3"
 tokio = { workspace = true, features = ["time", "rt-multi-thread"] }
 
 [[bench]]
@@ -67,10 +84,16 @@ name = "benchmark"
 harness = false
 required-features = ["file-io"]
 
-# Local-only lazy-match matrix (match_pattern without materialization).
-# CodSpeed CI runs `cargo codspeed run --bench benchmark`, so this target is
-# never uploaded; it feeds the dashboard's lazy-match table.
 [[bench]]
 name = "match_lazy"
 harness = false
+required-features = ["file-io"]
+
+[[bench]]
+name = "compare"
+harness = false
+required-features = ["file-io"]
+
+[[test]]
+name = "bench_dataset"
 required-features = ["file-io"]

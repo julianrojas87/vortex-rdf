@@ -1,72 +1,50 @@
-use super::spill::{
-    PairMerger, PairRunSpiller, Run, RunWriter, TempRunsGuard, make_temp_dir, write_run,
-};
+//! The [`SortedStreamBuilder`] strategy: spill sorted runs to temporary
+//! files, then K-way merge them back into one global (s, p, o, g) order.
+//!
+//! It offers the same sortedness guarantee as
+//! [`sorted_in_memory`](super::sorted_in_memory) — globally sorted `s` and
+//! index children, both binary-searchable — without holding the dataset,
+//! paying for it in temp-file I/O. Requested indexes are merged from their
+//! own spilled `(value, row id)` runs and stream straight out as components,
+//! never materialized whole. The run file format itself belongs to
+//! [`spill`](super::spill), the emission machinery to [`builders`](super);
+//! what lives here is the merge.
+
+use super::spill::{Run, RunMerger, RunSpiller, RunWriter, Spillable, TempRunsGuard};
 use super::{
-    BuiltArray, BuiltStream, ChunkStream, DEFAULT_CHUNK_SIZE, VortexArrayBuilder, assemble_chunks,
-    build_struct_array, canonicalize_sorted, into_vortex_error, make_empty_struct,
+    BuiltArray, BuiltStream, ChunkStream, DEFAULT_CHUNK_ROWS, VortexArrayBuilder, assemble_chunks,
+    build_struct_array, into_vortex_error, make_empty_struct,
 };
-use crate::common::array::stamp_is_sorted;
 use crate::error::{Result, VortexRdfError};
+use crate::io::container::NativeComponentWrite;
 use crate::store::RawQuad;
-use crate::store::indexes::secondary_by_copy::{self, CopyKey};
-use crate::store::indexes::secondary_by_reference::append_sorted_string_pairs;
-use crate::store::indexes::{
-    IndexType, Indexes, indexes_need_global_sorted_emission, unique_indexes,
-};
-use crate::store::layouts::term_dictionary::{TermDictionary, TermDictionaryBuilder};
+use crate::store::array::{chunked_or_single, with_subject_stamp};
+use crate::store::indexes::secondary_by_copy::{self, out_of_core::CopyKey};
+use crate::store::indexes::{IndexComponent, IndexType, Indexes, known_component, unique_indexes};
+use crate::store::layouts::dictionary::{TermCodeMap, TermDictionary, TermDictionaryBuilder};
 use crate::store::layouts::{LayoutStrategy, dictionary};
 
+use crate::debug;
 use futures::{Stream, StreamExt, TryStreamExt, stream};
-use rkyv::api::high::{HighDeserializer, HighSerializer};
-use rkyv::rancor::Error as RkyvError;
-use rkyv::ser::allocator::ArenaHandle;
-use rkyv::util::AlignedVec;
-use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
-use std::collections::BinaryHeap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use web_time::Instant;
 
 use vortex_array::ArrayRef;
 use vortex_array::arrays::StructArray;
-use vortex_array::validity::Validity;
-use vortex_array::{IntoArray, dtype::DType};
+use vortex_array::dtype::DType;
 
 /// Out-of-core globally sorted Vortex RDF Array Builder.
 ///
 /// Processes datasets larger than available memory using external merge sort:
 /// sorted runs are spilled to disk, then K-way merged into fixed-size chunks.
 ///
-/// When Reference secondary indexes are requested, the pipeline runs a second
-/// external sort so the index columns come out in *global* sorted order
-/// (stamped `IsSorted`, binary-searchable): the quad merge is run eagerly to
-/// a spill — row IDs are only known as the merge assigns them — while the
-/// `(value, row ID)` pairs are spilled as sorted runs, then chunk emission
-/// zips the re-read quads with the pair merges. This roughly doubles disk
-/// I/O; without indexes the original lazy single-pass merge is used.
+/// With any secondary index requested, the quad merge runs eagerly to a spill
+/// (row ids are assigned by the merge) while each index family's
+/// `(value, row id)` entries are spilled as sorted runs; each family then
+/// streams its child straight off its own merger beside the lazily re-read
+/// quad chunks. Without indexes a single lazy merge pass emits chunks as the
+/// consumer polls.
 pub struct SortedStreamBuilder;
-
-struct HeapItem {
-    quad: RawQuad,
-    reader_idx: usize,
-}
-
-impl Eq for HeapItem {}
-impl PartialEq for HeapItem {
-    fn eq(&self, other: &Self) -> bool {
-        self.quad == other.quad
-    }
-}
-impl Ord for HeapItem {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        other.quad.cmp(&self.quad) // reversed for min-heap
-    }
-}
-impl PartialOrd for HeapItem {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
 
 impl VortexArrayBuilder for SortedStreamBuilder {
     async fn build_vortex_array(
@@ -74,50 +52,84 @@ impl VortexArrayBuilder for SortedStreamBuilder {
         layout: LayoutStrategy,
         indexes: Indexes,
     ) -> Result<BuiltArray> {
-        build_sorted_stream_array(quad_stream, layout, indexes, DEFAULT_CHUNK_SIZE).await
+        build_array(quad_stream, layout, indexes, DEFAULT_CHUNK_ROWS).await
     }
 
-    /// True streaming implementation: after the (inherently blocking) run-sort
-    /// phase, merged chunks are built on demand as the file writer polls.
+    /// After the (blocking) run-sort phase, merged chunks are built on demand
+    /// as the file writer polls.
     async fn build_vortex_stream(
         quad_stream: Box<dyn Stream<Item = Result<RawQuad>> + Unpin + Send + 'static>,
         layout: LayoutStrategy,
         indexes: Indexes,
     ) -> Result<BuiltStream> {
-        build_sorted_stream_chunk_stream(quad_stream, layout, indexes, DEFAULT_CHUNK_SIZE).await
+        build_chunk_stream(quad_stream, layout, indexes, DEFAULT_CHUNK_ROWS, None).await
     }
 }
 
 /// Materialize the chunk stream into a single in-memory array.
 ///
-/// The result is canonicalized and its sortedness stats re-stamped: the `s`
-/// column and any global-order index columns are sorted across the whole
-/// array, but assembling chunks loses the per-chunk stats that `match_pattern`
-/// gates its binary searches on.
-pub(crate) async fn build_sorted_stream_array(
+/// The quad result is canonicalized and its `s` sortedness stat re-stamped
+/// (assembling chunks loses the per-chunk stats that `match_pattern` gates
+/// its binary searches on). The streamed index children are materialized
+/// directly as the store's in-memory components, which `from_built` adopts
+/// as they are.
+pub(crate) async fn build_array(
     quad_stream: Box<dyn Stream<Item = Result<RawQuad>> + Unpin + Send + 'static>,
     layout: LayoutStrategy,
     indexes: Indexes,
     chunk_size: usize,
 ) -> Result<BuiltArray> {
-    let start = Instant::now();
+    use vortex_array::VortexSessionExecute as _;
 
-    let built =
-        build_sorted_stream_chunk_stream(quad_stream, layout, indexes.clone(), chunk_size).await?;
+    let start = debug::timer();
+
+    let built = build_chunk_stream(quad_stream, layout, indexes.clone(), chunk_size, None).await?;
     let chunks: Vec<ArrayRef> = built
         .chunks
         .try_collect()
         .await
         .map_err(VortexRdfError::Vortex)?;
 
-    let result = canonicalize_sorted(assemble_chunks(chunks, layout, &indexes)?)?;
+    // Materialize each streamed component child as one canonical struct in
+    // child schema. Sortedness is the descriptor's provenance — the mergers
+    // emit each family in its global sort order — not an inspection.
+    let mut components: Vec<IndexComponent> = Vec::new();
+    let mut ctx = crate::session::VORTEX_SESSION.create_execution_ctx();
+    for component in built.components {
+        let Some(known) = known_component(&component.descriptor.implementation) else {
+            continue;
+        };
+        let arrays: Vec<ArrayRef> = component
+            .source
+            .open()
+            .map_err(VortexRdfError::Vortex)?
+            .try_collect()
+            .await
+            .map_err(VortexRdfError::Vortex)?;
+        let part = chunked_or_single(arrays, component.descriptor.dtype.clone())?;
+        let array = part
+            .execute::<StructArray>(&mut ctx)
+            .map_err(VortexRdfError::Vortex)?;
+        components.push(IndexComponent::built(
+            known.identity.name,
+            known.identity.slug,
+            array,
+            component.descriptor.sorted,
+        ));
+    }
+    let assembled = assemble_chunks(chunks)?;
+    // Correct by construction for this builder: every emission is a window
+    // of the global merge, so the s column is globally sorted — the stamp
+    // the store's adoption reads back.
+    let result = with_subject_stamp(assembled, true)?;
     log::debug!(
         "[SortedStreamBuilder] Materialized {} quads in {:?}",
         result.len(),
-        start.elapsed()
+        debug::elapsed(start)
     );
     Ok(BuiltArray {
         array: result,
+        components,
         dict: built.dict,
     })
 }
@@ -131,285 +143,200 @@ pub(crate) async fn build_sorted_stream_array(
 /// them, the merge itself also runs eagerly (see [`SortedStreamBuilder`]) and
 /// only chunk emission stays lazy. Temp run files are removed when the stream
 /// is dropped.
-pub(crate) async fn build_sorted_stream_chunk_stream(
+///
+/// `spill_dir` pins where the run files land (compaction points it at the
+/// store file's own directory so spills share the output's volume); `None`
+/// takes [`TempRunsGuard::create`]'s default resolution.
+pub(crate) async fn build_chunk_stream(
     mut quads_in: Box<dyn Stream<Item = Result<RawQuad>> + Unpin + Send + 'static>,
     layout: LayoutStrategy,
     indexes: Indexes,
     chunk_size: usize,
+    spill_dir: Option<&Path>,
 ) -> Result<BuiltStream> {
-    let build_start = Instant::now();
+    let build_start = debug::timer();
     // ── Phase 1: Ingest and write sorted runs ──
-    let ingest_start = Instant::now();
-    let temp_dir = make_temp_dir("sorted_stream")?;
-    let guard = TempRunsGuard {
-        dir: temp_dir.clone(),
-    };
+    let ingest_start = debug::timer();
+    let guard = Arc::new(TempRunsGuard::create("sorted_stream", spill_dir)?);
 
     // For the Dictionary layout, the global term dictionary is built
     // incrementally during this same ingestion pass.
     let mut dict_builder = (layout == LayoutStrategy::Dictionary).then(TermDictionaryBuilder::new);
 
-    let mut buffer: Vec<RawQuad> = Vec::with_capacity(chunk_size.min(4096));
-    let mut run_paths = Vec::new();
+    let mut spiller = RunSpiller::<RawQuad>::new(guard.path(), "quads", chunk_size);
     let mut total_ingested = 0usize;
-
     while let Some(res) = quads_in.next().await {
         let raw = res?;
         if let Some(b) = dict_builder.as_mut() {
             b.insert_quad(&raw);
         }
-        // Spill only to make room for a quad that would not fit, never merely on
-        // reaching the chunk size — a dataset of exactly `chunk_size` quads then
-        // stays one in-memory run (see [`Run`]). Peak buffered quads is
-        // unchanged, and so is the run size.
-        if buffer.len() == chunk_size {
-            buffer.sort_unstable();
-            let run_path = temp_dir.join(format!("run_{}.bin", run_paths.len()));
-            write_run(&run_path, &buffer)?;
-            log::debug!(
-                "[SortedStreamBuilder] Wrote sorted run {} ({} quads)",
-                run_paths.len(),
-                buffer.len()
-            );
-            run_paths.push(run_path);
-            buffer.clear();
-        }
-        buffer.push(raw);
+        spiller.push(raw)?;
         total_ingested += 1;
     }
-
-    // Phase 2 input: the spilled runs, plus whatever is still buffered. A lone
-    // buffer never touches the filesystem; alongside spilled runs it has to join
-    // them on disk so the K-way merge sees uniform runs.
-    let mut runs: Vec<Run<RawQuad>> = if run_paths.is_empty() {
-        buffer.sort_unstable();
-        log::debug!(
-            "[SortedStreamBuilder] Kept the single sorted run of {} quads in memory",
-            buffer.len()
-        );
-        vec![Run::memory(buffer)]
-    } else {
-        if !buffer.is_empty() {
-            buffer.sort_unstable();
-            let run_path = temp_dir.join(format!("run_{}.bin", run_paths.len()));
-            write_run(&run_path, &buffer)?;
-            log::debug!(
-                "[SortedStreamBuilder] Wrote final sorted run {} ({} quads)",
-                run_paths.len(),
-                buffer.len()
-            );
-            run_paths.push(run_path);
-        }
-        drop(buffer);
-        run_paths
-            .iter()
-            .map(|p| Run::file(p))
-            .collect::<Result<_>>()?
-    };
+    let merger = spiller.into_merger()?;
     log::debug!(
         "[SortedStreamBuilder] Ingested {} quads into {} runs in {:?} (dictionary collection={})",
         total_ingested,
-        runs.len(),
-        ingest_start.elapsed(),
+        merger.run_count(),
+        debug::elapsed(ingest_start),
         dict_builder.is_some()
     );
+    let dict = dict_builder
+        .map(|b| finish_dict(b, build_start))
+        .transpose()?;
 
-    // ── Phase 2: K-way merge setup ──
-    let mut heap = BinaryHeap::new();
-    for (i, r) in runs.iter_mut().enumerate() {
-        if let Some(q) = r.next()? {
-            heap.push(HeapItem {
-                quad: q,
-                reader_idx: i,
-            });
-        }
-    }
-
-    // ── Phase 3: chunk emission ──
-    let want_global_idx = indexes_need_global_sorted_emission(&indexes);
-
-    if want_global_idx {
-        // Two-pass pipeline for globally sorted index columns; spill only the
-        // families the requested index types actually need.
-        let unique = unique_indexes(&indexes);
+    // ── Phase 2: chunk emission ──
+    // Any requested index means the two-pass pipeline: the index children are
+    // globally sorted, which needs the quad merge's row ids (first pass)
+    // before the pairs can be sorted and emitted (second pass). Spill only
+    // the families the requested types need.
+    let unique = unique_indexes(&indexes);
+    if !unique.is_empty() {
         let want_ref = unique.contains(&IndexType::SecondaryByReference);
         let want_copy = unique.contains(&IndexType::SecondaryByCopy);
-        if let Some(b) = dict_builder {
-            let dict_start = Instant::now();
-            let dict = Arc::new(b.finish()?);
-            let id_map = Arc::new(dict.build_id_map());
-            log::debug!(
-                "[SortedStreamBuilder] Finalized dictionary of {} terms in {:?} ({:?} since build start)",
-                dict.len(),
-                dict_start.elapsed(),
-                build_start.elapsed()
-            );
-            let ids = id_map.clone();
-            let (merged, spilled) = merge_to_spill(
-                runs,
-                heap,
-                &temp_dir,
-                chunk_size,
-                want_ref,
-                want_copy,
-                move |q| {
-                    let encode = |term: &str| {
-                        ids.get(term).copied().ok_or_else(|| {
-                            VortexRdfError::Serialization(format!(
-                                "Term missing from dictionary during encoding: {}",
-                                term
-                            ))
-                        })
-                    };
-                    Ok([encode(&q.s)?, encode(&q.p)?, encode(&q.o)?, encode(&q.g)?])
-                },
-            )?;
-            return emit_presorted_dict_chunks(
-                merged, spilled, dict, id_map, indexes, chunk_size, guard,
-            );
-        }
-        let (merged, spilled) = merge_to_spill(
-            runs,
-            heap,
-            &temp_dir,
-            chunk_size,
-            want_ref,
-            want_copy,
-            |q| Ok([q.s.clone(), q.p.clone(), q.o.clone(), q.g.clone()]),
-        )?;
-        let (dtype, chunks) =
-            emit_presorted_chunks(merged, spilled, layout, indexes, chunk_size, guard)?;
-        return Ok(BuiltStream {
-            dtype,
-            chunks,
-            dict: None,
-        });
+        return match dict {
+            Some((dict, code_map)) => {
+                let codes = Arc::clone(&code_map);
+                let (merged, mergers) = merge_quads_feeding_indexes(
+                    merger,
+                    guard.path(),
+                    chunk_size,
+                    want_ref,
+                    want_copy,
+                    move |term| dictionary::code_of(&codes, term),
+                )?;
+                emit_merged_run_dict_chunks(merged, mergers, dict, code_map, chunk_size, guard)
+            }
+            None => {
+                let (merged, mergers) = merge_quads_feeding_indexes(
+                    merger,
+                    guard.path(),
+                    chunk_size,
+                    want_ref,
+                    want_copy,
+                    |term| Ok(term.to_string()),
+                )?;
+                emit_merged_run_chunks(merged, mergers, layout, chunk_size, guard)
+            }
+        };
     }
 
     // ── No secondary indexes: lazily emit merged chunks ──
-    if let Some(b) = dict_builder {
-        let dict_start = Instant::now();
-        let dict = Arc::new(b.finish()?);
-        let id_map = Arc::new(dict.build_id_map());
-        log::debug!(
-            "[SortedStreamBuilder] Finalized dictionary of {} terms in {:?} ({:?} since build start)",
-            dict.len(),
-            dict_start.elapsed(),
-            build_start.elapsed()
-        );
-        return emit_dict_chunks(runs, heap, dict, id_map, indexes, chunk_size, guard);
+    match dict {
+        Some((dict, code_map)) => emit_dict_chunks(merger, dict, code_map, chunk_size, guard),
+        None => {
+            let (dtype, chunks) = chunk_stream(
+                (merger, guard),
+                chunk_size,
+                |(merger, _guard), n| merger.next_batch(n),
+                move |buf| build_struct_array(buf, layout, true),
+                || make_empty_struct(layout),
+            )?;
+            Ok(BuiltStream {
+                dtype,
+                chunks,
+                components: Vec::new(),
+                quads_sorted: true,
+                dict: None,
+            })
+        }
     }
+}
 
-    // The first chunk is built eagerly so the schema dtype is known up front.
-    let first_buf = next_sorted_chunk(&mut runs, &mut heap, chunk_size)?;
-    let first = if first_buf.is_empty() {
-        make_empty_struct(layout, &indexes)?
+/// Freeze the dictionary collected during ingest.
+fn finish_dict(
+    builder: TermDictionaryBuilder,
+    build_start: Option<web_time::Instant>,
+) -> Result<(Arc<TermDictionary>, Arc<TermCodeMap>)> {
+    let dict_start = debug::timer();
+    let (dict, code_map) = builder.finish()?;
+    log::debug!(
+        "[SortedStreamBuilder] Finalized dictionary of {} terms in {:?} ({:?} since build start)",
+        dict.len(),
+        debug::elapsed(dict_start),
+        debug::elapsed(build_start)
+    );
+    Ok((Arc::new(dict), Arc::new(code_map)))
+}
+
+/// The eager-first-chunk-then-unfold emission every chunk stream here shares:
+/// `pull` takes up to `chunk_size` quads off `source` in global order, `build`
+/// turns a non-empty batch into one primary chunk, and `empty` supplies the
+/// schema-carrying chunk of an empty dataset. The first chunk is built before
+/// returning so the dtype is known up front; the rest are built as polled.
+fn chunk_stream<S: Send + 'static>(
+    mut source: S,
+    chunk_size: usize,
+    mut pull: impl FnMut(&mut S, usize) -> Result<Vec<RawQuad>> + Send + 'static,
+    build: impl Fn(&[RawQuad]) -> Result<ArrayRef> + Send + 'static,
+    empty: impl FnOnce() -> Result<ArrayRef>,
+) -> Result<(DType, ChunkStream)> {
+    let buf = pull(&mut source, chunk_size)?;
+    let first = if buf.is_empty() {
+        empty()?
     } else {
-        build_struct_array(
-            &first_buf,
-            layout,
-            &indexes,
-            first_buf.len(),
-            0,
-            true,
-            false,
-        )?
+        build(&buf)?
     };
     let dtype = first.dtype().clone();
-    let next_row = first_buf.len() as u32;
-    drop(first_buf);
+    drop(buf);
 
     let rest = stream::unfold(
-        (runs, heap, layout, indexes, next_row, guard),
-        move |(mut runs, mut heap, layout, indexes, row, guard)| async move {
-            let buf = match next_sorted_chunk(&mut runs, &mut heap, chunk_size) {
-                Ok(b) => b,
-                Err(e) => {
-                    return Some((
-                        Err(into_vortex_error(e)),
-                        (runs, heap, layout, indexes, row, guard),
-                    ));
+        (source, pull, build),
+        move |(mut source, mut pull, build)| async move {
+            let chunk = (|| {
+                let buf = pull(&mut source, chunk_size)?;
+                if buf.is_empty() {
+                    return Ok(None);
                 }
-            };
-            if buf.is_empty() {
-                return None;
+                build(&buf).map(Some)
+            })();
+            match chunk {
+                Ok(None) => None,
+                Ok(Some(c)) => Some((Ok(c), (source, pull, build))),
+                Err(e) => Some((Err(into_vortex_error(e)), (source, pull, build))),
             }
-            let n = buf.len();
-            let chunk = build_struct_array(&buf, layout, &indexes, n, row, true, false)
-                .map_err(into_vortex_error);
-            Some((chunk, (runs, heap, layout, indexes, row + n as u32, guard)))
         },
     );
 
     let chunks: ChunkStream = stream::once(async move { Ok(first) }).chain(rest).boxed();
-    Ok(BuiltStream {
-        dtype,
-        chunks,
-        dict: None,
-    })
+    Ok((dtype, chunks))
 }
 
 /// The two `SecondaryByReference` mergers of a build: (objects, predicates).
-type RefMergers<V> = (PairMerger<V>, PairMerger<V>);
+type RefMergers<V> = (RunMerger<(V, u32)>, RunMerger<(V, u32)>);
 /// The two `SecondaryByCopy` mergers of a build: (POSG keys, OSPG keys).
-type CopyMergers<V> = (PairMerger<CopyKey<V>>, PairMerger<CopyKey<V>>);
-/// One chunk of the two reference index columns: (objects, predicates), each a
-/// run of (value, row ID) entries.
-type RefBatches<V> = (Vec<(V, u32)>, Vec<(V, u32)>);
-/// One chunk of the two copy index columns: (POSG, OSPG), each a run of
-/// (sort key, row ID) entries.
-type CopyBatches<V> = (Vec<(CopyKey<V>, u32)>, Vec<(CopyKey<V>, u32)>);
+type CopyMergers<V> = (RunMerger<(CopyKey<V>, u32)>, RunMerger<(CopyKey<V>, u32)>);
 
 /// The external-sort mergers for one build's secondary indexes, present only
 /// for the index types the build requested. `V` is the term encoding: strings,
 /// or u32 dictionary codes.
-struct SpilledIndexes<V> {
+struct IndexMergers<V> {
     ref_pairs: Option<RefMergers<V>>,
     copy_keys: Option<CopyMergers<V>>,
 }
 
-/// One chunk's worth of every present merger's output, pulled in lockstep with
-/// the merged-quad reader by [`next_index_batches`].
-struct IndexBatches<V> {
-    ref_pairs: Option<RefBatches<V>>,
-    copy_keys: Option<CopyBatches<V>>,
-}
-
-/// Run the K-way quad merge to completion (pass A of the indexed pipeline):
-/// merged quads are collected in merge order, while each quad's terms —
-/// extracted by `spog_of` as `[s, p, o, g]`, strings or u32 dictionary codes —
-/// feed the external-sort spillers of every requested index family:
-/// (value, row ID) pairs for the reference index, full [`CopyKey`]s for the
-/// copy index. Returns the merged quads and the per-family mergers, ready to
-/// stream entries in global sort order.
-///
-/// A single input run means the whole dataset already fit in memory once, so
-/// the merged output is kept there too rather than round-tripping through
-/// `merged.bin`; with several runs the merge is unbounded by construction and
-/// spills as before.
-fn merge_to_spill<V>(
-    mut runs: Vec<Run<RawQuad>>,
-    mut heap: BinaryHeap<HeapItem>,
+/// First pass of the indexed pipeline: run the K-way quad merge to completion,
+/// collecting merged quads — in memory when there is a single input run (the
+/// dataset already fit once), else spilled to `merged.bin` — while feeding
+/// each requested index family's spiller with that quad's terms encoded by
+/// `term_of`: `(value, row id)` pairs for the reference index, full
+/// [`CopyKey`]s for the copy index. Only the terms the requested families
+/// consume are encoded. Returns the merged quads and the per-family mergers,
+/// ready to stream entries in global sort order.
+fn merge_quads_feeding_indexes<V>(
+    mut merger: RunMerger<RawQuad>,
     temp_dir: &Path,
     pair_capacity: usize,
     want_ref: bool,
     want_copy: bool,
-    mut spog_of: impl FnMut(&RawQuad) -> Result<[V; 4]>,
-) -> Result<(Run<RawQuad>, SpilledIndexes<V>)>
+    mut term_of: impl FnMut(&str) -> Result<V>,
+) -> Result<(Run<RawQuad>, IndexMergers<V>)>
 where
-    V: Clone
-        + Ord
-        + Archive
-        + for<'a> RkyvSerialize<HighSerializer<AlignedVec, ArenaHandle<'a>, RkyvError>>,
-    V::Archived: RkyvDeserialize<V, HighDeserializer<RkyvError>>,
-    CopyKey<V>: Ord
-        + Archive
-        + for<'a> RkyvSerialize<HighSerializer<AlignedVec, ArenaHandle<'a>, RkyvError>>,
-    <CopyKey<V> as Archive>::Archived: RkyvDeserialize<CopyKey<V>, HighDeserializer<RkyvError>>,
+    V: Clone,
+    (V, u32): Ord + Spillable,
+    (CopyKey<V>, u32): Ord + Spillable,
 {
-    // One run in, one run out: keep the merged quads in memory (see the doc
-    // comment); otherwise stream them into a spill file.
-    let mut merged = if runs.len() <= 1 {
+    let mut merged = if merger.run_count() <= 1 {
         MergedSink::Memory(Vec::new())
     } else {
         let path = temp_dir.join("merged.bin");
@@ -418,40 +345,49 @@ where
             path,
         }
     };
-    let mut o_spill = want_ref.then(|| PairRunSpiller::<V>::new(temp_dir, "idx_o", pair_capacity));
-    let mut p_spill = want_ref.then(|| PairRunSpiller::<V>::new(temp_dir, "idx_p", pair_capacity));
-    let mut posg_spill =
-        want_copy.then(|| PairRunSpiller::<CopyKey<V>>::new(temp_dir, "idx_posg", pair_capacity));
-    let mut ospg_spill =
-        want_copy.then(|| PairRunSpiller::<CopyKey<V>>::new(temp_dir, "idx_ospg", pair_capacity));
+    let mut o_spill =
+        want_ref.then(|| RunSpiller::<(V, u32)>::new(temp_dir, "idx_o", pair_capacity));
+    let mut p_spill =
+        want_ref.then(|| RunSpiller::<(V, u32)>::new(temp_dir, "idx_p", pair_capacity));
+    let mut posg_spill = want_copy
+        .then(|| RunSpiller::<(CopyKey<V>, u32)>::new(temp_dir, "idx_posg", pair_capacity));
+    let mut ospg_spill = want_copy
+        .then(|| RunSpiller::<(CopyKey<V>, u32)>::new(temp_dir, "idx_ospg", pair_capacity));
 
     let mut rid: u32 = 0;
-    while let Some(item) = heap.pop() {
-        let r_idx = item.reader_idx;
-        let quad = item.quad;
-        let spog = spog_of(&quad)?;
-        if let Some(spiller) = posg_spill.as_mut() {
-            spiller.push(CopyKey::posg(&spog), rid)?;
-        }
-        if let Some(spiller) = ospg_spill.as_mut() {
-            spiller.push(CopyKey::ospg(&spog), rid)?;
-        }
-        // Consumed last, so the reference pairs take ownership with no clone.
-        let [_, p_val, o_val, _] = spog;
-        if let Some(spiller) = o_spill.as_mut() {
-            spiller.push(o_val, rid)?;
-        }
-        if let Some(spiller) = p_spill.as_mut() {
-            spiller.push(p_val, rid)?;
+    while let Some(quad) = merger.next()? {
+        if want_copy {
+            let spog = [
+                term_of(&quad.s)?,
+                term_of(&quad.p)?,
+                term_of(&quad.o)?,
+                term_of(&quad.g)?,
+            ];
+            if let Some(spiller) = posg_spill.as_mut() {
+                spiller.push((CopyKey::posg(&spog), rid))?;
+            }
+            // The reference pairs clone the two terms they share with the
+            // copy keys, so the OSPG constructor — consumed last — can take
+            // the whole tuple by value.
+            if let Some(spiller) = o_spill.as_mut() {
+                spiller.push((spog[2].clone(), rid))?;
+            }
+            if let Some(spiller) = p_spill.as_mut() {
+                spiller.push((spog[1].clone(), rid))?;
+            }
+            if let Some(spiller) = ospg_spill.as_mut() {
+                spiller.push((CopyKey::ospg(spog), rid))?;
+            }
+        } else if want_ref {
+            if let Some(spiller) = o_spill.as_mut() {
+                spiller.push((term_of(&quad.o)?, rid))?;
+            }
+            if let Some(spiller) = p_spill.as_mut() {
+                spiller.push((term_of(&quad.p)?, rid))?;
+            }
         }
         merged.push(quad)?;
         rid += 1;
-        if let Some(next_q) = runs[r_idx].next()? {
-            heap.push(HeapItem {
-                quad: next_q,
-                reader_idx: r_idx,
-            });
-        }
     }
     let merged = merged.finish()?;
     log::debug!(
@@ -469,15 +405,15 @@ where
     };
     Ok((
         merged,
-        SpilledIndexes {
+        IndexMergers {
             ref_pairs,
             copy_keys,
         },
     ))
 }
 
-/// Where [`merge_to_spill`] puts the merged quads: straight into memory when the
-/// merge had a single input run, otherwise into a spill file.
+/// Where [`merge_quads_feeding_indexes`] puts the merged quads: straight into
+/// memory when the merge had a single input run, otherwise into a spill file.
 enum MergedSink {
     Memory(Vec<RawQuad>),
     File {
@@ -509,252 +445,214 @@ impl MergedSink {
     }
 }
 
-/// Pull the next `n` entries off every present merger — one chunk's worth of
-/// index columns, advancing in lockstep with the merged-quad reader.
-fn next_index_batches<V>(spilled: &mut SpilledIndexes<V>, n: usize) -> Result<IndexBatches<V>>
-where
-    V: Ord
-        + Archive
-        + for<'a> RkyvSerialize<HighSerializer<AlignedVec, ArenaHandle<'a>, RkyvError>>,
-    V::Archived: RkyvDeserialize<V, HighDeserializer<RkyvError>>,
-    CopyKey<V>: Ord
-        + Archive
-        + for<'a> RkyvSerialize<HighSerializer<AlignedVec, ArenaHandle<'a>, RkyvError>>,
-    <CopyKey<V> as Archive>::Archived: RkyvDeserialize<CopyKey<V>, HighDeserializer<RkyvError>>,
-{
-    Ok(IndexBatches {
-        ref_pairs: match spilled.ref_pairs.as_mut() {
-            Some((o, p)) => Some((o.next_batch(n)?, p.next_batch(n)?)),
-            None => None,
-        },
-        copy_keys: match spilled.copy_keys.as_mut() {
-            Some((posg, ospg)) => Some((posg.next_batch(n)?, ospg.next_batch(n)?)),
-            None => None,
-        },
-    })
-}
+/// A window of one reference component's merged pairs, as one child chunk.
+type RefChunkFn<V> = fn(&[(V, u32)]) -> Result<ArrayRef>;
 
-/// Pull up to `n` quads off the merged-quads run.
-fn read_merged_batch(merged: &mut Run<RawQuad>, n: usize) -> Result<Vec<RawQuad>> {
-    let mut buf = Vec::with_capacity(n.min(4096));
-    while buf.len() < n {
-        match merged.next()? {
-            Some(q) => buf.push(q),
-            None => break,
+/// Turn a build's spill-run mergers into native component writes: each family
+/// streams its child's chunks straight off its merger — no lockstep zip with
+/// the quad stream, no materialization. The temp-run guard is shared with the
+/// quad stream so the run files outlive every reader. `encoded` says whether
+/// the entries hold u32 dictionary codes (else term strings), which picks the
+/// child dtypes; `ref_chunk` builds a reference child chunk for that encoding.
+fn merger_components<V>(
+    mergers: IndexMergers<V>,
+    chunk_size: usize,
+    guard: &Arc<TempRunsGuard>,
+    encoded: bool,
+    ref_chunk: RefChunkFn<V>,
+) -> Result<Vec<NativeComponentWrite>>
+where
+    V: Send + 'static + secondary_by_copy::TermColumn,
+    (V, u32): Ord + Spillable,
+    (CopyKey<V>, u32): Ord + Spillable,
+{
+    use crate::io::container::sources::PullComponentSource;
+    use crate::io::container::{
+        StoreComponentDescriptor, StoreComponentRole, default_child_strategy,
+    };
+    use crate::store::indexes::secondary_by_copy::CopyFamily;
+    use crate::store::indexes::secondary_by_copy::out_of_core::{
+        copy_child_chunk, copy_child_dtype,
+    };
+    use crate::store::indexes::secondary_by_reference::RefFamily;
+    use crate::store::indexes::secondary_by_reference::out_of_core::ref_child_dtype;
+
+    let copy_dtype = copy_child_dtype(encoded);
+    let ref_dtype = ref_child_dtype(encoded);
+
+    let mut components = Vec::new();
+    let mut push = |name: &str,
+                    slug: &str,
+                    dtype: DType,
+                    mut pull: Box<dyn FnMut(usize) -> Result<Option<ArrayRef>> + Send>|
+     -> Result<()> {
+        let guard = Arc::clone(guard);
+        let mut emitted = false;
+        let pull_fn: crate::io::container::sources::PullFn = Box::new(move |n| {
+            let _hold_runs = &guard;
+            match pull(n) {
+                Ok(Some(chunk)) => {
+                    emitted = true;
+                    Ok(Some(chunk))
+                }
+                // The child strategy needs at least one (possibly empty)
+                // chunk to write a schema-complete component.
+                Ok(None) if !emitted => {
+                    emitted = true;
+                    pull(0).map_err(into_vortex_error)
+                }
+                Ok(None) => Ok(None),
+                Err(e) => Err(into_vortex_error(e)),
+            }
+        });
+        components.push(
+            NativeComponentWrite::new(
+                StoreComponentDescriptor {
+                    name: name.into(),
+                    role: StoreComponentRole::Index,
+                    implementation: slug.into(),
+                    version: 1,
+                    required: false,
+                    // The merger emits each family in its global sort order.
+                    sorted: true,
+                    dtype: dtype.clone(),
+                },
+                Arc::new(PullComponentSource::new(dtype, chunk_size, pull_fn)),
+                default_child_strategy(),
+            )
+            .map_err(VortexRdfError::Vortex)?,
+        );
+        Ok(())
+    };
+
+    if let Some((posg, ospg)) = mergers.copy_keys {
+        for (family, merger) in [(CopyFamily::Posg, posg), (CopyFamily::Ospg, ospg)] {
+            let mut merger = merger;
+            push(
+                family.component_name(),
+                family.component_slug(),
+                copy_dtype.clone(),
+                Box::new(move |n| {
+                    let batch = merger.next_batch(n)?;
+                    if batch.is_empty() && n > 0 {
+                        return Ok(None);
+                    }
+                    copy_child_chunk(family, &batch).map(Some)
+                }),
+            )?;
         }
     }
-    Ok(buf)
-}
-
-/// Build one chunk from merged quads plus the matching window of every
-/// present index family's globally sorted entries.
-fn build_presorted_chunk(
-    quads: &[RawQuad],
-    layout: LayoutStrategy,
-    batches: &IndexBatches<String>,
-) -> Result<ArrayRef> {
-    let mut names = layout.field_names();
-    let mut arrays = layout.build_columns(quads)?;
-    stamp_is_sorted(&arrays[0]); // merge output is globally s-sorted
-    if let Some((posg, ospg)) = &batches.copy_keys {
-        secondary_by_copy::append_sorted_string_keys(&mut names, &mut arrays, posg, ospg, true);
+    if let Some((o_pairs, p_pairs)) = mergers.ref_pairs {
+        for (family, merger) in [
+            (RefFamily::Object, o_pairs),
+            (RefFamily::Predicate, p_pairs),
+        ] {
+            let mut merger = merger;
+            push(
+                family.component_name(),
+                family.component_slug(),
+                ref_dtype.clone(),
+                Box::new(move |n| {
+                    let batch = merger.next_batch(n)?;
+                    if batch.is_empty() && n > 0 {
+                        return Ok(None);
+                    }
+                    ref_chunk(&batch).map(Some)
+                }),
+            )?;
+        }
     }
-    if let Some((o_pairs, p_pairs)) = &batches.ref_pairs {
-        append_sorted_string_pairs(&mut names, &mut arrays, o_pairs, p_pairs, true);
-    }
-    StructArray::try_new(names.into(), arrays, quads.len(), Validity::NonNullable)
-        .map_err(VortexRdfError::Vortex)
-        .map(|a| a.into_array())
+    Ok(components)
 }
 
-/// Pass C of the indexed pipeline (string layouts): lazily re-read the merged
-/// quads in chunk-size batches and zip each with the next window of the pair
-/// merges. Quad `i` of the merge and pair-window `[i·C, (i+1)·C)` advance in
-/// lockstep, so every chunk gets exactly its rows' worth of index entries.
-fn emit_presorted_chunks(
-    mut merged: Run<RawQuad>,
-    mut spilled: SpilledIndexes<String>,
+/// Second pass of the indexed pipeline (string layouts): lazily re-read the merged
+/// quads in chunk-size batches as primary-only chunks, while each index
+/// family's merger streams its own child component beside them.
+fn emit_merged_run_chunks(
+    merged: Run<RawQuad>,
+    mergers: IndexMergers<String>,
     layout: LayoutStrategy,
-    indexes: Indexes,
     chunk_size: usize,
-    guard: TempRunsGuard,
-) -> Result<(DType, ChunkStream)> {
-    let buf = read_merged_batch(&mut merged, chunk_size)?;
-    let first = if buf.is_empty() {
-        make_empty_struct(layout, &indexes)?
-    } else {
-        let batches = next_index_batches(&mut spilled, buf.len())?;
-        build_presorted_chunk(&buf, layout, &batches)?
-    };
-    let dtype = first.dtype().clone();
-
-    let rest = stream::unfold(
-        (merged, spilled, layout, guard),
-        move |(mut merged, mut spilled, layout, guard)| async move {
-            let chunk = (|| {
-                let buf = read_merged_batch(&mut merged, chunk_size)?;
-                if buf.is_empty() {
-                    return Ok(None);
-                }
-                let batches = next_index_batches(&mut spilled, buf.len())?;
-                build_presorted_chunk(&buf, layout, &batches).map(Some)
-            })();
-            match chunk {
-                Ok(None) => None,
-                Ok(Some(c)) => Some((Ok(c), (merged, spilled, layout, guard))),
-                Err(e) => Some((Err(into_vortex_error(e)), (merged, spilled, layout, guard))),
-            }
-        },
-    );
-
-    let chunks: ChunkStream = stream::once(async move { Ok(first) }).chain(rest).boxed();
-    Ok((dtype, chunks))
-}
-
-/// Dictionary-layout variant of [`emit_presorted_chunks`]: the entries hold
-/// u32 codes; the dictionary rides beside the stream for the serializer.
-fn emit_presorted_dict_chunks(
-    mut merged: Run<RawQuad>,
-    mut spilled: SpilledIndexes<u32>,
-    dict: Arc<TermDictionary>,
-    id_map: Arc<crate::store::layouts::term_dictionary::TermIdMap>,
-    indexes: Indexes,
-    chunk_size: usize,
-    guard: TempRunsGuard,
+    guard: Arc<TempRunsGuard>,
 ) -> Result<BuiltStream> {
-    let buf = read_merged_batch(&mut merged, chunk_size)?;
-    let first = if buf.is_empty() {
-        dictionary::empty_struct(&indexes)?
-    } else {
-        let batches = next_index_batches(&mut spilled, buf.len())?;
-        build_presorted_dict_chunk(&buf, &dict, &id_map, &batches)?
-    };
-    let dtype = first.dtype().clone();
-
-    let stream_dict = Arc::clone(&dict);
-    let rest = stream::unfold(
-        (merged, spilled, stream_dict, id_map, guard),
-        move |(mut merged, mut spilled, dict, id_map, guard)| async move {
-            let chunk = (|| {
-                let buf = read_merged_batch(&mut merged, chunk_size)?;
-                if buf.is_empty() {
-                    return Ok(None);
-                }
-                let batches = next_index_batches(&mut spilled, buf.len())?;
-                build_presorted_dict_chunk(&buf, &dict, &id_map, &batches).map(Some)
-            })();
-            match chunk {
-                Ok(None) => None,
-                Ok(Some(c)) => Some((Ok(c), (merged, spilled, dict, id_map, guard))),
-                Err(e) => Some((
-                    Err(into_vortex_error(e)),
-                    (merged, spilled, dict, id_map, guard),
-                )),
-            }
-        },
-    );
-
-    let chunks: ChunkStream = stream::once(async move { Ok(first) }).chain(rest).boxed();
+    let components = merger_components(
+        mergers,
+        chunk_size,
+        &guard,
+        false,
+        crate::store::indexes::secondary_by_reference::out_of_core::ref_child_chunk_strings,
+    )?;
+    let (dtype, chunks) = chunk_stream(
+        (merged, guard),
+        chunk_size,
+        |(merged, _guard), n| merged.next_batch(n),
+        move |buf| build_struct_array(buf, layout, true),
+        || make_empty_struct(layout),
+    )?;
     Ok(BuiltStream {
         dtype,
         chunks,
-        dict: Some(dict),
+        components,
+        quads_sorted: true,
+        dict: None,
     })
 }
 
-/// Adapt an [`IndexBatches`] window to `dictionary::build_chunk_presorted_indexes`.
-fn build_presorted_dict_chunk(
-    quads: &[RawQuad],
-    dict: &TermDictionary,
-    id_map: &crate::store::layouts::term_dictionary::TermIdMap,
-    batches: &IndexBatches<u32>,
-) -> Result<ArrayRef> {
-    dictionary::build_chunk_presorted_indexes(
-        quads,
-        dict,
-        id_map,
-        batches
-            .ref_pairs
-            .as_ref()
-            .map(|(o, p)| (o.as_slice(), p.as_slice())),
-        batches
-            .copy_keys
-            .as_ref()
-            .map(|(posg, ospg)| (posg.as_slice(), ospg.as_slice())),
+/// Dictionary-layout variant of [`emit_merged_run_chunks`]: the entries hold
+/// u32 codes; the dictionary rides beside the stream for the serializer.
+fn emit_merged_run_dict_chunks(
+    merged: Run<RawQuad>,
+    mergers: IndexMergers<u32>,
+    dict: Arc<TermDictionary>,
+    code_map: Arc<TermCodeMap>,
+    chunk_size: usize,
+    guard: Arc<TempRunsGuard>,
+) -> Result<BuiltStream> {
+    let components = merger_components(
+        mergers,
+        chunk_size,
+        &guard,
         true,
-    )
+        crate::store::indexes::secondary_by_reference::out_of_core::ref_child_chunk_codes,
+    )?;
+    let (dtype, chunks) = chunk_stream(
+        (merged, guard),
+        chunk_size,
+        |(merged, _guard), n| merged.next_batch(n),
+        move |buf| dictionary::build_chunk(buf, &code_map, true),
+        dictionary::empty_struct,
+    )?;
+    Ok(BuiltStream {
+        dtype,
+        chunks,
+        components,
+        quads_sorted: true,
+        dict: Some(dict),
+    })
 }
 
 /// Dictionary-layout emission over the K-way merge (no secondary indexes):
 /// chunks of u32 codes encoded against the completed global dictionary,
 /// which rides beside the stream for the serializer to place.
 fn emit_dict_chunks(
-    mut runs: Vec<Run<RawQuad>>,
-    mut heap: BinaryHeap<HeapItem>,
+    merger: RunMerger<RawQuad>,
     dict: Arc<TermDictionary>,
-    id_map: Arc<crate::store::layouts::term_dictionary::TermIdMap>,
-    indexes: Indexes,
+    code_map: Arc<TermCodeMap>,
     chunk_size: usize,
-    guard: TempRunsGuard,
+    guard: Arc<TempRunsGuard>,
 ) -> Result<BuiltStream> {
-    let first_buf = next_sorted_chunk(&mut runs, &mut heap, chunk_size)?;
-    let first = if first_buf.is_empty() {
-        dictionary::empty_struct(&indexes)?
-    } else {
-        dictionary::build_chunk(&first_buf, &dict, &id_map, &indexes, 0, true, false)?
-    };
-    let dtype = first.dtype().clone();
-    let next_row = first_buf.len() as u32;
-    drop(first_buf);
-
-    let stream_dict = Arc::clone(&dict);
-    let rest = stream::unfold(
-        (runs, heap, stream_dict, id_map, indexes, next_row, guard),
-        move |(mut runs, mut heap, dict, id_map, indexes, row, guard)| async move {
-            let buf = match next_sorted_chunk(&mut runs, &mut heap, chunk_size) {
-                Ok(b) => b,
-                Err(e) => {
-                    return Some((
-                        Err(into_vortex_error(e)),
-                        (runs, heap, dict, id_map, indexes, row, guard),
-                    ));
-                }
-            };
-            if buf.is_empty() {
-                return None;
-            }
-            let n = buf.len() as u32;
-            let chunk = dictionary::build_chunk(&buf, &dict, &id_map, &indexes, row, true, false)
-                .map_err(into_vortex_error);
-            Some((chunk, (runs, heap, dict, id_map, indexes, row + n, guard)))
-        },
-    );
-
-    let chunks: ChunkStream = stream::once(async move { Ok(first) }).chain(rest).boxed();
+    let (dtype, chunks) = chunk_stream(
+        (merger, guard),
+        chunk_size,
+        |(merger, _guard), n| merger.next_batch(n),
+        move |buf| dictionary::build_chunk(buf, &code_map, true),
+        dictionary::empty_struct,
+    )?;
     Ok(BuiltStream {
         dtype,
         chunks,
+        components: Vec::new(),
+        quads_sorted: true,
         dict: Some(dict),
     })
-}
-
-/// Pull up to `chunk_size` quads off the K-way merge in global sort order.
-fn next_sorted_chunk(
-    runs: &mut [Run<RawQuad>],
-    heap: &mut BinaryHeap<HeapItem>,
-    chunk_size: usize,
-) -> Result<Vec<RawQuad>> {
-    let mut buf = Vec::with_capacity(chunk_size.min(4096));
-    while buf.len() < chunk_size {
-        let Some(item) = heap.pop() else { break };
-        let r_idx = item.reader_idx;
-        buf.push(item.quad);
-        if let Some(next_q) = runs[r_idx].next()? {
-            heap.push(HeapItem {
-                quad: next_q,
-                reader_idx: r_idx,
-            });
-        }
-    }
-    Ok(buf)
 }

@@ -9,7 +9,8 @@ await init();
 init_panic_hook();
 
 export {
+    TermDict,
     VortexRdfStore,
-    rdf_to_vortex,
-    vortex_to_rdf,
+    serializeRdf,
+    deserializeRdf,
 } from '../pkg/web/vortex_rdf.js';

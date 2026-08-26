@@ -7,31 +7,21 @@
 // run in one process would report every config at the high-water mark of the
 // largest one before it.
 //
-// ── Why this measures RETAINED memory by building several stores ─────────────
-//
-// The obvious instrument — build one store, read `memory.buffer.byteLength` —
-// does not work, and it is worth recording why. Ingest allocates a large
-// transient (the packed quad buffer crossing the boundary, plus the owned
-// `RawQuad` strings) whose size tracks *rows*, not distinct terms. That
-// transient sets the module's high-water mark; the dictionary is then allocated
-// inside the space it freed, so linear memory does not grow and the dictionary
-// is invisible. Measured directly: wasm memory sat at exactly 104 MB across a
-// 900x sweep of term cardinality.
-//
-// So instead: build `STORES` stores of the same config, keeping them all alive,
-// and read memory after each. The transient is reused across builds, but each
-// *retained* store must add to the module. The slope of memory against store
-// count is the retained per-store cost — which is what we actually want to
-// attribute.
+// Retained memory is read as a slope: `STORES` stores of one config are built
+// and kept alive, linear memory read after each. The ingest transient (packed
+// quad buffer + owned strings) sets the module's high-water mark and scales
+// with rows, so a single store's footprint is hidden inside it; only the
+// per-store increment isolates what a store retains.
 
 import { writeFileSync } from 'node:fs';
 
 import {
     VORTEX_VARIANTS, vortexAdapter, genDataset, datasetProbes, moduli,
     reclaim, peakRssMb, rssMb, jsHeapMb, wasmHeapMb,
-    type DatasetOpts,
+    type DatasetOpts, type DictMemoryPoint,
 } from './shared.js';
-import type { VortexRdfStore } from '../entry/node.js';
+import { decodeAll } from './util.js';
+import type { VortexRdfStore } from '@vortex-rdf/vortex-rdf-store';
 
 const [, , slugArg, nArg, subjRatioArg, objRatioArg, outFile] = process.argv;
 if (!slugArg || !nArg || !subjRatioArg || !objRatioArg || !outFile) {
@@ -49,21 +39,6 @@ const opts: DatasetOpts = {
 const STORES = Number(process.env.DICT_MEM_STORES ?? 4);
 /** Deletes to run before re-querying, exercising the dictionary-view rebuild. */
 const DELETES = Number(process.env.DICT_MEM_DELETES ?? 5);
-
-/** Force every term of every quad to be materialized.
- *
- * `countMatch` only takes `.length`, which for the Dictionary layout never
- * decodes a single term — so it cannot see the cost of the on-demand dictionary.
- * Reading `.value` is what makes each distinct code cross the boundary once. */
-function decodeAll(quads: readonly unknown[]): number {
-    let chars = 0;
-    for (const q of quads as { subject: { value: string }; predicate: { value: string };
-                               object: { value: string }; graph: { value: string } }[]) {
-        chars += q.subject.value.length + q.predicate.value.length
-            + q.object.value.length + q.graph.value.length;
-    }
-    return chars;
-}
 
 async function main(): Promise<void> {
     const variant = VORTEX_VARIANTS.find((v) => v.slug === slugArg);
@@ -94,8 +69,8 @@ async function main(): Promise<void> {
     const h = live[0];
 
     // ── first Dictionary-layout read ─────────────────────────────────────────
-    // This is what used to flatten the whole dictionary into wasm and copy it
-    // again into the JS heap, however few terms the query touched.
+    // The read that would flatten the whole dictionary into wasm and copy it
+    // again into the JS heap, if the dictionary were not read on demand.
     const pPat = probes.triples.find((p) => p.name === 'P')!;
     const firstQueryRows = await a.countMatch(h, pPat);
     const wasmAfterFirstQuery = await wasmHeapMb();
@@ -103,8 +78,8 @@ async function main(): Promise<void> {
 
     // ── full scan, terms actually materialized ───────────────────────────────
     // Under the on-demand dictionary this pays one boundary crossing per
-    // distinct term; under the old bulk copy it paid one large copy. This is the
-    // number that decides whether on-demand is affordable.
+    // distinct term, against a single large copy for a bulk transfer. This is
+    // the number that decides whether on-demand is affordable.
     const scanStart = performance.now();
     const all = await h.getQuads(null, null, null, null);
     const scanMs = performance.now() - scanStart;
@@ -117,7 +92,7 @@ async function main(): Promise<void> {
 
     // ── mutate-then-query ────────────────────────────────────────────────────
     // Each delete drops the cached dictionary view, so the next read rebuilds
-    // it. That rebuild used to be O(dictionary); it should now be O(1).
+    // it. That rebuild must be O(1), not O(dictionary).
     const delQuads = quads.slice(0, DELETES);
     const mutStart = performance.now();
     for (const q of delQuads) {
@@ -132,12 +107,11 @@ async function main(): Promise<void> {
     live.length = 0;
     const wasmAfterFree = await wasmHeapMb();
 
-    writeFileSync(outFile, JSON.stringify({
+    const point: DictMemoryPoint = {
         slug: slugArg,
         n,
         subjectRatio: opts.subjectRatio,
         objectRatio: opts.objectRatio,
-        terms: m.terms,
         cardinality: m,
         stores: STORES,
         wasmPerStore,
@@ -161,7 +135,8 @@ async function main(): Promise<void> {
         jsAfterRebuild,
         rssAfterBuild,
         peakRssMb: peakRssMb(),
-    }));
+    };
+    writeFileSync(outFile, JSON.stringify(point));
 }
 
 main().catch((e) => {

@@ -1,24 +1,23 @@
 //! Bulk quad ingestion across the wasm boundary: length-prefixed packed
-//! buffers (one boundary crossing per chunk instead of ~16–20 `Reflect` calls
-//! per quad) and RDF/JS `Stream<Quad>` adaptation.
+//! buffers decoded with a linear cursor, and RDF/JS `Stream<Quad>` adaptation.
 
 use futures::channel::mpsc;
 use futures::{Stream, stream};
 use js_sys::Reflect;
 use oxrdf::{GraphName, NamedNode, NamedOrBlankNode, Quad, Term};
-use vortex_rdf_core::error::{Result as CoreResult, VortexRdfError};
-use vortex_rdf_core::store::{BuiltArray, RawQuad};
-use vortex_rdf_core::{DictionaryQuadSink, Indexes};
+use vortex_rdf_core::{
+    BuiltArray, DictionaryQuadSink, Indexes, RawQuad, Result as CoreResult, VortexRdfError,
+};
 use wasm_bindgen::prelude::*;
 
+use crate::error::js_err;
 use crate::terms::js_to_quad;
 
-#[wasm_bindgen(module = "/js-snippets/lazy-rdf.js")]
+#[wasm_bindgen(module = "/js-snippets/pack-quads.js")]
 extern "C" {
-    /// Flatten an RDF/JS quad array into one length-prefixed byte buffer
-    /// host-side, so bulk ingestion crosses the wasm boundary once instead of
-    /// ~16–20 Reflect calls per quad. Decoded by [`packed_to_quads`]. Throws
-    /// on a malformed quad (hence `catch`).
+    /// Flatten a range of an RDF/JS quad array into one length-prefixed byte
+    /// buffer host-side, decoded by [`packed_to_quads_into`]. Throws on a
+    /// malformed quad (hence `catch`).
     #[wasm_bindgen(js_name = packQuads, catch)]
     fn pack_quads(
         quads: &js_sys::Array,
@@ -28,10 +27,8 @@ extern "C" {
 }
 
 /// Quads per `packQuads` call. The packed buffer is copied into linear memory
-/// and must stay live while the quads in it are decoded, so packing the whole
-/// array at once put a second full copy of the dataset's term bytes on the wasm
-/// high-water mark. Packing a range at a time bounds that to one chunk; the
-/// boundary crossing it saves is per-chunk rather than per-quad either way.
+/// and stays live until its quads are decoded, so this bounds the ingest
+/// transient to one chunk's term bytes.
 const PACK_CHUNK: u32 = 1 << 16;
 
 /// Decode a JS quad array in `PACK_CHUNK`-sized ranges, converting with `emit`.
@@ -60,31 +57,18 @@ fn js_array_to_raw_quads(quads: js_sys::Array) -> Result<Vec<RawQuad>, JsValue> 
 /// interning [`DictionaryQuadSink`] and build the array from it.
 ///
 /// Unlike [`js_array_to_raw_quads`], nothing accumulates per quad but four
-/// u32 ids — each `RawQuad`'s Strings die inside `push` — so the ingest
+/// u32 term codes — each `RawQuad`'s Strings die inside `push` — so the ingest
 /// high-water holds one packed chunk plus one copy of every distinct term
 /// instead of four owned Strings per quad.
 pub(crate) fn js_array_to_dictionary_array(
     quads: js_sys::Array,
-    sorted: bool,
     indexes: Indexes,
 ) -> Result<BuiltArray, JsValue> {
-    let mut sink = DictionaryQuadSink::new(sorted, indexes);
-    let total = quads.length();
-    let mut start = 0u32;
-    // `packed_to_quads_into` emits per quad; collect only unit results.
-    let mut sunk: Vec<()> = Vec::new();
-    while start < total {
-        let end = (start + PACK_CHUNK).min(total);
-        let packed = pack_quads(&quads, start, end)?;
-        packed_to_quads_into(
-            &packed.to_vec(),
-            &mut |q| sink.push(RawQuad::from_quad(&q)),
-            &mut sunk,
-        )?;
-        sunk.clear();
-        start = end;
-    }
-    sink.finish().map_err(|e| JsValue::from_str(&e.to_string()))
+    let mut sink = DictionaryQuadSink::new(indexes);
+    // `push` returns `()`, so the decode loop's collected results are a ZST
+    // vector: nothing per quad is allocated.
+    js_array_decode(&quads, |q| sink.push(RawQuad::from_quad(&q)))?;
+    sink.finish().map_err(js_err)
 }
 
 /// Mutation form: quads as `oxrdf::Quad`, which `add_quads` needs because its
@@ -96,14 +80,12 @@ pub(crate) fn js_array_to_quads(quads: js_sys::Array) -> Result<Vec<Quad>, JsVal
 }
 
 /// Decode the buffer [`pack_quads`] produced back into owned quads. Term
-/// construction/validation mirrors [`js_to_quad`]: IRIs and language tags are
-/// validated, blank-node ids are taken as-is.
+/// construction mirrors [`js_to_quad`]: IRIs, blank-node labels and language
+/// tags are validated; a failure is reported with the quad's index.
 ///
 /// `emit` converts each decoded quad as it is produced, so on the ingest path
-/// the `oxrdf::Quad` dies inside the loop. Collecting `Vec<Quad>` and
-/// converting afterwards — which is what every builder did with it — held a
-/// second owned copy of every term in the dataset live at once, and that copy
-/// was a large part of the wasm ingest high-water mark.
+/// the `oxrdf::Quad` is dropped inside the loop and at most one packed chunk's
+/// terms are live at a time.
 fn packed_to_quads_into<T>(
     bytes: &[u8],
     emit: &mut impl FnMut(Quad) -> T,
@@ -118,7 +100,7 @@ fn packed_to_quads_into<T>(
             let b = *self
                 .bytes
                 .get(self.pos)
-                .ok_or_else(|| JsValue::from_str("Truncated quad buffer"))?;
+                .ok_or_else(|| js_err("Truncated quad buffer"))?;
             self.pos += 1;
             Ok(b)
         }
@@ -127,7 +109,7 @@ fn packed_to_quads_into<T>(
             let s = self
                 .bytes
                 .get(self.pos..end)
-                .ok_or_else(|| JsValue::from_str("Truncated quad buffer"))?;
+                .ok_or_else(|| js_err("Truncated quad buffer"))?;
             self.pos = end;
             Ok(u32::from_le_bytes(s.try_into().unwrap()))
         }
@@ -137,13 +119,13 @@ fn packed_to_quads_into<T>(
             let s = self
                 .bytes
                 .get(self.pos..end)
-                .ok_or_else(|| JsValue::from_str("Truncated quad buffer"))?;
+                .ok_or_else(|| js_err("Truncated quad buffer"))?;
             self.pos = end;
-            std::str::from_utf8(s).map_err(|_| JsValue::from_str("Invalid UTF-8 in quad buffer"))
+            std::str::from_utf8(s).map_err(|_| js_err("Invalid UTF-8 in quad buffer"))
         }
     }
 
-    let invalid = |i: usize| JsValue::from_str(&format!("Invalid quad object at index {}", i));
+    let invalid = |i: usize| js_err(format!("Invalid quad object at index {}", i));
     let mut cur = Cursor { bytes, pos: 0 };
     let n = cur.u32()? as usize;
     out.reserve(n);
@@ -151,7 +133,9 @@ fn packed_to_quads_into<T>(
         // subject: NamedNode | BlankNode
         let s = match cur.u8()? {
             0 => NamedOrBlankNode::NamedNode(NamedNode::new(cur.str()?).map_err(|_| invalid(i))?),
-            1 => NamedOrBlankNode::BlankNode(oxrdf::BlankNode::new_unchecked(cur.str()?)),
+            1 => NamedOrBlankNode::BlankNode(
+                oxrdf::BlankNode::new(cur.str()?).map_err(|_| invalid(i))?,
+            ),
             _ => return Err(invalid(i)),
         };
         // predicate: NamedNode
@@ -162,7 +146,7 @@ fn packed_to_quads_into<T>(
         // object: any term
         let o = match cur.u8()? {
             0 => Term::NamedNode(NamedNode::new(cur.str()?).map_err(|_| invalid(i))?),
-            1 => Term::BlankNode(oxrdf::BlankNode::new_unchecked(cur.str()?)),
+            1 => Term::BlankNode(oxrdf::BlankNode::new(cur.str()?).map_err(|_| invalid(i))?),
             2 => Term::Literal(oxrdf::Literal::new_simple_literal(cur.str()?)),
             3 => {
                 let value = cur.str()?.to_owned();
@@ -182,7 +166,7 @@ fn packed_to_quads_into<T>(
         // graph: NamedNode | BlankNode | DefaultGraph
         let g = match cur.u8()? {
             0 => GraphName::NamedNode(NamedNode::new(cur.str()?).map_err(|_| invalid(i))?),
-            1 => GraphName::BlankNode(oxrdf::BlankNode::new_unchecked(cur.str()?)),
+            1 => GraphName::BlankNode(oxrdf::BlankNode::new(cur.str()?).map_err(|_| invalid(i))?),
             5 => GraphName::DefaultGraph,
             _ => return Err(invalid(i)),
         };
@@ -225,7 +209,7 @@ fn rdfjs_stream_to_quads(stream_val: JsValue) -> Result<BoxedQuadStream, JsValue
         .ok()
         .and_then(|f| f.dyn_into::<js_sys::Function>().ok())
         .ok_or_else(|| {
-            JsValue::from_str(
+            js_err(
                 "fromQuads expects an array of quads or an RDF/JS Stream \
                  (an object with an 'on' method)",
             )
@@ -234,13 +218,17 @@ fn rdfjs_stream_to_quads(stream_val: JsValue) -> Result<BoxedQuadStream, JsValue
     let (tx, rx) = mpsc::unbounded::<CoreResult<RawQuad>>();
 
     let tx_data = tx.clone();
+    let mut position = 0usize;
     let on_data = Closure::wrap(Box::new(move |quad_js: JsValue| {
         let item = js_to_quad(quad_js)
             .as_ref()
             .map(RawQuad::from_quad)
             .ok_or_else(|| {
-                VortexRdfError::Deserialization("Invalid quad object in RDF/JS stream".to_string())
+                VortexRdfError::Deserialization(format!(
+                    "Invalid quad object in RDF/JS stream at position {position}"
+                ))
             });
+        position += 1;
         let _ = tx_data.unbounded_send(item);
     }) as Box<dyn FnMut(JsValue)>);
 
@@ -259,11 +247,11 @@ fn rdfjs_stream_to_quads(stream_val: JsValue) -> Result<BoxedQuadStream, JsValue
     }) as Box<dyn FnMut()>);
 
     on.call2(&stream_val, &"data".into(), on_data.as_ref())
-        .map_err(|_| JsValue::from_str("Failed to attach a 'data' listener to the stream"))?;
+        .map_err(|_| js_err("Failed to attach a 'data' listener to the stream"))?;
     on.call2(&stream_val, &"error".into(), on_error.as_ref())
-        .map_err(|_| JsValue::from_str("Failed to attach an 'error' listener to the stream"))?;
+        .map_err(|_| js_err("Failed to attach an 'error' listener to the stream"))?;
     on.call2(&stream_val, &"end".into(), on_end.as_ref())
-        .map_err(|_| JsValue::from_str("Failed to attach an 'end' listener to the stream"))?;
+        .map_err(|_| js_err("Failed to attach an 'end' listener to the stream"))?;
 
     on_data.forget();
     on_error.forget();

@@ -5,3 +5,8 @@
 # and read back by hand for the memory sweep. Not committed.
 /bench/results*.json
 /bench/dict-memory.json
+# Built by `npm run build:hdt-wasm` (see bench/hdt-wasm). Only the type
+# declaration is committed, so `npm run typecheck` resolves the module on a
+# checkout that never runs that build — CI among them.
+/bench/hdt-pkg/*
+!/bench/hdt-pkg/hdt_wasm_bench.d.ts

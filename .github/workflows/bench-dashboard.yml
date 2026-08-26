@@ -37,32 +37,133 @@ jobs:
         # Both targets feed one log: the render script keeps parsing across
         # concatenated divan outputs. match_lazy is the local/dashboard-only
         # lazy match matrix (never uploaded to CodSpeed).
+        #
+        # BENCH_SIZE puts the Rust tab on the same 1,048,576 quads the JS and
+        # Python comparative suites default to, so a row means the same thing
+        # on all three tabs. The internals suites' own default is the much
+        # smaller CodSpeed size, which stays that way — instrumented runs there
+        # measure instructions, where a bigger dataset only multiplies valgrind
+        # cost. Repetition counts need no env: they are per-bench in the source
+        # (QUERY_SAMPLES / HEAVY_SAMPLES), matching the other two suites.
+        env:
+          BENCH_SIZE: 1048576
         run: |
           cargo bench --bench benchmark | tee bench_output.txt
           cargo bench --bench match_lazy | tee -a bench_output.txt
+          # Cross-library comparison (oxigraph, sophia, hdt). Writes its own
+          # JSON rather than divan text, so it is not appended above.
+          cargo bench --bench compare
 
       - name: Setup Node
         uses: actions/setup-node@v7
         with:
-          node-version: 25
+          node-version-file: .tool-versions
+          cache: npm
+          cache-dependency-path: js/package-lock.json
 
-      # Build the wasm bindings and run the JavaScript comparative benchmark
-      # (VortexRdfStore variants vs rdf-stores.js vs oxigraph). Wall-clock via
-      # tinybench; deliberately NOT uploaded to CodSpeed. Same full scale as a
-      # local run (rdf-stores' own default: BENCH_DIM=128, 2,097,152 triples).
-      - name: Build wasm + run JS comparative benchmark
+      - name: Install JS dependencies
+        working-directory: js
+        run: npm ci
+
+      # The wasm bindings depend only on the Rust sources listed in the key;
+      # wasm-pack plus wasm-opt cost ~10 minutes, so a run whose Rust tree is
+      # unchanged reuses the previous artifact instead of rebuilding it.
+      - name: Cache wasm bindings
+        id: wasm-cache
+        uses: actions/cache@v4
+        with:
+          path: js/pkg/web
+          key: wasm-pkg-${{ hashFiles('core/src/**', 'core/Cargo.toml', 'encoded-search/src/**', 'encoded-search/Cargo.toml', 'js/src/**', 'js/Cargo.toml', 'Cargo.lock') }}
+
+      - name: Build wasm bindings
+        if: steps.wasm-cache.outputs.cache-hit != 'true'
+        working-directory: js
+        run: npm run build
+
+      - name: Cache hdt wasm wrapper
+        id: hdt-wasm-cache
+        uses: actions/cache@v4
+        with:
+          path: js/bench/hdt-pkg
+          key: hdt-pkg-${{ hashFiles('js/bench/hdt-wasm/src/**', 'js/bench/hdt-wasm/Cargo.toml', 'js/bench/hdt-wasm/Cargo.lock') }}
+
+      - name: Build hdt wasm wrapper
+        if: steps.hdt-wasm-cache.outputs.cache-hit != 'true'
+        working-directory: js
+        run: npm run build:hdt-wasm
+
+      # Run the JavaScript comparative benchmark (VortexRdfStore variants vs
+      # rdf-stores.js, oxigraph and hdt). Wall-clock via tinybench; deliberately
+      # NOT uploaded to CodSpeed. BENCH_SIZE is the same variable (and value)
+      # as the Rust step — the hdt adapter opens the
+      # .hdt artifact that step built from the same dataset
+      # (target/bench_compare/hdt/data.hdt), and a size mismatch makes its
+      # rows report an error instead of numbers.
+      - name: Run JS comparative benchmark
         working-directory: js
         env:
-          BENCH_DIM: 128
-          BENCH_DIM_QUADS: 32
+          BENCH_SIZE: 1048576
           MUT_BATCH: 10000
+        run: npm run bench
+
+      # The Python comparative benchmark (vortex_rdf vs pyoxigraph, pycottas,
+      # rdflib, lightrdf). run.py provisions one uv virtualenv per library --
+      # they cannot share one, since pycottas hard-pins an older pyoxigraph
+      # than the version we want to measure. Wall-clock; not uploaded to
+      # CodSpeed, same as the JS comparative bench.
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+
+      # Same idea as the wasm cache: the extension depends only on the Rust
+      # sources, and `maturin develop --release` costs ~4 minutes.
+      - name: Cache Python native extension
+        id: py-native-cache
+        uses: actions/cache@v4
+        with:
+          path: python/vortex_rdf/_native.abi3.so
+          key: py-native-${{ hashFiles('core/src/**', 'core/Cargo.toml', 'encoded-search/src/**', 'encoded-search/Cargo.toml', 'python/src/**', 'python/Cargo.toml', 'Cargo.lock') }}
+
+      # One virtualenv per external library (their dependency sets conflict —
+      # pycottas hard-pins an older pyoxigraph). Provisioning them re-downloads
+      # every library each run; the pins live in adapters.py, so its hash is
+      # the cache identity.
+      - name: Cache benchmark virtualenvs
+        uses: actions/cache@v4
+        with:
+          path: python/bench/.venvs
+          key: py-bench-venvs-${{ hashFiles('python/bench/adapters.py') }}
+
+      - name: Build Python bindings
+        if: steps.py-native-cache.outputs.cache-hit != 'true'
+        working-directory: python
         run: |
-          npm ci
-          npm run build
-          npm run bench
+          uv venv .venv --python 3.13
+          uv pip install --python .venv/bin/python maturin
+          # `maturin develop` requires an active virtualenv, and it is what puts
+          # the compiled `_native.abi3.so` inside python/vortex_rdf/ — which is
+          # all the bench needs, since run.py reaches the bindings via
+          # PYTHONPATH rather than installing them into each adapter's venv.
+          VIRTUAL_ENV="$PWD/.venv" .venv/bin/maturin develop --release
+
+      - name: Run Python comparative benchmark
+        working-directory: python
+        env:
+          BENCH_SIZE: 1048576
+          MUT_BATCH: 10000
+        run: python3 bench/run.py
 
       - name: Render dashboard
-        run: python3 scripts/render_bench_dashboard.py bench_output.txt public/index.html --js js/bench/results.json
+        # --bench-size is now a fallback: each bench target stamps a `#dataset`
+        # line into the log with the row count and moduli it actually generated,
+        # and the renderer prefers that (and warns if the two disagree). Kept so
+        # a log from before the stamp still renders with the right size rather
+        # than the suite's compiled-in CodSpeed default.
+        run: |
+          python3 scripts/render_bench_dashboard.py bench_output.txt public/index.html \
+            --js js/bench/results.json \
+            --python python/bench/results.json \
+            --rust-compare core/bench/results.json \
+            --bench-size 1048576
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v5

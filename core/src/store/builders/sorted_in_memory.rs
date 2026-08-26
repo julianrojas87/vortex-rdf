@@ -1,24 +1,35 @@
+//! The [`SortedInMemoryBuilder`] strategy: hold the whole dataset, sort it
+//! once by (s, p, o, g), and emit chunks as windows of that single order.
+//!
+//! Holding everything at once is what earns the global sortedness this
+//! builder claims: the `s` column's `IsSorted` stamp, and the index children
+//! it builds through [`build_components`] over the sorted dataset. The cost
+//! is O(dataset) memory; the out-of-core strategy with the same guarantee is
+//! [`sorted_stream`](super::sorted_stream). Only this file's ordering
+//! discipline lives here — the emission machinery it drives belongs to
+//! [`builders`](super).
+
 use super::{
-    BuiltArray, BuiltStream, ChunkStream, DEFAULT_CHUNK_SIZE, VortexArrayBuilder,
-    build_struct_array, build_struct_array_global, into_vortex_error, make_empty_struct,
+    BuiltArray, BuiltStream, ChunkStream, DEFAULT_CHUNK_ROWS, VortexArrayBuilder, build_components,
+    build_components_from_codes, build_struct_array, into_vortex_error, make_empty_struct,
 };
 use crate::error::Result;
 use crate::store::RawQuad;
-use crate::store::indexes::{GlobalIndexes, Indexes};
-use crate::store::layouts::dictionary::{QuadCodes, ingest_interning};
-use crate::store::layouts::term_dictionary::TermDictionary;
+use crate::store::indexes::Indexes;
+use crate::store::layouts::dictionary::ingest::{InterningQuadBuilder, finish_interned};
+use crate::store::layouts::dictionary::{QuadCodes, TermDictionary};
 use crate::store::layouts::{LayoutStrategy, dictionary};
 
+use crate::debug;
 use futures::{Stream, StreamExt, stream};
 use std::sync::Arc;
-use web_time::Instant;
 
 /// Fully in-memory, globally sorted Vortex RDF Array Builder.
 ///
-/// Sorts all quads in memory by (s, p, o, g) before writing columns.
-/// Produces Reference secondary indexes when requested; their columns are
-/// emitted in global sorted order (stamped `IsSorted`), so `match_pattern`
-/// can binary-search them.
+/// Sorts all quads in memory by (s, p, o, g), builds the primary columns, and
+/// builds every requested index child (by copy and by reference) over the
+/// same sorted dataset, so each child is globally sorted and
+/// binary-searchable.
 pub struct SortedInMemoryBuilder;
 
 impl VortexArrayBuilder for SortedInMemoryBuilder {
@@ -27,55 +38,54 @@ impl VortexArrayBuilder for SortedInMemoryBuilder {
         layout: LayoutStrategy,
         indexes: Indexes,
     ) -> Result<BuiltArray> {
-        let start = Instant::now();
+        let start = debug::timer();
 
-        // Build a single contiguous StructArray: for in-memory stores this
-        // keeps index columns global and the s column monotonically sorted.
+        // Build a single contiguous StructArray of primary columns, with each
+        // requested index's child built beside it over the same sorted
+        // dataset: both the `s` column and every child are then globally
+        // sorted.
         //
         // Dictionary layout interns terms as the stream drains, so the sort
         // runs over 16-byte coded rows and no `Vec<RawQuad>` (four owned
         // Strings per quad) ever accumulates.
         let (n, build_start, built);
         if layout == LayoutStrategy::Dictionary {
-            let (dict, codes) = ingest_interning(quad_stream).await?.finish(true)?;
-            n = codes.s.len();
-            build_start = Instant::now();
-            built = BuiltArray {
-                array: dictionary::build_array(&codes, &indexes, true)?,
-                dict: Some(Arc::new(dict)),
-            };
+            let interner = InterningQuadBuilder::from_stream(quad_stream).await?;
+            build_start = debug::timer();
+            built = finish_interned(interner, &indexes)?;
+            n = built.array.len();
         } else {
             let quads = ingest_and_sort(quad_stream).await?;
             n = quads.len();
-            build_start = Instant::now();
+            build_start = debug::timer();
             built = BuiltArray {
-                array: build_struct_array(&quads, layout, &indexes, n, 0, true, true)?,
+                array: build_struct_array(&quads, layout, true)?,
+                components: build_components(&indexes, &quads)?,
                 dict: None,
             };
         };
         log::debug!(
             "[SortedInMemoryBuilder] Constructed StructArray in {:?}",
-            build_start.elapsed()
+            debug::elapsed(build_start)
         );
         log::debug!(
             "[SortedInMemoryBuilder] Completed serialization of {} quads in {:?}",
             n,
-            start.elapsed()
+            debug::elapsed(start)
         );
 
         Ok(built)
     }
 
-    /// Streaming override for file writes: the sort still requires the whole
-    /// dataset in memory as `RawQuad`s, but column chunks are built lazily as
-    /// the writer polls, so only one chunk's Vortex arrays exist at a time —
-    /// peak memory drops from ~2× dataset to ~1× dataset + one chunk.
+    /// The sort holds the whole dataset (as `RawQuad`s, or as interned codes
+    /// under the Dictionary layout); column chunks are built lazily as the
+    /// writer polls, so only one chunk's Vortex arrays exist at a time.
     async fn build_vortex_stream(
         quad_stream: Box<dyn Stream<Item = Result<RawQuad>> + Unpin + Send + 'static>,
         layout: LayoutStrategy,
         indexes: Indexes,
     ) -> Result<BuiltStream> {
-        build_sorted_chunk_stream(quad_stream, layout, indexes, DEFAULT_CHUNK_SIZE).await
+        build_chunk_stream(quad_stream, layout, indexes, DEFAULT_CHUNK_ROWS).await
     }
 }
 
@@ -89,108 +99,123 @@ async fn ingest_and_sort(
     }
     log::debug!("[SortedInMemoryBuilder] Read {} quads", quads.len());
 
-    let sort_start = Instant::now();
+    let sort_start = debug::timer();
     quads.sort_unstable();
     log::debug!(
         "[SortedInMemoryBuilder] Sorted quads in {:?}",
-        sort_start.elapsed()
+        debug::elapsed(sort_start)
     );
 
     Ok(quads)
 }
 
-/// Ingest, sort, then emit fixed-size StructArray chunks over slices of the
-/// sorted vec. The first chunk is built eagerly so the schema dtype is known
-/// up front; subsequent chunks are built only when polled.
+/// Ingest, sort, then emit fixed-size primary StructArray chunks over slices
+/// of the sorted vec. The first chunk is built eagerly so the schema dtype is
+/// known up front; subsequent chunks are built only when polled.
 ///
-/// Index columns are precomputed once in global sorted order and sliced per
-/// chunk, so their concatenation across chunks stays globally sorted (each
-/// slice is stamped `IsSorted`) and row IDs address the assembled array.
-pub(crate) async fn build_sorted_chunk_stream(
+/// The index children are built once over the whole sorted dataset and ride
+/// beside the stream as complete components — their row ids address the
+/// assembled array, so they cannot be cut per chunk anyway.
+pub(crate) async fn build_chunk_stream(
     quad_stream: Box<dyn Stream<Item = Result<RawQuad>> + Unpin + Send + 'static>,
     layout: LayoutStrategy,
     indexes: Indexes,
     chunk_size: usize,
 ) -> Result<BuiltStream> {
     if layout == LayoutStrategy::Dictionary {
-        let (dict, codes) = ingest_interning(quad_stream).await?.finish(true)?;
+        let (dict, codes) = InterningQuadBuilder::from_stream(quad_stream)
+            .await?
+            .finish()?;
         return emit_dict_chunks(codes, Arc::new(dict), indexes, chunk_size);
     }
 
     let quads = ingest_and_sort(quad_stream).await?;
 
-    let global_idx = Arc::new(GlobalIndexes::from_quads(&indexes, &quads));
+    let components = component_writes(build_components(&indexes, &quads)?)?;
 
     let n0 = quads.len().min(chunk_size);
     let first = if quads.is_empty() {
-        make_empty_struct(layout, &indexes)?
+        make_empty_struct(layout)?
     } else {
-        build_struct_array_global(&quads[..n0], layout, &global_idx, 0..n0, true)?
+        build_struct_array(&quads[..n0], layout, true)?
     };
     let dtype = first.dtype().clone();
 
     let rest = stream::unfold(
-        (quads, layout, global_idx, n0),
-        move |(quads, layout, global_idx, offset)| async move {
+        (quads, layout, n0),
+        move |(quads, layout, offset)| async move {
             if offset >= quads.len() {
                 return None;
             }
             let end = (offset + chunk_size).min(quads.len());
-            let chunk = build_struct_array_global(
-                &quads[offset..end],
-                layout,
-                &global_idx,
-                offset..end,
-                true,
-            )
-            .map_err(into_vortex_error);
-            Some((chunk, (quads, layout, global_idx, end)))
+            let chunk =
+                build_struct_array(&quads[offset..end], layout, true).map_err(into_vortex_error);
+            Some((chunk, (quads, layout, end)))
         },
     );
 
     let chunks: ChunkStream = stream::once(async move { Ok(first) }).chain(rest).boxed();
     Ok(BuiltStream {
+        components,
+        quads_sorted: true,
         dtype,
         chunks,
         dict: None,
     })
 }
 
-/// Dictionary-layout emission over the interned codes: the index order is
-/// precomputed globally over the codes, and chunks are cut as ranges of both.
-/// The dictionary rides beside the stream for the serializer to place.
+/// The built children as writable components. They are already materialized
+/// (this builder holds the dataset), so each is a replayable single-chunk
+/// source. A build with no serializer compiled in has nothing to hand them
+/// to, and says so with an empty roster.
+fn component_writes(
+    components: Vec<crate::store::indexes::IndexComponent>,
+) -> Result<Vec<crate::io::container::NativeComponentWrite>> {
+    #[cfg(any(feature = "file-io", target_arch = "wasm32"))]
+    {
+        components.iter().map(|c| c.to_write()).collect()
+    }
+    #[cfg(not(any(feature = "file-io", target_arch = "wasm32")))]
+    {
+        drop(components);
+        Ok(Vec::new())
+    }
+}
+
+/// Dictionary-layout emission over the interned codes: primary code chunks
+/// cut as ranges of the coded dataset, index children built once over all of
+/// it. The dictionary rides beside the stream for the serializer to place.
 fn emit_dict_chunks(
     codes: QuadCodes,
     dict: Arc<TermDictionary>,
     indexes: Indexes,
     chunk_size: usize,
 ) -> Result<BuiltStream> {
-    let global_idx = GlobalIndexes::from_codes(&indexes, &codes);
+    let components = component_writes(build_components_from_codes(&indexes, &codes)?)?;
     let n = codes.s.len();
 
     let n0 = n.min(chunk_size);
     let first = if n == 0 {
-        dictionary::empty_struct(&indexes)?
+        dictionary::empty_struct()?
     } else {
-        dictionary::build_chunk_global(&codes, 0..n0, &global_idx, true)?
+        dictionary::build_code_chunk(&codes, 0..n0, true)?
     };
     let dtype = first.dtype().clone();
 
-    let rest = stream::unfold(
-        (codes, global_idx, n0),
-        move |(codes, global_idx, offset)| async move {
-            if offset >= n {
-                return None;
-            }
-            let end = (offset + chunk_size).min(n);
-            let chunk = dictionary::build_chunk_global(&codes, offset..end, &global_idx, true)
-                .map_err(into_vortex_error);
-            Some((chunk, (codes, global_idx, end)))
-        },
-    );
+    let rest = stream::unfold((codes, n0), move |(codes, offset)| async move {
+        if offset >= n {
+            return None;
+        }
+        let end = (offset + chunk_size).min(n);
+        let chunk =
+            dictionary::build_code_chunk(&codes, offset..end, true).map_err(into_vortex_error);
+        Some((chunk, (codes, end)))
+    });
 
     let chunks: ChunkStream = stream::once(async move { Ok(first) }).chain(rest).boxed();
     Ok(BuiltStream {
+        components,
+        quads_sorted: true,
         dtype,
         chunks,
         dict: Some(dict),

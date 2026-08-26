@@ -1,0 +1,16 @@
+// Types shared by the Node and browser entry points: both expose the same
+// public surface as the generated wasm bindings, minus the low-level
+// `init`/`initSync` (each entry calls init for the caller). Kept in sync with
+// the re-exports in entry/node.js and entry/browser.js.
+export {
+    TermDict,
+    VortexRdfStore,
+    serializeRdf,
+    deserializeRdf,
+} from '../pkg/web/vortex_rdf.js';
+export type {
+    BuildOptions,
+    LayoutStrategy,
+    IndexType,
+    RdfFormatName,
+} from '../pkg/web/vortex_rdf.js';

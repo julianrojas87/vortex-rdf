@@ -1,15 +1,29 @@
-// Shared definitions between the orchestrator (compare.bench.ts) and the per-adapter
-// worker (compare.worker.ts). Each adapter's full lifecycle runs in its own child
-// process (see compare.bench.ts) — this file is imported independently by both, so
-// it must be pure/deterministic given the same env vars (no shared in-memory state
-// crosses the process boundary).
+// Shared infrastructure for every multi-process bench instrument here: the
+// comparative orchestrator (compare.bench.ts), its per-adapter worker
+// (compare.worker.ts), and the dictionary-memory worker (dict-memory.worker.ts,
+// which takes the dataset generator, the Vortex adapters and the memory probes).
+//
+// PURITY CONTRACT: each of those runs in its own child process and imports this
+// file independently, so it must be pure/deterministic given the same env vars —
+// no shared in-memory state crosses the process boundary, and every knob is an
+// env var read here, never a value passed between processes.
+//
+// codspeed.bench.ts deliberately does NOT import this file: the store libraries
+// loaded below would put a foreign multi-MB wasm module into its Valgrind-
+// instrumented process. The pure halves live elsewhere and are re-exported
+// here so the workers keep their single import: generic helpers in ./util.ts,
+// the dataset-generation layer in ./datasets.ts (both importable by
+// codspeed.bench.ts).
 
 import type { BenchOptions, Bench } from 'tinybench';
-import { DataFactory } from 'rdf-data-factory';
-import type { Quad, Term } from '@rdfjs/types';
-import { readFileSync } from 'node:fs';
+import type { Quad } from '@rdfjs/types';
+import { existsSync, readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { dirname, resolve } from 'node:path';
 
-import { VortexRdfStore, type BuildOptions } from '../entry/node.js';
+import { VortexRdfStore, type BuildOptions } from '@vortex-rdf/vortex-rdf-store';
+import { fmtNs, consumeQuads, consumeStrings } from './util.js';
+import { df, moduli, type Pat } from './datasets.js';
 import {
     RdfStore,
     RdfStoreIndexNestedMapQuoted,
@@ -18,227 +32,27 @@ import {
 } from 'rdf-stores';
 import { Store as OxiStore } from 'oxigraph';
 
-export const df = new DataFactory();
+export * from './datasets.js';
 
 // ─── Config (env-tunable) ────────────────────────────────────────────────────
-export const D = Number(process.env.BENCH_DIM ?? 128); // triples dataset: D³ triples
-export const DQ = Number(process.env.BENCH_DIM_QUADS ?? 32); // quads dataset: DQ⁴ quads
-export const MUT_BATCH = Number(process.env.MUT_BATCH ?? 10_000); // add/delete batch, independent of D
-/** Row counts, kept as D³/DQ⁴ so the existing scale knobs mean what they always did. */
-export const N_TRIPLES = D ** 3;
-export const N_QUADS = DQ ** 4;
-
-// ─── Dataset generator ───────────────────────────────────────────────────────
 //
-// Term cardinality is an explicit knob, independent of row count. The previous
-// generator drew D³ rows from a namespace of only D IRIs (128 distinct terms for
-// 2,097,152 triples), which made every store's term handling — dictionaries,
-// interning, string storage — invisible to the benchmark, and is nothing like
-// real RDF, where distinct terms scale with the data.
-//
-// Uniqueness: term indices are `i % k` per role, so quad i maps to the residue
-// tuple (i mod nSubj, i mod nPred, i mod nObj, i mod nGraph). By the Chinese
-// Remainder Theorem that map is injective over `i < lcm(...)`, so making the
-// four moduli pairwise coprime (their lcm is then their product) and checking
-// the product covers `n` guarantees every generated quad is distinct — with no
-// dedupe set, which at these row counts would itself dominate memory.
-//
-// Deliberate consequence: index 0 exists for every role, so row 0 satisfies all
-// four single-term probes and every pattern in `datasetProbes` matches at least
-// one row.
+// BENCH_SIZE sets the row count (default 2^20, ~630k distinct terms) — the same
+// env name the Rust suites read; BENCH_DIM=d is cube shorthand (d³ rows) for
+// quick pilots and loses to an explicit BENCH_SIZE.
+const dim = Number(process.env.BENCH_DIM ?? 0);
+/** One dataset for the whole run: every store whose model has graphs builds
+ *  from it and answers every pattern on it, and one whose model does not (hdt)
+ *  reads the same rows with the graph dropped. */
+export const N_TRIPLES = Number(process.env.BENCH_SIZE ?? 0) || (dim > 0 ? dim ** 3 : 1_048_576);
+/** Named graphs in that dataset, before the generator's coprimality nudge.
+ *  Matches the Rust suite's `WANT_GRAPHS` and the Python suite's
+ *  BENCH_GRAPHS_QUADS, so all three tabs describe the same shape. */
+export const GRAPHS = Number(process.env.BENCH_GRAPHS_QUADS ?? 8);
+export const MUT_BATCH = Number(process.env.MUT_BATCH ?? 10_000); // add/delete batch, independent of scale
 
-const BASE = 'http://data.example.org';
-
-export interface DatasetOpts {
-    /** distinct subjects / n (default 0.1 — see `SUBJECT_RATIO_DEFAULT`). */
-    subjectRatio?: number;
-    /** distinct predicates: a small closed vocabulary, as in real data (default 32). */
-    predicates?: number;
-    /** distinct objects / n (default 0.5). */
-    objectRatio?: number;
-    /** fraction of distinct objects that are literals rather than IRIs (default 0.4). */
-    literalFrac?: number;
-    /** distinct named graphs; 1 means the default graph only (default 1). */
-    graphs?: number;
-}
-
-/** Distinct subjects per row, i.e. the reciprocal of how many triples describe
- *  each resource. 0.1 is ten triples per subject.
- *
- *  This is the knob that decides how much of the dataset is *terms*: the
- *  dictionary holds `subjectRatio + objectRatio` terms per quad, so the two
- *  ratios alone say whether there are more distinct terms than rows.
- *
- *  It was 1.0 — a distinct subject for every row. That is not how RDF looks: a
- *  resource is normally described by several properties, so its subject recurs
- *  across that many triples. 1.0 also made `S` match exactly one row, and with
- *  `PO`/`SPO`/`SPOG` matching one apiece, five of the seven probes returned two
- *  rows or fewer — so the comparison measured query *setup* almost to the
- *  exclusion of decoding, on a dictionary half again the size of the dataset.
- *
- *  Set `BENCH_SUBJ_RATIO=1.0` to get that back deliberately: it is a reasonable
- *  dictionary-stress configuration, and `bench:dict-memory` asks for it
- *  explicitly for exactly that reason. It is a poor default. */
-export const SUBJECT_RATIO_DEFAULT = 0.1;
-
-/** Env-overridable defaults, so a sweep can vary cardinality without new code. */
-export function datasetOpts(o: DatasetOpts = {}): Required<DatasetOpts> {
-    return {
-        subjectRatio:
-            o.subjectRatio ?? Number(process.env.BENCH_SUBJ_RATIO ?? SUBJECT_RATIO_DEFAULT),
-        predicates: o.predicates ?? Number(process.env.BENCH_PREDICATES ?? 32),
-        objectRatio: o.objectRatio ?? Number(process.env.BENCH_OBJ_RATIO ?? 0.5),
-        literalFrac: o.literalFrac ?? Number(process.env.BENCH_LITERAL_FRAC ?? 0.4),
-        graphs: o.graphs ?? Number(process.env.BENCH_GRAPHS ?? 1),
-    };
-}
-
-function gcd(a: number, b: number): number {
-    while (b) [a, b] = [b, a % b];
-    return a;
-}
-
-/** Per-role term counts: the requested values nudged up until pairwise coprime. */
-export function moduli(n: number, opts: DatasetOpts = {}): {
-    nSubj: number; nPred: number; nObj: number; nGraph: number; terms: number;
-} {
-    const o = datasetOpts(opts);
-    const want = [
-        Math.max(1, Math.round(n * o.subjectRatio)),
-        Math.max(1, Math.round(o.predicates)),
-        Math.max(1, Math.round(n * o.objectRatio)),
-        Math.max(1, Math.round(o.graphs)),
-    ];
-    const got: number[] = [];
-    for (const w of want) {
-        let k = w;
-        while (got.some((g) => gcd(g, k) !== 1)) k++;
-        got.push(k);
-    }
-    const [nSubj, nPred, nObj, nGraph] = got;
-    // Product == lcm because they are pairwise coprime; see the CRT note above.
-    // Use logs: the product overflows the float mantissa long before it matters.
-    const logProduct = got.reduce((acc, k) => acc + Math.log(k), 0);
-    if (logProduct < Math.log(n)) {
-        throw new Error(
-            `dataset cardinality too low for ${n} distinct quads: ` +
-            `${nSubj}x${nPred}x${nObj}x${nGraph} cannot cover it — raise a ratio`,
-        );
-    }
-    // The default graph is a term too, and it is not one of the named graphs.
-    const terms = nSubj + nPred + nObj + (nGraph === 1 ? 1 : nGraph);
-    return { nSubj, nPred, nObj, nGraph, terms };
-}
-
-const subjectTerm = (i: number) =>
-    df.namedNode(`${BASE}/resource/2026/subject/${String(i).padStart(9, '0')}`);
-const predicateTerm = (i: number) =>
-    df.namedNode(`${BASE}/ontology/2026/property/${String(i).padStart(4, '0')}`);
-const graphTerm = (i: number) =>
-    df.namedNode(`${BASE}/graph/2026/named/${String(i).padStart(6, '0')}`);
-
-/** Objects alternate IRI/literal deterministically, in `literalFrac` proportion. */
-function objectTerm(i: number, literalFrac: number): Term {
-    return i % 10 < Math.round(literalFrac * 10)
-        ? df.literal(`descriptive object value number ${String(i).padStart(9, '0')}`)
-        : df.namedNode(`${BASE}/resource/2026/object/${String(i).padStart(9, '0')}`);
-}
-
-/** Quad `i` of the `n`-row dataset. Pure in `i`, so probes and prefixes can be
- *  derived without materializing the array. */
-function quadAt(i: number, m: ReturnType<typeof moduli>, literalFrac: number): Quad {
-    return df.quad(
-        subjectTerm(i % m.nSubj),
-        predicateTerm(i % m.nPred),
-        objectTerm(i % m.nObj, literalFrac) as never,
-        m.nGraph === 1 ? df.defaultGraph() : graphTerm(i % m.nGraph),
-    );
-}
-
-/** `n` distinct quads whose term cardinality follows `opts`. */
-export function genDataset(n: number, opts: DatasetOpts = {}): Quad[] {
-    const o = datasetOpts(opts);
-    const m = moduli(n, opts);
-    const out: Quad[] = new Array(n);
-    for (let i = 0; i < n; i++) out[i] = quadAt(i, m, o.literalFrac);
-    return out;
-}
-
-/** The first `take` quads `genDataset(n, opts)` would produce, without building
- *  the full array — the mutation worker needs only a MUT_BATCH-sized slice for
- *  the delete phase, and `n` can be a couple of million. */
-export function genDatasetPrefix(n: number, take: number, opts: DatasetOpts = {}): Quad[] {
-    const o = datasetOpts(opts);
-    const m = moduli(n, opts);
-    const k = Math.min(take, n);
-    const out: Quad[] = new Array(k);
-    for (let i = 0; i < k; i++) out[i] = quadAt(i, m, o.literalFrac);
-    return out;
-}
-
-/** A batch of fresh quads in a disjoint namespace, for the add phase. */
-export function genFresh(n: number): Quad[] {
-    const out: Quad[] = new Array(n);
-    for (let i = 0; i < n; i++) {
-        out[i] = df.quad(
-            df.namedNode(`${BASE}/fresh/2026/subject/${String(i).padStart(9, '0')}`),
-            df.namedNode(`${BASE}/fresh/2026/property/0000`),
-            df.namedNode(`${BASE}/fresh/2026/object/${String(i).padStart(9, '0')}`),
-        );
-    }
-    return out;
-}
-
-// ─── Query patterns (probe terms fixed at index 0, so they always hit rows) ──
-export type Pat = { name: string; s: Term | null; p: Term | null; o: Term | null; g: Term | null };
-// 'full' (every variable unbound) is measured separately from the selective patterns,
-// under FULL_SCAN_OPTS's much lower repetition count: repeating a full-table
-// materialization (all D³ rows, ~2M at the default D=128) ~15x (QUERY_OPTS's 5 warmup
-// + 10 timed) reproducibly trips an internal `unreachable` trap in oxigraph's wasm
-// build around the 5th repetition on the same store — confirmed in isolation with
-// nothing else in the process, so it's not a cross-adapter memory issue. No other
-// adapter under test showed any problem with that many repetitions, but a full-table
-// dump repeated many times is a heavy op for any store (closer in spirit to `ingest`
-// than to a selective query), so the lower budget applies to every adapter uniformly
-// rather than singling out the one library that happens to crash on it.
-export const FULL_SCAN_PATTERN: Pat = { name: 'full', s: null, p: null, o: null, g: null };
-
-/**
- * Probes for an `n`-row dataset built with `opts`, all bound to term index 0 so
- * every one matches row 0 at minimum — no pattern can silently measure a
- * zero-row query.
- *
- * Selectivity now follows the data rather than the old shared namespace: at the
- * defaults `S` matches ~1 row (subjects are near-unique), `P` ~n/32, `O` ~2, and
- * the conjunctions narrow to a handful. That spread is what real queries look
- * like, but it is *not* comparable to the pre-cardinality numbers — the workers
- * record each pattern's matched-row count alongside its timing so the figures
- * stay interpretable.
- */
-export function datasetProbes(n: number, opts: DatasetOpts = {}): {
-    triples: Pat[]; quads: Pat[]; full: Pat;
-} {
-    const o = datasetOpts(opts);
-    const m = moduli(n, opts);
-    const s0 = subjectTerm(0);
-    const p0 = predicateTerm(0);
-    const o0 = objectTerm(0, o.literalFrac);
-    const g0 = m.nGraph === 1 ? df.defaultGraph() : graphTerm(0);
-    return {
-        triples: [
-            { name: 'S', s: s0, p: null, o: null, g: null },
-            { name: 'P', s: null, p: p0, o: null, g: null },
-            { name: 'O', s: null, p: null, o: o0, g: null },
-            { name: 'PO', s: null, p: p0, o: o0, g: null },
-            { name: 'SPO', s: s0, p: p0, o: o0, g: null },
-        ],
-        quads: [
-            { name: 'G', s: null, p: null, o: null, g: g0 },
-            { name: 'SPOG', s: s0, p: p0, o: o0, g: g0 },
-        ],
-        full: FULL_SCAN_PATTERN,
-    };
-}
+// The dataset-generation layer (genDataset and friends, the probe patterns,
+// and the dense-cube generators) lives in ./datasets.ts — pure, so the
+// instrumented CodSpeed suite can import it too — and is re-exported above.
 
 // ─── Adapter interface ───────────────────────────────────────────────────────
 export interface StoreAdapter<H = unknown> {
@@ -249,7 +63,30 @@ export interface StoreAdapter<H = unknown> {
     addAll(h: H, quads: Quad[]): Promise<void> | void; // per-quad add loop
     addBatch?(h: H, quads: Quad[]): Promise<void> | void; // optional batch add (Vortex)
     deleteAll(h: H, quads: Quad[]): Promise<void> | void; // per-quad delete loop
-    countMatch(h: H, p: Pat): Promise<number> | number; // consume + count
+    countMatch(h: H, p: Pat): Promise<number> | number; // count by consuming — every result term is read (consumeQuads)
+    /** Resolve the pattern and return only the match count — no term value is
+     *  read. Each store's cheapest correct count path (a count API where one
+     *  exists, the result set's length otherwise): the COUNT/ASK shape. */
+    countOnly(h: H, p: Pat): Promise<number> | number;
+    // Cold-regime pair, optional: `snapshot` serializes a built store once
+    // (untimed) and `open` adopts that snapshot into a fresh handle, which the
+    // cold query phase does per iteration. Only the stores with a persistent
+    // form implement them — an in-memory library has no artifact to reopen, so
+    // its "cold" would be a full re-parse of the source and would compare
+    // seconds against microseconds. Adapters without the pair are simply
+    // absent from the cold rows.
+    snapshot?(h: H): Promise<unknown>;
+    open?(snapshot: unknown): Promise<H>;
+    // Operations a store cannot perform in this environment, as opposed to slow
+    // ones. When set, the worker emits explained `unsupported` cells instead of
+    // timing anything: `ingestUnsupported` covers build-from-quads (hdt's wasm
+    // surface is read-only — `build` opens a pre-built artifact instead),
+    // `quadsUnsupported` covers the named-graph dataset (the HDT model has no
+    // graphs), and `mutationUnsupported` covers add/delete. Same vocabulary as
+    // the Rust and Python tabs' unsupported rows.
+    ingestUnsupported?: string;
+    quadsUnsupported?: string;
+    mutationUnsupported?: string;
     // Both Vortex and oxigraph are wasm-bindgen: `.free()` deterministically drops
     // the WASM-side allocation. The generated FinalizationRegistry is a fallback
     // only — V8 has no visibility into WASM linear-memory pressure, so it can defer
@@ -259,16 +96,7 @@ export interface StoreAdapter<H = unknown> {
     dispose?(h: H): void;
 }
 
-// Both Vortex's and oxigraph's public `.d.ts` are hand-curated (typescript_custom_section
-// / equivalent) and deliberately omit the wasm-bindgen `free()` method from the normal
-// consumer-facing API — ordinary callers are meant to lean on the FinalizationRegistry.
-// This benchmark is not an ordinary caller: it needs deterministic disposal, so it reaches
-// past the curated type rather than widening what real consumers see.
-function freeWasm(h: unknown): void {
-    (h as { free(): void }).free();
-}
-
-// Disposal alone isn't enough for the pure-JS adapters (rdf-stores): a 2M-quad store
+// Disposal alone isn't enough for the pure-JS adapters (rdf-stores): a full-size store
 // there is a large, long-lived Map-of-Maps graph, and merely dropping the reference
 // only makes it *eligible* for GC — V8's generational collector has no obligation to
 // actually reclaim it before the next multi-hundred-MB allocation piles on top. Run
@@ -289,17 +117,21 @@ export function reclaim(a: StoreAdapter, h: unknown): void {
     global.gc?.();
 }
 
-// Vortex: one adapter per curated build variant (mirrors the Rust star design axes).
+// Vortex: one adapter per curated build variant. The Dictionary rows are the
+// cross-library comparison (see COMPARE_VARIANTS); the Default rows exist for
+// dict-memory.bench.ts, which sweeps them to isolate what is *not* the dictionary.
 export const VORTEX_VARIANTS: { slug: string; label: string; options: BuildOptions }[] = [
-    { slug: 'vortex_unsorted_dict', label: 'Vortex Unsorted/Dict', options: { builder: 'Unsorted', layout: 'Dictionary' } },
-    { slug: 'vortex_unsorted_default', label: 'Vortex Unsorted/Default', options: { builder: 'Unsorted', layout: 'Default' } },
-    { slug: 'vortex_sorted_dict', label: 'Vortex Sorted/Dict', options: { builder: 'Sorted', layout: 'Dictionary' } },
-    { slug: 'vortex_sorted_dict_byref', label: 'Vortex Sorted/Dict+ByRef', options: { builder: 'Sorted', layout: 'Dictionary', indexes: ['SecondaryByReference'] } },
-    { slug: 'vortex_sorted_dict_bycopy', label: 'Vortex Sorted/Dict+ByCopy', options: { builder: 'Sorted', layout: 'Dictionary', indexes: ['SecondaryByCopy'] } },
-    { slug: 'vortex_sorted_default', label: 'Vortex Sorted/Default', options: { builder: 'Sorted', layout: 'Default' } },
-    { slug: 'vortex_sorted_default_byref', label: 'Vortex Sorted/Default+ByRef', options: { builder: 'Sorted', layout: 'Default', indexes: ['SecondaryByReference'] } },
-    { slug: 'vortex_sorted_default_bycopy', label: 'Vortex Sorted/Default+ByCopy', options: { builder: 'Sorted', layout: 'Default', indexes: ['SecondaryByCopy'] } },
+    { slug: 'vortex_dict', label: 'Vortex Dict', options: { layout: 'dictionary' } },
+    { slug: 'vortex_dict_byref', label: 'Vortex Dict+ByRef', options: { layout: 'dictionary', indexes: ['secondary-by-reference'] } },
+    { slug: 'vortex_dict_bycopy', label: 'Vortex Dict+ByCopy', options: { layout: 'dictionary', indexes: ['secondary-by-copy'] } },
+    { slug: 'vortex_default', label: 'Vortex Default', options: { layout: 'default' } },
+    { slug: 'vortex_default_byref', label: 'Vortex Default+ByRef', options: { layout: 'default', indexes: ['secondary-by-reference'] } },
+    { slug: 'vortex_default_bycopy', label: 'Vortex Default+ByCopy', options: { layout: 'default', indexes: ['secondary-by-copy'] } },
 ];
+
+// Result sets are counted by consuming them — `consumeQuads` / `consumeStrings`
+// in util.ts read every term value, so materialization is measured work on
+// every store.
 
 export function vortexAdapter(variant: { slug: string; label: string; options: BuildOptions }): StoreAdapter<VortexRdfStore> {
     return {
@@ -310,8 +142,11 @@ export function vortexAdapter(variant: { slug: string; label: string; options: B
         addAll: async (h, quads) => { for (const q of quads) await h.addQuad(q); },
         addBatch: (h, quads) => h.addQuads(quads),
         deleteAll: async (h, quads) => { for (const q of quads) await h.deleteQuad(q); },
-        countMatch: async (h, p) => (await h.getQuads(p.s, p.p, p.o, p.g)).length,
-        dispose: freeWasm,
+        countMatch: async (h, p) => consumeQuads(await h.getQuads(p.s, p.p, p.o, p.g)),
+        countOnly: (h, p) => h.countQuads(p.s, p.p, p.o, p.g),
+        snapshot: (h) => h.toBytes(),
+        open: (bytes) => VortexRdfStore.fromBytes(bytes as Uint8Array),
+        dispose: (h) => h.free(),
     };
 }
 
@@ -321,8 +156,8 @@ function newRdfStore(kind: 'default' | 'single'): RdfStore {
     // `createDefault` is rdf-stores's only factory and always wires in quoted-triple
     // (RDF-star) support (RdfStoreIndexNestedMapQuoted / TermDictionaryQuotedIndexed) —
     // there's no leaner non-quoted construction path in the library, so mirroring that
-    // exact choice here (rather than substituting a plain, non-quoted index) is what
-    // keeps this an apples-to-apples comparison with what real rdf-stores callers get.
+    // exact choice here keeps this an apples-to-apples comparison with what real
+    // rdf-stores callers get.
     // Pin <number> (as createDefault does) so Q resolves to Quad, not BaseQuad.
     return new RdfStore<number>({
         indexCombinations: [['graph', 'subject', 'predicate', 'object']],
@@ -340,7 +175,8 @@ export function rdfStoresAdapter(kind: 'default' | 'single', label: string): Sto
         newEmpty: () => newRdfStore(kind),
         addAll: (h, quads) => { for (const q of quads) h.addQuad(q); },
         deleteAll: (h, quads) => { for (const q of quads) h.removeQuad(q); },
-        countMatch: (h, p) => h.getQuads(p.s, p.p, p.o, p.g).length, // synchronous array
+        countMatch: (h, p) => consumeQuads(h.getQuads(p.s, p.p, p.o, p.g)), // synchronous array
+        countOnly: (h, p) => h.countQuads(p.s, p.p, p.o, p.g),
     };
 }
 
@@ -352,22 +188,137 @@ export function oxigraphAdapter(): StoreAdapter<OxiStore> {
         newEmpty: () => new OxiStore(),
         addAll: (h, quads) => { for (const q of quads) h.add(q as never); },
         deleteAll: (h, quads) => { for (const q of quads) h.delete(q as never); },
-        countMatch: (h, p) => h.match(p.s as never, p.p as never, p.o as never, p.g as never).length,
-        dispose: freeWasm,
+        countMatch: (h, p) => consumeQuads(h.match(p.s as never, p.p as never, p.o as never, p.g as never)),
+        // No count API: match() materializes its result array either way, so
+        // walking its length is this store's floor for a count.
+        countOnly: (h, p) => h.match(p.s as never, p.p as never, p.o as never, p.g as never).length,
+        // oxigraph's shipped `.d.ts` does not declare the wasm-bindgen `free()`.
+        dispose: (h) => (h as unknown as { free(): void }).free(),
     };
 }
 
+// ─── hdt (wasm, read-only) ───────────────────────────────────────────────────
+//
+// The hdt crate's wasm surface is read-only: HDT *construction* (`read_nt`)
+// spawns OS threads and uses rayon, which trap on wasm32, so the artifact is
+// built natively and only opened here. The Rust comparative bench writes one
+// from the same shared dataset as part of its run (`cargo bench --bench
+// compare`, at BENCH_SIZE = this tab's D³) — point `HDT_FILE` elsewhere to
+// override. The wasm module itself is the bench's own build of the crate's
+// bindings: `npm run build:hdt-wasm` → bench/hdt-pkg (see bench/hdt-wasm).
+
+const here = dirname(fileURLToPath(import.meta.url));
+export const HDT_FILE = process.env.HDT_FILE
+    ?? resolve(here, '../../target/bench_compare/hdt/data.hdt');
+
+type HdtModule = typeof import('./hdt-pkg/hdt_wasm_bench.js');
+type Hdt = import('./hdt-pkg/hdt_wasm_bench.js').Hdt;
+let hdtModule: HdtModule | null = null;
+async function hdtMod(): Promise<HdtModule> {
+    if (!hdtModule) {
+        // Same init path as entry/node.js: hand `init` the wasm bytes directly,
+        // because Node's fetch does not speak file: URLs.
+        const mod = await import('./hdt-pkg/hdt_wasm_bench.js');
+        const wasmPath = resolve(here, 'hdt-pkg/hdt_wasm_bench_bg.wasm');
+        await mod.default({ module_or_path: readFileSync(wasmPath) });
+        hdtModule = mod;
+    }
+    return hdtModule;
+}
+
+/** A probe term in HDT dictionary spelling: IRIs bare, literals with their
+ *  quotes — the same conversion the Rust tab's hdt adapter applies. */
+function hdtTerm(t: { termType: string; value: string } | null): string | undefined {
+    if (!t) return undefined;
+    return t.termType === 'Literal' ? `"${t.value}"` : t.value;
+}
+
+/** Window for `ids_to_strings`: translating several million ids in one call is
+ *  that surface's documented OOM risk, so the full scan feeds it chunks. */
+const HDT_TRANSLATE_IDS = 300_000 * 3;
+
+/** Total triples in an HDT store: the harness's check that the pre-built
+ *  artifact matches the dataset the other adapters generate in-process. */
+function hdtNumTriples(h: Hdt): number {
+    return h.triple_ids_with_pattern(undefined, undefined, undefined).length / 3;
+}
+
+export function hdtAdapter(): StoreAdapter<Hdt> {
+    return {
+        slug: 'hdt',
+        // Not "(file)": the wasm bindings parse the artifact's bytes into wasm
+        // linear memory, so this store answers from memory like the others.
+        label: 'hdt',
+        ingestUnsupported:
+            'the wasm bindings are read-only — the artifact is built natively '
+            + '(the Rust comparative bench writes it) and only opened here',
+        quadsUnsupported: 'the HDT format has no named graphs — triples only',
+        mutationUnsupported: 'an HDT file is immutable once built',
+        // `build` opens the pre-built artifact; the quads argument is only the
+        // consistency check that the artifact and this run's generated dataset
+        // are the same rows — the probe-count cross-check then verifies the
+        // contents, not just the cardinality.
+        build: async (quads) => {
+            if (!existsSync(HDT_FILE)) {
+                throw new Error(
+                    `no HDT artifact at ${HDT_FILE} — the Rust comparative bench builds it `
+                    + '(cargo bench --bench compare), or point HDT_FILE at one');
+            }
+            const mod = await hdtMod();
+            const h = new mod.Hdt(readFileSync(HDT_FILE));
+            const n = hdtNumTriples(h);
+            if (n !== quads.length) {
+                h.free();
+                throw new Error(
+                    `HDT artifact at ${HDT_FILE} holds ${n} triples but this run's dataset has `
+                    + `${quads.length} — rebuild it: BENCH_SIZE=${quads.length} cargo bench --bench compare`);
+            }
+            return h;
+        },
+        newEmpty: () => { throw new Error('hdt is read-only'); },
+        addAll: () => { throw new Error('hdt is read-only'); },
+        deleteAll: () => { throw new Error('hdt is read-only'); },
+        countMatch: (h, p) => {
+            const ids = h.triple_ids_with_pattern(hdtTerm(p.s), hdtTerm(p.p), hdtTerm(p.o));
+            // Materialize every term string, in windows — the counterpart of
+            // consumeQuads reading every term value on the quad-shaped stores.
+            for (let off = 0; off < ids.length; off += HDT_TRANSLATE_IDS) {
+                consumeStrings(h.ids_to_strings(ids.subarray(off, Math.min(off + HDT_TRANSLATE_IDS, ids.length))));
+            }
+            return ids.length / 3;
+        },
+        // The id-level read: pattern resolution over the dictionary-encoded
+        // triples, no string translated.
+        countOnly: (h, p) => h.triple_ids_with_pattern(hdtTerm(p.s), hdtTerm(p.p), hdtTerm(p.o)).length / 3,
+        // Its persistent form IS the artifact: snapshot hands over the file's
+        // bytes, open parses them — the same reopen the other tabs measure.
+        snapshot: async () => readFileSync(HDT_FILE),
+        open: async (bytes) => {
+            const mod = await hdtMod();
+            return new mod.Hdt(bytes as Uint8Array);
+        },
+        dispose: (h) => h.free(),
+    };
+}
+
+// The variants the comparative tab renders: Dictionary layout across the index
+// axis, the same axis the Rust and Python tabs cross. Derived from the layout so
+// a variant added above cannot silently join the comparison — a Default-layout
+// build here would cost an ingest and a full probe sweep for rows no tab lists.
+export const COMPARE_VARIANTS = VORTEX_VARIANTS.filter((v) => v.options.layout === 'dictionary');
+
 // Full matrix for ingest + query.
 export const ADAPTERS: StoreAdapter[] = [
-    ...VORTEX_VARIANTS.map(vortexAdapter),
+    ...COMPARE_VARIANTS.map(vortexAdapter),
     rdfStoresAdapter('default', 'rdf-stores (default)'),
     rdfStoresAdapter('single', 'rdf-stores (1 index)'),
     oxigraphAdapter(),
+    hdtAdapter(),
 ];
 
 // Representative subset for mutations (per-quad add/delete is the fair cross-lib path).
 export const MUT_ADAPTERS: StoreAdapter[] = [
-    vortexAdapter({ slug: 'vortex', label: 'Vortex', options: { layout: 'Dictionary' } }),
+    vortexAdapter({ slug: 'vortex', label: 'Vortex', options: { layout: 'dictionary' } }),
     rdfStoresAdapter('default', 'rdf-stores (default)'),
     oxigraphAdapter(),
 ];
@@ -376,18 +327,69 @@ export const MUT_ADAPTERS: StoreAdapter[] = [
 export interface Row {
     group: string; variant: string | null; id: string;
     fastest: string; slowest: string; median: string; mean: string;
-    fastest_ns: number; slowest_ns: number; median_ns: number; mean_ns: number;
+    fastest_ns: number | null; slowest_ns: number | null;
+    median_ns: number | null; mean_ns: number | null;
     samples: string;
+    /** Cache regime this row was measured in — 'warm' is a repeat query on an
+     *  open store, 'cold' opens one per iteration and answers its first. Absent
+     *  on rows where the distinction does not apply (ingest, mutation). */
+    regime?: 'cold' | 'warm';
+    /** An operation this store cannot perform, as opposed to a slow one. */
+    unsupported?: boolean;
+    /** Why, shown as the cell's tooltip. */
+    reason?: string;
 }
 
-export function fmtNs(ns: number): string {
-    if (ns < 1e3) return ns.toFixed(0) + ' ns';
-    if (ns < 1e6) return (ns / 1e3).toPrecision(3) + ' µs';
-    if (ns < 1e9) return (ns / 1e6).toPrecision(3) + ' ms';
-    return (ns / 1e9).toPrecision(3) + ' s';
+/** What compare.worker.ts writes for one adapter and role, and what
+ *  compare.bench.ts reads back. */
+export interface WorkerOutput {
+    rows: Row[];
+    peakRssMb: number | null;
+    /** What building the store cost over and above the shared input `Quad[]`.
+     *  `wasmHeapMb` is Vortex-only and null for the other adapters. */
+    storeFootprint: Record<string, number | null>;
+    /** Rows each probe matched, by pattern name. */
+    matched: Record<string, number>;
+    failures: { phase: string; error: string }[];
+    cardinality?: ReturnType<typeof moduli>;
 }
 
-export function collect(bench: Bench, results: Row[]): void {
+/** What dict-memory.worker.ts writes for one cardinality point, and what
+ *  dict-memory.bench.ts reads back. */
+export interface DictMemoryPoint {
+    slug: string; n: number; subjectRatio?: number; objectRatio?: number;
+    cardinality: { terms: number; [k: string]: unknown };
+    stores: number; deletes: number;
+    wasmPerStore: (number | null)[];
+    wasmAfterInit: number | null; wasmAfterGen: number | null;
+    wasmAfterFirstQuery: number | null; wasmAfterFullScan: number | null;
+    wasmAfterRebuild: number | null; wasmAfterFree: number | null;
+    jsAfterInit: number; jsAfterBuild: number; jsAfterFirstQuery: number;
+    jsAfterFullScan: number; jsAfterRebuild: number;
+    rssAfterBuild: number | null; peakRssMb: number | null;
+    scanMs: number; decodeMs: number; mutateQueryMs: number;
+    fullRows: number; firstQueryRows: number; decodedChars: number;
+}
+
+/** A row the dashboard renders as 'unsupported' rather than as a missing cell.
+ *
+ *  Mirrors `unsupported_row` in python/bench/worker.py, down to the null
+ *  `median_ns` that keeps the row out of its column's best/ratio arithmetic:
+ *  an operation a store cannot perform is not a slow result, and a blank cell
+ *  reads as a benchmark nobody ran. */
+export function unsupportedRow(id: string, reason: string): Row {
+    const [group, variant] = id.split('::');
+    return {
+        group, variant: variant ?? null, id,
+        unsupported: true, reason,
+        fastest: 'unsupported', slowest: 'unsupported',
+        median: 'unsupported', mean: 'unsupported',
+        fastest_ns: null, slowest_ns: null, median_ns: null, mean_ns: null,
+        samples: '0',
+    };
+}
+
+export function collect(bench: Bench, results: Row[], regime?: 'cold' | 'warm'): void {
     for (const task of bench.tasks) {
         const r = task.result;
         if (!r || !('latency' in r) || !r.latency) continue;
@@ -405,15 +407,32 @@ export function collect(bench: Bench, results: Row[]): void {
             median: fmtNs(median_ns), mean: fmtNs(mean_ns),
             fastest_ns, slowest_ns, median_ns, mean_ns,
             samples: String(lat.samplesCount),
+            ...(regime ? { regime } : {}),
         });
     }
 }
 
-// tinybench options per phase. Query gets a time budget; the expensive build/mutation
-// phases get a low fixed iteration count (each build is costly at D=128).
-export const QUERY_OPTS: BenchOptions = { time: 500, iterations: 10, warmup: true, warmupIterations: 5, throws: true };
+// tinybench options per phase, in the repetition counts every comparative suite
+// shares: 10 measured runs for a query (`QUERY_ITERS` in
+// `python/bench/worker.py`, `QUERY_SAMPLES` in `core/benches/support/mod.rs`),
+// 3 for the phases that cost seconds each.
+//
+// `time: 0` is what makes the query count mean 10. tinybench treats `time` as a
+// minimum duration and keeps iterating until BOTH budgets are satisfied, so any
+// nonzero floor would run a microsecond-scale query tens of thousands of times
+// and report a mean over those, against the other tabs' median of 10.
+export const QUERY_OPTS: BenchOptions = { time: 0, iterations: 10, warmup: true, warmupIterations: 5, throws: true };
 export const HEAVY_OPTS: BenchOptions = { time: 0, iterations: 3, warmup: false, warmupIterations: 0, throws: true };
-// See the comment on FULL_SCAN_PATTERN: far fewer repetitions of a full-table dump.
+// The cold arm keeps the query repetition count but drops warmup, for two
+// reasons. Warming up a cold measurement is self-contradictory — every
+// iteration adopts a fresh store by construction, so there is nothing for a
+// preceding run to warm. And each adoption is expensive in a way that does not
+// come back: the first query on a `fromBytes` store retains its whole buffer
+// past `free()`, and wasm linear memory never shrinks, so warmup runs would
+// spend a third of the budget for nothing and trip the wasm allocator.
+export const COLD_QUERY_OPTS: BenchOptions = { time: 0, iterations: 10, warmup: false, warmupIterations: 0, throws: true };
+// See the comment on FULL_SCAN_PATTERN (datasets.ts): far fewer repetitions of a
+// full-table dump.
 export const FULL_SCAN_OPTS: BenchOptions = { time: 0, iterations: 3, warmup: false, warmupIterations: 0, throws: true };
 
 // ─── Memory instrumentation ──────────────────────────────────────────────────
@@ -424,32 +443,27 @@ export const FULL_SCAN_OPTS: BenchOptions = { time: 0, iterations: 3, warmup: fa
 // meaningless for rdf-stores and would understate oxigraph, which has its own
 // module. Never rank adapters by it.
 
-/** Linux-only: the kernel-tracked high-water mark, the true peak RSS for this
- * process's whole lifetime — unlike `process.memoryUsage().rss`, which is only a
- * point-in-time reading and can miss a spike between samples. */
-export function peakRssMb(): number | null {
+/** One field of Linux's `/proc/self/status`, in MB; null off Linux. */
+function procStatusMb(field: 'VmHWM' | 'VmRSS'): number | null {
     try {
         const status = readFileSync('/proc/self/status', 'utf8');
-        const m = status.match(/^VmHWM:\s+(\d+)\s+kB/m);
+        const m = status.match(new RegExp(`^${field}:\\s+(\\d+)\\s+kB`, 'm'));
         return m ? Math.round(Number(m[1]) / 1024) : null;
     } catch {
         return null;
     }
 }
 
+/** Linux-only: the kernel-tracked high-water mark, the true peak RSS for this
+ * process's whole lifetime — unlike `process.memoryUsage().rss`, which is only a
+ * point-in-time reading and can miss a spike between samples. */
+export const peakRssMb = (): number | null => procStatusMb('VmHWM');
+
 /** Current (not peak) RSS. Paired with dropping the input quads and forcing a
  * collection, this isolates what a store actually holds: the generated `Quad[]`
  * is well over a gigabyte of JS objects at the default scale, is identical for
  * every adapter, and otherwise swamps the differences between them in the peak. */
-export function rssMb(): number | null {
-    try {
-        const status = readFileSync('/proc/self/status', 'utf8');
-        const m = status.match(/^VmRSS:\s+(\d+)\s+kB/m);
-        return m ? Math.round(Number(m[1]) / 1024) : null;
-    } catch {
-        return null;
-    }
-}
+export const rssMb = (): number | null => procStatusMb('VmRSS');
 
 /** JS heap in use, after forcing a collection. Requires `--expose-gc` (every
  * worker spawn wires it in); without it this is a point-in-time reading that may

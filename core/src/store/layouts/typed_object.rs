@@ -4,35 +4,38 @@
 //!
 //! [`LayoutStrategy::TypedObject`]: super::LayoutStrategy::TypedObject
 
-use std::sync::Arc;
-
 use oxrdf::{BlankNode, Literal, NamedNode, Quad, Term};
-use vortex_array::arrays::struct_::{StructArray, StructArrayExt};
+use vortex_array::arrays::struct_::StructArray;
 use vortex_array::arrays::{PrimitiveArray, VarBinViewArray};
-use vortex_array::{ArrayRef, IntoArray, VortexSessionExecute};
+use vortex_array::{ArrayRef, ExecutionCtx, IntoArray, VortexSessionExecute};
 
-use crate::common::array::{StrColReader, make_nullable_string_array, make_string_array};
-use crate::common::terms::{get_as_term, parse_graph_name, parse_named_node, parse_subject};
+use crate::common::terms::{parse_graph_name, parse_named_node, parse_subject, parse_term};
 use crate::error::{Result, VortexRdfError};
-use crate::io::VORTEX_LIGHT_SESSION;
+use crate::session::VORTEX_SESSION;
 use crate::store::RawQuad;
-use crate::store::schema::{
-    COL_G, COL_O_DATATYPE, COL_O_KIND, COL_O_LANG, COL_O_VALUE, COL_P, COL_S,
-};
+use crate::store::array::{StrColReader, field_as, make_nullable_string_array, make_string_array};
+use crate::store::schema::{COL_G, COL_P, COL_S};
 
-/// Field names of the primary columns:
+/// The term kind tag — its presence in a schema is what marks the layout.
+pub(crate) const COL_O_KIND: &str = "o_kind";
+/// The object's lexical value: IRI string, blank node id, or literal value.
+pub(crate) const COL_O_VALUE: &str = "o_value";
+/// The literal datatype IRI — null unless the object is a typed literal.
+pub(crate) const COL_O_DATATYPE: &str = "o_datatype";
+/// The literal language tag — null unless the object is a language literal.
+pub(crate) const COL_O_LANG: &str = "o_lang";
+
+/// The primary columns:
 /// `s`, `p`, `o_kind`, `o_value`, `o_datatype`, `o_lang`, `g`.
-pub(crate) fn field_names() -> Vec<Arc<str>> {
-    vec![
-        COL_S.into(),
-        COL_P.into(),
-        COL_O_KIND.into(),
-        COL_O_VALUE.into(),
-        COL_O_DATATYPE.into(),
-        COL_O_LANG.into(),
-        COL_G.into(),
-    ]
-}
+pub(crate) const COLUMNS: &[&str] = &[
+    COL_S,
+    COL_P,
+    COL_O_KIND,
+    COL_O_VALUE,
+    COL_O_DATATYPE,
+    COL_O_LANG,
+    COL_G,
+];
 
 /// Build the primary column arrays from raw quads, decomposing each object
 /// term into its typed sub-columns. An empty slice yields empty columns with
@@ -45,7 +48,7 @@ pub(crate) fn build_columns(quads: &[RawQuad]) -> Result<Vec<ArrayRef>> {
     let mut langs: Vec<Option<String>> = Vec::with_capacity(n);
 
     for q in quads {
-        let term = get_as_term(&q.o).ok_or_else(|| {
+        let term = parse_term(&q.o).ok_or_else(|| {
             VortexRdfError::Deserialization(format!("Cannot parse object string: {}", q.o))
         })?;
         let (kind, value, dt, lang) = decompose_object(&term);
@@ -99,7 +102,7 @@ fn compose_object(
     // Trusted-input decode path — see `parse_named_node`: the sub-columns
     // were decomposed from already-validated terms at build time, so the
     // checked constructors' re-validation (a full `oxiri::Iri::parse` per
-    // IRI) is skipped, matching `get_as_term`.
+    // IRI) is skipped, matching `parse_term`.
     match kind {
         0 => Ok(Term::NamedNode(NamedNode::new_unchecked(value))),
         1 => Ok(Term::BlankNode(BlankNode::new_unchecked(value))),
@@ -121,69 +124,98 @@ fn compose_object(
     }
 }
 
-/// Reconstruct the object terms in N-Triples form — the representation the
-/// secondary index stores — from the typed sub-columns, one per row.
-///
-/// The counterpart to [`build_columns`]' object decomposition, used when
-/// rebuilding indexes during compaction: the index's `_idx_o_val` column
-/// holds the full object term, which under this layout has to be recomposed
-/// from `o_kind`/`o_value`/`o_datatype`/`o_lang`.
-pub(crate) fn object_terms(struct_arr: &StructArray) -> Result<Vec<String>> {
-    let mut ctx = VORTEX_LIGHT_SESSION.create_execution_ctx();
+/// A nullable string column, or `None` when it cannot be read as one — every
+/// row then reads as null.
+fn nullable_str_col(
+    struct_arr: &StructArray,
+    name: &str,
+    ctx: &mut ExecutionCtx,
+) -> Option<VarBinViewArray> {
+    field_as::<VarBinViewArray>(struct_arr, name, ctx).ok()
+}
 
-    let kind_col = struct_arr
-        .unmasked_field_by_name(COL_O_KIND)
-        .map_err(VortexRdfError::Vortex)?
-        .clone()
-        .execute::<PrimitiveArray>(&mut ctx)
-        .map_err(VortexRdfError::Vortex)?;
-    let val_col = struct_arr
-        .unmasked_field_by_name(COL_O_VALUE)
-        .map_err(VortexRdfError::Vortex)?
-        .clone()
-        .execute::<VarBinViewArray>(&mut ctx)
-        .map_err(VortexRdfError::Vortex)?;
-    // Nullable columns — try VarBinViewArray; fall back to all-None on error.
-    let dt_col: Option<VarBinViewArray> = struct_arr
-        .unmasked_field_by_name(COL_O_DATATYPE)
-        .ok()
-        .and_then(|c| c.clone().execute::<VarBinViewArray>(&mut ctx).ok());
-    let lang_col: Option<VarBinViewArray> = struct_arr
-        .unmasked_field_by_name(COL_O_LANG)
-        .ok()
-        .and_then(|c| c.clone().execute::<VarBinViewArray>(&mut ctx).ok());
+/// The four object sub-columns of a chunk, executed to their canonical
+/// arrays.
+struct ObjectColumns {
+    kind: PrimitiveArray,
+    value: VarBinViewArray,
+    datatype: Option<VarBinViewArray>,
+    lang: Option<VarBinViewArray>,
+}
 
-    let kinds = kind_col.as_slice::<u8>();
-    let vals = StrColReader::new(&val_col);
-    let dts = dt_col.as_ref().map(StrColReader::new);
-    let langs = lang_col.as_ref().map(StrColReader::new);
-
-    (0..struct_arr.len())
-        .map(|i| {
-            let dt = match &dts {
-                Some(c) => {
-                    let s = c.str_at(i)?;
-                    if s.is_empty() { None } else { Some(s) }
-                }
-                None => None,
-            };
-            let lang = match &langs {
-                Some(c) => {
-                    let s = c.str_at(i)?;
-                    if s.is_empty() { None } else { Some(s) }
-                }
-                None => None,
-            };
-
-            let object = compose_object(kinds[i], vals.str_at(i)?, dt, lang)?;
-            Ok(object.to_string())
+impl ObjectColumns {
+    /// Load the sub-columns of `struct_arr`. `o_kind` and `o_value` are
+    /// required; the nullable `o_datatype`/`o_lang` fall back to all-null.
+    fn load(struct_arr: &StructArray, ctx: &mut ExecutionCtx) -> Result<Self> {
+        Ok(Self {
+            kind: field_as::<PrimitiveArray>(struct_arr, COL_O_KIND, ctx)?,
+            value: field_as::<VarBinViewArray>(struct_arr, COL_O_VALUE, ctx)?,
+            datatype: nullable_str_col(struct_arr, COL_O_DATATYPE, ctx),
+            lang: nullable_str_col(struct_arr, COL_O_LANG, ctx),
         })
+    }
+
+    /// Row-level readers over the loaded columns.
+    fn reader(&self) -> ObjectReader<'_> {
+        ObjectReader {
+            kinds: self.kind.as_slice::<u8>(),
+            values: StrColReader::new(&self.value),
+            datatypes: self.datatype.as_ref().map(StrColReader::new),
+            langs: self.lang.as_ref().map(StrColReader::new),
+        }
+    }
+}
+
+/// Per-row access to an [`ObjectColumns`], recomposing each row's object
+/// term.
+struct ObjectReader<'a> {
+    kinds: &'a [u8],
+    values: StrColReader<'a>,
+    datatypes: Option<StrColReader<'a>>,
+    langs: Option<StrColReader<'a>>,
+}
+
+impl ObjectReader<'_> {
+    /// The object term at row `i`.
+    fn term_at(&self, i: usize) -> Result<Term> {
+        compose_object(
+            self.kinds[i],
+            self.values.str_at(i)?,
+            nullable_str_at(self.datatypes.as_ref(), i)?,
+            nullable_str_at(self.langs.as_ref(), i)?,
+        )
+    }
+}
+
+/// Row `i` of a nullable string column: `None` for a missing column or an
+/// empty value.
+fn nullable_str_at<'a>(col: Option<&StrColReader<'a>>, i: usize) -> Result<Option<&'a str>> {
+    match col {
+        Some(c) => {
+            let s = c.str_at(i)?;
+            Ok(if s.is_empty() { None } else { Some(s) })
+        }
+        None => Ok(None),
+    }
+}
+
+/// The object terms of every row in N-Triples form, recomposed from
+/// `o_kind`/`o_value`/`o_datatype`/`o_lang` — the inverse of
+/// [`build_columns`]' decomposition, used by
+/// [`ResolvedLayout::raw_quads`](super::ResolvedLayout::raw_quads) wherever
+/// rows are rebuilt from their string form.
+pub(crate) fn object_terms(struct_arr: &StructArray) -> Result<Vec<String>> {
+    let mut ctx = VORTEX_SESSION.create_execution_ctx();
+    let columns = ObjectColumns::load(struct_arr, &mut ctx)?;
+    let objects = columns.reader();
+    (0..struct_arr.len())
+        .map(|i| Ok(objects.term_at(i)?.to_string()))
         .collect()
 }
 
 /// Decode a StructArray chunk with typed object sub-columns into Quads.
 pub(crate) fn decode_chunk(chunk: &ArrayRef) -> Vec<Result<Quad>> {
-    let mut ctx = VORTEX_LIGHT_SESSION.create_execution_ctx();
+    let mut ctx = VORTEX_SESSION.create_execution_ctx();
 
     let struct_arr = match chunk.clone().execute::<StructArray>(&mut ctx) {
         Ok(a) => a,
@@ -192,80 +224,45 @@ pub(crate) fn decode_chunk(chunk: &ArrayRef) -> Vec<Result<Quad>> {
 
     let n = struct_arr.len();
 
-    macro_rules! get_str_col {
-        ($name:expr) => {
-            match struct_arr
-                .unmasked_field_by_name($name)
-                .map_err(VortexRdfError::Vortex)
-                .and_then(|c| {
-                    c.clone()
-                        .execute::<VarBinViewArray>(&mut ctx)
-                        .map_err(VortexRdfError::Vortex)
-                }) {
-                Ok(arr) => arr,
-                Err(e) => return vec![Err(e)],
-            }
-        };
-    }
-
-    let s_col = get_str_col!(COL_S);
-    let p_col = get_str_col!(COL_P);
-    let kind_col = match struct_arr
-        .unmasked_field_by_name(COL_O_KIND)
-        .map_err(VortexRdfError::Vortex)
-        .and_then(|c| {
-            c.clone()
-                .execute::<PrimitiveArray>(&mut ctx)
-                .map_err(VortexRdfError::Vortex)
-        }) {
-        Ok(a) => a,
+    let columns = (|| {
+        Ok((
+            field_as::<VarBinViewArray>(&struct_arr, COL_S, &mut ctx)?,
+            field_as::<VarBinViewArray>(&struct_arr, COL_P, &mut ctx)?,
+            ObjectColumns::load(&struct_arr, &mut ctx)?,
+            field_as::<VarBinViewArray>(&struct_arr, COL_G, &mut ctx)?,
+        ))
+    })();
+    let (s_col, p_col, o_cols, g_col) = match columns {
+        Ok(columns) => columns,
         Err(e) => return vec![Err(e)],
     };
-    let val_col = get_str_col!(COL_O_VALUE);
-    let g_col = get_str_col!(COL_G);
 
-    // Nullable columns — try VarBinViewArray; fall back to all-None on error.
-    let dt_col: Option<VarBinViewArray> = struct_arr
-        .unmasked_field_by_name(COL_O_DATATYPE)
-        .ok()
-        .and_then(|c| c.clone().execute::<VarBinViewArray>(&mut ctx).ok());
-    let lang_col: Option<VarBinViewArray> = struct_arr
-        .unmasked_field_by_name(COL_O_LANG)
-        .ok()
-        .and_then(|c| c.clone().execute::<VarBinViewArray>(&mut ctx).ok());
-
-    let kinds = kind_col.as_slice::<u8>();
     let subjects = StrColReader::new(&s_col);
     let predicates = StrColReader::new(&p_col);
-    let vals = StrColReader::new(&val_col);
+    let objects = o_cols.reader();
     let graphs = StrColReader::new(&g_col);
-    let dts = dt_col.as_ref().map(StrColReader::new);
-    let langs = lang_col.as_ref().map(StrColReader::new);
 
     (0..n)
         .map(|i| {
-            // Borrow &str views over the column buffers (zero-copy);
-            // the oxrdf constructors make the single owned copy.
-            let dt = match &dts {
-                Some(c) => {
-                    let s = c.str_at(i)?;
-                    if s.is_empty() { None } else { Some(s) }
-                }
-                None => None,
-            };
-            let lang = match &langs {
-                Some(c) => {
-                    let s = c.str_at(i)?;
-                    if s.is_empty() { None } else { Some(s) }
-                }
-                None => None,
-            };
-
             let subject = parse_subject(subjects.str_at(i)?)?;
             let predicate = parse_named_node(predicates.str_at(i)?)?;
-            let object = compose_object(kinds[i], vals.str_at(i)?, dt, lang)?;
+            let object = objects.term_at(i)?;
             let graph_name = parse_graph_name(graphs.str_at(i)?)?;
             Ok(Quad::new(subject, predicate, object, graph_name))
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compose_object_rejects_unknown_kind() {
+        let err = compose_object(5, "x", None, None).unwrap_err();
+        assert!(
+            matches!(&err, VortexRdfError::Deserialization(msg) if msg.contains("Unknown object kind: 5")),
+            "{err:?}"
+        );
+    }
 }
