@@ -11,7 +11,7 @@ Vortex-RDF is a columnar RDF serialization and a queryable quad store built on t
 
 ## Key features
 
-- **Columnar storage**: quads are four [Vortex](https://docs.vortex.dev/specs/file-format) columns, on disk and in memory alike, with the same layout in both.
+- **Columnar storage**: quads are [Vortex](https://docs.vortex.dev/specs/file-format) arrays, on disk and in memory alike, with the same layout in both.
 - **Zero-copy reads**: opening a file is lazy, and pattern filters are pushed down into the scan so only the touched chunks are read.
 - **Adaptive compression**: Vortex picks per-column encodings (FSST, dictionary, run-length, bit-packing, …) and decompresses just in time.
 - **Streaming, out-of-core ingestion**: datasets larger than RAM are globally sorted through an external merge sort with bounded memory.
@@ -31,7 +31,7 @@ Vortex-RDF is a columnar RDF serialization and a queryable quad store built on t
 
 **Rust** — convert an RDF file to `.vortex`, open it lazily, match a pattern, export the matches:
 
-```rust,no_run
+```rust no_run
 use oxrdf::NamedNode;
 use oxrdfio::RdfFormat;
 use vortex_rdf_core::{IndexType, LayoutStrategy, VortexRdfStore, export_rdf};
