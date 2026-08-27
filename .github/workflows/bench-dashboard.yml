@@ -127,11 +127,20 @@ jobs:
       # pycottas hard-pins an older pyoxigraph). Provisioning them re-downloads
       # every library each run; the pins live in adapters.py, so its hash is
       # the cache identity.
+      #
+      # The uv-managed interpreter is cached beside the venvs, not for its own
+      # sake but because each venv's `bin/python` is an absolute symlink into
+      # it: restore the venvs alone and every link dangles, so run.py rebuilds
+      # all of them and the cache buys nothing. `PYTHON_VERSION` in run.py is
+      # part of the key for the same reason — a bumped interpreter must not
+      # come back as a stale one under a fresh venv.
       - name: Cache benchmark virtualenvs
         uses: actions/cache@v4
         with:
-          path: python/bench/.venvs
-          key: py-bench-venvs-${{ hashFiles('python/bench/adapters.py') }}
+          path: |
+            python/bench/.venvs
+            ~/.local/share/uv/python
+          key: py-bench-venvs-${{ hashFiles('python/bench/adapters.py', 'python/bench/run.py') }}
 
       - name: Build Python bindings
         if: steps.py-native-cache.outputs.cache-hit != 'true'
