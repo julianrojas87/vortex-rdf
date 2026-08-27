@@ -98,9 +98,8 @@ the dictionary's values, fetched once and shared, into a dictionary array the
 probe resolves like any other. Because the probe's dictionary node bisects the
 decoded values, the order the writer assigned codes in never matters.
 
-```toml
-[dependencies]
-vortex-rdf-encoded-search = { version = "0.10", features = ["layout"] }
+```console
+cargo add vortex-rdf-encoded-search --features layout
 ```
 
 ## Performance
