@@ -1,9 +1,9 @@
 # Vortex-RDF for Python
 [![PyPI](https://img.shields.io/pypi/v/vortex-rdf.svg)](https://pypi.org/project/vortex-rdf/)
 
-Python bindings for [Vortex-RDF](https://github.com/vortex-rdf/vortex-rdf), a columnar RDF store format built on Vortex. Stores are opened lazily from `.vortex` files and queried in place, without loading the dataset into memory. The bindings are read-only: build `.vortex` files with `serialize_rdf` (file → file), then open and query them; there is no in-memory build, RDF export, membership test or mutation (the JS bindings have those).
+Python bindings for [Vortex-RDF](https://github.com/vortex-rdf/vortex-rdf), a columnar RDF store format built on Vortex. Stores are opened lazily from `.vortex` files and queried in place, without loading the dataset into memory. The bindings are read-only (mutations are in the roadmap): build `.vortex` files with `serialize_rdf` (file → file), then open and query them; in-memory builds are not yet supported.
 
-A separate [`vortex-rdflib`](https://pypi.org/project/vortex-rdflib/) package builds an rdflib integration on these bindings; see its own documentation for what it supports.
+A separate [`vortex-rdflib`](https://pypi.org/project/vortex-rdflib/) package builds an rdflib integration on these bindings; see its own documentation.
 
 ## Install
 
@@ -35,7 +35,7 @@ store.get_quads(p="<http://xmlns.com/foaf/0.1/name>")        # [(s, p, o, g), ..
 store.match_columns(p="<http://xmlns.com/foaf/0.1/name>")    # (subjects, predicates, objects, graphs)
 ```
 
-`get_quads` returns whole quads; `match_columns` returns the same rows transposed into four parallel columns, for callers that work a position at a time. Both are served from the term-code columns whenever the store can (Dictionary layout, resident dictionary) and from the matched quads otherwise; results are identical. On the code path a term that repeats down a column is one shared Python string, so a caller converting terms into its own representation can memoize on the string it is handed.
+`get_quads` returns whole quads; `match_columns` returns the same rows transposed into four parallel columns, for callers that work a position at a time. Both are served from the term-code columns whenever the store can (Dictionary layout, resident dictionary) and from the matched quads otherwise; results are identical. On the code path a term that repeats down a column is one shared Python string, so a caller converting terms into its own representation can rely on the cached string it is handed.
 
 ## Term codes (low-level)
 
@@ -102,7 +102,7 @@ Building from source (the sdist or a development build) additionally requires **
 
 ### Benchmarks
 
-`bench/run.py` measures these bindings against [pyoxigraph](https://pypi.org/project/pyoxigraph/), [pycottas](https://pypi.org/project/pycottas/), [rdflib](https://pypi.org/project/rdflib/) and [lightrdf](https://pypi.org/project/lightrdf/) on a file → store → query workload and writes `bench/results.json` for the dashboard's Python tab; `bench/test_codspeed.py` is the instrumented suite CodSpeed runs.
+`bench/run.py` measures these bindings against [pyoxigraph](https://pypi.org/project/pyoxigraph/), [pycottas](https://pypi.org/project/pycottas/), [rdflib](https://pypi.org/project/rdflib/) and [lightrdf](https://pypi.org/project/lightrdf/) on a file → store → query workload and writes `bench/results.json` for [the dashboard's Python tab](https://vortex-rdf.github.io/vortex-rdf/#py); `bench/test_codspeed.py` is the instrumented suite CodSpeed runs.
 
 ```bash
 python3 python/bench/run.py                 # full run
@@ -110,12 +110,12 @@ BENCH_DIM=32 python3 python/bench/run.py    # quick pilot
 uv run pytest bench/test_codspeed.py --codspeed
 ```
 
-Harness design (per-library virtualenvs, dataset parity with `js/bench/datasets.ts`, `unsupported` cells where a library lacks the operation, matched-row counts cross-checked and any disagreement recorded in `config.countWarnings`) is documented in `bench/run.py`, `bench/worker.py` and `bench/adapters.py`. Knobs:
+Harness design (per-library virtualenvs, dataset parity with `js/bench/datasets.ts`, `unsupported` cells where a library lacks the operation, matched-row counts cross-checked and any disagreement recorded in `config.countWarnings`) is documented in `bench/run.py`, `bench/worker.py` and `bench/adapters.py`. Configuration variables:
 
 | Var | Default | Meaning |
 | --- | --- | --- |
-| `BENCH_SIZE` | 1,048,576 | rows (one knob shared with the Rust and JS suites) |
-| `BENCH_DIM` | unset | optional cube shorthand, `D³` rows; an explicit `BENCH_SIZE` wins |
+| `BENCH_SIZE` | 1,048,576 | rows (value shared with the Rust and JS suites) |
+| `BENCH_DIM` | unset | optional cube shorthand, `D³` rows; ignored if `BENCH_SIZE` is set |
 | `BENCH_GRAPHS_QUADS` | 8 | named graphs the comparative bench asks for |
 | `MUT_BATCH` | 10000 | quads per add/delete batch |
 | `BENCH_PYTHON` | 3.13 | Python version the per-library virtualenvs are provisioned with |
