@@ -1,4 +1,5 @@
 # vortex-rdf-encoded-search
+[![Crates.io](https://img.shields.io/crates/v/vortex-rdf-encoded-search.svg)](https://crates.io/crates/vortex-rdf-encoded-search)
 
 Bounds search and point access over compressed [Vortex](https://github.com/spiraldb/vortex)
 arrays, without decoding them.
@@ -7,15 +8,14 @@ Vortex's generic `search_sorted` is correct for every encoding, but it goes
 through the compute kernel machinery: an `ExecutionCtx`, scalar boxing, and —
 for encodings without a specialised kernel — canonicalization of the array
 being searched. When the column is a sorted, non-nullable unsigned integer
-column (a dictionary code column, a row-id column, an index key), that is a
-great deal of machinery to answer "where does value `v` start and end".
+column (a dictionary code column, a row-id column, an index key), that adds significan overhead to answer  queries like "where does value `v` start and end".
 
 This crate resolves such an array once into a borrowed tree of typed probe
 nodes, then answers queries against the compressed representation directly:
 slice reads, integer arithmetic, and single bit-packed word extraction. No
 `ExecutionCtx`, no scalars, no canonicalization, no allocation per query.
 
-It is not RDF-specific: it depends on nothing from
+It is not RDF-specific: it is independent from
 [vortex-rdf](https://github.com/vortex-rdf/vortex-rdf), which uses it to probe
 its sorted code columns.
 
@@ -98,20 +98,27 @@ the dictionary's values, fetched once and shared, into a dictionary array the
 probe resolves like any other. Because the probe's dictionary node bisects the
 decoded values, the order the writer assigned codes in never matters.
 
-```toml
-[dependencies]
-vortex-rdf-encoded-search = { version = "0.10", features = ["layout"] }
+```console
+cargo add vortex-rdf-encoded-search --features layout
 ```
 
 ## Performance
 
-Measured against Vortex 0.85 with `benches/probe.rs` (fastest of 100 samples,
-Intel Core Ultra 7 155H, 2026-08): on the 2M-row run-end-encoded `runend_2m`
-fixture, one two-sided `bounds` query costs ~0.7 µs against the compressed
-array, versus ~250 µs through Vortex's generic `search_sorted` on the same
-array, and ~0.14 µs against a fully decoded `Vec<u32>` with `partition_point`.
-It recovers most of the canonical binary-search floor while leaving the column
-compressed. The figures are refreshed with each Vortex minor bump.
+Measured against Vortex 0.85 with [`benches/probe.rs`](./benches/probe.rs) (fastest of 100
+samples, Intel Core Ultra 7 155H, 2026-08). One two-sided `bounds` query on a
+2M-row column, by fixture:
+
+| Fixture | `SortedProbe::bounds` | Vortex `search_sorted` | Decoded `Vec<u32>` (`partition_point`) |
+|---|---|---|---|
+| `runend_2m` | 0.69 µs | 249 µs | 0.08 µs |
+| `for_bitpacked_2m` | 0.39 µs | 14.4 µs | 0.07 µs |
+| `dict_2m` | 0.31 µs | 13.2 µs | 0.07 µs |
+
+The gap against the generic kernel is widest on `runend_2m` (~360×), where
+Vortex has no specialised `search_sorted` kernel and canonicalizes all 2M rows
+on every call; where a kernel does exist it is ~40×. Either way the probe stays
+within 4–9× of a fully decoded binary search while leaving the column
+compressed, and resolving one costs 130–240 ns, once. The figures are refreshed on every new release.
 
 Reproduce with:
 
@@ -121,8 +128,7 @@ cargo bench -p vortex-rdf-encoded-search --bench probe
 
 ## Compatibility
 
-Each release tracks one Vortex minor version — the crate reaches into encoding
-internals, which are not stable across Vortex minors. This release is built
+Each release tracks Vortex new releases. This release is built
 against Vortex `0.85`.
 
 Minimum supported Rust version: 1.95 (edition 2024).

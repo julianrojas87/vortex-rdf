@@ -78,9 +78,14 @@ def provision(name: str) -> Path:
     if python.exists():
         return python
     log(f"provisioning venv: {name}")
-    subprocess.run(
-        ["uv", "venv", str(venv), "--python", PYTHON_VERSION, "-q"], check=True, cwd=REPO_ROOT
-    )
+    # `bin/python` is an absolute symlink to a uv-managed interpreter that
+    # lives outside this tree, so a restored cache can bring the venv back
+    # with that link dangling — and the check above follows symlinks, so it
+    # reads as absent. Let uv replace the directory rather than refuse it.
+    cmd = ["uv", "venv", str(venv), "--python", PYTHON_VERSION, "-q"]
+    if venv.exists():
+        cmd.append("--clear")
+    subprocess.run(cmd, check=True, cwd=REPO_ROOT)
     pkgs = VENV_PACKAGES[name]
     if pkgs:
         subprocess.run(

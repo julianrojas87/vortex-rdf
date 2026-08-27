@@ -72,7 +72,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.98.0
       - name: Compare declared versions
         run: |
           set -euo pipefail
@@ -124,7 +124,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.98.0
       - name: Authenticate with crates.io
         if: ${{ !inputs.dry_run }}
         id: auth
@@ -150,7 +150,7 @@ jobs:
           node-version-file: .tool-versions
           registry-url: "https://registry.npmjs.org"
       - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.98.0
         with:
           targets: wasm32-unknown-unknown
       # wasm-pack is a pinned npm devDependency; `npm ci` installs it and npm

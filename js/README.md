@@ -9,7 +9,7 @@ JavaScript bindings for [Vortex-RDF](https://github.com/vortex-rdf/vortex-rdf), 
 npm install @vortex-rdf/vortex-rdf-store
 ```
 
-The package is ESM-only (no CommonJS `require`) and works identically in Node.js and browsers: the same `import` resolves to a Node entry point (reads the `.wasm` file off disk with `node:fs`) or a browser one (`fetch` via `import.meta.url`), and both await the wasm module's initialization for you, so there is no `init()` to call.
+The package is ESM-only (no CommonJS `require`) and works identically in Node.js and browsers: the same `import` resolves to a Node entry point (reads the `.wasm` file off disk with `node:fs`) or a browser one (`fetch` via `import.meta.url`), and both await the wasm module's initialization.
 
 > **Bundler note:** both entry points use top-level `await`. Vite and Rollup
 > support this by default; webpack 5 needs

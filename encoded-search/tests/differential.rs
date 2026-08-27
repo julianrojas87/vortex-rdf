@@ -1,7 +1,7 @@
 //! Differential suite: probe bounds and point access against two oracles —
-//! the canonical `partition_point` floor and vortex's generic `search_sorted`
-//! kernel — over forced-encoding fixtures and a randomized sweep through the
-//! default BtrBlocks cascade.
+//! the canonical `partition_point` floor on every needle and vortex's generic
+//! `search_sorted` kernel on a sample of them — over forced-encoding fixtures
+//! and a randomized sweep through the default BtrBlocks cascade.
 //!
 //! Forced fixtures assert the resolved `node_kinds`, so a compressor change
 //! that silently reroutes a fixture to a different encoding fails the test
@@ -33,6 +33,10 @@ const SUPPORTED_ENCODINGS: &[&str] = &[
     "vortex.dict",
     "vortex.shared",
 ];
+
+/// Most generic-oracle calls a single fixture makes. Fixtures with fewer
+/// needles than this check every one of them; larger ones are stride-sampled.
+const GENERIC_ORACLE_NEEDLES: usize = 2000;
 
 fn ctx() -> ExecutionCtx {
     session().create_execution_ctx()
@@ -136,13 +140,23 @@ fn assert_probe(arr: &ArrayRef, data: &[u32], expect_kinds: &[NodeKind]) {
     }
     assert_eq!(probe.len(), data.len());
 
-    for needle in needles_for(data) {
+    let needles = needles_for(data);
+    let generic_stride = needles.len().div_ceil(GENERIC_ORACLE_NEEDLES);
+    for (i, needle) in needles.iter().copied().enumerate() {
         let got = probe.bounds(needle);
         assert_eq!(
             got,
             canonical_bounds(data, needle),
             "canonical oracle, needle {needle}"
         );
+        // A generic `search_sorted` call costs orders of magnitude more than
+        // the canonical floor, so a high-cardinality fixture is stride-sampled
+        // down to `GENERIC_ORACLE_NEEDLES` of them. Index 0 and the ptype's
+        // upper edge are always taken, and every needle still meets the
+        // canonical oracle above.
+        if i % generic_stride != 0 && needle != u64::from(u32::MAX) {
+            continue;
+        }
         if let Ok(narrow) = u32::try_from(needle) {
             assert_eq!(
                 got,

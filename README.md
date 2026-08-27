@@ -11,18 +11,18 @@ Vortex-RDF is a columnar RDF serialization and a queryable quad store built on t
 
 ## Key features
 
-- **Columnar storage**: quads are four [Vortex](https://docs.vortex.dev/specs/file-format) columns, on disk and in memory alike, with the same layout in both.
-- **Zero-copy reads**: opening a file is lazy, and pattern filters are pushed down into the scan so only the touched chunks are read.
-- **Adaptive compression**: Vortex picks per-column encodings (FSST, dictionary, run-length, bit-packing, …) and decompresses just in time.
-- **Streaming, out-of-core ingestion**: datasets larger than RAM are globally sorted through an external merge sort with bounded memory.
-- **RDF 1.1 quads**: named graphs `(s, p, o, g)`, blank nodes, language-tagged and typed literals.
-- **Cross-platform**: one Rust core behind a CLI, WebAssembly bindings for Node.js and browsers, and Python bindings.
+- 📊 **Columnar storage**: quads are [Vortex](https://docs.vortex.dev/specs/file-format) arrays, on disk and in memory alike, with the same layout in both.
+- ♻️ **Zero-copy reads**: opening a file is lazy, and pattern filters are pushed down into the scan so only the touched chunks are read.
+- 📦 **Adaptive compression**: Vortex picks per-column encodings (FSST, dictionary, run-length, bit-packing, …) and decompresses just in time.
+- ☄️ **Streaming, out-of-core ingestion**: datasets larger than RAM are globally sorted through an external merge sort with bounded memory.
+- 🍀 **RDF 1.1 quads**: named graphs `(s, p, o, g)`, blank nodes, language-tagged and typed literals.
+- 🌍 **Cross-platform**: one Rust core behind a CLI, WebAssembly bindings for Node.js and browsers, and Python bindings.
 
 ## Install
 
 | Surface | Install | Notes |
 |---|---|---|
-| Rust | `vortex-rdf-core = "0.10.0"` | the default `file-io` feature adds path-based file reading/writing on Tokio; disable default features on wasm, where stores are exchanged as bytes |
+| Rust | `cargo add vortex-rdf-core` | the default `file-io` feature adds path-based file reading/writing on Tokio; add `--no-default-features` on wasm, where stores are exchanged as bytes |
 | CLI | `cargo install vortex-rdf-cli` | |
 | JavaScript | `npm install @vortex-rdf/vortex-rdf-store` | [js/README.md](js/README.md) |
 | Python | `pip install vortex-rdf` | [python/README.md](python/README.md); [`vortex-rdflib`](https://pypi.org/project/vortex-rdflib/) builds an rdflib integration on it |
@@ -31,7 +31,7 @@ Vortex-RDF is a columnar RDF serialization and a queryable quad store built on t
 
 **Rust** — convert an RDF file to `.vortex`, open it lazily, match a pattern, export the matches:
 
-```rust,no_run
+```rust no_run
 use oxrdf::NamedNode;
 use oxrdfio::RdfFormat;
 use vortex_rdf_core::{IndexType, LayoutStrategy, VortexRdfStore, export_rdf};
@@ -115,13 +115,13 @@ for await (const quad of store.match(null, 'http://ex/p', null, null)) {
 }
 ```
 
-## Concepts in one screen
+## Main concepts overview
 
 - **Column layouts** — `Default` stores the four terms as N-Triples strings; `TypedObject` splits the object into kind/value/datatype/language columns; `Dictionary` stores `u32` codes into one sorted term dictionary, held as the file's `dictionary` child and point-read through its chunk leaves when it stays file-backed. See [docs/file-format.md §4–5](docs/file-format.md#4-the-quad-table).
 - **Secondary indexes** — `SecondaryByCopy` keeps two extra copies of the quads sorted by `(p, o, s, g)` and `(o, s, p, g)`; `SecondaryByReference` keeps sorted `{val, rid}` pairs for predicates and objects. In memory they are binary-searched; in a file, a run is located by a chunk-probe binary search, then range-scanned or point-read. See [docs/file-format.md §6](docs/file-format.md#6-the-index-children) and [docs/matching.md §8](docs/matching.md#8-the-index-resolvers).
 - **Builders** — every build sorts globally by `(s, p, o, g)`: in memory on wasm, out of core (spilling sorted runs to disk) everywhere a filesystem exists. See [docs/serialization.md](docs/serialization.md).
 - **The store** — a base (array or lazily scanned file) plus a view: a row selection, tombstone masks and an append tail; `match_pattern` routes each bound position to the cheapest path (subject prefix probe, index, pushed-down filter, mask scan) and matches the tail independently. See [docs/matching.md](docs/matching.md).
-- **Mutations & compaction** — additions accrete in the tail, deletions tombstone rows, nothing is rewritten until a compaction rebuilds one sorted, indexed base (automatically once the tail outgrows its thresholds). See [docs/mutations.md](docs/mutations.md).
+- **Mutations & compaction** — additions are accumulated in the `Tail`, deletions are `Tombstone` rows, nothing is rewritten until a compaction rebuilds one sorted, indexed base (automatically once the tail outgrows its thresholds). See [docs/mutations.md](docs/mutations.md).
 - **The `.vortex` container** — one self-describing Vortex file: the quad table, the `dictionary` child and the index children under a `vortex-rdf.store.v1` root, also the byte-exchange format of the bindings. See [docs/file-format.md](docs/file-format.md).
 
 ## Read more

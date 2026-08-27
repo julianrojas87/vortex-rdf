@@ -28,12 +28,26 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Setup rust toolchain, cache and cargo-codspeed binary
+      # `cache: false` — this action keeps its own ~/.cargo cache under a
+      # separate key, duplicating what rust-cache already stores repo-wide and
+      # crowding the 10 GB limit. Toolchain and bins only; rust-cache below
+      # covers the caching (including CARGO_HOME/bin, so cargo-codspeed is
+      # still restored rather than reinstalled).
+      - name: Setup rust toolchain and cargo-codspeed binary
         uses: moonrepo/setup-rust@v1
         with:
-          channel: stable
-          cache-target: release
+          channel: "1.98.0"
+          cache: false
           bins: cargo-codspeed
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          # No profile selector needed: rust-cache stores the whole target
+          # directory, and the instrumented build's RUSTFLAGS are part of the
+          # key, so this entry can never collide with an uninstrumented one.
+          shared-key: bench-release
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       # Only the benchmark target is uploaded; match_lazy belongs to the
       # dashboard workflow, so instrumenting it here would be wasted work.
@@ -57,9 +71,15 @@ jobs:
       # wasm-pack (invoked by `npm run build`) needs a Rust toolchain with the
       # wasm target; the bindings are compiled fresh so the bench measures HEAD.
       - name: Setup Rust toolchain (for wasm-pack)
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.98.0
         with:
           targets: wasm32-unknown-unknown
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: wasm
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Setup Node
         uses: actions/setup-node@v7
@@ -101,12 +121,13 @@ jobs:
       # The extension is compiled fresh so the benchmark measures HEAD, the
       # same reason the JS job rebuilds the wasm bindings.
       - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.98.0
 
       - name: Cache Rust artifacts
         uses: Swatinem/rust-cache@v2
         with:
-          key: python-codspeed
+          shared-key: py-release
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Install uv
         uses: astral-sh/setup-uv@v7
