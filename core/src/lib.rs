@@ -14,10 +14,7 @@
 //! ```
 //! use futures::{executor::block_on, stream};
 //! use oxrdf::{GraphName, Literal, NamedNode, NamedOrBlankNode, Quad, Term};
-//! use vortex_rdf_core::{
-//!     LayoutStrategy, RawQuad, SortedInMemoryBuilder, VortexArrayBuilder, VortexRdfError,
-//!     VortexRdfStore,
-//! };
+//! use vortex_rdf_core::{LayoutStrategy, RawQuad, VortexRdfError, VortexRdfStore};
 //!
 //! block_on(async {
 //!     let quad = Quad::new(
@@ -30,17 +27,11 @@
 //!     // columns store. `parse_quads_from_reader` yields these directly.
 //!     let quads = stream::iter(vec![Ok::<_, VortexRdfError>(RawQuad::from_quad(&quad))]);
 //!
-//!     // Run the quad stream through a builder (here: sorted in memory by
-//!     // (s, p, o, g), plain string columns, no secondary indexes), then adopt
-//!     // its output as a queryable store.
-//!     let built = SortedInMemoryBuilder::build_vortex_array(
-//!         Box::new(quads),
-//!         LayoutStrategy::Default,
-//!         vec![],
-//!     )
-//!     .await
-//!     .unwrap();
-//!     let store = VortexRdfStore::from_built(built).unwrap();
+//!     // Sort the stream globally by (s, p, o, g) and adopt the result as a
+//!     // queryable store (here: plain string columns, no secondary indexes).
+//!     let store = VortexRdfStore::from_quads(quads, LayoutStrategy::Default, vec![])
+//!         .await
+//!         .unwrap();
 //!
 //!     // Pattern matching narrows a view over the store without copying data.
 //!     let p = NamedNode::new("http://example.org/p").unwrap();

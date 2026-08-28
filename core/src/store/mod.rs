@@ -53,6 +53,8 @@ use selection::{RowSelection, ViewSelection};
 use std::iter;
 use std::sync::Arc;
 
+use futures::Stream;
+
 use vortex_array::arrays::StructArray;
 use vortex_array::dtype::FieldNames;
 use vortex_array::validity::Validity;
@@ -163,6 +165,36 @@ fn compress_built_parts(
 
 impl VortexRdfStore {
     // ── constructors ─────────────────────────────────────────────────────────
+
+    /// Build a store from a quad stream: the global `(s, p, o, g)` sort, the
+    /// layout's columns, the requested indexes and the store assembly in one
+    /// call. Callers who need neither a particular builder nor its
+    /// intermediate [`BuiltArray`] should prefer this over pairing
+    /// `VortexArrayBuilder::build_vortex_array` with
+    /// [`from_built`](Self::from_built).
+    ///
+    /// The builder is picked by target: the out-of-core `SortedStreamBuilder`
+    /// wherever a filesystem exists, so the sort itself is not bounded by
+    /// memory, and `SortedInMemoryBuilder` on wasm, which has none. Both
+    /// produce the same globally sorted rows; name one directly to override
+    /// the choice.
+    ///
+    /// The finished store is resident either way. Writing a dataset larger
+    /// than memory never has to materialize it — `io::quads_stream_to_vortex_file`
+    /// streams the builder's chunks straight into the file writer instead.
+    pub async fn from_quads(
+        quads: impl Stream<Item = Result<RawQuad>> + Unpin + Send + 'static,
+        layout: LayoutStrategy,
+        indexes: Indexes,
+    ) -> Result<Self> {
+        #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+        let built =
+            SortedInMemoryBuilder::build_vortex_array(Box::new(quads), layout, indexes).await?;
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+        let built =
+            SortedStreamBuilder::build_vortex_array(Box::new(quads), layout, indexes).await?;
+        Self::from_built(built)
+    }
 
     /// Rebuild a store from [`StoreParts`] — the inverse of
     /// [`to_serializable_parts`](Self::to_serializable_parts). A

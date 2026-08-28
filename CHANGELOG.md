@@ -57,6 +57,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Probe dictionary-coded columns through their codes leaves (encoded-search) ([`62e4874`](https://github.com/vortex-rdf/vortex-rdf/commit/62e4874e621bdc3e4c5bd37c742aee26e2951617) by @julianrojas87)
 - Validate pattern terms, expose indexes() and TermDict.encode (bindings) ([`46e4fcf`](https://github.com/vortex-rdf/vortex-rdf/commit/46e4fcf55dad9ca5420937f0e953da64b36b70ec) by @julianrojas87)
 - SerializeRdf/deserializeRdf, keyword-only serialize_rdf, dictionary as the one default (bindings) ([`6961421`](https://github.com/vortex-rdf/vortex-rdf/commit/6961421c78443e4da774fbb2481368d26fa7fc4b) by @julianrojas87)
+- Add VortexRdfStore::from_quads (core) ([`7acfea1`](https://github.com/vortex-rdf/vortex-rdf/commit/7acfea1508b948a31a2b9f0c374079c4bba78aff) by @julianrojas87)
 
 ### Changed
 
@@ -132,6 +133,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Fmt complaints 4 ([`3f45458`](https://github.com/vortex-rdf/vortex-rdf/commit/3f454585a642db6c800cc69503b31a55ea10c671) by @julianrojas87)
 - Missing fixes for the CI ([`c9e10bf`](https://github.com/vortex-rdf/vortex-rdf/commit/c9e10bfa84f579df8a439aab22293e39ea99ba8c) by @julianrojas87)
 - Warn when a suite's scale disagrees with the Rust run (dashboard) ([`1e73f71`](https://github.com/vortex-rdf/vortex-rdf/commit/1e73f71b586ea2a378ecd4f633034ba172e6d30d) by @julianrojas87)
+- Survive a restored venv whose interpreter is gone (bench) ([`9a9d424`](https://github.com/vortex-rdf/vortex-rdf/commit/9a9d424288d3e000cc6bdc8357a946b9be47b206) by @julianrojas87)
 
 ## [0.5.0](https://github.com/vortex-rdf/vortex-rdf/compare/v0.4.0...v0.5.0) - 2026-07-29
 
