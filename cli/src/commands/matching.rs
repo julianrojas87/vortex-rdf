@@ -12,7 +12,7 @@ use vortex_rdf_core::common::formats::detect_format;
 use vortex_rdf_core::common::terms::{parse_pattern_checked, parse_quads_from_reader};
 use vortex_rdf_core::debug as debug_time;
 use vortex_rdf_core::{
-    LayoutStrategy, SortedStreamBuilder, VortexArrayBuilder, VortexRdfStore, export_rdf,
+    LayoutStrategy, VortexRdfStore, export_rdf,
 };
 
 use crate::MatchArgs;
@@ -77,13 +77,8 @@ pub async fn run(args: MatchArgs) -> Result<()> {
         let reader = Box::new(File::open(&input).context("Failed to open input file")?);
         let quads_stream = parse_quads_from_reader(reader, input_format);
 
-        let built = SortedStreamBuilder::build_vortex_array(
-            Box::new(quads_stream),
-            LayoutStrategy::Dictionary,
-            vec![],
-        )
-        .await?;
-        let store = VortexRdfStore::from_built(built).map_err(|e| anyhow::anyhow!(e))?;
+        let store =
+            VortexRdfStore::from_quads(quads_stream, LayoutStrategy::Dictionary, vec![]).await?;
         debug!(
             "Vortex store built in {:?}",
             debug_time::elapsed(load_start)

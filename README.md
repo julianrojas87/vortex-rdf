@@ -61,19 +61,23 @@ export_rdf(matched, std::fs::File::create("knows.nq")?, RdfFormat::NQuads).await
 
 ```rust
 use oxrdf::{GraphName, NamedNode, Quad};
-use vortex_rdf_core::{LayoutStrategy, RawQuad, SortedInMemoryBuilder, VortexArrayBuilder, VortexRdfStore};
+use vortex_rdf_core::{LayoutStrategy, RawQuad, VortexRdfStore};
 # fn main() -> Result<(), Box<dyn std::error::Error>> {
 # futures::executor::block_on(async {
+ 
+// Create some quads
 let (s, p) = (NamedNode::new("http://ex/s")?, NamedNode::new("http://ex/p")?);
 let a = Quad::new(s.clone(), p.clone(), NamedNode::new("http://ex/a")?, GraphName::DefaultGraph);
 let b = Quad::new(s, p, NamedNode::new("http://ex/b")?, GraphName::DefaultGraph);
-// Sort the quads in memory and adopt the result as a store (Dictionary layout, no indexes)
+
+// Sort the quads and adopt the result as a store (Dictionary layout, no indexes)
 let quads = futures::stream::iter([Ok(RawQuad::from_quad(&a))]);
-let built = SortedInMemoryBuilder::build_vortex_array(Box::new(quads), LayoutStrategy::Dictionary, vec![]).await?;
-let store = VortexRdfStore::from_built(built)?;
+let store = VortexRdfStore::from_quads(quads, LayoutStrategy::Dictionary, vec![]).await?;
+
 // Mutations return derived stores: additions append to a tail, deletions tombstone rows
 let store = store.add_quad(b).await?;
 let store = store.delete_quad(&a).await?;
+
 assert_eq!(store.size().await?, 1);
 # Ok::<(), Box<dyn std::error::Error>>(()) })?; Ok(()) }
 ```
@@ -81,14 +85,18 @@ assert_eq!(store.size().await?, 1);
 **CLI**:
 
 ```bash
+# Transform RDF data into Vortex-RDF
 vortex-rdf-cli serialize -i data.ttl -o data.vortex --indexes secondary-by-reference   # --layout defaults to dictionary
-vortex-rdf-cli deserialize -i data.vortex -o data.nq                                    # format from the extension, else N-Quads
+
+# Transform back to RDF
+vortex-rdf-cli deserialize -i data.vortex -o data.nq                                # format from the extension, else N-Quads
+
+# Match graph patterns over Vortex-RDF stores
 vortex-rdf-cli match -i data.vortex --predicate "http://xmlns.com/foaf/0.1/knows"       # matches to stdout as N-Quads
 # --layout: default | typed-object | dictionary    --indexes (repeatable): secondary-by-copy | secondary-by-reference
 
-# Any command takes RUST_LOG for the engine's own timings — which path resolved
-# a pattern (an index, a binary search, a mask scan) and how long each stage of
-# a match, an export, or a write took:
+# Any command takes RUST_LOG for detailed debug logs timing the path used to resolve
+# a pattern (an index, a binary search, a mask scan):
 RUST_LOG=vortex_rdf_core=debug vortex-rdf-cli match -i data.vortex --predicate "http://xmlns.com/foaf/0.1/knows"
 ```
 
@@ -110,6 +118,7 @@ import { VortexRdfStore, serializeRdf } from '@vortex-rdf/vortex-rdf-store';
 
 const bytes = await serializeRdf('<http://ex/s> <http://ex/p> "o" .', 'turtle');
 const store = await VortexRdfStore.fromBytes(bytes);
+
 for await (const quad of store.match(null, 'http://ex/p', null, null)) {
   console.log(quad.subject.value, quad.object.value);
 }
